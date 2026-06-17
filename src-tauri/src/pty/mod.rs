@@ -187,6 +187,11 @@ impl PtyManager {
             .and_then(|p| p.foreground_pid())
     }
 
+    /// The pane's live working directory (U10, R13).
+    pub fn cwd(&self, id: PaneId) -> Option<std::path::PathBuf> {
+        self.foreground_pid(id).and_then(crate::cwd::proc_cwd)
+    }
+
     /// Number of registered panes.
     pub fn count(&self) -> usize {
         self.panes.lock().unwrap().len()
@@ -267,4 +272,13 @@ pub fn pty_resume(
     pane_id: PaneId,
 ) -> Result<(), String> {
     manager.resume(pane_id)
+}
+
+/// The pane's live working directory, for session restore (U10, R13).
+#[tauri::command]
+pub fn pane_cwd(
+    manager: tauri::State<'_, Arc<PtyManager>>,
+    pane_id: PaneId,
+) -> Option<String> {
+    manager.cwd(pane_id).map(|p| p.to_string_lossy().into_owned())
 }

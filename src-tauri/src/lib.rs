@@ -5,6 +5,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod cwd;
 pub mod hooks;
 pub mod notify;
 pub mod pty;
@@ -113,6 +114,7 @@ pub fn run() {
             pty::close_pane,
             pty::pty_pause,
             pty::pty_resume,
+            pty::pane_cwd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running fly");
