@@ -19,6 +19,7 @@ use tauri::Manager;
 
 use config::ConfigStore;
 use hooks::{Dispatch, HookServer, TokenRegistry, ValidatedHook};
+use notify::{NotificationGate, Surfaced};
 use pty::PtyManager;
 use state::attention::{Signal, Tier};
 use state::AttentionManager;
@@ -69,6 +70,9 @@ pub fn run() {
     let pty_manager = Arc::new(PtyManager::new());
     let tokens = Arc::new(TokenRegistry::new());
     let attention = Arc::new(AttentionManager::new(config.get().attention_debounce_ms));
+    let gate = Arc::new(NotificationGate::new(
+        config.get().notification_coalesce_threshold,
+    ));
 
     // Clones for the hook server's dispatch (the originals are managed below).
     let tokens_for_hooks = Arc::clone(&tokens);
@@ -84,6 +88,7 @@ pub fn run() {
         .setup(move |app| {
             let handle = app.handle().clone();
             let attention = attention_for_hooks;
+            let gate = gate;
             let dispatch: Dispatch = Arc::new(move |pane, hook: ValidatedHook| {
                 let signal = Signal {
                     reason: hook.reason,
@@ -94,7 +99,18 @@ pub fn run() {
                     if outcome.notify {
                         let title = hook.title.as_deref().unwrap_or("fly: an agent needs you");
                         let body = hook.body.as_deref().unwrap_or("");
-                        notify::surface(&handle, title, body);
+                        // Coalesce when many panes are raised; rate-limit bursts.
+                        match gate.decide(attention.raised_count(), title, body, gate.now_ms()) {
+                            Surfaced::Individual { title, body } => {
+                                notify::surface(&handle, &title, &body)
+                            }
+                            Surfaced::Coalesced { count } => notify::surface(
+                                &handle,
+                                "fly",
+                                &format!("{count} agents need attention"),
+                            ),
+                            Surfaced::Suppressed => {}
+                        }
                     }
                 }
             });

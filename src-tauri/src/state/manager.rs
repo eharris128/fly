@@ -91,4 +91,15 @@ impl AttentionManager {
         let mut machines = self.machines.lock().unwrap();
         machines.get_mut(&pane).map(|m| m.on_exit())
     }
+
+    /// How many panes are currently raised (for notification coalescing, U11).
+    pub fn raised_count(&self) -> usize {
+        use super::attention::AttentionState;
+        self.machines
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|m| m.state() == AttentionState::Raised)
+            .count()
+    }
 }
