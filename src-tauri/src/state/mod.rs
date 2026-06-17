@@ -5,4 +5,6 @@
 //! lifecycle transitions; U7 formalizes the full transition tables, the
 //! attention machine, and the notification-suppression matrix.
 
+pub mod attention;
 pub mod lifecycle;
+pub mod suppress;

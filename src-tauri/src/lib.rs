@@ -3,6 +3,8 @@
 //! This library backs both the desktop app and the `fly` CLI subcommands
 //! (KTD12); `main.rs` is a thin shim over [`run`].
 
+pub mod cli;
+pub mod hooks;
 pub mod pty;
 pub mod state;
 pub mod stream;
@@ -31,8 +33,16 @@ fn frontend_log(msg: String) {
     eprintln!("[fly-webview] {msg}");
 }
 
-/// Run the fly desktop application.
+/// Run the fly desktop application — or a `fly` CLI subcommand if argv selects
+/// one (KTD12).
 pub fn run() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(first) = args.get(1) {
+        if cli::is_cli_subcommand(first) {
+            std::process::exit(cli::run(&args));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     apply_linux_webview_env();
 
