@@ -86,3 +86,13 @@ export function ptyResize(
 export function closePane(paneId: PaneId): Promise<void> {
   return invoke("close_pane", { paneId });
 }
+
+/** Pause a pane's output when unacked bytes exceed the high watermark (KTD4). */
+export function ptyPause(paneId: PaneId): Promise<void> {
+  return invoke("pty_pause", { paneId });
+}
+
+/** Resume a paused pane when unacked bytes drain below the low watermark. */
+export function ptyResume(paneId: PaneId): Promise<void> {
+  return invoke("pty_resume", { paneId });
+}

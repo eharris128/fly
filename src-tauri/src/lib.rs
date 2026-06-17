@@ -111,6 +111,8 @@ pub fn run() {
             pty::pty_write,
             pty::pty_resize,
             pty::close_pane,
+            pty::pty_pause,
+            pty::pty_resume,
         ])
         .run(tauri::generate_context!())
         .expect("error while running fly");

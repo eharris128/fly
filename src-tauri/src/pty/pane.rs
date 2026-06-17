@@ -13,7 +13,7 @@
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -22,8 +22,10 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use super::{ExitCallback, OutputSink, PaneId, SpawnConfig};
 use crate::state::lifecycle::LifecycleState;
 
-/// PTY read buffer (KTD2: 8 KB blocking reads; U4 layers coalescing on top).
-const READ_BUF: usize = 8 * 1024;
+/// PTY read buffer. A large buffer gives natural coalescing under load (a
+/// single `read` returns a big chunk during a flood) while staying low-latency
+/// when idle (it returns immediately with whatever's there) — KTD4.
+const READ_BUF: usize = 64 * 1024;
 /// How long to wait after SIGHUP before escalating to SIGKILL on close.
 const GRACE: Duration = Duration::from_millis(200);
 
@@ -41,6 +43,11 @@ struct PaneShared {
     /// Fires once when the child is reaped (lets teardown time its SIGKILL
     /// escalation without a busy-wait).
     reaped_tx: Sender<()>,
+    /// Backpressure (KTD4): when set, the read thread parks instead of issuing
+    /// reads, so the kernel PTY buffer backpressures the producer losslessly.
+    /// The thread is never torn down — pause/resume just gate reads.
+    paused: Mutex<bool>,
+    pause_cv: Condvar,
 }
 
 /// A live PTY pane.
@@ -144,6 +151,8 @@ impl Pane {
             stopping: AtomicBool::new(false),
             reaped: AtomicBool::new(false),
             reaped_tx,
+            paused: Mutex::new(false),
+            pause_cv: Condvar::new(),
         });
 
         let thread_shared = Arc::clone(&shared);
@@ -182,6 +191,18 @@ impl Pane {
             .map_err(|e| format!("resize failed: {e}"))
     }
 
+    /// Pause reads (backpressure). The in-flight read drains, then the thread
+    /// parks until [`Pane::resume`] (KTD4).
+    pub fn pause(&self) {
+        *self.shared.paused.lock().unwrap() = true;
+    }
+
+    /// Resume reads after a pause.
+    pub fn resume(&self) {
+        *self.shared.paused.lock().unwrap() = false;
+        self.shared.pause_cv.notify_all();
+    }
+
     /// Current lifecycle state.
     pub fn lifecycle(&self) -> LifecycleState {
         self.shared.lifecycle.lock().unwrap().clone()
@@ -209,6 +230,8 @@ impl Pane {
         }
         log::debug!("tearing down pane {}", self.id.0);
         self.shared.stopping.store(true, Ordering::Release);
+        // Wake the read thread if it's parked on the pause condvar.
+        self.shared.pause_cv.notify_all();
 
         if let Some(pid) = self.pid {
             // Graceful hangup unless the child is already gone. The shell is a
@@ -250,8 +273,18 @@ fn read_loop(
     shared: Arc<PaneShared>,
     on_exit: ExitCallback,
 ) {
-    let mut buf = [0u8; READ_BUF];
+    let mut buf = vec![0u8; READ_BUF];
     loop {
+        // Park while paused for backpressure (KTD4), but wake to tear down.
+        {
+            let mut paused = shared.paused.lock().unwrap();
+            while *paused && !shared.stopping.load(Ordering::Acquire) {
+                paused = shared.pause_cv.wait(paused).unwrap();
+            }
+        }
+        if shared.stopping.load(Ordering::Acquire) {
+            break;
+        }
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF
             Ok(n) => sink(&buf[..n]),

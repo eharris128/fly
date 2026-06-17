@@ -5,12 +5,15 @@
   import { WebglAddon } from "@xterm/addon-webgl";
   import { Unicode11Addon } from "@xterm/addon-unicode11";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { getConfig } from "./config";
   import "@xterm/xterm/css/xterm.css";
   import {
     spawnPane,
     ptyWrite,
     ptyResize,
     closePane,
+    ptyPause,
+    ptyResume,
     makeOutputChannel,
     setPaneFocus,
     setWindowForeground,
@@ -32,6 +35,30 @@
   let attention = $state<AttentionState>("idle");
   let reason = $state<AttentionReason | null>(null);
 
+  // Flow control (KTD4): pause the PTY when too many bytes are unacked by
+  // xterm, resume when they drain. Bounds in-flight memory under output floods.
+  const HIGH_WATERMARK = 2 * 1024 * 1024; // 2 MB
+  const LOW_WATERMARK = 512 * 1024; // 512 KB
+  let unacked = 0;
+  let paused = false;
+
+  function onOutput(bytes: Uint8Array) {
+    if (!term) return;
+    const n = bytes.length;
+    unacked += n;
+    term.write(bytes, () => {
+      unacked -= n;
+      if (paused && unacked < LOW_WATERMARK && paneId !== null) {
+        paused = false;
+        void ptyResume(paneId);
+      }
+    });
+    if (!paused && unacked > HIGH_WATERMARK && paneId !== null) {
+      paused = true;
+      void ptyPause(paneId);
+    }
+  }
+
   const REASON_LABEL: Record<AttentionReason, string> = {
     question: "waiting for you",
     permission: "needs permission",
@@ -46,11 +73,13 @@
   }
 
   onMount(async () => {
+    const config = await getConfig();
+
     term = new Terminal({
       fontFamily: "ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace",
       fontSize: 13,
       cursorBlink: true,
-      scrollback: 10_000,
+      scrollback: config.scrollbackLines, // capped (KTD4)
       allowProposedApi: true, // required by the unicode11 addon
       theme: { background: "#0b1020", foreground: "#c9d1d9" },
     });
@@ -62,19 +91,24 @@
 
     term.open(container);
 
-    try {
-      const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose());
-      term.loadAddon(webgl);
-    } catch (err) {
-      console.warn("WebGL renderer unavailable, using DOM renderer", err);
+    // WebGL with a DOM-renderer fallback (KTD6, R15). On context loss —
+    // common on WebKitGTK's DMABUF path — dispose the addon, which drops xterm
+    // back to the DOM renderer transparently.
+    if (config.renderer !== "dom") {
+      try {
+        const webgl = new WebglAddon();
+        webgl.onContextLoss(() => webgl.dispose());
+        term.loadAddon(webgl);
+      } catch (err) {
+        console.warn("WebGL renderer unavailable, using DOM renderer", err);
+      }
     }
 
     fit.fit();
     const cols = term.cols >= 2 ? term.cols : 80;
     const rows = term.rows >= 2 ? term.rows : 24;
 
-    const channel = makeOutputChannel((bytes) => term?.write(bytes));
+    const channel = makeOutputChannel(onOutput);
     paneId = await spawnPane(channel, { rows, cols });
 
     term.onData((data) => {

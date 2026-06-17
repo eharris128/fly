@@ -137,6 +137,20 @@ impl PtyManager {
         pane.resize(rows, cols)
     }
 
+    /// Pause reads on a pane (backpressure, KTD4).
+    pub fn pause(&self, id: PaneId) -> Result<(), String> {
+        let panes = self.panes.lock().unwrap();
+        panes.get(&id).ok_or_else(|| no_such(id))?.pause();
+        Ok(())
+    }
+
+    /// Resume reads on a pane.
+    pub fn resume(&self, id: PaneId) -> Result<(), String> {
+        let panes = self.panes.lock().unwrap();
+        panes.get(&id).ok_or_else(|| no_such(id))?.resume();
+        Ok(())
+    }
+
     /// Close a pane: remove it from the registry first (so no new accessor
     /// resolves it), then tear down and reap its child (KTD13).
     pub fn close(&self, id: PaneId) -> Result<(), String> {
@@ -234,4 +248,23 @@ pub fn close_pane(
     pane_id: PaneId,
 ) -> Result<(), String> {
     manager.close(pane_id)
+}
+
+/// Pause a pane's output (frontend flow control, KTD4): called when unacked
+/// bytes exceed the high watermark.
+#[tauri::command]
+pub fn pty_pause(
+    manager: tauri::State<'_, Arc<PtyManager>>,
+    pane_id: PaneId,
+) -> Result<(), String> {
+    manager.pause(pane_id)
+}
+
+/// Resume a paused pane when unacked bytes drain below the low watermark.
+#[tauri::command]
+pub fn pty_resume(
+    manager: tauri::State<'_, Arc<PtyManager>>,
+    pane_id: PaneId,
+) -> Result<(), String> {
+    manager.resume(pane_id)
 }
