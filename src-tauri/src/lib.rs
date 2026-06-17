@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod cwd;
 pub mod hooks;
+pub mod lifecycle;
 pub mod notify;
 pub mod pty;
 pub mod session;
@@ -145,6 +146,12 @@ pub fn run() {
             session::save_scrollback,
             session::load_scrollback,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running fly");
+        .build(tauri::generate_context!())
+        .expect("error while building fly")
+        // Ordered teardown on quit: reap every pane (no zombies/orphans, R4).
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                lifecycle::shutdown(app_handle);
+            }
+        });
 }

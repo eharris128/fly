@@ -27,6 +27,7 @@
   } from "./ipc";
   import { Keymap } from "./lib/keymap";
   import { getConfig } from "./lib/config";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import {
     saveSession,
     loadSession,
@@ -239,6 +240,18 @@
       activeId = t.id;
     }
     ready = true;
+
+    // Flush a final save before the window closes, while the shells are still
+    // alive so their cwds are captured (R13/R14). Then the backend reaps panes.
+    const win = getCurrentWindow();
+    await win.onCloseRequested(async (event) => {
+      event.preventDefault();
+      try {
+        await persist();
+      } finally {
+        await win.destroy();
+      }
+    });
   }
 
   function reportForeground() {
