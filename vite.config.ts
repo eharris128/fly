@@ -2,7 +2,18 @@ import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
 export default defineConfig({
-  plugins: [svelte()],
+  plugins: [
+    svelte(),
+    {
+      // WebKitGTK fails to load `crossorigin` module scripts from Tauri's
+      // custom asset protocol, leaving a blank window in release builds.
+      name: "fly-strip-crossorigin",
+      enforce: "post",
+      transformIndexHtml(html) {
+        return html.replace(/\s+crossorigin/g, "");
+      },
+    },
+  ],
   // Tauri shows its own errors; don't let Vite wipe them.
   clearScreen: false,
   server: {

@@ -30,6 +30,20 @@ pnpm tauri build              # release .deb (primary) + AppImage (secondary)
   from `devUrl` (the Vite server), so it shows blank if run standalone — use
   `pnpm tauri dev`. The **release** build (`pnpm tauri build`) embeds the
   frontend and runs standalone.
+- **Known: release-mode blank window on WebKitGTK 2.52 (this 24.04 dev box).**
+  `pnpm tauri build` compiles, embeds the frontend, and produces the `.deb`, but
+  the release binary's WebKitGTK webview does not load the embedded assets via
+  Tauri's custom protocol here — the page never gets a working JS context (even
+  a backend `eval` can't run, and Tauri's IPC isn't injected). **Dev mode works
+  fully.** This is a regression in the very new **WebKitGTK 2.52.3** on Ubuntu
+  24.04, not app code; the plan (KTD11) targets the **Ubuntu 22.04 baseline**
+  (WebKitGTK ~2.40), where the custom protocol is expected to work. Follow-ups
+  to confirm/fix on this box: build on the 22.04 baseline; bump Tauri to a patch
+  with WebKitGTK 2.52 compat; or inspect the exact protocol error via the
+  release webview's devtools (GUI). Stripping `crossorigin` from the built HTML
+  (a Vite plugin, already in `vite.config.ts`) is a related, kept fix.
+- The AppImage target also needs network to download `linuxdeploy`/`AppRun` from
+  GitHub at bundle time (timed out in the sandbox); the `.deb` (primary) builds.
 - The webview console is invisible; the frontend forwards uncaught errors to
   stderr via the `frontend_log` command (look for `[fly-webview]`).
 
