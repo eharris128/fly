@@ -25,6 +25,11 @@ pub struct PaneId(pub u64);
 /// U3 wires a `tauri::ipc::Channel`; tests wire an mpsc sender.
 pub type OutputSink = Box<dyn FnMut(&[u8]) + Send>;
 
+/// Called once by the read thread after the child is reaped, with the pane's
+/// final lifecycle state. U3 wires this to a Tauri event so the frontend can
+/// surface the exit; tests pass a no-op.
+pub type ExitCallback = Box<dyn FnOnce(PaneId, LifecycleState) + Send>;
+
 /// How to spawn a pane's shell.
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
@@ -83,9 +88,10 @@ impl PtyManager {
         cfg: SpawnConfig,
         token: String,
         sink: OutputSink,
+        on_exit: ExitCallback,
     ) -> Result<PaneId, String> {
         let id = PaneId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let pane = Pane::spawn(id, cfg, token, sink)?;
+        let pane = Pane::spawn(id, cfg, token, sink, on_exit)?;
         self.panes.lock().unwrap().insert(id, pane);
         Ok(id)
     }

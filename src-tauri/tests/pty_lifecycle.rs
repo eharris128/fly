@@ -77,7 +77,7 @@ fn poll_lifecycle<F: Fn(&LifecycleState) -> bool>(
 fn echo_executes_and_round_trips() {
     let mgr = PtyManager::new();
     let (sink, rx) = channel_sink();
-    let id = mgr.spawn(bash(), "tok".into(), sink).unwrap();
+    let id = mgr.spawn(bash(), "tok".into(), sink, Box::new(|_, _| {})).unwrap();
 
     // The computed value (not the literal echo of input) proves execution.
     mgr.write(id, b"echo FLYMARK$((6*7))\n").unwrap();
@@ -94,7 +94,7 @@ fn echo_executes_and_round_trips() {
 fn input_is_echoed_by_the_tty() {
     let mgr = PtyManager::new();
     let (sink, rx) = channel_sink();
-    let id = mgr.spawn(bash(), "tok".into(), sink).unwrap();
+    let id = mgr.spawn(bash(), "tok".into(), sink, Box::new(|_, _| {})).unwrap();
 
     mgr.write(id, b"ZZmarker").unwrap(); // no newline: pure tty echo
     let out = wait_for(&rx, b"ZZmarker", Duration::from_secs(5));
@@ -106,7 +106,7 @@ fn input_is_echoed_by_the_tty() {
 fn resize_propagates_winsize() {
     let mgr = PtyManager::new();
     let (sink, rx) = channel_sink();
-    let id = mgr.spawn(bash(), "tok".into(), sink).unwrap();
+    let id = mgr.spawn(bash(), "tok".into(), sink, Box::new(|_, _| {})).unwrap();
 
     // Distinctive geometry so a coincidental match is implausible.
     mgr.resize(id, 40, 137).unwrap();
@@ -124,7 +124,7 @@ fn resize_propagates_winsize() {
 fn shell_exit_reaps_child_no_zombie() {
     let mgr = PtyManager::new();
     let (sink, _rx) = channel_sink();
-    let id = mgr.spawn(bash(), "tok".into(), sink).unwrap();
+    let id = mgr.spawn(bash(), "tok".into(), sink, Box::new(|_, _| {})).unwrap();
 
     mgr.write(id, b"exit\n").unwrap();
     // Lifecycle becomes Exited only after the read thread's wait() reaps the
@@ -141,7 +141,7 @@ fn shell_exit_reaps_child_no_zombie() {
 fn close_kills_and_reaps_live_shell() {
     let mgr = PtyManager::new();
     let (sink, _rx) = channel_sink();
-    let id = mgr.spawn(bash(), "tok".into(), sink).unwrap();
+    let id = mgr.spawn(bash(), "tok".into(), sink, Box::new(|_, _| {})).unwrap();
 
     assert!(mgr.lifecycle(id).is_some());
     mgr.close(id).unwrap(); // must not hang; joins the reaping read thread
@@ -153,7 +153,7 @@ fn close_kills_and_reaps_live_shell() {
 fn binary_output_is_forwarded_verbatim() {
     let mgr = PtyManager::new();
     let (sink, rx) = channel_sink();
-    let id = mgr.spawn(bash(), "tok".into(), sink).unwrap();
+    let id = mgr.spawn(bash(), "tok".into(), sink, Box::new(|_, _| {})).unwrap();
 
     // Emit raw non-UTF-8 bytes; the read path must forward them verbatim and
     // never panic. (Any chunk boundary is safe because no decoding happens.)
@@ -170,7 +170,7 @@ fn binary_output_is_forwarded_verbatim() {
 fn close_during_flood_tears_down_in_order() {
     let mgr = PtyManager::new();
     let (sink, rx) = channel_sink();
-    let id = mgr.spawn(bash(), "tok".into(), sink).unwrap();
+    let id = mgr.spawn(bash(), "tok".into(), sink, Box::new(|_, _| {})).unwrap();
 
     // Start an unbounded flood, confirm it's producing, then close mid-stream.
     mgr.write(id, b"yes FLYFLOOD\n").unwrap();
@@ -191,6 +191,6 @@ fn spawn_failure_is_reported() {
         shell: Some("/nonexistent/definitely-not-a-shell".into()),
         ..Default::default()
     };
-    let res = mgr.spawn(cfg, "tok".into(), sink);
+    let res = mgr.spawn(cfg, "tok".into(), sink, Box::new(|_, _| {}));
     assert!(res.is_err(), "spawning a missing shell should fail");
 }

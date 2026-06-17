@@ -5,6 +5,7 @@
 
 pub mod pty;
 pub mod state;
+pub mod stream;
 
 use std::sync::Arc;
 
@@ -22,6 +23,14 @@ fn apply_linux_webview_env() {
     }
 }
 
+/// Surface webview errors to the app's stderr. The webview console is
+/// otherwise invisible when running outside a browser devtools session, so the
+/// frontend forwards uncaught errors here.
+#[tauri::command]
+fn frontend_log(msg: String) {
+    eprintln!("[fly-webview] {msg}");
+}
+
 /// Run the fly desktop application.
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -34,6 +43,8 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .manage(pty_manager)
         .invoke_handler(tauri::generate_handler![
+            frontend_log,
+            stream::spawn_pane,
             pty::pty_write,
             pty::pty_resize,
             pty::close_pane,

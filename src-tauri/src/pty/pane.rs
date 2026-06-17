@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
-use super::{OutputSink, PaneId, SpawnConfig};
+use super::{ExitCallback, OutputSink, PaneId, SpawnConfig};
 use crate::state::lifecycle::LifecycleState;
 
 /// PTY read buffer (KTD2: 8 KB blocking reads; U4 layers coalescing on top).
@@ -71,6 +71,7 @@ impl Pane {
         cfg: SpawnConfig,
         token: String,
         sink: OutputSink,
+        on_exit: ExitCallback,
     ) -> Result<Pane, String> {
         let pty_system = native_pty_system();
         let size = PtySize {
@@ -148,7 +149,7 @@ impl Pane {
         let thread_shared = Arc::clone(&shared);
         let handle = std::thread::Builder::new()
             .name(format!("fly-pty-{}", id.0))
-            .spawn(move || read_loop(reader, child, sink, thread_shared))
+            .spawn(move || read_loop(id, reader, child, sink, thread_shared, on_exit))
             .map_err(|e| format!("spawn read thread failed: {e}"))?;
 
         Ok(Pane {
@@ -242,10 +243,12 @@ impl Drop for Pane {
 
 /// The blocking read loop. Owns the child and reaps it when the read side ends.
 fn read_loop(
+    id: PaneId,
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn Child + Send + Sync>,
     mut sink: OutputSink,
     shared: Arc<PaneShared>,
+    on_exit: ExitCallback,
 ) {
     let mut buf = [0u8; READ_BUF];
     loop {
@@ -261,7 +264,7 @@ fn read_loop(
 
     // The read side ended ⟹ the child closed the PTY ⟹ it has exited. Reap it.
     let status = child.wait();
-    {
+    let final_state = {
         let mut lc = shared.lifecycle.lock().unwrap();
         if !lc.is_terminal() {
             *lc = if shared.stopping.load(Ordering::Acquire) {
@@ -278,9 +281,12 @@ fn read_loop(
                 }
             };
         }
-    }
+        lc.clone()
+    };
     shared.reaped.store(true, Ordering::Release);
     let _ = shared.reaped_tx.send(());
+    // Notify outside the lock; surfaces the exit to the frontend (U3).
+    on_exit(id, final_state);
 }
 
 /// Send a signal to a process. ESRCH (already gone) is ignored.
