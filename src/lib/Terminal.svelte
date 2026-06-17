@@ -4,6 +4,7 @@
   import { FitAddon } from "@xterm/addon-fit";
   import { WebglAddon } from "@xterm/addon-webgl";
   import { Unicode11Addon } from "@xterm/addon-unicode11";
+  import { SerializeAddon } from "@xterm/addon-serialize";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getConfig } from "./config";
   import type { Keymap } from "./keymap";
@@ -17,6 +18,8 @@
     ptyResume,
     setPaneFocus,
     makeOutputChannel,
+    loadScrollback,
+    saveScrollback as persistScrollback,
     type PaneId,
     type PaneExitEvent,
     type AttentionEvent,
@@ -28,7 +31,10 @@
     leafKey: string;
     focused: boolean;
     keymap?: Keymap | null;
+    cwd?: string | null;
+    saveScrollback?: boolean;
     onFocusRequest: (leafKey: string) => void;
+    onSpawned?: (leafKey: string, paneId: PaneId) => void;
     onExit?: (leafKey: string) => void;
     onAttention?: (
       leafKey: string,
@@ -36,8 +42,19 @@
       reason: AttentionReason | null,
     ) => void;
   }
-  let { leafKey, focused, keymap, onFocusRequest, onExit, onAttention }: Props =
-    $props();
+  let {
+    leafKey,
+    focused,
+    keymap,
+    cwd = null,
+    saveScrollback = false,
+    onFocusRequest,
+    onSpawned,
+    onExit,
+    onAttention,
+  }: Props = $props();
+
+  let serializer: SerializeAddon | undefined;
 
   let container: HTMLDivElement;
   let term: Terminal | undefined;
@@ -102,6 +119,8 @@
     fit = new FitAddon();
     term.loadAddon(fit);
     term.loadAddon(new Unicode11Addon());
+    serializer = new SerializeAddon();
+    term.loadAddon(serializer);
     term.unicode.activeVersion = "11";
     term.open(container);
 
@@ -124,8 +143,20 @@
     const cols = term.cols >= 2 ? term.cols : 80;
     const rows = term.rows >= 2 ? term.rows : 24;
 
+    // Replay prior scrollback as inert text before the live shell starts — no
+    // command is ever re-run (R14, KTD10).
+    if (saveScrollback) {
+      const prev = await loadScrollback(leafKey);
+      if (prev) {
+        term.write(prev);
+        term.write("\r\n\x1b[2m[previous session]\x1b[0m\r\n");
+      }
+    }
+
     const channel = makeOutputChannel(onOutput);
-    paneId = await spawnPane(channel, { rows, cols });
+    // A missing/stale cwd falls back to $HOME (portable-pty filters non-dirs).
+    paneId = await spawnPane(channel, { rows, cols, cwd });
+    onSpawned?.(leafKey, paneId);
 
     term.onData((data) => {
       if (paneId !== null) void ptyWrite(paneId, data);
@@ -170,6 +201,10 @@
   onDestroy(() => {
     resizeObs?.disconnect();
     unlisteners.forEach((u) => u());
+    // Persist scrollback if opted in (off by default for privacy, KTD10).
+    if (saveScrollback && serializer && term) {
+      void persistScrollback(leafKey, serializer.serialize());
+    }
     if (paneId !== null) void closePane(paneId);
     term?.dispose();
   });

@@ -96,3 +96,16 @@ export function ptyPause(paneId: PaneId): Promise<void> {
 export function ptyResume(paneId: PaneId): Promise<void> {
   return invoke("pty_resume", { paneId });
 }
+
+/** The pane's live working directory (U10/U12). */
+export function paneCwd(paneId: PaneId): Promise<string | null> {
+  return invoke<string | null>("pane_cwd", { paneId });
+}
+
+export function saveScrollback(paneKey: string, data: string): Promise<void> {
+  return invoke("save_scrollback", { paneKey, data });
+}
+
+export function loadScrollback(paneKey: string): Promise<string | null> {
+  return invoke<string | null>("load_scrollback", { paneKey });
+}

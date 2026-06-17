@@ -46,6 +46,21 @@ export function newLeaf(): Leaf {
   return { kind: "leaf", key: nextKey("leaf") };
 }
 
+/** Every node key in the tree (leaf + split), for restore collision-avoidance. */
+export function collectKeys(node: Node): string[] {
+  return node.kind === "leaf"
+    ? [node.key]
+    : [node.key, ...collectKeys(node.first), ...collectKeys(node.second)];
+}
+
+/** Advance the key counter past any restored keys so new nodes never collide. */
+export function ensureKeyCounterAbove(keys: string[]): void {
+  for (const k of keys) {
+    const m = k.match(/-(\d+)$/);
+    if (m) counter = Math.max(counter, Number.parseInt(m[1], 10));
+  }
+}
+
 /** All leaves, left-to-right / top-to-bottom. */
 export function leaves(node: Node): Leaf[] {
   return node.kind === "leaf"

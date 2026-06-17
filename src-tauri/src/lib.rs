@@ -9,6 +9,7 @@ pub mod cwd;
 pub mod hooks;
 pub mod notify;
 pub mod pty;
+pub mod session;
 pub mod state;
 pub mod stream;
 
@@ -79,6 +80,14 @@ pub fn run() {
     let attention_for_hooks = Arc::clone(&attention);
 
     tauri::Builder::default()
+        // single-instance must be registered first; a second launch focuses
+        // the existing window instead of corrupting the shared session state.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .manage(config)
@@ -131,6 +140,10 @@ pub fn run() {
             pty::pty_pause,
             pty::pty_resume,
             pty::pane_cwd,
+            session::save_session,
+            session::load_session,
+            session::save_scrollback,
+            session::load_scrollback,
         ])
         .run(tauri::generate_context!())
         .expect("error while running fly");

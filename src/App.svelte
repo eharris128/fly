@@ -12,17 +12,27 @@
     canSplit,
     neighbor,
     setRatio,
+    collectKeys,
+    ensureKeyCounterAbove,
     type Node,
     type Orientation,
     type DividerRect,
   } from "./lib/layout";
   import {
     setWindowForeground,
+    paneCwd,
+    type PaneId,
     type AttentionState,
     type AttentionReason,
   } from "./ipc";
   import { Keymap } from "./lib/keymap";
   import { getConfig } from "./lib/config";
+  import {
+    saveSession,
+    loadSession,
+    type SavedTab,
+    type SavedPane,
+  } from "./lib/serialize";
 
   interface Tab {
     id: string;
@@ -36,22 +46,28 @@
     return { id: `tab-${nextTabId++}`, tree: l, focusedLeafKey: l.key };
   }
 
-  const firstTab = makeTab();
-  let tabs = $state<Tab[]>([firstTab]);
-  let activeId = $state(firstTab.id);
+  let tabs = $state<Tab[]>([]);
+  let activeId = $state("");
+  let ready = $state(false);
   let attentionByLeaf = $state<Record<string, AttentionState>>({});
+  // leaf key → backend pane id (for cwd queries on save) and restored cwd.
+  let paneIdByLeaf: Record<string, PaneId> = {};
+  let cwdByLeaf = $state<Record<string, string | null>>({});
+  let saveScrollbackEnabled = $state(false);
+  let keymap = $state<Keymap | null>(null);
   let layoutEl: HTMLDivElement;
   let layoutW = $state(1000);
   let layoutH = $state(600);
 
-  const activeTab = $derived(tabs.find((t) => t.id === activeId) ?? tabs[0]);
+  const activeTab = $derived(tabs.find((t) => t.id === activeId));
   const rects = $derived(
-    computeRects(activeTab.tree, { x: 0, y: 0, w: layoutW, h: layoutH }),
+    activeTab
+      ? computeRects(activeTab.tree, { x: 0, y: 0, w: layoutW, h: layoutH })
+      : new Map(),
   );
   const dividerList = $derived(
-    dividers(activeTab.tree, { x: 0, y: 0, w: layoutW, h: layoutH }),
+    activeTab ? dividers(activeTab.tree, { x: 0, y: 0, w: layoutW, h: layoutH }) : [],
   );
-  // All leaves across all tabs; keyed so panes survive splits and tab switches.
   const allPanes = $derived(
     tabs.flatMap((t) => leaves(t.tree).map((l) => ({ tabId: t.id, key: l.key }))),
   );
@@ -75,20 +91,23 @@
   }
 
   function split(orientation: Orientation) {
+    if (!activeTab) return;
     const rect = rects.get(activeTab.focusedLeafKey);
     if (rect && !canSplit(rect, orientation)) return; // min-size clamp (R7)
     const res = splitLeaf(activeTab.tree, activeTab.focusedLeafKey, orientation);
     if (res) setActiveTree(res.tree, res.added.key);
   }
   function closePane() {
+    if (!activeTab) return;
     const tree = removeLeaf(activeTab.tree, activeTab.focusedLeafKey);
     if (tree === null) {
-      closeTab(activeId); // closing the last pane closes the tab
+      closeTab(activeId);
       return;
     }
     setActiveTree(tree, leaves(tree)[0]?.key);
   }
   function focusDir(dir: "left" | "right" | "up" | "down") {
+    if (!activeTab) return;
     const n = neighbor(rects, activeTab.focusedLeafKey, dir);
     if (n) setActiveFocus(n);
   }
@@ -96,7 +115,6 @@
     activeId = tabId;
     tabs = tabs.map((t) => (t.id === tabId ? { ...t, focusedLeafKey: key } : t));
   }
-  /** Leader+u: jump to the next pane that needs attention (across tabs). */
   function cycleAttention() {
     const raised: { tabId: string; key: string }[] = [];
     for (const t of tabs)
@@ -104,7 +122,7 @@
         if (attentionByLeaf[l.key] === "raised") raised.push({ tabId: t.id, key: l.key });
     if (raised.length === 0) return;
     const cur = raised.findIndex(
-      (r) => r.tabId === activeId && r.key === activeTab.focusedLeafKey,
+      (r) => r.tabId === activeId && r.key === activeTab?.focusedLeafKey,
     );
     const next = raised[(cur + 1) % raised.length];
     focusPane(next.tabId, next.key);
@@ -127,16 +145,16 @@
     if (activeId === id) activeId = next[Math.max(0, idx - 1)].id;
   }
 
-  function onAttention(
-    key: string,
-    state: AttentionState,
-    _reason: AttentionReason | null,
-  ) {
+  function onAttention(key: string, state: AttentionState, _reason: AttentionReason | null) {
     attentionByLeaf = { ...attentionByLeaf, [key]: state };
+  }
+  function onSpawned(key: string, paneId: PaneId) {
+    paneIdByLeaf[key] = paneId;
   }
 
   function startDrag(d: DividerRect, ev: PointerEvent) {
     ev.preventDefault();
+    if (!activeTab) return;
     const horizontal = d.orientation === "horizontal";
     const move = (e: PointerEvent) => {
       const base = layoutEl.getBoundingClientRect();
@@ -144,7 +162,7 @@
         ? (e.clientX - base.left - d.parent.x) / d.parent.w
         : (e.clientY - base.top - d.parent.y) / d.parent.h;
       setActiveTree(
-        setRatio(activeTab.tree, d.splitKey, Math.min(0.9, Math.max(0.1, ratio))),
+        setRatio(activeTab!.tree, d.splitKey, Math.min(0.9, Math.max(0.1, ratio))),
       );
     };
     const up = () => {
@@ -155,9 +173,74 @@
     window.addEventListener("pointerup", up);
   }
 
-  let keymap = $state<Keymap | null>(null);
+  // ---- persistence (U12) ---------------------------------------------------
+  async function persist() {
+    const savedTabs: SavedTab[] = [];
+    for (const t of tabs) {
+      const panes: Record<string, SavedPane> = {};
+      for (const l of leaves(t.tree)) {
+        const pid = paneIdByLeaf[l.key];
+        const cwd = pid != null ? await paneCwd(pid) : (cwdByLeaf[l.key] ?? null);
+        panes[l.key] = { cwd, title: null };
+      }
+      savedTabs.push({ tree: t.tree, panes });
+    }
+    await saveSession({
+      tabs: savedTabs,
+      activeIndex: Math.max(0, tabs.findIndex((t) => t.id === activeId)),
+    });
+  }
 
-  // Window foreground feeds the attention suppression matrix (KTD8).
+  let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    // Re-run on any layout change; debounce the write (R13).
+    void tabs;
+    void activeId;
+    if (!ready) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => void persist(), 800);
+  });
+
+  async function restore() {
+    const cfg = await getConfig();
+    saveScrollbackEnabled = cfg.saveScrollback;
+    keymap = new Keymap(cfg.leaderKey, {
+      newTab,
+      splitHorizontal: () => split("horizontal"),
+      splitVertical: () => split("vertical"),
+      closePane,
+      focusLeft: () => focusDir("left"),
+      focusRight: () => focusDir("right"),
+      focusUp: () => focusDir("up"),
+      focusDown: () => focusDir("down"),
+      cycleAttention,
+    });
+
+    const saved = await loadSession();
+    if (saved && saved.tabs.length) {
+      // Keep saved keys (so scrollback files match) and bump the counter past
+      // them so new nodes never collide.
+      ensureKeyCounterAbove(saved.tabs.flatMap((t) => collectKeys(t.tree)));
+      const cwds: Record<string, string | null> = {};
+      for (const st of saved.tabs)
+        for (const [k, p] of Object.entries(st.panes)) cwds[k] = p.cwd;
+      cwdByLeaf = cwds;
+      tabs = saved.tabs.map((st) => ({
+        id: `tab-${nextTabId++}`,
+        tree: st.tree,
+        focusedLeafKey: leaves(st.tree)[0]?.key ?? "",
+      }));
+      activeId =
+        tabs[Math.min(Math.max(0, saved.activeIndex), tabs.length - 1)]?.id ??
+        tabs[0].id;
+    } else {
+      const t = makeTab();
+      tabs = [t];
+      activeId = t.id;
+    }
+    ready = true;
+  }
+
   function reportForeground() {
     void setWindowForeground(document.hasFocus());
   }
@@ -165,20 +248,7 @@
     window.addEventListener("focus", reportForeground);
     window.addEventListener("blur", reportForeground);
     reportForeground();
-    // Build the keymap once the leader key is loaded from config (U13).
-    void getConfig().then((cfg) => {
-      keymap = new Keymap(cfg.leaderKey, {
-        newTab,
-        splitHorizontal: () => split("horizontal"),
-        splitVertical: () => split("vertical"),
-        closePane,
-        focusLeft: () => focusDir("left"),
-        focusRight: () => focusDir("right"),
-        focusUp: () => focusDir("up"),
-        focusDown: () => focusDir("down"),
-        cycleAttention,
-      });
-    });
+    void restore();
     return () => {
       window.removeEventListener("focus", reportForeground);
       window.removeEventListener("blur", reportForeground);
@@ -207,10 +277,12 @@
       >
         <Terminal
           leafKey={p.key}
-          focused={p.tabId === activeId && activeTab.focusedLeafKey === p.key}
+          focused={p.tabId === activeId && activeTab?.focusedLeafKey === p.key}
+          cwd={cwdByLeaf[p.key] ?? null}
+          saveScrollback={saveScrollbackEnabled}
           {keymap}
           onFocusRequest={setActiveFocus}
-          onExit={() => {}}
+          {onSpawned}
           {onAttention}
         />
       </div>
