@@ -83,6 +83,29 @@ impl PtyManager {
     /// Spawn a new pane and register it. `token` is the per-pane auth secret
     /// (U8), already registered with the hook server and injected into `cfg.env`
     /// by the caller before this call so no callback can race registration.
+    /// Reserve the next pane id without spawning. Lets the caller issue the
+    /// pane's auth token and inject it into the env before the child starts,
+    /// so no callback can race registration (KTD7).
+    pub fn reserve_id(&self) -> PaneId {
+        PaneId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Spawn a pane under a previously reserved id.
+    pub fn spawn_with_id(
+        &self,
+        id: PaneId,
+        cfg: SpawnConfig,
+        token: String,
+        sink: OutputSink,
+        on_exit: ExitCallback,
+    ) -> Result<PaneId, String> {
+        let pane = Pane::spawn(id, cfg, token, sink, on_exit)?;
+        self.panes.lock().unwrap().insert(id, pane);
+        Ok(id)
+    }
+
+    /// Reserve an id and spawn in one step (used where the token isn't needed
+    /// up front, e.g. tests).
     pub fn spawn(
         &self,
         cfg: SpawnConfig,
@@ -90,10 +113,8 @@ impl PtyManager {
         sink: OutputSink,
         on_exit: ExitCallback,
     ) -> Result<PaneId, String> {
-        let id = PaneId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let pane = Pane::spawn(id, cfg, token, sink, on_exit)?;
-        self.panes.lock().unwrap().insert(id, pane);
-        Ok(id)
+        let id = self.reserve_id();
+        self.spawn_with_id(id, cfg, token, sink, on_exit)
     }
 
     /// Write input bytes to a pane's PTY. Clones the writer out of the registry
@@ -178,14 +199,21 @@ fn no_such(id: PaneId) -> String {
 // for output) lands in U3; these control-plane commands are independent of it.
 
 /// Write input to a pane. xterm.js `onData` yields a string whose UTF-8 bytes
-/// (including control bytes like Ctrl-C `0x03`) are written verbatim.
+/// (including control bytes like Ctrl-C `0x03`) are written verbatim. Typing
+/// also clears the pane's attention (stage two of the two-stage clear).
 #[tauri::command]
 pub fn pty_write(
+    app: tauri::AppHandle,
     manager: tauri::State<'_, Arc<PtyManager>>,
+    attention: tauri::State<'_, Arc<crate::state::AttentionManager>>,
     pane_id: PaneId,
     data: String,
 ) -> Result<(), String> {
-    manager.write(pane_id, data.as_bytes())
+    manager.write(pane_id, data.as_bytes())?;
+    if let Some(outcome) = attention.on_input(pane_id) {
+        crate::stream::emit_attention(&app, pane_id, &outcome);
+    }
+    Ok(())
 }
 
 /// Resize a pane's PTY to the given grid.

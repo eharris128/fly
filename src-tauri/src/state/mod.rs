@@ -7,4 +7,7 @@
 
 pub mod attention;
 pub mod lifecycle;
+pub mod manager;
 pub mod suppress;
+
+pub use manager::AttentionManager;

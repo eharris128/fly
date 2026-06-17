@@ -23,6 +23,27 @@ export interface PaneExitEvent {
   state: LifecycleState;
 }
 
+export type AttentionState = "idle" | "raised" | "acknowledged";
+export type AttentionReason = "question" | "permission" | "finished" | "error";
+export type AttentionTier = "hook" | "cli" | "bel" | "osc";
+
+export interface AttentionEvent {
+  paneId: number;
+  state: AttentionState;
+  reason: AttentionReason | null;
+  tier: AttentionTier | null;
+}
+
+/** Replicate a pane's keyboard focus to the backend (KTD8). */
+export function setPaneFocus(paneId: PaneId, focused: boolean): Promise<void> {
+  return invoke("set_pane_focus", { paneId, focused });
+}
+
+/** Replicate the window foreground state to the backend (KTD8). */
+export function setWindowForeground(foregrounded: boolean): Promise<void> {
+  return invoke("set_window_foreground", { foregrounded });
+}
+
 /**
  * Create an output Channel that decodes raw PTY bytes to `Uint8Array`.
  * The backend sends `InvokeResponseBody::Raw`, which arrives as an

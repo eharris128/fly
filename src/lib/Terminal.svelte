@@ -12,16 +12,38 @@
     ptyResize,
     closePane,
     makeOutputChannel,
+    setPaneFocus,
+    setWindowForeground,
     type PaneId,
     type PaneExitEvent,
+    type AttentionEvent,
+    type AttentionState,
+    type AttentionReason,
   } from "../ipc";
 
   let container: HTMLDivElement;
   let term: Terminal | undefined;
   let fit: FitAddon | undefined;
   let paneId: PaneId | null = null;
-  let unlistenExit: UnlistenFn | null = null;
+  let unlisteners: UnlistenFn[] = [];
   let resizeObs: ResizeObserver | null = null;
+
+  // Reactive attention state drives the visual indicator.
+  let attention = $state<AttentionState>("idle");
+  let reason = $state<AttentionReason | null>(null);
+
+  const REASON_LABEL: Record<AttentionReason, string> = {
+    question: "waiting for you",
+    permission: "needs permission",
+    finished: "finished",
+    error: "error",
+  };
+
+  function reportForeground() {
+    const fg = document.hasFocus();
+    void setWindowForeground(fg);
+    if (paneId !== null) void setPaneFocus(paneId, fg);
+  }
 
   onMount(async () => {
     term = new Terminal({
@@ -40,8 +62,6 @@
 
     term.open(container);
 
-    // Prefer the WebGL renderer; fall back to the DOM renderer on failure or
-    // context loss. The full eviction policy lands in U4/U6.
     try {
       const webgl = new WebglAddon();
       webgl.onContextLoss(() => webgl.dispose());
@@ -57,14 +77,10 @@
     const channel = makeOutputChannel((bytes) => term?.write(bytes));
     paneId = await spawnPane(channel, { rows, cols });
 
-    // Keystrokes (including control bytes like Ctrl-C = 0x03) pass straight to
-    // the PTY. Leader-key interception arrives in U6.
     term.onData((data) => {
       if (paneId !== null) void ptyWrite(paneId, data);
     });
 
-    // Re-fit and propagate geometry on container resize (debounced by the
-    // browser's rAF coalescing of ResizeObserver).
     resizeObs = new ResizeObserver(() => {
       if (!fit || !term) return;
       fit.fit();
@@ -72,34 +88,97 @@
     });
     resizeObs.observe(container);
 
-    unlistenExit = await listen<PaneExitEvent>("pane://exit", (ev) => {
-      if (ev.payload.paneId !== paneId || !term) return;
-      const s = ev.payload.state;
-      const note =
-        s.kind === "exited"
-          ? `process exited (code ${s.code}${s.signal ? `, ${s.signal}` : ""})`
-          : `process ${s.kind}`;
-      term.write(`\r\n\x1b[2m[${note}]\x1b[0m\r\n`);
-    });
+    unlisteners.push(
+      await listen<PaneExitEvent>("pane://exit", (ev) => {
+        if (ev.payload.paneId !== paneId || !term) return;
+        const s = ev.payload.state;
+        const note =
+          s.kind === "exited"
+            ? `process exited (code ${s.code}${s.signal ? `, ${s.signal}` : ""})`
+            : `process ${s.kind}`;
+        term.write(`\r\n\x1b[2m[${note}]\x1b[0m\r\n`);
+      }),
+    );
+    unlisteners.push(
+      await listen<AttentionEvent>("pane://attention", (ev) => {
+        if (ev.payload.paneId !== paneId) return;
+        attention = ev.payload.state;
+        reason = ev.payload.reason;
+      }),
+    );
+
+    // Report focus/foreground so the suppression matrix is accurate.
+    window.addEventListener("focus", reportForeground);
+    window.addEventListener("blur", reportForeground);
+    reportForeground();
 
     term.focus();
   });
 
   onDestroy(() => {
+    window.removeEventListener("focus", reportForeground);
+    window.removeEventListener("blur", reportForeground);
     resizeObs?.disconnect();
-    unlistenExit?.();
+    unlisteners.forEach((u) => u());
     if (paneId !== null) void closePane(paneId);
     term?.dispose();
   });
 </script>
 
-<div class="terminal" bind:this={container}></div>
+<div
+  class="pane"
+  class:raised={attention === "raised"}
+  class:acknowledged={attention === "acknowledged"}
+>
+  <div class="terminal" bind:this={container}></div>
+  {#if attention === "raised"}
+    <div class="badge">{reason ? REASON_LABEL[reason] : "needs you"}</div>
+  {/if}
+</div>
 
 <style>
+  .pane {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    background: #0b1020;
+  }
   .terminal {
     width: 100%;
     height: 100%;
     padding: 4px;
-    background: #0b1020;
+  }
+  /* Attention ring overlay — sits above the terminal, never blocks input. */
+  .pane.raised::after,
+  .pane.acknowledged::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border: 2px solid transparent;
+    border-radius: 4px;
+    pointer-events: none;
+  }
+  .pane.raised::after {
+    border-color: #f5a623;
+    box-shadow:
+      inset 0 0 12px rgba(245, 166, 35, 0.35),
+      0 0 0 1px rgba(245, 166, 35, 0.5);
+  }
+  .pane.acknowledged::after {
+    border-color: rgba(245, 166, 35, 0.25);
+  }
+  .badge {
+    position: absolute;
+    top: 6px;
+    right: 8px;
+    padding: 2px 8px;
+    font:
+      600 11px/1.4 ui-monospace,
+      monospace;
+    color: #1a1205;
+    background: #f5a623;
+    border-radius: 10px;
+    pointer-events: none;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
   }
 </style>
