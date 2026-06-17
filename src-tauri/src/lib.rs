@@ -4,6 +4,7 @@
 //! (KTD12); `main.rs` is a thin shim over [`run`].
 
 pub mod cli;
+pub mod config;
 pub mod hooks;
 pub mod notify;
 pub mod pty;
@@ -15,13 +16,11 @@ use std::sync::Arc;
 
 use tauri::Manager;
 
+use config::ConfigStore;
 use hooks::{Dispatch, HookServer, TokenRegistry, ValidatedHook};
 use pty::PtyManager;
 use state::attention::{Signal, Tier};
 use state::AttentionManager;
-
-/// Attention debounce window (KTD8); configurable in U13.
-const ATTENTION_DEBOUNCE_MS: u64 = 400;
 
 /// Apply Linux-specific webview workarounds before the webview initializes.
 ///
@@ -65,9 +64,10 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     apply_linux_webview_env();
 
+    let config = Arc::new(ConfigStore::load(config::default_path()));
     let pty_manager = Arc::new(PtyManager::new());
     let tokens = Arc::new(TokenRegistry::new());
-    let attention = Arc::new(AttentionManager::new(ATTENTION_DEBOUNCE_MS));
+    let attention = Arc::new(AttentionManager::new(config.get().attention_debounce_ms));
 
     // Clones for the hook server's dispatch (the originals are managed below).
     let tokens_for_hooks = Arc::clone(&tokens);
@@ -76,6 +76,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .manage(config)
         .manage(pty_manager)
         .manage(tokens)
         .manage(attention)
@@ -103,6 +104,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             frontend_log,
+            config::get_config,
             stream::spawn_pane,
             stream::set_pane_focus,
             stream::set_window_foreground,
