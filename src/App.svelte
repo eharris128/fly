@@ -21,6 +21,8 @@
     type AttentionState,
     type AttentionReason,
   } from "./ipc";
+  import { Keymap } from "./lib/keymap";
+  import { getConfig } from "./lib/config";
 
   interface Tab {
     id: string;
@@ -90,6 +92,23 @@
     const n = neighbor(rects, activeTab.focusedLeafKey, dir);
     if (n) setActiveFocus(n);
   }
+  function focusPane(tabId: string, key: string) {
+    activeId = tabId;
+    tabs = tabs.map((t) => (t.id === tabId ? { ...t, focusedLeafKey: key } : t));
+  }
+  /** Leader+u: jump to the next pane that needs attention (across tabs). */
+  function cycleAttention() {
+    const raised: { tabId: string; key: string }[] = [];
+    for (const t of tabs)
+      for (const l of leaves(t.tree))
+        if (attentionByLeaf[l.key] === "raised") raised.push({ tabId: t.id, key: l.key });
+    if (raised.length === 0) return;
+    const cur = raised.findIndex(
+      (r) => r.tabId === activeId && r.key === activeTab.focusedLeafKey,
+    );
+    const next = raised[(cur + 1) % raised.length];
+    focusPane(next.tabId, next.key);
+  }
   function newTab() {
     const t = makeTab();
     tabs = [...tabs, t];
@@ -136,6 +155,8 @@
     window.addEventListener("pointerup", up);
   }
 
+  let keymap = $state<Keymap | null>(null);
+
   // Window foreground feeds the attention suppression matrix (KTD8).
   function reportForeground() {
     void setWindowForeground(document.hasFocus());
@@ -144,14 +165,25 @@
     window.addEventListener("focus", reportForeground);
     window.addEventListener("blur", reportForeground);
     reportForeground();
+    // Build the keymap once the leader key is loaded from config (U13).
+    void getConfig().then((cfg) => {
+      keymap = new Keymap(cfg.leaderKey, {
+        newTab,
+        splitHorizontal: () => split("horizontal"),
+        splitVertical: () => split("vertical"),
+        closePane,
+        focusLeft: () => focusDir("left"),
+        focusRight: () => focusDir("right"),
+        focusUp: () => focusDir("up"),
+        focusDown: () => focusDir("down"),
+        cycleAttention,
+      });
+    });
     return () => {
       window.removeEventListener("focus", reportForeground);
       window.removeEventListener("blur", reportForeground);
     };
   });
-
-  // Suppress "unused" until the keyboard layer (U6) wires these.
-  void focusDir;
 </script>
 
 <div class="app">
@@ -176,6 +208,7 @@
         <Terminal
           leafKey={p.key}
           focused={p.tabId === activeId && activeTab.focusedLeafKey === p.key}
+          {keymap}
           onFocusRequest={setActiveFocus}
           onExit={() => {}}
           {onAttention}

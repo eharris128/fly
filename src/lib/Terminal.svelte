@@ -6,6 +6,7 @@
   import { Unicode11Addon } from "@xterm/addon-unicode11";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getConfig } from "./config";
+  import type { Keymap } from "./keymap";
   import "@xterm/xterm/css/xterm.css";
   import {
     spawnPane,
@@ -26,6 +27,7 @@
   interface Props {
     leafKey: string;
     focused: boolean;
+    keymap?: Keymap | null;
     onFocusRequest: (leafKey: string) => void;
     onExit?: (leafKey: string) => void;
     onAttention?: (
@@ -34,7 +36,8 @@
       reason: AttentionReason | null,
     ) => void;
   }
-  let { leafKey, focused, onFocusRequest, onExit, onAttention }: Props = $props();
+  let { leafKey, focused, keymap, onFocusRequest, onExit, onAttention }: Props =
+    $props();
 
   let container: HTMLDivElement;
   let term: Terminal | undefined;
@@ -101,6 +104,11 @@
     term.loadAddon(new Unicode11Addon());
     term.unicode.activeVersion = "11";
     term.open(container);
+
+    // The leader chord is intercepted here and never reaches the shell; every
+    // other key (Ctrl-C, Ctrl-W, vim nav, …) returns true and flows to the PTY
+    // (R6). Bracketed paste arrives via onData, untouched.
+    term.attachCustomKeyEventHandler((e) => (keymap ? !keymap.handle(e) : true));
 
     if (config.renderer !== "dom") {
       try {
