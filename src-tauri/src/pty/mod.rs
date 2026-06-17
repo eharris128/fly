@@ -1,0 +1,203 @@
+//! PTY backend: a registry of panes keyed by an opaque, never-reused
+//! [`PaneId`]. All pane operations route through [`PtyManager`] so the deferred
+//! daemonized-mux / remote-pane work becomes a transport swap behind a stable
+//! interface (KTD5).
+
+mod pane;
+
+use std::collections::HashMap;
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
+
+use crate::state::lifecycle::LifecycleState;
+use pane::Pane;
+
+/// Opaque pane handle. Ids are allocated monotonically and never reused, so a
+/// stale id from a closed pane resolves to "gone" rather than aliasing a reused
+/// slot — the generational guarantee from KTD13, achieved by non-reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PaneId(pub u64);
+
+/// Raw PTY output sink. The read thread calls this for each chunk of bytes.
+/// U3 wires a `tauri::ipc::Channel`; tests wire an mpsc sender.
+pub type OutputSink = Box<dyn FnMut(&[u8]) + Send>;
+
+/// How to spawn a pane's shell.
+#[derive(Debug, Clone)]
+pub struct SpawnConfig {
+    /// Shell to run; defaults to `$SHELL`, then `/bin/bash`.
+    pub shell: Option<String>,
+    /// Extra arguments to the shell (empty = a plain interactive shell).
+    pub args: Vec<String>,
+    /// Initial working directory; defaults to the shell's choice (`$HOME`).
+    pub cwd: Option<String>,
+    /// Extra environment entries (e.g. `FLY_PANE_TOKEN`, `FLY_SOCKET_PATH`).
+    pub env: Vec<(String, String)>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl Default for SpawnConfig {
+    fn default() -> Self {
+        Self {
+            shell: None,
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+        }
+    }
+}
+
+/// In-process registry of live panes (KTD5). The `Mutex` guards registry
+/// mutation only; reader/writer handles are cloned out so blocking I/O never
+/// holds this lock (KTD13).
+pub struct PtyManager {
+    panes: Mutex<HashMap<PaneId, Pane>>,
+    next_id: AtomicU64,
+}
+
+impl Default for PtyManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PtyManager {
+    pub fn new() -> Self {
+        Self {
+            panes: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    /// Spawn a new pane and register it. `token` is the per-pane auth secret
+    /// (U8), already registered with the hook server and injected into `cfg.env`
+    /// by the caller before this call so no callback can race registration.
+    pub fn spawn(
+        &self,
+        cfg: SpawnConfig,
+        token: String,
+        sink: OutputSink,
+    ) -> Result<PaneId, String> {
+        let id = PaneId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let pane = Pane::spawn(id, cfg, token, sink)?;
+        self.panes.lock().unwrap().insert(id, pane);
+        Ok(id)
+    }
+
+    /// Write input bytes to a pane's PTY. Clones the writer out of the registry
+    /// lock so the write itself doesn't hold it.
+    pub fn write(&self, id: PaneId, data: &[u8]) -> Result<(), String> {
+        let writer = {
+            let panes = self.panes.lock().unwrap();
+            let pane = panes.get(&id).ok_or_else(|| no_such(id))?;
+            pane.writer()
+        };
+        let mut w = writer.lock().unwrap();
+        w.write_all(data).map_err(|e| format!("write failed: {e}"))?;
+        w.flush().map_err(|e| format!("flush failed: {e}"))
+    }
+
+    /// Resize a pane's PTY (R2).
+    pub fn resize(&self, id: PaneId, rows: u16, cols: u16) -> Result<(), String> {
+        let panes = self.panes.lock().unwrap();
+        let pane = panes.get(&id).ok_or_else(|| no_such(id))?;
+        pane.resize(rows, cols)
+    }
+
+    /// Close a pane: remove it from the registry first (so no new accessor
+    /// resolves it), then tear down and reap its child (KTD13).
+    pub fn close(&self, id: PaneId) -> Result<(), String> {
+        let pane = self.panes.lock().unwrap().remove(&id);
+        match pane {
+            Some(mut p) => {
+                p.teardown();
+                Ok(())
+            }
+            None => Err(no_such(id)),
+        }
+    }
+
+    /// Current lifecycle state of a pane, if it exists.
+    pub fn lifecycle(&self, id: PaneId) -> Option<LifecycleState> {
+        self.panes.lock().unwrap().get(&id).map(|p| p.lifecycle())
+    }
+
+    /// The pane's hook auth token (U8).
+    pub fn token(&self, id: PaneId) -> Option<String> {
+        self.panes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|p| p.token().to_string())
+    }
+
+    /// The pane's foreground pid, for `/proc`-based cwd tracking (U10).
+    pub fn foreground_pid(&self, id: PaneId) -> Option<u32> {
+        self.panes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|p| p.foreground_pid())
+    }
+
+    /// Number of registered panes.
+    pub fn count(&self) -> usize {
+        self.panes.lock().unwrap().len()
+    }
+
+    /// Close every pane (used at app shutdown, U14).
+    pub fn close_all(&self) {
+        let mut drained: Vec<Pane> = {
+            let mut panes = self.panes.lock().unwrap();
+            panes.drain().map(|(_, p)| p).collect()
+        };
+        for p in &mut drained {
+            p.teardown();
+        }
+    }
+}
+
+fn no_such(id: PaneId) -> String {
+    format!("no such pane: {}", id.0)
+}
+
+// ---- Tauri command surface -------------------------------------------------
+// Thin wrappers over `PtyManager`. `spawn_pane` (which needs an `ipc::Channel`
+// for output) lands in U3; these control-plane commands are independent of it.
+
+/// Write input to a pane. xterm.js `onData` yields a string whose UTF-8 bytes
+/// (including control bytes like Ctrl-C `0x03`) are written verbatim.
+#[tauri::command]
+pub fn pty_write(
+    manager: tauri::State<'_, Arc<PtyManager>>,
+    pane_id: PaneId,
+    data: String,
+) -> Result<(), String> {
+    manager.write(pane_id, data.as_bytes())
+}
+
+/// Resize a pane's PTY to the given grid.
+#[tauri::command]
+pub fn pty_resize(
+    manager: tauri::State<'_, Arc<PtyManager>>,
+    pane_id: PaneId,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    manager.resize(pane_id, rows, cols)
+}
+
+/// Close a pane and reap its child.
+#[tauri::command]
+pub fn close_pane(
+    manager: tauri::State<'_, Arc<PtyManager>>,
+    pane_id: PaneId,
+) -> Result<(), String> {
+    manager.close(pane_id)
+}
