@@ -14,15 +14,27 @@
     closePane,
     ptyPause,
     ptyResume,
-    makeOutputChannel,
     setPaneFocus,
-    setWindowForeground,
+    makeOutputChannel,
     type PaneId,
     type PaneExitEvent,
     type AttentionEvent,
     type AttentionState,
     type AttentionReason,
   } from "../ipc";
+
+  interface Props {
+    leafKey: string;
+    focused: boolean;
+    onFocusRequest: (leafKey: string) => void;
+    onExit?: (leafKey: string) => void;
+    onAttention?: (
+      leafKey: string,
+      state: AttentionState,
+      reason: AttentionReason | null,
+    ) => void;
+  }
+  let { leafKey, focused, onFocusRequest, onExit, onAttention }: Props = $props();
 
   let container: HTMLDivElement;
   let term: Terminal | undefined;
@@ -31,14 +43,19 @@
   let unlisteners: UnlistenFn[] = [];
   let resizeObs: ResizeObserver | null = null;
 
-  // Reactive attention state drives the visual indicator.
   let attention = $state<AttentionState>("idle");
   let reason = $state<AttentionReason | null>(null);
 
-  // Flow control (KTD4): pause the PTY when too many bytes are unacked by
-  // xterm, resume when they drain. Bounds in-flight memory under output floods.
-  const HIGH_WATERMARK = 2 * 1024 * 1024; // 2 MB
-  const LOW_WATERMARK = 512 * 1024; // 512 KB
+  const REASON_LABEL: Record<AttentionReason, string> = {
+    question: "waiting for you",
+    permission: "needs permission",
+    finished: "finished",
+    error: "error",
+  };
+
+  // Flow control (KTD4).
+  const HIGH_WATERMARK = 2 * 1024 * 1024;
+  const LOW_WATERMARK = 512 * 1024;
   let unacked = 0;
   let paused = false;
 
@@ -59,18 +76,13 @@
     }
   }
 
-  const REASON_LABEL: Record<AttentionReason, string> = {
-    question: "waiting for you",
-    permission: "needs permission",
-    finished: "finished",
-    error: "error",
-  };
-
-  function reportForeground() {
-    const fg = document.hasFocus();
-    void setWindowForeground(fg);
-    if (paneId !== null) void setPaneFocus(paneId, fg);
-  }
+  // When this pane becomes the focused leaf, focus xterm and tell the backend.
+  $effect(() => {
+    if (focused && term && paneId !== null) {
+      term.focus();
+      void setPaneFocus(paneId, document.hasFocus());
+    }
+  });
 
   onMount(async () => {
     const config = await getConfig();
@@ -79,8 +91,8 @@
       fontFamily: "ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace",
       fontSize: 13,
       cursorBlink: true,
-      scrollback: config.scrollbackLines, // capped (KTD4)
-      allowProposedApi: true, // required by the unicode11 addon
+      scrollback: config.scrollbackLines,
+      allowProposedApi: true,
       theme: { background: "#0b1020", foreground: "#c9d1d9" },
     });
 
@@ -88,12 +100,8 @@
     term.loadAddon(fit);
     term.loadAddon(new Unicode11Addon());
     term.unicode.activeVersion = "11";
-
     term.open(container);
 
-    // WebGL with a DOM-renderer fallback (KTD6, R15). On context loss —
-    // common on WebKitGTK's DMABUF path — dispose the addon, which drops xterm
-    // back to the DOM renderer transparently.
     if (config.renderer !== "dom") {
       try {
         const webgl = new WebglAddon();
@@ -117,6 +125,8 @@
 
     resizeObs = new ResizeObserver(() => {
       if (!fit || !term) return;
+      // Skip while hidden (a background tab) — clientWidth is 0.
+      if (container.clientWidth === 0 || container.clientHeight === 0) return;
       fit.fit();
       if (paneId !== null) void ptyResize(paneId, term.rows, term.cols);
     });
@@ -131,6 +141,7 @@
             ? `process exited (code ${s.code}${s.signal ? `, ${s.signal}` : ""})`
             : `process ${s.kind}`;
         term.write(`\r\n\x1b[2m[${note}]\x1b[0m\r\n`);
+        onExit?.(leafKey);
       }),
     );
     unlisteners.push(
@@ -138,20 +149,17 @@
         if (ev.payload.paneId !== paneId) return;
         attention = ev.payload.state;
         reason = ev.payload.reason;
+        onAttention?.(leafKey, ev.payload.state, ev.payload.reason);
       }),
     );
 
-    // Report focus/foreground so the suppression matrix is accurate.
-    window.addEventListener("focus", reportForeground);
-    window.addEventListener("blur", reportForeground);
-    reportForeground();
-
-    term.focus();
+    if (focused) {
+      void setPaneFocus(paneId, document.hasFocus());
+      term.focus();
+    }
   });
 
   onDestroy(() => {
-    window.removeEventListener("focus", reportForeground);
-    window.removeEventListener("blur", reportForeground);
     resizeObs?.disconnect();
     unlisteners.forEach((u) => u());
     if (paneId !== null) void closePane(paneId);
@@ -163,6 +171,9 @@
   class="pane"
   class:raised={attention === "raised"}
   class:acknowledged={attention === "acknowledged"}
+  class:focused
+  role="presentation"
+  onpointerdown={() => onFocusRequest(leafKey)}
 >
   <div class="terminal" bind:this={container}></div>
   {#if attention === "raised"}
@@ -182,7 +193,14 @@
     height: 100%;
     padding: 4px;
   }
-  /* Attention ring overlay — sits above the terminal, never blocks input. */
+  /* A subtle focus outline so the active pane is obvious. */
+  .pane.focused::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border: 1px solid #2b3a55;
+    pointer-events: none;
+  }
   .pane.raised::after,
   .pane.acknowledged::after {
     content: "";
