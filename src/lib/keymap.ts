@@ -13,6 +13,7 @@ export interface KeymapActions {
   focusUp: () => void;
   focusDown: () => void;
   cycleAttention: () => void;
+  openMenu: () => void;
 }
 
 /**
@@ -42,6 +43,7 @@ export const BINDINGS: Binding[] = [
   { keys: ["k", "arrowup"], label: "Focus up", action: "focusUp" },
   { keys: ["j", "arrowdown"], label: "Focus down", action: "focusDown" },
   { keys: ["u"], label: "Cycle attention", action: "cycleAttention" },
+  { keys: ["?"], label: "Hotkey menu", action: "openMenu" },
 ];
 
 /** Build a matcher for a leader spec like "ctrl+a" or "super+space". */

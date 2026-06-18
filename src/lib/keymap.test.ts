@@ -31,6 +31,7 @@ function spyActions(): KeymapActions & { calls: string[] } {
     focusUp: mk("up"),
     focusDown: mk("down"),
     cycleAttention: mk("cycle"),
+    openMenu: mk("openMenu"),
   };
 }
 
@@ -114,6 +115,14 @@ describe("Keymap", () => {
     km.handle(ev("a", { ctrl: true }));
     km.handle(ev("X", { shift: true })); // literal uppercase → close tab
     expect(a.calls).toEqual(["close", "closeTab"]);
+  });
+
+  it("leader ? opens the hotkey menu (shifted key still reaches dispatch)", () => {
+    const a = spyActions();
+    const km = new Keymap("ctrl+a", a);
+    km.handle(ev("a", { ctrl: true }));
+    expect(km.handle(ev("?", { shift: true }))).toBe(true);
+    expect(a.calls).toEqual(["openMenu"]);
   });
 
   it("a configurable leader works (super+space)", () => {

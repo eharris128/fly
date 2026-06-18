@@ -56,6 +56,12 @@
   let cwdByLeaf = $state<Record<string, string | null>>({});
   let saveScrollbackEnabled = $state(false);
   let keymap = $state<Keymap | null>(null);
+  let menuOpen = $state(false);
+  // Retained for the hotkey menu's leader display (R6). Initialised to the
+  // config default so the menu never shows an empty leader if it is somehow
+  // opened before restore() resolves; restore() overwrites it with the real
+  // configured value.
+  let leaderKey = $state("ctrl+a");
   let layoutEl: HTMLDivElement;
   let layoutW = $state(1000);
   let layoutH = $state(600);
@@ -248,6 +254,7 @@
   async function restore() {
     const cfg = await getConfig();
     saveScrollbackEnabled = cfg.saveScrollback;
+    leaderKey = cfg.leaderKey;
     keymap = new Keymap(cfg.leaderKey, {
       newTab,
       splitHorizontal: () => split("horizontal"),
@@ -259,6 +266,7 @@
       focusUp: () => focusDir("up"),
       focusDown: () => focusDir("down"),
       cycleAttention,
+      openMenu: () => (menuOpen = true),
     });
 
     const saved = await loadSession();
