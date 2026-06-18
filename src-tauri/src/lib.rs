@@ -29,13 +29,25 @@ use state::AttentionManager;
 /// Apply Linux-specific webview workarounds before the webview initializes.
 ///
 /// The WebKitGTK DMABUF renderer causes blank windows on Wayland/NVIDIA
-/// (KTD11). Disabling it is the documented fix. We only set it when the user
-/// hasn't already chosen a value, so it stays overridable from the environment.
+/// (KTD11). Disabling it is the documented fix, but it forces software
+/// compositing — and on non-NVIDIA GPUs (Intel/AMD) that adds visible
+/// per-keystroke render lag in the terminal panes for no benefit. So we only
+/// apply the workaround when the NVIDIA driver is actually loaded, and only
+/// when the user hasn't already chosen a value (it stays env-overridable).
 #[cfg(target_os = "linux")]
 fn apply_linux_webview_env() {
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() && nvidia_driver_active() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
+}
+
+/// Whether the NVIDIA kernel driver is loaded (the only case where the DMABUF
+/// blank-window workaround is needed). On hybrid laptops rendering on the Intel
+/// iGPU these nodes are absent, so the webview keeps hardware compositing.
+#[cfg(target_os = "linux")]
+fn nvidia_driver_active() -> bool {
+    std::path::Path::new("/proc/driver/nvidia/version").exists()
+        || std::path::Path::new("/dev/nvidiactl").exists()
 }
 
 /// Where the hook socket lives — under the XDG runtime dir, keyed by pid so
