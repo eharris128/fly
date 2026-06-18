@@ -87,6 +87,24 @@ describe("Keymap", () => {
     expect(a.calls).toEqual(["left", "right", "newTab", "close", "cycle"]);
   });
 
+  it("every split chord form fires after the BINDINGS refactor", () => {
+    // The refactor (U1) is the one change that could silently regress a
+    // shifted-symbol chord; the old suite only proved "|". Cover all forms.
+    const cases: Array<[string, { shift?: boolean }, string]> = [
+      ["|", { shift: true }, "splitH"], // Shift+\
+      ["\\", {}, "splitH"], // unshifted alias
+      ["-", {}, "splitV"],
+      ["_", { shift: true }, "splitV"], // Shift+-
+    ];
+    for (const [key, mods, expected] of cases) {
+      const a = spyActions();
+      const km = new Keymap("ctrl+a", a);
+      km.handle(ev("a", { ctrl: true }));
+      expect(km.handle(ev(key, mods))).toBe(true);
+      expect(a.calls).toEqual([expected]);
+    }
+  });
+
   it("a configurable leader works (super+space)", () => {
     const a = spyActions();
     const km = new Keymap("super+space", a);

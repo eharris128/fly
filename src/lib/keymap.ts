@@ -14,6 +14,34 @@ export interface KeymapActions {
   cycleAttention: () => void;
 }
 
+/**
+ * A leader chord → action binding. `keys` are matched against
+ * `e.key.toLowerCase()`, so punctuation arrives as its produced character
+ * (`|`, `?`, `_`) and CapsLock never changes which letter matches. The single
+ * exception is `upper`: when set, the binding only fires when the *literal*
+ * `e.key` is the uppercase form (so `leader X` = close tab is distinct from
+ * `leader x` = close pane). This is the one chord→action map; both `dispatch()`
+ * and the hotkey menu (U4) render from it, so they can never drift (R3/KTD1).
+ */
+export interface Binding {
+  keys: string[];
+  upper?: boolean;
+  label: string;
+  action: keyof KeymapActions;
+}
+
+export const BINDINGS: Binding[] = [
+  { keys: ["c"], label: "New tab", action: "newTab" },
+  { keys: ["|", "\\"], label: "Split right", action: "splitHorizontal" },
+  { keys: ["-", "_"], label: "Split down", action: "splitVertical" },
+  { keys: ["x"], label: "Close pane", action: "closePane" },
+  { keys: ["h", "arrowleft"], label: "Focus left", action: "focusLeft" },
+  { keys: ["l", "arrowright"], label: "Focus right", action: "focusRight" },
+  { keys: ["k", "arrowup"], label: "Focus up", action: "focusUp" },
+  { keys: ["j", "arrowdown"], label: "Focus down", action: "focusDown" },
+  { keys: ["u"], label: "Cycle attention", action: "cycleAttention" },
+];
+
 /** Build a matcher for a leader spec like "ctrl+a" or "super+space". */
 export function parseLeader(spec: string): (e: KeyboardEvent) => boolean {
   const parts = spec.toLowerCase().split("+").map((p) => p.trim());
@@ -65,42 +93,18 @@ export class Keymap {
   }
 
   private dispatch(e: KeyboardEvent): void {
-    switch (e.key.toLowerCase()) {
-      case "c":
-        this.actions.newTab();
-        break;
-      case "|":
-      case "\\":
-        this.actions.splitHorizontal();
-        break;
-      case "-":
-      case "_":
-        this.actions.splitVertical();
-        break;
-      case "x":
-        this.actions.closePane();
-        break;
-      case "h":
-      case "arrowleft":
-        this.actions.focusLeft();
-        break;
-      case "l":
-      case "arrowright":
-        this.actions.focusRight();
-        break;
-      case "k":
-      case "arrowup":
-        this.actions.focusUp();
-        break;
-      case "j":
-      case "arrowdown":
-        this.actions.focusDown();
-        break;
-      case "u":
-        this.actions.cycleAttention();
-        break;
-      default:
-        break; // unbound leader chord → no-op, but still consumed (no leak)
-    }
+    const lower = e.key.toLowerCase();
+    // Prefer a case-sensitive (`upper`) binding when the literal key is the
+    // uppercase form — this is what splits `leader X` (close tab) from
+    // `leader x` (close pane). `e.key !== lower` is true exactly when the
+    // produced character is uppercase, whether via Shift or CapsLock, so the
+    // distinction is CapsLock-robust (KTD2). Everything else matches on the
+    // lowercased key, leaving `?`, `|`, `_` and CapsLocked letters unaffected.
+    const binding =
+      BINDINGS.find((b) => b.upper && e.key !== lower && b.keys.includes(lower)) ??
+      BINDINGS.find((b) => !b.upper && b.keys.includes(lower));
+    if (binding) this.actions[binding.action]();
+    // An unmatched leader chord is a consumed no-op (the caller still returns
+    // `true`, so it never leaks to the PTY).
   }
 }
