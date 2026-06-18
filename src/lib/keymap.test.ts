@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { Keymap, parseLeader, type KeymapActions } from "./keymap";
+import {
+  Keymap,
+  parseLeader,
+  formatLeader,
+  BINDINGS,
+  type KeymapActions,
+} from "./keymap";
 
 function ev(
   key: string,
@@ -34,6 +40,29 @@ function spyActions(): KeymapActions & { calls: string[] } {
     openMenu: mk("openMenu"),
   };
 }
+
+describe("formatLeader", () => {
+  it("renders leader specs for the hotkey menu", () => {
+    expect(formatLeader("ctrl+a")).toBe("Ctrl-A");
+    expect(formatLeader("super+space")).toBe("Super-Space");
+    expect(formatLeader("alt+shift+x")).toBe("Alt-Shift-X");
+  });
+});
+
+describe("BINDINGS", () => {
+  it("is the single source of truth and carries the new chords", () => {
+    const actions = BINDINGS.map((b) => b.action);
+    expect(actions).toContain("openMenu");
+    // x and X are distinct entries — close pane vs close tab (R3 anti-drift).
+    const xEntries = BINDINGS.filter((b) => b.keys.includes("x"));
+    expect(xEntries.map((b) => b.action).sort()).toEqual([
+      "closePane",
+      "closeTab",
+    ]);
+    expect(BINDINGS.find((b) => b.action === "closeTab")?.upper).toBe(true);
+    expect(BINDINGS.find((b) => b.action === "closePane")?.upper).toBeUndefined();
+  });
+});
 
 describe("parseLeader", () => {
   it("matches the exact leader chord only", () => {

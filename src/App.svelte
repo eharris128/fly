@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import Terminal from "./lib/Terminal.svelte";
   import TabBar from "./lib/TabBar.svelte";
+  import HotkeyMenu from "./lib/HotkeyMenu.svelte";
   import {
     newLeaf,
     splitLeaf,
@@ -175,6 +176,21 @@
   function cancelCloseTab() {
     pendingCloseTab = null;
   }
+  // While the hotkey menu is open, Escape dismisses it. The capture listener
+  // is mounted only for that window, so Escape reaches a running TUI (vim, an
+  // agent) normally at every other time, and xterm keeps focus (KTD3).
+  $effect(() => {
+    if (!menuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        menuOpen = false;
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  });
   // While the confirm is up, Enter confirms and Escape cancels. The capture
   // listener exists only for the duration of the prompt, so Escape reaches a
   // running TUI normally the rest of the time (mirrors the menu, KTD3).
@@ -331,6 +347,7 @@
     onSplitH={() => split("horizontal")}
     onSplitV={() => split("vertical")}
     onClosePane={closePane}
+    onMenu={() => (menuOpen = true)}
   />
   <div class="layout" bind:this={layoutEl} bind:clientWidth={layoutW} bind:clientHeight={layoutH}>
     {#each allPanes as p (p.key)}
@@ -384,6 +401,12 @@
       </div>
     </div>
   {/if}
+
+  <HotkeyMenu
+    open={menuOpen}
+    leader={leaderKey}
+    onClose={() => (menuOpen = false)}
+  />
 </div>
 
 <style>

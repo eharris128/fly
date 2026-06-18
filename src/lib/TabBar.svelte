@@ -13,6 +13,7 @@
     onSplitH: () => void;
     onSplitV: () => void;
     onClosePane: () => void;
+    onMenu: () => void;
   }
   let {
     tabs,
@@ -23,6 +24,7 @@
     onSplitH,
     onSplitV,
     onClosePane,
+    onMenu,
   }: Props = $props();
 </script>
 
@@ -58,6 +60,7 @@
     <button class="iconbtn" title="split right" onclick={onSplitH}>▥</button>
     <button class="iconbtn" title="split down" onclick={onSplitV}>▤</button>
     <button class="iconbtn" title="close pane" onclick={onClosePane}>✕</button>
+    <button class="iconbtn" title="hotkeys" onclick={onMenu}>?</button>
   </div>
 </div>
 

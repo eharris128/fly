@@ -46,6 +46,35 @@ export const BINDINGS: Binding[] = [
   { keys: ["?"], label: "Hotkey menu", action: "openMenu" },
 ];
 
+/**
+ * Turn a leader spec (`"ctrl+a"`, `"super+space"`) into a display string for
+ * the hotkey menu: `"Ctrl-A"`, `"Super-Space"` (R6). Known modifier/key names
+ * are title-cased to their conventional forms; anything else is upper-cased
+ * (single char) or capitalised (word).
+ */
+export function formatLeader(spec: string): string {
+  const names: Record<string, string> = {
+    ctrl: "Ctrl",
+    super: "Super",
+    meta: "Super",
+    cmd: "Super",
+    alt: "Alt",
+    shift: "Shift",
+    space: "Space",
+  };
+  return spec
+    .toLowerCase()
+    .split("+")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
+    .map(
+      (p) =>
+        names[p] ??
+        (p.length === 1 ? p.toUpperCase() : p[0].toUpperCase() + p.slice(1)),
+    )
+    .join("-");
+}
+
 /** Build a matcher for a leader spec like "ctrl+a" or "super+space". */
 export function parseLeader(spec: string): (e: KeyboardEvent) => boolean {
   const parts = spec.toLowerCase().split("+").map((p) => p.trim());
