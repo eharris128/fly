@@ -75,6 +75,13 @@ export function formatLeader(spec: string): string {
     .join("-");
 }
 
+/** Bare modifier keys, which fire their own keydown before the modified key. */
+function isModifierKey(key: string): boolean {
+  return (
+    key === "Shift" || key === "Control" || key === "Alt" || key === "Meta"
+  );
+}
+
 /** Build a matcher for a leader spec like "ctrl+a" or "super+space". */
 export function parseLeader(spec: string): (e: KeyboardEvent) => boolean {
   const parts = spec.toLowerCase().split("+").map((p) => p.trim());
@@ -112,6 +119,11 @@ export class Keymap {
     if (e.type !== "keydown") return false;
 
     if (this.leaderPending) {
+      // A bare modifier keydown (Shift/Ctrl/Alt/Meta) fires before the key it
+      // modifies — pressing Shift to type `?` or `X` arrives as its own event.
+      // Don't let it consume the pending leader; keep waiting for the real key,
+      // or shifted chords (`?`, `X`, `|`, `_`) would never fire.
+      if (isModifierKey(e.key)) return true;
       this.leaderPending = false;
       this.dispatch(e);
       return true; // the command key never reaches the shell

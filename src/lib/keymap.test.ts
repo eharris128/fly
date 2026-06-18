@@ -154,6 +154,19 @@ describe("Keymap", () => {
     expect(a.calls).toEqual(["openMenu"]);
   });
 
+  it("a bare modifier keydown does not consume the pending leader", () => {
+    // The browser delivers a "Shift" keydown of its own before the shifted
+    // key. Without skipping it, the leader would be cleared and chords like
+    // ? / X / | / _ would never fire.
+    const a = spyActions();
+    const km = new Keymap("ctrl+a", a);
+    km.handle(ev("a", { ctrl: true })); // leader
+    expect(km.handle(ev("Shift", { shift: true }))).toBe(true); // swallowed
+    expect(a.calls).toEqual([]); // still pending — nothing dispatched yet
+    expect(km.handle(ev("?", { shift: true }))).toBe(true); // real key
+    expect(a.calls).toEqual(["openMenu"]);
+  });
+
   it("a configurable leader works (super+space)", () => {
     const a = spyActions();
     const km = new Keymap("super+space", a);
