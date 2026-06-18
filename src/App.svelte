@@ -58,10 +58,8 @@
   let saveScrollbackEnabled = $state(false);
   let keymap = $state<Keymap | null>(null);
   let menuOpen = $state(false);
-  // Retained for the hotkey menu's leader display (R6). Initialised to the
-  // config default so the menu never shows an empty leader if it is somehow
-  // opened before restore() resolves; restore() overwrites it with the real
-  // configured value.
+  // Initialised to the config default so the menu never shows an empty leader
+  // if it is somehow opened before restore() resolves (R6).
   let leaderKey = $state("ctrl+a");
   let layoutEl: HTMLDivElement;
   let layoutW = $state(1000);
@@ -158,13 +156,15 @@
   // with multiple live agent panes asks first, so a sticky-Shift mis-fire of
   // leader x → X cannot silently destroy several agents' work (KTD5/R4).
   let pendingCloseTab = $state<string | null>(null);
-  let pendingCloseCount = $state(0);
+  const pendingCloseCount = $derived(
+    pendingCloseTab !== null
+      ? leaves(tabs.find((t) => t.id === pendingCloseTab)!.tree).length
+      : 0,
+  );
   function requestCloseTab() {
     if (!activeTab) return;
-    const count = leaves(activeTab.tree).length;
-    if (count > 1) {
-      pendingCloseCount = count;
-      pendingCloseTab = activeId;
+    if (leaves(activeTab.tree).length > 1) {
+      pendingCloseTab = activeId; // ask first (KTD5); confirm overlay renders
     } else {
       closeTab(activeId);
     }
@@ -176,27 +176,27 @@
   function cancelCloseTab() {
     pendingCloseTab = null;
   }
-  // While the hotkey menu is open, Escape dismisses it. The capture listener
-  // is mounted only for that window, so Escape reaches a running TUI (vim, an
-  // agent) normally at every other time, and xterm keeps focus (KTD3).
+  // Capture-phase keydown while an overlay is up, torn down with it. The
+  // capture phase + stopPropagation keeps the key from reaching xterm; because
+  // the listener exists only while the overlay is open, Escape reaches a
+  // running TUI (vim, an agent) normally at every other time (KTD3).
+  function captureKeys(handler: (e: KeyboardEvent) => void): () => void {
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }
   $effect(() => {
-    if (!menuOpen) return;
-    const onKey = (e: KeyboardEvent) => {
+    if (!menuOpen) return; // hotkey menu: Escape closes
+    return captureKeys((e) => {
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
         menuOpen = false;
       }
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    });
   });
-  // While the confirm is up, Enter confirms and Escape cancels. The capture
-  // listener exists only for the duration of the prompt, so Escape reaches a
-  // running TUI normally the rest of the time (mirrors the menu, KTD3).
   $effect(() => {
-    if (pendingCloseTab === null) return;
-    const onKey = (e: KeyboardEvent) => {
+    if (pendingCloseTab === null) return; // close-tab confirm: Enter / Escape
+    return captureKeys((e) => {
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
@@ -206,9 +206,7 @@
         e.stopPropagation();
         confirmCloseTab();
       }
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    });
   });
 
   function onAttention(key: string, state: AttentionState, _reason: AttentionReason | null) {

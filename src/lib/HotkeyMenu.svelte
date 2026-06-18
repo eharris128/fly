@@ -13,7 +13,10 @@
   }
   let { open, leader, onClose }: Props = $props();
 
-  // The chord's primary key, cased to match how it is typed (X vs x).
+  const formattedLeader = $derived(formatLeader(leader));
+
+  // keys[0] is the canonical display key; aliases (keys[1..], e.g. \ for |)
+  // are suppressed. Cased to match how the chord is typed (X vs x).
   function keyLabel(b: Binding): string {
     const k = b.keys[0];
     return b.upper ? k.toUpperCase() : k;
@@ -32,14 +35,14 @@
     >
       <div class="head">
         <span class="title">Hotkeys</span>
-        <span class="leader">Leader&nbsp;<kbd>{formatLeader(leader)}</kbd></span>
+        <span class="leader">Leader&nbsp;<kbd>{formattedLeader}</kbd></span>
         <button class="close" title="close" onclick={onClose}>×</button>
       </div>
       <ul class="rows">
         {#each BINDINGS as b (b.label)}
           <li class="row">
             <span class="keys">
-              <kbd>{formatLeader(leader)}</kbd>
+              <kbd>{formattedLeader}</kbd>
               <kbd>{keyLabel(b)}</kbd>
             </span>
             <span class="label">{b.label}</span>
