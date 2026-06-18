@@ -156,17 +156,24 @@
   // with multiple live agent panes asks first, so a sticky-Shift mis-fire of
   // leader x → X cannot silently destroy several agents' work (KTD5/R4).
   let pendingCloseTab = $state<string | null>(null);
-  const pendingCloseCount = $derived(
-    pendingCloseTab !== null
-      ? leaves(tabs.find((t) => t.id === pendingCloseTab)!.tree).length
-      : 0,
-  );
-  function requestCloseTab() {
-    if (!activeTab) return;
-    if (leaves(activeTab.tree).length > 1) {
-      pendingCloseTab = activeId; // ask first (KTD5); confirm overlay renders
+  // Null-safe: pendingCloseTab can briefly outlive its tab (e.g. closing the
+  // tab's last pane by keyboard while the confirm is up), so never assert.
+  const pendingCloseCount = $derived.by(() => {
+    const t = tabs.find((tab) => tab.id === pendingCloseTab);
+    return t ? leaves(t.tree).length : 0;
+  });
+  // Confirm before closing a tab with more than one pane, whichever entry
+  // point asks (leader X or the tab-bar ×) — a multi-pane tab holds several
+  // live agents and the close is irreversible (KTD5/R4). Single-pane tabs
+  // close immediately. The two overlays are kept mutually exclusive (openMenu).
+  function requestCloseTab(id: string = activeId) {
+    const tab = tabs.find((t) => t.id === id);
+    if (!tab) return;
+    if (leaves(tab.tree).length > 1) {
+      menuOpen = false;
+      pendingCloseTab = id;
     } else {
-      closeTab(activeId);
+      closeTab(id);
     }
   }
   function confirmCloseTab() {
@@ -175,6 +182,12 @@
   }
   function cancelCloseTab() {
     pendingCloseTab = null;
+  }
+  // Opening the menu dismisses any pending close-tab confirm, so at most one
+  // overlay is ever up — otherwise both Escape capture listeners would fire.
+  function openMenu() {
+    pendingCloseTab = null;
+    menuOpen = true;
   }
   // Capture-phase keydown while an overlay is up, torn down with it. The
   // capture phase + stopPropagation keeps the key from reaching xterm; because
@@ -280,7 +293,7 @@
       focusUp: () => focusDir("up"),
       focusDown: () => focusDir("down"),
       cycleAttention,
-      openMenu: () => (menuOpen = true),
+      openMenu,
     });
 
     const saved = await loadSession();
@@ -340,12 +353,12 @@
     tabs={tabViews}
     {activeId}
     onSelect={(id) => (activeId = id)}
-    onClose={closeTab}
+    onClose={requestCloseTab}
     onNew={newTab}
     onSplitH={() => split("horizontal")}
     onSplitV={() => split("vertical")}
     onClosePane={closePane}
-    onMenu={() => (menuOpen = true)}
+    onMenu={openMenu}
   />
   <div class="layout" bind:this={layoutEl} bind:clientWidth={layoutW} bind:clientHeight={layoutH}>
     {#each allPanes as p (p.key)}
