@@ -25,6 +25,7 @@ function spyActions(): KeymapActions & { calls: string[] } {
     splitHorizontal: mk("splitH"),
     splitVertical: mk("splitV"),
     closePane: mk("close"),
+    closeTab: mk("closeTab"),
     focusLeft: mk("left"),
     focusRight: mk("right"),
     focusUp: mk("up"),
@@ -103,6 +104,16 @@ describe("Keymap", () => {
       expect(km.handle(ev(key, mods))).toBe(true);
       expect(a.calls).toEqual([expected]);
     }
+  });
+
+  it("distinguishes leader x (close pane) from leader X (close tab)", () => {
+    const a = spyActions();
+    const km = new Keymap("ctrl+a", a);
+    km.handle(ev("a", { ctrl: true }));
+    km.handle(ev("x")); // literal lowercase → close pane
+    km.handle(ev("a", { ctrl: true }));
+    km.handle(ev("X", { shift: true })); // literal uppercase → close tab
+    expect(a.calls).toEqual(["close", "closeTab"]);
   });
 
   it("a configurable leader works (super+space)", () => {

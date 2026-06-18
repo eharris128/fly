@@ -7,6 +7,7 @@ export interface KeymapActions {
   splitHorizontal: () => void;
   splitVertical: () => void;
   closePane: () => void;
+  closeTab: () => void;
   focusLeft: () => void;
   focusRight: () => void;
   focusUp: () => void;
@@ -35,6 +36,7 @@ export const BINDINGS: Binding[] = [
   { keys: ["|", "\\"], label: "Split right", action: "splitHorizontal" },
   { keys: ["-", "_"], label: "Split down", action: "splitVertical" },
   { keys: ["x"], label: "Close pane", action: "closePane" },
+  { keys: ["x"], upper: true, label: "Close tab", action: "closeTab" },
   { keys: ["h", "arrowleft"], label: "Focus left", action: "focusLeft" },
   { keys: ["l", "arrowright"], label: "Focus right", action: "focusRight" },
   { keys: ["k", "arrowup"], label: "Focus up", action: "focusUp" },

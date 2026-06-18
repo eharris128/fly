@@ -146,6 +146,49 @@
     if (activeId === id) activeId = next[Math.max(0, idx - 1)].id;
   }
 
+  // leader X closes the whole active tab. Closing a single-pane tab is no more
+  // destructive than closing its last pane, so it proceeds immediately; a tab
+  // with multiple live agent panes asks first, so a sticky-Shift mis-fire of
+  // leader x → X cannot silently destroy several agents' work (KTD5/R4).
+  let pendingCloseTab = $state<string | null>(null);
+  let pendingCloseCount = $state(0);
+  function requestCloseTab() {
+    if (!activeTab) return;
+    const count = leaves(activeTab.tree).length;
+    if (count > 1) {
+      pendingCloseCount = count;
+      pendingCloseTab = activeId;
+    } else {
+      closeTab(activeId);
+    }
+  }
+  function confirmCloseTab() {
+    if (pendingCloseTab) closeTab(pendingCloseTab);
+    pendingCloseTab = null;
+  }
+  function cancelCloseTab() {
+    pendingCloseTab = null;
+  }
+  // While the confirm is up, Enter confirms and Escape cancels. The capture
+  // listener exists only for the duration of the prompt, so Escape reaches a
+  // running TUI normally the rest of the time (mirrors the menu, KTD3).
+  $effect(() => {
+    if (pendingCloseTab === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelCloseTab();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        confirmCloseTab();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  });
+
   function onAttention(key: string, state: AttentionState, _reason: AttentionReason | null) {
     attentionByLeaf = { ...attentionByLeaf, [key]: state };
   }
@@ -210,6 +253,7 @@
       splitHorizontal: () => split("horizontal"),
       splitVertical: () => split("vertical"),
       closePane,
+      closeTab: requestCloseTab,
       focusLeft: () => focusDir("left"),
       focusRight: () => focusDir("right"),
       focusUp: () => focusDir("up"),
@@ -311,6 +355,27 @@
       ></div>
     {/each}
   </div>
+
+  {#if pendingCloseTab !== null}
+    <div class="backdrop" role="presentation" onpointerdown={cancelCloseTab}>
+      <div
+        class="confirm"
+        role="alertdialog"
+        aria-label="Close tab confirmation"
+        tabindex="-1"
+        onpointerdown={(e) => e.stopPropagation()}
+      >
+        <p class="confirm-msg">
+          Close this tab and its {pendingCloseCount} panes?
+        </p>
+        <div class="confirm-actions">
+          <button class="btn danger" onclick={confirmCloseTab}>Close tab</button>
+          <button class="btn" onclick={cancelCloseTab}>Cancel</button>
+        </div>
+        <p class="confirm-hint">Enter to close · Esc to cancel</p>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -346,5 +411,59 @@
   }
   .divider.vertical {
     cursor: row-resize;
+  }
+  .backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(5, 8, 16, 0.6);
+  }
+  .confirm {
+    background: #0b1020;
+    border: 1px solid #2b3a55;
+    border-radius: 6px;
+    padding: 18px 20px;
+    min-width: 260px;
+    text-align: center;
+    color: #c9d1d9;
+    font:
+      13px/1.4 ui-monospace,
+      monospace;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  }
+  .confirm-msg {
+    margin: 0 0 14px;
+  }
+  .confirm-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+  }
+  .btn {
+    background: #11182b;
+    border: 1px solid #2b3a55;
+    color: #c9d1d9;
+    border-radius: 4px;
+    padding: 6px 14px;
+    cursor: pointer;
+    font: inherit;
+  }
+  .btn:hover {
+    background: #1a2740;
+  }
+  .btn.danger {
+    border-color: #f5a623;
+    color: #f5a623;
+  }
+  .btn.danger:hover {
+    background: #2a2410;
+  }
+  .confirm-hint {
+    margin: 12px 0 0;
+    opacity: 0.5;
+    font-size: 11px;
   }
 </style>
