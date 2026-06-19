@@ -14,6 +14,11 @@ export interface KeymapActions {
   focusDown: () => void;
   cycleAttention: () => void;
   openMenu: () => void;
+  toggleSidebar: () => void;
+  newWorkspace: () => void;
+  prevWorkspace: () => void;
+  nextWorkspace: () => void;
+  renameTab: () => void;
 }
 
 /**
@@ -43,6 +48,11 @@ export const BINDINGS: Binding[] = [
   { keys: ["k", "arrowup"], label: "Focus up", action: "focusUp" },
   { keys: ["j", "arrowdown"], label: "Focus down", action: "focusDown" },
   { keys: ["u"], label: "Cycle attention", action: "cycleAttention" },
+  { keys: ["r"], label: "Rename tab", action: "renameTab" },
+  { keys: ["w"], label: "New workspace", action: "newWorkspace" },
+  { keys: ["["], label: "Previous workspace", action: "prevWorkspace" },
+  { keys: ["]"], label: "Next workspace", action: "nextWorkspace" },
+  { keys: ["b"], label: "Toggle sidebar", action: "toggleSidebar" },
   { keys: ["?"], label: "Hotkey menu", action: "openMenu" },
 ];
 

@@ -136,19 +136,29 @@ arguments so they're tested without a running app.
   places.
 
 ### Frontend (`src/`)
-- `App.svelte` — orchestrates tabs and the split tree; owns attention/cwd state,
-  debounced session persistence (~800ms), and overlay (hotkey menu / close-tab
-  confirm) wiring.
+- `App.svelte` — orchestrates workspaces, tabs, and the split tree; owns
+  attention/cwd state, debounced session persistence (~800ms), and overlay
+  (hotkey menu / destructive-confirm) wiring.
 - `lib/layout.ts` — **pure split-tree model**. Leaves render flat and keyed, so
   splitting/resizing never unmounts a pane (which would respawn its agent). Leaf
   keys are stable and also key the scrollback files — preserve this invariant.
+  `App.svelte` renders every pane across **all** workspaces/tabs (hiding inactive
+  ones) so switching never unmounts/respawns an agent — same invariant.
+- `lib/workspaces.ts` — **pure workspace/tab model** (mirrors `layout.ts`): a
+  workspace is a named collection of tabs; helpers (`tabDisplayTitle`,
+  `closeTabIn`, `deleteWorkspaceFrom`, `flattenRaised`) take id factories so
+  they're tested without an app.
 - `lib/keymap.ts` — the leader-key model (tmux-style: default Ctrl-A, then a
   command key; everything else passes through to the PTY). `BINDINGS` is the
   single source of truth shared by `dispatch()` and the hotkey menu, so they
   cannot drift.
 - `lib/Terminal.svelte` — embeddable xterm leaf; subscribes to `pane://attention`.
   Terminal font size comes from config (`config.fontSize`, default 15).
-- `lib/{config,serialize}.ts`, `lib/{TabBar,HotkeyMenu}.svelte`.
+- `lib/Sidebar.svelte` — collapsible cmux-style workspace tree (workspaces ▸
+  named tabs); `lib/ControlBar.svelte` — slim top bar (sidebar toggle +
+  breadcrumb + pane controls).
+- `lib/{config,serialize}.ts` (`serialize.migrateSession` upgrades old sessions
+  into the workspace shape), `lib/HotkeyMenu.svelte`.
 
 ## Conventions
 

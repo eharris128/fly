@@ -38,6 +38,11 @@ function spyActions(): KeymapActions & { calls: string[] } {
     focusDown: mk("down"),
     cycleAttention: mk("cycle"),
     openMenu: mk("openMenu"),
+    toggleSidebar: mk("toggleSidebar"),
+    newWorkspace: mk("newWorkspace"),
+    prevWorkspace: mk("prevWorkspace"),
+    nextWorkspace: mk("nextWorkspace"),
+    renameTab: mk("renameTab"),
   };
 }
 
@@ -144,6 +149,27 @@ describe("Keymap", () => {
     km.handle(ev("a", { ctrl: true }));
     km.handle(ev("X", { shift: true })); // literal uppercase → close tab
     expect(a.calls).toEqual(["close", "closeTab"]);
+  });
+
+  it("maps the workspace + sidebar chords", () => {
+    const a = spyActions();
+    const km = new Keymap("ctrl+a", a);
+    const chord = (k: string, mods = {}) => {
+      km.handle(ev("a", { ctrl: true }));
+      expect(km.handle(ev(k, mods))).toBe(true);
+    };
+    chord("b");
+    chord("w");
+    chord("[");
+    chord("]");
+    chord("r");
+    expect(a.calls).toEqual([
+      "toggleSidebar",
+      "newWorkspace",
+      "prevWorkspace",
+      "nextWorkspace",
+      "renameTab",
+    ]);
   });
 
   it("leader ? opens the hotkey menu (shifted key still reaches dispatch)", () => {
