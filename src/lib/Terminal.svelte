@@ -104,6 +104,14 @@
     }
   });
 
+  // Imperatively focus this pane's terminal. The command palette uses this to
+  // hand focus back to the active pane when it closes — the palette takes DOM
+  // focus (the cheat-sheet never does, KTD3), so without this the leader would
+  // go dead until the user clicked a pane.
+  export function focus() {
+    term?.focus();
+  }
+
   onMount(async () => {
     const config = await getConfig();
 

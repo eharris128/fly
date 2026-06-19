@@ -38,6 +38,7 @@ function spyActions(): KeymapActions & { calls: string[] } {
     focusDown: mk("down"),
     cycleAttention: mk("cycle"),
     openMenu: mk("openMenu"),
+    openPalette: mk("openPalette"),
     toggleSidebar: mk("toggleSidebar"),
     newWorkspace: mk("newWorkspace"),
     prevWorkspace: mk("prevWorkspace"),
@@ -58,6 +59,8 @@ describe("BINDINGS", () => {
   it("is the single source of truth and carries the new chords", () => {
     const actions = BINDINGS.map((b) => b.action);
     expect(actions).toContain("openMenu");
+    expect(actions).toContain("openPalette");
+    expect(BINDINGS.find((b) => b.action === "openPalette")?.keys).toEqual(["p"]);
     // x and X are distinct entries — close pane vs close tab (R3 anti-drift).
     const xEntries = BINDINGS.filter((b) => b.keys.includes("x"));
     expect(xEntries.map((b) => b.action).sort()).toEqual([
@@ -178,6 +181,14 @@ describe("Keymap", () => {
     km.handle(ev("a", { ctrl: true }));
     expect(km.handle(ev("?", { shift: true }))).toBe(true);
     expect(a.calls).toEqual(["openMenu"]);
+  });
+
+  it("leader p opens the command palette", () => {
+    const a = spyActions();
+    const km = new Keymap("ctrl+a", a);
+    km.handle(ev("a", { ctrl: true }));
+    expect(km.handle(ev("p"))).toBe(true);
+    expect(a.calls).toEqual(["openPalette"]);
   });
 
   it("a bare modifier keydown does not consume the pending leader", () => {

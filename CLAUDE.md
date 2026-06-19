@@ -150,15 +150,19 @@ arguments so they're tested without a running app.
   they're tested without an app.
 - `lib/keymap.ts` — the leader-key model (tmux-style: default Ctrl-A, then a
   command key; everything else passes through to the PTY). `BINDINGS` is the
-  single source of truth shared by `dispatch()` and the hotkey menu, so they
-  cannot drift.
+  single source of truth shared by `dispatch()`, the hotkey menu, and the
+  command palette, so they cannot drift.
 - `lib/Terminal.svelte` — embeddable xterm leaf; subscribes to `pane://attention`.
   Terminal font size comes from config (`config.fontSize`, default 15).
 - `lib/Sidebar.svelte` — collapsible cmux-style workspace tree (workspaces ▸
   named tabs); `lib/ControlBar.svelte` — slim top bar (sidebar toggle +
   breadcrumb + pane controls).
 - `lib/{config,serialize}.ts` (`serialize.migrateSession` upgrades old sessions
-  into the workspace shape), `lib/HotkeyMenu.svelte`.
+  into the workspace shape), `lib/HotkeyMenu.svelte` (passive cheat-sheet).
+- `lib/CommandPalette.svelte` + `lib/palette.ts` — type-to-run command palette
+  on `leader p`: every `BINDINGS` action (so it can't drift) plus live
+  jump-to-workspace/tab navigation. Unlike the cheat-sheet it takes DOM focus,
+  so `App.focusActivePane()` hands focus back to the active pane on close.
 
 ## Conventions
 

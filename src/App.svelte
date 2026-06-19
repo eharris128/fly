@@ -4,6 +4,7 @@
   import ControlBar from "./lib/ControlBar.svelte";
   import Sidebar from "./lib/Sidebar.svelte";
   import HotkeyMenu from "./lib/HotkeyMenu.svelte";
+  import CommandPalette from "./lib/CommandPalette.svelte";
   import {
     newLeaf,
     splitLeaf,
@@ -36,7 +37,8 @@
     type AttentionState,
     type AttentionReason,
   } from "./ipc";
-  import { Keymap } from "./lib/keymap";
+  import { Keymap, type KeymapActions } from "./lib/keymap";
+  import { actionCommands, navCommands, type PaletteCommand } from "./lib/palette";
   import { getConfig } from "./lib/config";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import {
@@ -65,10 +67,15 @@
   let attentionByLeaf = $state<Record<string, AttentionState>>({});
   // leaf key → backend pane id (for cwd queries) and last-known cwd (auto names).
   let paneIdByLeaf: Record<string, PaneId> = {};
+  // leaf key → pane component handle, so the palette can return focus to the
+  // active terminal when it closes. The palette takes DOM focus; the cheat-sheet
+  // (KTD3) does not, so only the palette needs this.
+  let paneRefs: Record<string, { focus: () => void } | undefined> = {};
   let cwdByLeaf = $state<Record<string, string | null>>({});
   let saveScrollbackEnabled = $state(false);
   let keymap = $state<Keymap | null>(null);
   let menuOpen = $state(false);
+  let paletteOpen = $state(false);
   let sidebarCollapsed = $state(false);
   // Inline-rename target, owned here so the leader `r` chord and a sidebar
   // double-click drive the exact same edit (U16).
@@ -270,6 +277,7 @@
     const panes = leaves(found.tab.tree).length;
     if (panes > 1) {
       menuOpen = false;
+      paletteOpen = false;
       const name = tabDisplayTitle(found.tab, cwdByLeaf);
       pendingConfirm = {
         message: `Close tab “${name}” and its ${panes} panes?`,
@@ -285,6 +293,7 @@
     const panes = paneCount(ws);
     if (panes > 1) {
       menuOpen = false;
+      paletteOpen = false;
       pendingConfirm = {
         message: `Delete workspace “${ws.name}” and its ${panes} panes?`,
         onConfirm: () => doDeleteWorkspace(wsId),
@@ -305,7 +314,34 @@
   // ever up — otherwise both Escape capture listeners would fire.
   function openMenu() {
     pendingConfirm = null;
+    paletteOpen = false;
     menuOpen = true;
+  }
+  // The command palette (a U4 follow-up): a focus-taking, type-to-run overlay.
+  // Mutually exclusive with the cheat-sheet and the confirm so only one overlay
+  // is ever up (their Escape handlers must not both fire).
+  function openPalette() {
+    pendingConfirm = null;
+    menuOpen = false;
+    paletteOpen = true;
+  }
+  // Hand focus back to the active terminal after the palette closes, so typing
+  // and the leader keep working without a click. Deferred a frame so it lands
+  // after the overlay input blurs and any tab switch from the command settles.
+  function focusActivePane() {
+    requestAnimationFrame(() => {
+      const key = activeTab?.focusedLeafKey;
+      if (key) paneRefs[key]?.focus();
+    });
+  }
+  function closePalette() {
+    paletteOpen = false;
+    focusActivePane();
+  }
+  function runPaletteCommand(cmd: PaletteCommand) {
+    paletteOpen = false; // close first, so a command that opens the confirm wins
+    cmd.run();
+    focusActivePane();
   }
   // Capture-phase keydown while an overlay is up, torn down with it. The
   // capture phase + stopPropagation keeps the key from reaching xterm; because
@@ -349,7 +385,7 @@
   // instance). We also bail while a rename field or overlay is up so they keep
   // their own keys.
   function onWindowKeydown(e: KeyboardEvent) {
-    if (!keymap || editing || menuOpen || pendingConfirm) return;
+    if (!keymap || editing || menuOpen || pendingConfirm || paletteOpen) return;
     if (document.activeElement?.closest(".xterm")) return; // xterm will handle it
     if (keymap.handle(e)) {
       e.preventDefault();
@@ -447,28 +483,41 @@
     saveTimer = setTimeout(() => void persist(), 800);
   });
 
+  // The single action map shared by the keymap and the palette. Both render
+  // from it together with BINDINGS, so a command can never drift from its chord
+  // (R3/KTD1).
+  const keymapActions: KeymapActions = {
+    newTab: () => newTab(),
+    splitHorizontal: () => split("horizontal"),
+    splitVertical: () => split("vertical"),
+    closePane,
+    closeTab: () => requestCloseTab(),
+    focusLeft: () => focusDir("left"),
+    focusRight: () => focusDir("right"),
+    focusUp: () => focusDir("up"),
+    focusDown: () => focusDir("down"),
+    cycleAttention,
+    openMenu,
+    openPalette,
+    toggleSidebar: () => (sidebarCollapsed = !sidebarCollapsed),
+    newWorkspace,
+    prevWorkspace: () => shiftWorkspace(-1),
+    nextWorkspace: () => shiftWorkspace(1),
+    renameTab: startRenameActiveTab,
+  };
+  // Palette commands: every leader action (from BINDINGS) plus live "jump to
+  // workspace/tab" navigation, built from the same resolved view model the
+  // sidebar uses. Reactive, so the nav list is current whenever it opens.
+  const paletteCommands = $derived<PaletteCommand[]>([
+    ...actionCommands(keymapActions, leaderKey),
+    ...navCommands(sidebarWorkspaces, selectWorkspace, selectTab),
+  ]);
+
   async function restore() {
     const cfg = await getConfig();
     saveScrollbackEnabled = cfg.saveScrollback;
     leaderKey = cfg.leaderKey;
-    keymap = new Keymap(cfg.leaderKey, {
-      newTab: () => newTab(),
-      splitHorizontal: () => split("horizontal"),
-      splitVertical: () => split("vertical"),
-      closePane,
-      closeTab: () => requestCloseTab(),
-      focusLeft: () => focusDir("left"),
-      focusRight: () => focusDir("right"),
-      focusUp: () => focusDir("up"),
-      focusDown: () => focusDir("down"),
-      cycleAttention,
-      openMenu,
-      toggleSidebar: () => (sidebarCollapsed = !sidebarCollapsed),
-      newWorkspace,
-      prevWorkspace: () => shiftWorkspace(-1),
-      nextWorkspace: () => shiftWorkspace(1),
-      renameTab: startRenameActiveTab,
-    });
+    keymap = new Keymap(cfg.leaderKey, keymapActions);
 
     const saved = await loadSession();
     if (saved && saved.workspaces.length) {
@@ -583,6 +632,7 @@
           style={r ? `left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px` : ""}
         >
           <Terminal
+            bind:this={paneRefs[p.key]}
             leafKey={p.key}
             focused={p.tabId === activeTab?.id && activeTab?.focusedLeafKey === p.key}
             cwd={cwdByLeaf[p.key] ?? null}
@@ -630,6 +680,13 @@
     open={menuOpen}
     leader={leaderKey}
     onClose={() => (menuOpen = false)}
+  />
+
+  <CommandPalette
+    open={paletteOpen}
+    commands={paletteCommands}
+    onRun={runPaletteCommand}
+    onClose={closePalette}
   />
 </div>
 
