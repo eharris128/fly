@@ -2,9 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`AGENTS.md` is the canonical agent guide and overlaps heavily with this file —
-read it too. `docs/plans/` holds the full design; the code is cross-referenced
-to it by ID (see "Conventions").
+`docs/plans/` holds the full design; the code is cross-referenced to it by ID
+(see "Conventions"). This file is the single agent guide for the repo.
 
 ## What this is
 
@@ -19,9 +18,10 @@ source. Stack: **Tauri v2** (Rust backend) + **Svelte 5** (Vite/TS frontend) +
 ```bash
 pnpm install                  # frontend deps
 pnpm tauri dev                # run the app (Vite dev server + cargo run) — use this, not a bare cargo build
+pnpm flavor:dev               # run a dev build ALONGSIDE an installed release (see "Stable + dev side by side")
 pnpm check                    # svelte-check: type-check the frontend
 pnpm test:unit                # vitest: all frontend unit tests
-pnpm tauri build              # release .deb (primary) + AppImage (secondary)
+pnpm tauri build --bundles deb   # standalone .deb (skip AppImage — it needs network at bundle time)
 
 cargo test --offline --manifest-path src-tauri/Cargo.toml          # all Rust tests
 cargo test --offline --manifest-path src-tauri/Cargo.toml --test hook_auth   # one integration-test file (src-tauri/tests/<name>.rs)
@@ -31,23 +31,61 @@ pnpm vitest run src/lib/keymap.test.ts          # one frontend test file
 pnpm vitest run -t "leader"                      # frontend tests matching a name
 ```
 
+**System deps** (Tauri/WebKitGTK on Ubuntu): `libwebkit2gtk-4.1-dev
+build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+patchelf`.
+
 ### Environment gotchas (important — these will bite)
 
 - **cargo + the Bash sandbox**: `index.crates.io` is blocked, so any build that
   resolves a *new* crate hangs. Run new-dependency builds with
   `dangerouslyDisableSandbox: true`; once deps are cached, `cargo
-  build/test --offline` works sandboxed.
+  build/test --offline` works sandboxed. (Caution: `dangerouslyDisableSandbox`
+  + a foreground `sleep` in the same Bash call has been seen to abort with exit
+  144 — keep sleeps out of sandbox-disabled commands.)
 - **Run via `pnpm tauri dev`, never a bare debug `cargo build` binary** — the
   debug binary loads the frontend from the Vite `devUrl`, so standalone it shows
-  a blank window. The release build embeds the frontend.
-- **Known release-mode blank window on WebKitGTK 2.52** (this 24.04 dev box):
-  `pnpm tauri build` produces a working `.deb`, but the release webview here
-  fails to load embedded assets via Tauri's custom protocol. It's a WebKitGTK
-  2.52 regression, not app code; the target baseline is Ubuntu 22.04. Dev mode
-  works fully. (`vite.config.ts` strips `crossorigin` from the built HTML — a
-  related, kept fix.)
+  a blank window. The release build embeds the frontend and runs standalone.
+- **Release builds render fine here** (verified on this 24.04 box, Wayland +
+  X11). An earlier blank-window issue on WebKitGTK 2.52 was the `crossorigin`
+  module-script attribute failing to load over Tauri's custom asset protocol;
+  the `fly-strip-crossorigin` Vite plugin in `vite.config.ts` strips it and
+  fixes it. If a release build ever shows blank on Wayland, `GDK_BACKEND=x11
+  fly` is a proven fallback.
+- **Wayland screenshots are locked down** (GNOME 46: `org.gnome.Shell.Screenshot`
+  → AccessDenied; x11grab of rootless Xwayland is black). To capture the app,
+  launch it with `GDK_BACKEND=x11` (makes it an Xwayland client), then
+  `xwd -id <winid> -out f.xwd && ffmpeg -i f.xwd f.png`.
 - **The webview console is invisible.** The frontend forwards uncaught errors to
   app stderr via the `frontend_log` command — grep stderr for `[fly-webview]`.
+
+## Packaging & running a stable build
+
+`pnpm tauri build --bundles deb` produces
+`src-tauri/target/release/bundle/deb/fly_<ver>_amd64.deb`. Install it
+(`sudo apt install ./…deb`) for a standalone `/usr/bin/fly` + launcher,
+independent of the source tree.
+
+### Stable + dev side by side
+
+A normal `pnpm tauri dev` shares the installed app's Tauri **identifier**
+(`dev.evan.fly`) and its config/session/socket dirs, so the `single-instance`
+plugin (registered in `lib.rs`) would just focus the installed window instead of
+opening a second one, and the two would clobber each other's saved tabs. To run
+an iterating dev build next to an installed stable app, use **`pnpm flavor:dev`**:
+
+- `src-tauri/tauri.dev.conf.json` (merged via `tauri dev --config`) gives the
+  dev build a distinct identifier `dev.evan.fly-dev` → its own single-instance
+  lock, so both windows coexist.
+- `FLY_APP_NAME=fly-dev` (set by the script) isolates its on-disk state. All
+  three path roots derive from `lib.rs::app_dir_name()` (default `fly`,
+  overridable via `FLY_APP_NAME`): config `~/.config/<app>/`, session/scrollback
+  `~/.local/share/<app>/`, and the hook socket under `$XDG_RUNTIME_DIR/<app>/`.
+  The installed release leaves `FLY_APP_NAME` unset → stays on `fly`.
+- The dev window's title becomes `fly (dev)` (set at runtime in `lib.rs` setup
+  when the flavor isn't `fly`) so it's distinguishable from the stable window.
+
+The per-pane hook socket is also PID-keyed, so it never collides regardless.
 
 ## Architecture
 
@@ -62,6 +100,7 @@ This is the data flow that makes an agent's "I need you" reach the UI:
 
 1. `fly hooks setup` installs a Claude Code `command` hook in
    `~/.claude/settings.json` (backed up first) that runs `fly notify`.
+   `fly hooks teardown` removes only fly's hooks.
 2. When a pane spawns (`stream::spawn_pane`), the backend mints a per-pane
    CSPRNG token and injects `FLY_PANE_TOKEN` + `FLY_SOCKET_PATH` into the child
    env, and registers the pane with the `AttentionManager`.
@@ -108,6 +147,7 @@ arguments so they're tested without a running app.
   single source of truth shared by `dispatch()` and the hotkey menu, so they
   cannot drift.
 - `lib/Terminal.svelte` — embeddable xterm leaf; subscribes to `pane://attention`.
+  Terminal font size comes from config (`config.fontSize`, default 15).
 - `lib/{config,serialize}.ts`, `lib/{TabBar,HotkeyMenu}.svelte`.
 
 ## Conventions
