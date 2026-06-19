@@ -13,6 +13,7 @@ fn defaults_load_when_no_file_exists() {
     assert_eq!(config, Config::default());
     assert_eq!(config.leader_key, "ctrl+a");
     assert_eq!(config.renderer, Renderer::Auto);
+    assert_eq!(config.font_size, 15);
 }
 
 #[test]
@@ -21,13 +22,14 @@ fn valid_config_overrides_defaults() {
     let path = dir.path().join("config.json");
     std::fs::write(
         &path,
-        r#"{"leaderKey":"ctrl+b","attentionDebounceMs":250,"saveScrollback":true}"#,
+        r#"{"leaderKey":"ctrl+b","attentionDebounceMs":250,"fontSize":18,"saveScrollback":true}"#,
     )
     .unwrap();
 
     let config = load_with_fallback(&path);
     assert_eq!(config.leader_key, "ctrl+b");
     assert_eq!(config.attention_debounce_ms, 250);
+    assert_eq!(config.font_size, 18);
     assert!(config.save_scrollback);
     // Unspecified fields keep their defaults.
     assert_eq!(config.renderer, Renderer::Auto);

@@ -32,6 +32,8 @@ pub struct Config {
     pub renderer: Renderer,
     /// xterm.js scrollback cap in lines (KTD4).
     pub scrollback_lines: usize,
+    /// Terminal font size in px. Integer so `Config` keeps `Eq`.
+    pub font_size: u16,
     /// Persist scrollback across restart — off by default for privacy (KTD10).
     pub save_scrollback: bool,
 }
@@ -45,6 +47,7 @@ impl Default for Config {
             osc_bel_fallback: false,
             renderer: Renderer::Auto,
             scrollback_lines: 10_000,
+            font_size: 15,
             save_scrollback: false,
         }
     }

@@ -109,7 +109,7 @@
 
     term = new Terminal({
       fontFamily: "ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace",
-      fontSize: 13,
+      fontSize: config.fontSize,
       cursorBlink: true,
       scrollback: config.scrollbackLines,
       allowProposedApi: true,

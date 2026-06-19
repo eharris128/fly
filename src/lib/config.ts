@@ -10,6 +10,7 @@ export interface Config {
   oscBelFallback: boolean;
   renderer: Renderer;
   scrollbackLines: number;
+  fontSize: number;
   saveScrollback: boolean;
 }
 
