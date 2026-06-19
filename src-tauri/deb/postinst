@@ -1,0 +1,22 @@
+#!/bin/sh
+# Debian post-install: force-refresh the icon cache + desktop database.
+#
+# The hicolor dpkg trigger only rebuilds the icon cache when the cache is
+# *older* than the icon dirs; a cache that's already newer (common right after
+# an unrelated refresh) is left untouched, so a freshly-added "fly" icon never
+# gets indexed and the dock shows a blank icon (worse on Wayland, which has no
+# window-icon fallback). Forcing the rebuild here guarantees the icon resolves.
+set -e
+
+case "$1" in
+  configure)
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -f -q /usr/share/icons/hicolor || true
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q || true
+    fi
+    ;;
+esac
+
+exit 0
