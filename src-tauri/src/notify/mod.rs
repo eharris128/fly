@@ -11,6 +11,11 @@ use tauri_plugin_notification::NotificationExt;
 
 const TITLE_CAP: usize = 120;
 const BODY_CAP: usize = 400;
+/// XDG sound-theme name played with each notification so an agent's "I need
+/// you" is audible, not just visual. A standard freedesktop sound present in
+/// the default and Yaru themes; the desktop maps it to the `sound-name` hint
+/// (requires the DE's event sounds to be enabled).
+const NOTIFICATION_SOUND: &str = "message-new-instant";
 /// Minimum gap between OS notifications, so a looping agent can't thrash the
 /// notification daemon or the window urgency hint (R16/U11).
 const MIN_INTERVAL_MS: u64 = 800;
@@ -30,6 +35,7 @@ pub fn surface(app: &AppHandle, title: &str, body: &str) {
         .builder()
         .title(title)
         .body(body)
+        .sound(NOTIFICATION_SOUND)
         .show();
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
