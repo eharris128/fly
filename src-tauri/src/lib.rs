@@ -50,13 +50,33 @@ fn nvidia_driver_active() -> bool {
         || std::path::Path::new("/dev/nvidiactl").exists()
 }
 
+/// The per-flavor directory name used under the XDG config/data/runtime dirs.
+///
+/// Defaults to `fly`, but `FLY_APP_NAME` overrides it so a dev build can run
+/// alongside an installed release without sharing settings, session state, or
+/// the hook socket. The value is sanitized to a single safe path segment (it is
+/// joined into XDG paths), falling back to `fly` if empty.
+pub fn app_dir_name() -> String {
+    let cleaned: String = std::env::var("FLY_APP_NAME")
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if cleaned.is_empty() {
+        "fly".into()
+    } else {
+        cleaned
+    }
+}
+
 /// Where the hook socket lives — under the XDG runtime dir, keyed by pid so
 /// instances don't collide (single-instance enforcement arrives in U14).
 fn hook_socket_path() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    base.join("fly").join(format!("hook-{}.sock", std::process::id()))
+    base.join(app_dir_name())
+        .join(format!("hook-{}.sock", std::process::id()))
 }
 
 /// Surface webview errors to the app's stderr. The webview console is
@@ -108,6 +128,18 @@ pub fn run() {
         .manage(tokens)
         .manage(attention)
         .setup(move |app| {
+            // A dev flavor (FLY_APP_NAME set) gets a distinct title so it's
+            // obvious which window is the throwaway dev build next to a stable
+            // install. The identifier (single-instance) + dirs are isolated
+            // separately; this is just the visible marker.
+            let flavor = app_dir_name();
+            if flavor != "fly" {
+                if let Some(win) = app.get_webview_window("main") {
+                    let suffix = flavor.strip_prefix("fly-").unwrap_or(&flavor);
+                    let _ = win.set_title(&format!("fly ({suffix})"));
+                }
+            }
+
             let handle = app.handle().clone();
             let attention = attention_for_hooks;
             let gate = gate;

@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test:unit": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "flavor:dev": "FLY_APP_NAME=fly-dev tauri dev --config src-tauri/tauri.dev.conf.json"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

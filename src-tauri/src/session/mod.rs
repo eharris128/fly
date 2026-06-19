@@ -21,7 +21,9 @@ pub fn data_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("fly")
+        // `<app>` = fly, or a FLY_APP_NAME override so a dev flavor keeps its
+        // own session/scrollback separate from an installed release.
+        .join(crate::app_dir_name())
 }
 
 pub fn session_path() -> PathBuf {

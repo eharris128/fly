@@ -35,13 +35,15 @@ impl ConfigStore {
     }
 }
 
-/// Default config file location: `$XDG_CONFIG_HOME/fly/config.json`.
+/// Default config file location: `$XDG_CONFIG_HOME/<app>/config.json`, where
+/// `<app>` is [`crate::app_dir_name`] (`fly`, or a `FLY_APP_NAME` override so a
+/// dev flavor keeps its own settings).
 pub fn default_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("fly").join("config.json")
+    base.join(crate::app_dir_name()).join("config.json")
 }
 
 /// Read + parse, or fall back to defaults. A corrupt file is renamed aside so
