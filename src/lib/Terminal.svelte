@@ -134,8 +134,17 @@
 
     // The leader chord is intercepted here and never reaches the shell; every
     // other key (Ctrl-C, Ctrl-W, vim nav, …) returns true and flows to the PTY
-    // (R6). Bracketed paste arrives via onData, untouched.
-    term.attachCustomKeyEventHandler((e) => (keymap ? !keymap.handle(e) : true));
+    // (R6). Bracketed paste arrives via onData, untouched. On a consumed chord
+    // we also preventDefault: otherwise the browser runs the key's default text
+    // insertion *after* focus shifts to an overlay it opened (the palette, the
+    // rename field), and the character lands in that input.
+    term.attachCustomKeyEventHandler((e) => {
+      if (keymap && keymap.handle(e)) {
+        e.preventDefault();
+        return false; // consumed by the app — xterm must not send it either
+      }
+      return true;
+    });
 
     if (config.renderer !== "dom") {
       try {
