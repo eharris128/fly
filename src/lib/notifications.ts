@@ -179,6 +179,26 @@ function coerceOne(raw: unknown): Notification | null {
   };
 }
 
+/** A notification augmented for display: the source label + whether its pane
+ *  still resolves to a live tab (for the jump). Built by App from the live tree. */
+export interface NotificationView extends Notification {
+  source: string;
+  jumpable: boolean;
+}
+
+/** Compact relative time ("now", "5s ago", "3m ago", "2h ago", "4d ago"). Pure:
+ *  `now` is injected so it is testable and never trips the workflow clock ban. */
+export function relativeTime(ts: number, now: number): string {
+  const s = Math.max(0, Math.floor((now - ts) / 1000));
+  if (s < 5) return "now";
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
 /** Coerce a raw persisted array into valid notifications, dropping malformed. */
 export function coerceNotifications(raw: unknown): Notification[] {
   if (!Array.isArray(raw)) return [];

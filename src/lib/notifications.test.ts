@@ -11,6 +11,7 @@ import {
   unreadTotal,
   newestUnread,
   toPersisted,
+  relativeTime,
   coerceNotifications,
   type IngestedNotification,
   type Notification,
@@ -141,6 +142,16 @@ describe("persistence + restore", () => {
     expect(restored.find((n) => n.id === 2)!.state).toBe("unread");
     // leafKey survives the round-trip (resolves after paneId reassignment).
     expect(restored.find((n) => n.id === 2)!.leafKey).toBe("leaf-2");
+  });
+
+  it("relativeTime renders compact buckets", () => {
+    const now = 1_000_000;
+    expect(relativeTime(now, now)).toBe("now");
+    expect(relativeTime(now - 30_000, now)).toBe("30s ago");
+    expect(relativeTime(now - 5 * 60_000, now)).toBe("5m ago");
+    expect(relativeTime(now - 3 * 3_600_000, now)).toBe("3h ago");
+    expect(relativeTime(now - 2 * 86_400_000, now)).toBe("2d ago");
+    expect(relativeTime(now + 5000, now)).toBe("now"); // clamps future
   });
 
   it("coerceNotifications tolerates absence and drops malformed entries", () => {

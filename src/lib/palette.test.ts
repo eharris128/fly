@@ -21,6 +21,9 @@ function spyActions(calls: string[]): KeymapActions {
     focusUp: mk("focusUp"),
     focusDown: mk("focusDown"),
     cycleAttention: mk("cycle"),
+    jumpNewestUnread: mk("jumpUnread"),
+    openNotifications: mk("openNotifications"),
+    toggleMute: mk("toggleMute"),
     openMenu: mk("openMenu"),
     openPalette: mk("openPalette"),
     toggleSidebar: mk("toggleSidebar"),
@@ -38,6 +41,21 @@ describe("actionCommands", () => {
     expect(cmds).toHaveLength(BINDINGS.length - 1);
     expect(cmds.some((c) => c.id === "action:openPalette")).toBe(false);
     expect(cmds.some((c) => c.id === "action:openMenu")).toBe(true);
+  });
+
+  it("lists the notification actions, so the palette can't drift from them", () => {
+    const cmds = actionCommands(spyActions([]), "ctrl+a");
+    for (const id of [
+      "action:openNotifications",
+      "action:jumpNewestUnread",
+      "action:toggleMute",
+    ]) {
+      expect(cmds.some((c) => c.id === id)).toBe(true);
+    }
+    // leader U (jump) renders its upper key, distinct from leader u (cycle).
+    expect(cmds.find((c) => c.id === "action:jumpNewestUnread")?.hint).toBe(
+      "Ctrl-A U",
+    );
   });
 
   it("shows each action's chord as the hint, cased to how it's typed", () => {

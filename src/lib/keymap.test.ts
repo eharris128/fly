@@ -37,6 +37,9 @@ function spyActions(): KeymapActions & { calls: string[] } {
     focusUp: mk("up"),
     focusDown: mk("down"),
     cycleAttention: mk("cycle"),
+    jumpNewestUnread: mk("jumpUnread"),
+    openNotifications: mk("openNotifications"),
+    toggleMute: mk("toggleMute"),
     openMenu: mk("openMenu"),
     openPalette: mk("openPalette"),
     toggleSidebar: mk("toggleSidebar"),
@@ -69,6 +72,20 @@ describe("BINDINGS", () => {
     ]);
     expect(BINDINGS.find((b) => b.action === "closeTab")?.upper).toBe(true);
     expect(BINDINGS.find((b) => b.action === "closePane")?.upper).toBeUndefined();
+  });
+
+  it("carries the notification chords with u/U disambiguated", () => {
+    const actions = BINDINGS.map((b) => b.action);
+    expect(actions).toContain("openNotifications");
+    expect(actions).toContain("toggleMute");
+    // u and U are distinct entries — cycle attention vs jump-to-unread.
+    const uEntries = BINDINGS.filter((b) => b.keys.includes("u"));
+    expect(uEntries.map((b) => b.action).sort()).toEqual([
+      "cycleAttention",
+      "jumpNewestUnread",
+    ]);
+    expect(BINDINGS.find((b) => b.action === "jumpNewestUnread")?.upper).toBe(true);
+    expect(BINDINGS.find((b) => b.action === "cycleAttention")?.upper).toBeUndefined();
   });
 });
 
@@ -189,6 +206,25 @@ describe("Keymap", () => {
     km.handle(ev("a", { ctrl: true }));
     expect(km.handle(ev("p"))).toBe(true);
     expect(a.calls).toEqual(["openPalette"]);
+  });
+
+  it("maps the notification chords; leader u/U stay distinct", () => {
+    const a = spyActions();
+    const km = new Keymap("ctrl+a", a);
+    const chord = (k: string, mods = {}) => {
+      km.handle(ev("a", { ctrl: true }));
+      expect(km.handle(ev(k, mods))).toBe(true);
+    };
+    chord("n"); // notifications panel
+    chord("m"); // toggle mute
+    chord("u"); // lowercase → cycle attention (no regression)
+    chord("U", { shift: true }); // uppercase → jump to newest unread
+    expect(a.calls).toEqual([
+      "openNotifications",
+      "toggleMute",
+      "cycle",
+      "jumpUnread",
+    ]);
   });
 
   it("a bare modifier keydown does not consume the pending leader", () => {

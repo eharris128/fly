@@ -13,6 +13,9 @@ export interface KeymapActions {
   focusUp: () => void;
   focusDown: () => void;
   cycleAttention: () => void;
+  jumpNewestUnread: () => void;
+  openNotifications: () => void;
+  toggleMute: () => void;
   openMenu: () => void;
   openPalette: () => void;
   toggleSidebar: () => void;
@@ -49,6 +52,12 @@ export const BINDINGS: Binding[] = [
   { keys: ["k", "arrowup"], label: "Focus up", action: "focusUp" },
   { keys: ["j", "arrowdown"], label: "Focus down", action: "focusDown" },
   { keys: ["u"], label: "Cycle attention", action: "cycleAttention" },
+  // Uppercase U is distinct from lowercase u (cycle attention) via `upper`,
+  // exactly like x / X: it jumps within the notification history, not the
+  // live-raised panes.
+  { keys: ["u"], upper: true, label: "Jump to newest unread", action: "jumpNewestUnread" },
+  { keys: ["n"], label: "Notifications", action: "openNotifications" },
+  { keys: ["m"], label: "Toggle mute", action: "toggleMute" },
   { keys: ["r"], label: "Rename tab", action: "renameTab" },
   { keys: ["w"], label: "New workspace", action: "newWorkspace" },
   { keys: ["["], label: "Previous workspace", action: "prevWorkspace" },

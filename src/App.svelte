@@ -5,6 +5,7 @@
   import Sidebar from "./lib/Sidebar.svelte";
   import HotkeyMenu from "./lib/HotkeyMenu.svelte";
   import CommandPalette from "./lib/CommandPalette.svelte";
+  import NotificationPanel from "./lib/NotificationPanel.svelte";
   import {
     newLeaf,
     splitLeaf,
@@ -34,6 +35,8 @@
     setWindowForeground,
     setVisiblePanes,
     setPaneWorkspace,
+    setPanelOpen,
+    setMuted,
     onNotificationAdded,
     paneCwd,
     type PaneId,
@@ -42,9 +45,16 @@
   } from "./ipc";
   import {
     addNotification,
+    markRead,
+    markReadForLeaves,
+    markAllRead,
+    clear as clearNotifications,
+    clearAll as clearAllNotifications,
+    newestUnread,
     pruneToLeaves,
     toPersisted,
     type Notification,
+    type NotificationView,
   } from "./lib/notifications";
   import { Keymap, type KeymapActions } from "./lib/keymap";
   import { actionCommands, navCommands, type PaletteCommand } from "./lib/palette";
@@ -93,6 +103,10 @@
   let keymap = $state<Keymap | null>(null);
   let menuOpen = $state(false);
   let paletteOpen = $state(false);
+  let notificationPanelOpen = $state(false);
+  // Global do-not-disturb. Seeded from the config default on restore; the
+  // runtime toggle is the session's source of truth, mirrored to the backend.
+  let muted = $state(false);
   let sidebarCollapsed = $state(false);
   // Inline-rename target, owned here so the leader `r` chord and a sidebar
   // double-click drive the exact same edit (U16).
@@ -150,6 +164,21 @@
       };
     }),
   );
+  // Notification panel rows: newest-first, each resolved to its source label and
+  // whether its pane still lives (for the jump). Reactive, so the panel and the
+  // unread badges stay consistent.
+  const notificationEntries = $derived<NotificationView[]>(
+    [...notifications]
+      .sort((a, b) => b.ts - a.ts || b.id - a.id)
+      .map((n) => {
+        const loc = locateLeaf(n.leafKey);
+        const ws = loc ? workspaces.find((w) => w.id === loc.wsId) : undefined;
+        const tab = ws?.tabs.find((t) => t.id === loc?.tabId);
+        const source =
+          ws && tab ? `${ws.name} / ${tabDisplayTitle(tab, cwdByLeaf)}` : "(closed)";
+        return { ...n, source, jumpable: loc !== null };
+      }),
+  );
 
   // ---- tab / workspace mutation --------------------------------------------
   function updateActiveTab(fn: (tab: Tab) => Tab) {
@@ -203,15 +232,18 @@
           }
         : w,
     );
+    markActiveTabRead();
   }
   function selectTab(wsId: string, tabId: string) {
     activeWorkspaceId = wsId;
     workspaces = workspaces.map((w) =>
       w.id === wsId ? { ...w, activeTabId: tabId } : w,
     );
+    markActiveTabRead();
   }
   function selectWorkspace(wsId: string) {
     activeWorkspaceId = wsId;
+    markActiveTabRead();
   }
   function cycleAttention() {
     const raised = flattenRaised(workspaces, attentionByLeaf);
@@ -252,6 +284,7 @@
     if (idx === -1) return;
     const next = workspaces[(idx + delta + workspaces.length) % workspaces.length];
     activeWorkspaceId = next.id;
+    markActiveTabRead();
   }
 
   // ---- inline rename -------------------------------------------------------
@@ -342,6 +375,7 @@
   function openMenu() {
     pendingConfirm = null;
     paletteOpen = false;
+    if (notificationPanelOpen) setNotificationPanel(false);
     menuOpen = true;
   }
   // The command palette (a U4 follow-up): a focus-taking, type-to-run overlay.
@@ -350,7 +384,67 @@
   function openPalette() {
     pendingConfirm = null;
     menuOpen = false;
+    if (notificationPanelOpen) setNotificationPanel(false);
     paletteOpen = true;
+  }
+  // ---- notification panel + mute (U21) -------------------------------------
+  // Replicate panel-open to the backend so KTD15's panel-open suppressor works.
+  function setNotificationPanel(open: boolean) {
+    notificationPanelOpen = open;
+    void setPanelOpen(open);
+  }
+  function openNotifications() {
+    if (notificationPanelOpen) {
+      closeNotifications(); // leader n toggles
+      return;
+    }
+    pendingConfirm = null;
+    menuOpen = false;
+    paletteOpen = false;
+    setNotificationPanel(true);
+  }
+  function closeNotifications() {
+    setNotificationPanel(false);
+    focusActivePane();
+  }
+  // Mark every notification on the active tab's leaves read — the "viewed a tab"
+  // transition. Called only on explicit switches, so a restored session's
+  // initial tab keeps its unread history (no auto-read on launch).
+  function markActiveTabRead() {
+    if (!activeTab) return;
+    notifications = markReadForLeaves(
+      notifications,
+      leaves(activeTab.tree).map((l) => l.key),
+    );
+  }
+  function jumpNewestUnread() {
+    const n = newestUnread(notifications);
+    if (!n) return;
+    const loc = locateLeaf(n.leafKey);
+    if (loc) focusPane(loc.wsId, loc.tabId, n.leafKey); // also marks the tab read
+    notifications = markRead(notifications, [n.id]); // best-effort if pane is gone
+  }
+  function toggleMute() {
+    muted = !muted;
+    void setMuted(muted);
+  }
+  function onPanelJump(id: number) {
+    const n = notifications.find((x) => x.id === id);
+    notifications = markRead(notifications, [id]);
+    if (n) {
+      const loc = locateLeaf(n.leafKey);
+      if (loc) focusPane(loc.wsId, loc.tabId, n.leafKey);
+    }
+    closeNotifications();
+  }
+  function onPanelClear(id: number) {
+    notifications = clearNotifications(notifications, [id]);
+  }
+  function onPanelClearAll() {
+    notifications = clearAllNotifications();
+  }
+  function onPanelMarkAllRead() {
+    notifications = markAllRead(notifications);
   }
   // Hand focus back to the active terminal after the palette closes, so typing
   // and the leader keep working without a click. Deferred a frame so it lands
@@ -412,7 +506,15 @@
   // instance). We also bail while a rename field or overlay is up so they keep
   // their own keys.
   function onWindowKeydown(e: KeyboardEvent) {
-    if (!keymap || editing || menuOpen || pendingConfirm || paletteOpen) return;
+    if (
+      !keymap ||
+      editing ||
+      menuOpen ||
+      pendingConfirm ||
+      paletteOpen ||
+      notificationPanelOpen
+    )
+      return;
     if (document.activeElement?.closest(".xterm")) return; // xterm will handle it
     if (keymap.handle(e)) {
       e.preventDefault();
@@ -431,11 +533,18 @@
       .filter((id): id is PaneId => id != null);
     void setVisiblePanes(ids);
   }
-  function workspaceIdForLeaf(key: string): string | null {
+  // Resolve a leaf key to its owning workspace + tab (for notification jumps and
+  // workspace registration). null when the leaf no longer exists (exited pane in
+  // a deleted tab) — the jump then degrades to mark-read only.
+  function locateLeaf(key: string): { wsId: string; tabId: string } | null {
     for (const w of workspaces)
       for (const t of w.tabs)
-        if (leaves(t.tree).some((l) => l.key === key)) return w.id;
+        if (leaves(t.tree).some((l) => l.key === key))
+          return { wsId: w.id, tabId: t.id };
     return null;
+  }
+  function workspaceIdForLeaf(key: string): string | null {
+    return locateLeaf(key)?.wsId ?? null;
   }
   function onSpawned(key: string, paneId: PaneId) {
     paneIdByLeaf[key] = paneId;
@@ -570,6 +679,9 @@
     focusUp: () => focusDir("up"),
     focusDown: () => focusDir("down"),
     cycleAttention,
+    jumpNewestUnread,
+    openNotifications,
+    toggleMute,
     openMenu,
     openPalette,
     toggleSidebar: () => (sidebarCollapsed = !sidebarCollapsed),
@@ -590,6 +702,9 @@
     const cfg = await getConfig();
     saveScrollbackEnabled = cfg.saveScrollback;
     leaderKey = cfg.leaderKey;
+    // Seed global mute from the config default; the backend seeds the same value
+    // at startup, so they start in sync (the runtime toggle keeps them so).
+    muted = cfg.notificationsMutedDefault;
     keymap = new Keymap(cfg.leaderKey, keymapActions);
 
     const saved = await loadSession();
@@ -782,6 +897,16 @@
     commands={paletteCommands}
     onRun={runPaletteCommand}
     onClose={closePalette}
+  />
+
+  <NotificationPanel
+    open={notificationPanelOpen}
+    entries={notificationEntries}
+    onJump={onPanelJump}
+    onClear={onPanelClear}
+    onClearAll={onPanelClearAll}
+    onMarkAllRead={onPanelMarkAllRead}
+    onClose={closeNotifications}
   />
 </div>
 
