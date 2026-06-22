@@ -798,9 +798,10 @@
           Math.min(Math.max(0, saved.activeWorkspaceIndex), workspaces.length - 1)
         ]?.id ?? workspaces[0].id;
       sidebarCollapsed = saved.sidebarCollapsed;
-      // Restore is NOT auto-read: a notification missed last session stays
-      // unread on the tab you reopen into (markReadForLeaves only fires on an
-      // explicit tab switch / panel open, U21).
+      // Restore is NOT auto-cleared: a notification missed last session stays
+      // unread on the tab you reopen into (clearActiveTabNotifications only fires
+      // on an explicit tab/workspace switch, and born-cleared only drops live
+      // raises — neither touches this restore path, U5/U21).
       notifications = saved.notifications;
     } else {
       const ws = makeWorkspace("default");
