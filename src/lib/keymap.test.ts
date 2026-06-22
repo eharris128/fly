@@ -43,6 +43,7 @@ function spyActions(): KeymapActions & { calls: string[] } {
     openMenu: mk("openMenu"),
     openPalette: mk("openPalette"),
     toggleSidebar: mk("toggleSidebar"),
+    toggleHome: mk("toggleHome"),
     newWorkspace: mk("newWorkspace"),
     closeWorkspace: mk("closeWorkspace"),
     prevWorkspace: mk("prevWorkspace"),
@@ -96,6 +97,14 @@ describe("BINDINGS", () => {
     expect(BINDINGS.find((b) => b.action === "jumpNewestUnread")?.upper).toBe(true);
     expect(BINDINGS.find((b) => b.action === "cycleAttention")?.upper).toBeUndefined();
   });
+
+  it("carries the dashboard toggle on leader d", () => {
+    const home = BINDINGS.filter((b) => b.action === "toggleHome");
+    expect(home).toHaveLength(1);
+    expect(home[0].keys).toEqual(["d"]);
+    expect(home[0].upper).toBeUndefined();
+    expect(home[0].label).toBe("Dashboard (home)");
+  });
 });
 
 describe("parseLeader", () => {
@@ -116,6 +125,14 @@ describe("Keymap", () => {
     expect(a.calls).toEqual([]);
     expect(km.handle(ev("|", { shift: true }))).toBe(true); // command consumed
     expect(a.calls).toEqual(["splitH"]);
+  });
+
+  it("leader d toggles the dashboard home view", () => {
+    const a = spyActions();
+    const km = new Keymap("ctrl+a", a);
+    expect(km.handle(ev("a", { ctrl: true }))).toBe(true);
+    expect(km.handle(ev("d"))).toBe(true); // command consumed, never reaches PTY
+    expect(a.calls).toEqual(["toggleHome"]);
   });
 
   it("passes ordinary input through to the PTY", () => {

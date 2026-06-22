@@ -107,6 +107,9 @@
   let saveScrollbackEnabled = $state(false);
   let keymap = $state<Keymap | null>(null);
   let menuOpen = $state(false);
+  // Agent dashboard home view (U7): a hotkey-toggled main-content surface that
+  // hides the terminal grid (panes stay mounted) while the Sidebar stays put.
+  let homeViewOpen = $state(false);
   let paletteOpen = $state(false);
   let notificationPanelOpen = $state(false);
   // Global do-not-disturb. Seeded from the config default on restore; the
@@ -729,6 +732,11 @@
   // The single action map shared by the keymap and the palette. Both render
   // from it together with BINDINGS, so a command can never drift from its chord
   // (R3/KTD1).
+  // Toggle the dashboard home view (U6/U7). Enriched in U7 to clear other
+  // overlays and hand focus back; the bare flip keeps U6 self-contained.
+  function toggleHome() {
+    homeViewOpen = !homeViewOpen;
+  }
   const keymapActions: KeymapActions = {
     newTab: () => void newTab(),
     splitHorizontal: () => split("horizontal"),
@@ -746,6 +754,7 @@
     openMenu,
     openPalette,
     toggleSidebar: () => (sidebarCollapsed = !sidebarCollapsed),
+    toggleHome,
     newWorkspace,
     closeWorkspace: () => requestDeleteWorkspace(activeWorkspaceId),
     prevWorkspace: () => shiftWorkspace(-1),

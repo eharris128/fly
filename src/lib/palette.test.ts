@@ -27,6 +27,7 @@ function spyActions(calls: string[]): KeymapActions {
     openMenu: mk("openMenu"),
     openPalette: mk("openPalette"),
     toggleSidebar: mk("toggleSidebar"),
+    toggleHome: mk("toggleHome"),
     newWorkspace: mk("newWorkspace"),
     closeWorkspace: mk("closeWorkspace"),
     prevWorkspace: mk("prev"),

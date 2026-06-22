@@ -19,6 +19,7 @@ export interface KeymapActions {
   openMenu: () => void;
   openPalette: () => void;
   toggleSidebar: () => void;
+  toggleHome: () => void;
   newWorkspace: () => void;
   closeWorkspace: () => void;
   prevWorkspace: () => void;
@@ -67,6 +68,7 @@ export const BINDINGS: Binding[] = [
   { keys: ["["], label: "Previous workspace", action: "prevWorkspace" },
   { keys: ["]"], label: "Next workspace", action: "nextWorkspace" },
   { keys: ["b"], label: "Toggle sidebar", action: "toggleSidebar" },
+  { keys: ["d"], label: "Dashboard (home)", action: "toggleHome" },
   { keys: ["p"], label: "Command palette", action: "openPalette" },
   { keys: ["?"], label: "Hotkey menu", action: "openMenu" },
 ];
