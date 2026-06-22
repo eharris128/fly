@@ -102,6 +102,34 @@ fn input_is_echoed_by_the_tty() {
     mgr.close(id).unwrap();
 }
 
+/// End-to-end agent-dashboard backend on a real pane (U2/U3/U4): a plain bash
+/// shell is not detected as an agent, and real output through the read thread
+/// anchors a current work stretch.
+#[test]
+fn agent_detection_and_activity_on_a_real_pane() {
+    let mgr = PtyManager::new();
+    let (sink, rx) = channel_sink();
+    let id = mgr.spawn(bash(), "tok".into(), sink, Box::new(|_, _| {})).unwrap();
+
+    // Drive real output through the read thread.
+    mgr.write(id, b"echo FLYACT$((2+3))\n").unwrap();
+    let out = wait_for(&rx, b"FLYACT5", Duration::from_secs(5));
+    assert!(find(&out, b"FLYACT5").is_some(), "expected command output");
+
+    // A plain bash shell is not a Claude Code agent (U2, AE4).
+    assert!(!mgr.is_agent(id), "bash must not be detected as an agent");
+
+    // Output through the read thread recorded a current work stretch (U3/U4).
+    let snap = mgr.pane_activity(id).expect("pane exists");
+    assert!(
+        snap.working_for_ms.is_some(),
+        "recent output should anchor a current work stretch"
+    );
+    assert!(snap.last_output_ago_ms.is_some());
+
+    mgr.close(id).unwrap();
+}
+
 #[test]
 fn resize_propagates_winsize() {
     let mgr = PtyManager::new();
