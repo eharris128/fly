@@ -10,11 +10,14 @@
     id: string;
     title: string;
     attention: boolean;
+    unread: number;
   }
   interface SidebarWorkspace {
     id: string;
     name: string;
     attention: boolean;
+    unread: number;
+    muted: boolean;
     tabs: SidebarTab[];
   }
   type Editing = { kind: "tab" | "ws"; id: string } | null;
@@ -33,6 +36,7 @@
     onStartEdit: (kind: "tab" | "ws", id: string) => void;
     onCommitEdit: (name: string) => void;
     onCancelEdit: () => void;
+    onToggleWorkspaceMute: (wsId: string) => void;
     onToggleCollapsed: () => void;
   }
   let {
@@ -49,6 +53,7 @@
     onStartEdit,
     onCommitEdit,
     onCancelEdit,
+    onToggleWorkspaceMute,
     onToggleCollapsed,
   }: Props = $props();
 
@@ -97,7 +102,7 @@
   <div class="tree">
     {#each workspaces as ws (ws.id)}
       {@const open = !folded.has(ws.id)}
-      <div class="ws" class:active={ws.id === activeWorkspaceId}>
+      <div class="ws" class:active={ws.id === activeWorkspaceId} class:muted={ws.muted}>
         <div
           class="ws-head"
           role="button"
@@ -137,6 +142,12 @@
           {#if ws.attention}
             <span class="dot" title="an agent needs attention"></span>
           {/if}
+          {#if ws.unread > 0}
+            <span class="count" title="{ws.unread} unread">{ws.unread}</span>
+          {/if}
+          {#if ws.muted}
+            <span class="muted-ind" title="workspace muted">🔇</span>
+          {/if}
           <span class="ws-actions">
             <button
               class="icon"
@@ -145,6 +156,14 @@
                 e.stopPropagation();
                 onNewTab(ws.id);
               }}>+</button
+            >
+            <button
+              class="icon"
+              title={ws.muted ? "unmute workspace" : "mute workspace"}
+              onclick={(e) => {
+                e.stopPropagation();
+                onToggleWorkspaceMute(ws.id);
+              }}>{ws.muted ? "🔊" : "🔇"}</button
             >
             <button
               class="icon"
@@ -195,6 +214,9 @@
                       onStartEdit("tab", tab.id);
                     }}>{tab.title}</button
                   >
+                {/if}
+                {#if tab.unread > 0}
+                  <span class="count" title="{tab.unread} unread">{tab.unread}</span>
                 {/if}
                 <button
                   class="icon close"
@@ -341,6 +363,30 @@
   .dot-spacer {
     width: 7px;
     flex: none;
+  }
+  /* Unread-notification count — a distinct cue from the amber raised dot. */
+  .count {
+    flex: none;
+    min-width: 16px;
+    height: 15px;
+    padding: 0 4px;
+    border-radius: 8px;
+    background: #2b3a55;
+    color: #c9d1d9;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 15px;
+    text-align: center;
+  }
+  .muted-ind {
+    flex: none;
+    font-size: 11px;
+    line-height: 1;
+    opacity: 0.85;
+  }
+  /* Muted precedence: a muted workspace reads as muted even with raised agents. */
+  .ws.muted > .ws-head .ws-name {
+    opacity: 0.5;
   }
   .icon {
     background: none;

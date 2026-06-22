@@ -7,6 +7,7 @@ import {
   closeTabIn,
   deleteWorkspaceFrom,
   flattenRaised,
+  unreadCountForLeaves,
   type Tab,
   type Workspace,
 } from "./workspaces";
@@ -143,6 +144,15 @@ describe("deleteWorkspaceFrom", () => {
     const res = deleteWorkspaceFrom([only], only.id, () => fresh);
     expect(res.workspaces).toEqual([fresh]);
     expect(res.nextActiveId).toBe(fresh.id);
+  });
+});
+
+describe("unreadCountForLeaves", () => {
+  it("sums per-leaf unread counts, treating missing leaves as zero", () => {
+    const unread = { "leaf-1": 2, "leaf-2": 1, "leaf-9": 5 };
+    expect(unreadCountForLeaves(["leaf-1", "leaf-2"], unread)).toBe(3);
+    expect(unreadCountForLeaves(["leaf-1", "leaf-absent"], unread)).toBe(2);
+    expect(unreadCountForLeaves([], unread)).toBe(0);
   });
 });
 

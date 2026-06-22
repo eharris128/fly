@@ -6,20 +6,28 @@
     workspaceName: string;
     tabName: string;
     sidebarCollapsed: boolean;
+    muted: boolean;
+    unreadTotal: number;
     onToggleSidebar: () => void;
     onSplitH: () => void;
     onSplitV: () => void;
     onClosePane: () => void;
+    onToggleMute: () => void;
+    onOpenNotifications: () => void;
     onMenu: () => void;
   }
   let {
     workspaceName,
     tabName,
     sidebarCollapsed,
+    muted,
+    unreadTotal,
     onToggleSidebar,
     onSplitH,
     onSplitV,
     onClosePane,
+    onToggleMute,
+    onOpenNotifications,
     onMenu,
   }: Props = $props();
 </script>
@@ -38,6 +46,20 @@
     </span>
   </div>
   <div class="controls">
+    <button
+      class="iconbtn notif"
+      title="notifications"
+      onclick={onOpenNotifications}
+    >
+      🔔{#if unreadTotal > 0}<span class="ubadge">{unreadTotal}</span>{/if}
+    </button>
+    <button
+      class="iconbtn"
+      class:on={muted}
+      title={muted ? "alerts muted — click to unmute" : "mute all alerts"}
+      onclick={onToggleMute}>{muted ? "🔇" : "🔊"}</button
+    >
+    <span class="divider"></span>
     <button class="iconbtn" title="split right" onclick={onSplitH}>▥</button>
     <button class="iconbtn" title="split down" onclick={onSplitV}>▤</button>
     <button class="iconbtn" title="close pane" onclick={onClosePane}>✕</button>
@@ -96,5 +118,34 @@
   .iconbtn:hover {
     opacity: 1;
     background: #11182b;
+  }
+  .iconbtn.on {
+    opacity: 1;
+    color: #f5a623;
+  }
+  .notif {
+    position: relative;
+  }
+  .ubadge {
+    position: absolute;
+    top: 2px;
+    right: 1px;
+    min-width: 14px;
+    height: 14px;
+    padding: 0 3px;
+    border-radius: 7px;
+    background: #f5a623;
+    color: #1a1205;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 14px;
+    text-align: center;
+  }
+  .divider {
+    width: 1px;
+    height: 16px;
+    margin: 0 4px;
+    background: #2b3a55;
+    opacity: 0.6;
   }
 </style>

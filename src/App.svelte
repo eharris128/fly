@@ -28,6 +28,7 @@
     closeTabIn,
     deleteWorkspaceFrom,
     flattenRaised,
+    unreadCountForLeaves,
     type Tab,
     type Workspace,
   } from "./lib/workspaces";
@@ -37,6 +38,7 @@
     setPaneWorkspace,
     setPanelOpen,
     setMuted,
+    setWorkspaceMuted,
     onNotificationAdded,
     paneCwd,
     type PaneId,
@@ -51,6 +53,8 @@
     clear as clearNotifications,
     clearAll as clearAllNotifications,
     newestUnread,
+    unreadByLeaf,
+    unreadTotal,
     pruneToLeaves,
     toPersisted,
     type Notification,
@@ -107,6 +111,8 @@
   // Global do-not-disturb. Seeded from the config default on restore; the
   // runtime toggle is the session's source of truth, mirrored to the backend.
   let muted = $state(false);
+  // Per-workspace mute (runtime only in v1), mirrored to the backend.
+  let mutedWorkspaces = $state<Set<string>>(new Set());
   let sidebarCollapsed = $state(false);
   // Inline-rename target, owned here so the leader `r` chord and a sidebar
   // double-click drive the exact same edit (U16).
@@ -149,17 +155,24 @@
   );
   // View model for the sidebar: names resolved, attention rolled up per tab and
   // per workspace so a collapsed workspace still surfaces a raised agent.
+  const unreadCounts = $derived(unreadByLeaf(notifications));
   const sidebarWorkspaces = $derived(
     workspaces.map((w) => {
-      const tabs = w.tabs.map((t) => ({
-        id: t.id,
-        title: tabDisplayTitle(t, cwdByLeaf),
-        attention: leaves(t.tree).some((l) => attentionByLeaf[l.key] === "raised"),
-      }));
+      const tabs = w.tabs.map((t) => {
+        const keys = leaves(t.tree).map((l) => l.key);
+        return {
+          id: t.id,
+          title: tabDisplayTitle(t, cwdByLeaf),
+          attention: keys.some((k) => attentionByLeaf[k] === "raised"),
+          unread: unreadCountForLeaves(keys, unreadCounts),
+        };
+      });
       return {
         id: w.id,
         name: w.name,
         attention: tabs.some((t) => t.attention),
+        unread: tabs.reduce((n, t) => n + t.unread, 0),
+        muted: mutedWorkspaces.has(w.id),
         tabs,
       };
     }),
@@ -278,6 +291,11 @@
     workspaces = res.workspaces;
     if (activeWorkspaceId === wsId) activeWorkspaceId = res.nextActiveId;
     pruneNotifications(); // drop history for the deleted workspace's leaves
+    if (mutedWorkspaces.has(wsId)) {
+      const next = new Set(mutedWorkspaces);
+      next.delete(wsId);
+      mutedWorkspaces = next;
+    }
   }
   function shiftWorkspace(delta: number) {
     const idx = workspaces.findIndex((w) => w.id === activeWorkspaceId);
@@ -427,6 +445,14 @@
   function toggleMute() {
     muted = !muted;
     void setMuted(muted);
+  }
+  function toggleWorkspaceMute(wsId: string) {
+    const next = new Set(mutedWorkspaces);
+    const nowMuted = !next.has(wsId);
+    if (nowMuted) next.add(wsId);
+    else next.delete(wsId);
+    mutedWorkspaces = next;
+    void setWorkspaceMuted(wsId, nowMuted);
   }
   function onPanelJump(id: number) {
     const n = notifications.find((x) => x.id === id);
@@ -803,10 +829,14 @@
     workspaceName={activeWorkspace?.name ?? ""}
     tabName={activeTab ? tabDisplayTitle(activeTab, cwdByLeaf) : ""}
     {sidebarCollapsed}
+    {muted}
+    unreadTotal={unreadTotal(notifications)}
     onToggleSidebar={() => (sidebarCollapsed = !sidebarCollapsed)}
     onSplitH={() => split("horizontal")}
     onSplitV={() => split("vertical")}
     onClosePane={closePane}
+    onToggleMute={toggleMute}
+    onOpenNotifications={openNotifications}
     onMenu={openMenu}
   />
   <div class="body">
@@ -825,6 +855,7 @@
         onStartEdit={startEdit}
         onCommitEdit={commitEdit}
         onCancelEdit={cancelEdit}
+        onToggleWorkspaceMute={toggleWorkspaceMute}
         onToggleCollapsed={() => (sidebarCollapsed = true)}
       />
     {/if}

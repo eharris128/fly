@@ -115,6 +115,20 @@ export function deleteWorkspaceFrom(
 }
 
 /**
+ * Sum unread notification counts over a set of leaf keys (a tab's or a
+ * workspace's leaves), from the per-leaf rollup. The tab/workspace badge counts
+ * derive from this — the notification analogue of the `attention` flag rollup.
+ */
+export function unreadCountForLeaves(
+  leafKeys: Iterable<string>,
+  unreadByLeaf: Record<string, number>,
+): number {
+  let n = 0;
+  for (const k of leafKeys) n += unreadByLeaf[k] ?? 0;
+  return n;
+}
+
+/**
  * Every raised pane across all workspaces, in stable workspace→tab→leaf order.
  * The ordering source for cross-workspace attention cycling (leader u).
  */
