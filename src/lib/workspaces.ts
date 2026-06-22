@@ -196,3 +196,21 @@ export function insertionIndex(
   const target = raw > draggedIndex ? raw - 1 : raw;
   return Math.min(Math.max(0, target), n - 1);
 }
+
+/**
+ * The leaf key whose cwd a new tab in workspace `wsId` should inherit (U-ID U4):
+ * the focused leaf of that workspace's active tab. Pure; `null` when the
+ * workspace or its active tab can't be resolved. The Sidebar "+ tab" can target
+ * a non-active workspace, so this reads the *target* workspace's active tab —
+ * not a global "current pane" — which is the less-surprising source after the
+ * "+ tab" click switches active to that workspace.
+ */
+export function sourceLeafForNewTab(
+  workspaces: Workspace[],
+  wsId: string,
+): string | null {
+  const ws = workspaces.find((w) => w.id === wsId);
+  if (!ws) return null;
+  const tab = ws.tabs.find((t) => t.id === ws.activeTabId);
+  return tab?.focusedLeafKey ?? null;
+}

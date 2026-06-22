@@ -29,6 +29,7 @@
     deleteWorkspaceFrom,
     flattenRaised,
     unreadCountForLeaves,
+    sourceLeafForNewTab,
     type Tab,
     type Workspace,
   } from "./lib/workspaces";
@@ -276,8 +277,24 @@
     const next = raised[(cur + 1) % raised.length];
     focusPane(next.wsId, next.tabId, next.key);
   }
-  function newTab(wsId: string = activeWorkspaceId) {
+  async function newTab(wsId: string = activeWorkspaceId) {
+    // Inherit the focused pane's cwd (U4): query fresh so a just-issued `cd` is
+    // honored, falling back to the polled cache then $HOME (null). Capture the
+    // source synchronously before the await so concurrent calls can't cross-wire
+    // (paneIdByLeaf is non-$state, so read it directly).
+    const srcKey = sourceLeafForNewTab(workspaces, wsId);
+    const srcPid = srcKey != null ? paneIdByLeaf[srcKey] : null;
+    const cwd =
+      (srcPid != null ? await paneCwd(srcPid) : null) ??
+      (srcKey != null ? (cwdByLeaf[srcKey] ?? null) : null);
+    // The target workspace may have been deleted during the await — never point
+    // active at a gone workspace (it would render a blank layout). Bail if so.
+    if (!workspaces.some((w) => w.id === wsId)) return;
     const t = makeTab();
+    const newKey = leaves(t.tree)[0].key;
+    // Seed the new leaf's cwd in the same synchronous block that adds the tab, so
+    // it's present before the Terminal mounts (Terminal reads cwd once at mount).
+    cwdByLeaf = { ...cwdByLeaf, [newKey]: cwd };
     workspaces = workspaces.map((w) =>
       w.id === wsId ? { ...w, tabs: [...w.tabs, t], activeTabId: t.id } : w,
     );
@@ -712,7 +729,7 @@
   // from it together with BINDINGS, so a command can never drift from its chord
   // (R3/KTD1).
   const keymapActions: KeymapActions = {
-    newTab: () => newTab(),
+    newTab: () => void newTab(),
     splitHorizontal: () => split("horizontal"),
     splitVertical: () => split("vertical"),
     closePane,
@@ -873,7 +890,7 @@
         {editing}
         onSelectTab={selectTab}
         onCloseTab={requestCloseTab}
-        onNewTab={(wsId) => newTab(wsId)}
+        onNewTab={(wsId) => void newTab(wsId)}
         onSelectWorkspace={selectWorkspace}
         onNewWorkspace={newWorkspace}
         onDeleteWorkspace={requestDeleteWorkspace}

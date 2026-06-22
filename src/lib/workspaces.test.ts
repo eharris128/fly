@@ -10,6 +10,7 @@ import {
   unreadCountForLeaves,
   reorderWorkspaces,
   insertionIndex,
+  sourceLeafForNewTab,
   type Tab,
   type Workspace,
 } from "./workspaces";
@@ -213,6 +214,26 @@ describe("insertionIndex", () => {
   });
   it("handles an empty list", () => {
     expect(insertionIndex(10, [], 0)).toBe(0);
+  });
+});
+
+describe("sourceLeafForNewTab", () => {
+  it("returns the focused leaf of the target workspace's active tab", () => {
+    const t1 = makeTab();
+    const t2 = makeTab();
+    const ws = { ...makeWorkspace("w", [t1, t2]), activeTabId: t2.id };
+    expect(sourceLeafForNewTab([ws], ws.id)).toBe(t2.focusedLeafKey);
+  });
+  it("reads the target workspace, not the first/other one", () => {
+    const a = makeTab();
+    const b = makeTab();
+    const wsA = makeWorkspace("a", [a]);
+    const wsB = makeWorkspace("b", [b]);
+    expect(sourceLeafForNewTab([wsA, wsB], wsB.id)).toBe(b.focusedLeafKey);
+  });
+  it("returns null for an unknown workspace", () => {
+    const ws = makeWorkspace("w", [makeTab()]);
+    expect(sourceLeafForNewTab([ws], "nope")).toBeNull();
   });
 });
 
