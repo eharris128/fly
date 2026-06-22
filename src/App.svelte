@@ -6,6 +6,7 @@
   import HotkeyMenu from "./lib/HotkeyMenu.svelte";
   import CommandPalette from "./lib/CommandPalette.svelte";
   import NotificationPanel from "./lib/NotificationPanel.svelte";
+  import HomeView from "./lib/HomeView.svelte";
   import {
     newLeaf,
     splitLeaf,
@@ -34,6 +35,7 @@
     type Tab,
     type Workspace,
   } from "./lib/workspaces";
+  import { buildHomeModel } from "./lib/home";
   import {
     setWindowForeground,
     setVisiblePanes,
@@ -43,7 +45,9 @@
     setWorkspaceMuted,
     onNotificationAdded,
     paneCwd,
+    paneActivity,
     type PaneId,
+    type PaneActivity,
     type AttentionState,
     type AttentionReason,
   } from "./ipc";
@@ -99,6 +103,11 @@
   // reused paneId maps to the new leaf; a now-exited pane's stale entry lingers
   // (it helps the best-effort jump while the tab still exists).
   let leafByPaneId: Record<number, string> = {};
+  // Wall-clock ms when a leaf's attention last cleared to idle. A work stretch
+  // with no new output since then is the just-finished turn's residual — App
+  // zeroes its workingForMs before buildHomeModel so a dashboard row doesn't
+  // flicker from "waiting" back to "working" after an ack (KTD-E grace).
+  let attentionClearedAt: Record<string, number> = {};
   // leaf key → pane component handle, so the palette can return focus to the
   // active terminal when it closes. The palette takes DOM focus; the cheat-sheet
   // (KTD3) does not, so only the palette needs this.
@@ -110,6 +119,10 @@
   // Agent dashboard home view (U7): a hotkey-toggled main-content surface that
   // hides the terminal grid (panes stay mounted) while the Sidebar stays put.
   let homeViewOpen = $state(false);
+  // leaf key → polled agent state (U7); rebuilt each poll while the dashboard is
+  // open. `agentsPolledAt` anchors the live "working for" tick in HomeView.
+  let agentByLeaf = $state<Record<string, PaneActivity>>({});
+  let agentsPolledAt = $state(0);
   let paletteOpen = $state(false);
   let notificationPanelOpen = $state(false);
   // Global do-not-disturb. Seeded from the config default on restore; the
@@ -574,6 +587,7 @@
       !keymap ||
       editing ||
       menuOpen ||
+      homeViewOpen ||
       pendingConfirm ||
       paletteOpen ||
       notificationPanelOpen
@@ -587,6 +601,11 @@
   }
 
   function onAttention(key: string, state: AttentionState, _reason: AttentionReason | null) {
+    const prev = attentionByLeaf[key];
+    // Remember when a raised/acknowledged leaf clears, for the dashboard grace.
+    if (state === "idle" && (prev === "raised" || prev === "acknowledged")) {
+      attentionClearedAt[key] = Date.now();
+    }
     attentionByLeaf = { ...attentionByLeaf, [key]: state };
   }
   // Push the visible-pane ids (active tab's leaves) to the backend. Reads the
@@ -675,6 +694,52 @@
     if (changed) cwdByLeaf = { ...cwdByLeaf, ...updates };
   }
 
+  // ---- agent dashboard (U7) -------------------------------------------------
+  // Poll each live pane's agent state. Gated to while the home view is open (the
+  // $effect below) so a toggle-only surface adds no always-on IPC. Rebuilt each
+  // poll from the live panes, so an exited pane drops out (its process is no
+  // longer `claude` → isAgent false).
+  async function refreshAgents() {
+    const entries = Object.entries(paneIdByLeaf);
+    const results = await Promise.all(
+      entries.map(async ([key, pid]) => [key, await paneActivity(pid)] as const),
+    );
+    const next: Record<string, PaneActivity> = {};
+    for (const [key, a] of results) next[key] = a;
+    agentByLeaf = next;
+    agentsPolledAt = Date.now();
+  }
+  // KTD-E grace: drop a lingering work stretch for a leaf whose attention just
+  // cleared and that has produced no new output since — the just-finished turn's
+  // residual must not resurrect a "working" timer. Keeps buildHomeModel pure.
+  function gracedAgents(): Record<string, PaneActivity> {
+    const now = Date.now();
+    const out: Record<string, PaneActivity> = {};
+    for (const [key, a] of Object.entries(agentByLeaf)) {
+      const clearedAt = attentionClearedAt[key];
+      if (a.workingForMs != null && clearedAt != null) {
+        const lastOutputAt = now - (a.lastOutputAgoMs ?? 0);
+        if (lastOutputAt <= clearedAt) {
+          out[key] = { ...a, workingForMs: null };
+          continue;
+        }
+      }
+      out[key] = a;
+    }
+    return out;
+  }
+  let homeModel = $derived(
+    buildHomeModel(workspaces, gracedAgents(), cwdByLeaf, attentionByLeaf),
+  );
+  // Run the agent poll only while the dashboard is open (KTD-C): an immediate
+  // fetch so it isn't blank, then every 1.5s; the cleanup tears down the timer.
+  $effect(() => {
+    if (!homeViewOpen) return;
+    void refreshAgents();
+    const timer = setInterval(() => void refreshAgents(), 1500);
+    return () => clearInterval(timer);
+  });
+
   // ---- persistence (U12) ---------------------------------------------------
   async function persist() {
     const savedWorkspaces: SavedWorkspace[] = [];
@@ -732,10 +797,25 @@
   // The single action map shared by the keymap and the palette. Both render
   // from it together with BINDINGS, so a command can never drift from its chord
   // (R3/KTD1).
-  // Toggle the dashboard home view (U6/U7). Enriched in U7 to clear other
-  // overlays and hand focus back; the bare flip keeps U6 self-contained.
+  // Toggle the dashboard home view (U6/U7). Mutually exclusive with the other
+  // overlays; hands focus back to the active pane on close.
   function toggleHome() {
-    homeViewOpen = !homeViewOpen;
+    if (homeViewOpen) {
+      homeViewOpen = false;
+      focusActivePane();
+      return;
+    }
+    pendingConfirm = null;
+    menuOpen = false;
+    paletteOpen = false;
+    if (notificationPanelOpen) setNotificationPanel(false);
+    homeViewOpen = true;
+  }
+  // Jump from a dashboard row to its pane, closing the view (R4).
+  function jumpFromHome(wsId: string, tabId: string, key: string) {
+    homeViewOpen = false;
+    focusPane(wsId, tabId, key);
+    focusActivePane();
   }
   const keymapActions: KeymapActions = {
     newTab: () => void newTab(),
@@ -917,6 +997,7 @@
     {/if}
     <div
       class="layout"
+      class:hidden={homeViewOpen}
       bind:this={layoutEl}
       bind:clientWidth={layoutW}
       bind:clientHeight={layoutH}
@@ -952,6 +1033,14 @@
         ></div>
       {/each}
     </div>
+    {#if homeViewOpen}
+      <HomeView
+        model={homeModel}
+        polledAt={agentsPolledAt}
+        onJump={jumpFromHome}
+        onClose={toggleHome}
+      />
+    {/if}
   </div>
 
   {#if pendingConfirm !== null}
@@ -1016,6 +1105,11 @@
     min-width: 0;
     min-height: 0;
     background: #161b2c;
+  }
+  /* Hide the terminal grid for the home view (U7). Panes stay mounted — the
+     never-unmount invariant (KTD5) — so toggling never respawns an agent. */
+  .layout.hidden {
+    display: none;
   }
   .slot {
     position: absolute;
