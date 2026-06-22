@@ -5,6 +5,7 @@ import {
   markReadForLeaves,
   markAllRead,
   clear,
+  clearForLeaves,
   clearAll,
   pruneToLeaves,
   unreadByLeaf,
@@ -85,6 +86,33 @@ describe("clearing", () => {
 
   it("clearAll empties the history", () => {
     expect(clearAll()).toEqual([]);
+  });
+
+  it("clearForLeaves removes every entry for the given leaves, leaving others", () => {
+    let list = addNotification([], ev({ id: 1, leafKey: "leaf-1" }));
+    list = addNotification(list, ev({ id: 2, leafKey: "leaf-1", read: true }));
+    list = addNotification(list, ev({ id: 3, leafKey: "leaf-2" }));
+    const out = clearForLeaves(list, ["leaf-1"]);
+    expect(out.map((n) => n.id)).toEqual([3]);
+    // Removing the entries drops the leaf's unread badge (the badge derives).
+    expect(unreadByLeaf(out)["leaf-1"]).toBeUndefined();
+  });
+
+  it("clearForLeaves clears a multi-leaf tab — all its leaves, none of others", () => {
+    let list = addNotification([], ev({ id: 1, leafKey: "leaf-1" }));
+    list = addNotification(list, ev({ id: 2, leafKey: "leaf-2" }));
+    list = addNotification(list, ev({ id: 3, leafKey: "leaf-3" }));
+    expect(clearForLeaves(list, ["leaf-1", "leaf-2"]).map((n) => n.id)).toEqual([3]);
+  });
+
+  it("clearForLeaves returns the same reference when nothing matches", () => {
+    const list = addNotification([], ev({ id: 1, leafKey: "leaf-1" }));
+    expect(clearForLeaves(list, ["leaf-absent"])).toBe(list);
+    expect(clearForLeaves(list, [])).toBe(list);
+  });
+
+  it("clearForLeaves is a no-op on an empty list (already-pruned leaf)", () => {
+    expect(clearForLeaves([], ["leaf-1"])).toEqual([]);
   });
 });
 

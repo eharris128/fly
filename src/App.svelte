@@ -47,10 +47,9 @@
   } from "./ipc";
   import {
     addNotification,
-    markRead,
-    markReadForLeaves,
     markAllRead,
     clear as clearNotifications,
+    clearForLeaves,
     clearAll as clearAllNotifications,
     newestUnread,
     unreadByLeaf,
@@ -245,14 +244,14 @@
           }
         : w,
     );
-    markActiveTabRead();
+    clearActiveTabNotifications();
   }
   function selectTab(wsId: string, tabId: string) {
     activeWorkspaceId = wsId;
     workspaces = workspaces.map((w) =>
       w.id === wsId ? { ...w, activeTabId: tabId } : w,
     );
-    markActiveTabRead();
+    clearActiveTabNotifications();
   }
   // Digit chord (leader 1–9 → select tab N, U1). Resolves the Nth tab (1-based)
   // in the ACTIVE workspace; out-of-range is a silent no-op. Routes through the
@@ -263,7 +262,7 @@
   }
   function selectWorkspace(wsId: string) {
     activeWorkspaceId = wsId;
-    markActiveTabRead();
+    clearActiveTabNotifications();
   }
   function cycleAttention() {
     const raised = flattenRaised(workspaces, attentionByLeaf);
@@ -309,7 +308,7 @@
     if (idx === -1) return;
     const next = workspaces[(idx + delta + workspaces.length) % workspaces.length];
     activeWorkspaceId = next.id;
-    markActiveTabRead();
+    clearActiveTabNotifications();
   }
 
   // ---- inline rename -------------------------------------------------------
@@ -436,12 +435,15 @@
     setNotificationPanel(false);
     focusActivePane();
   }
-  // Mark every notification on the active tab's leaves read — the "viewed a tab"
-  // transition. Called only on explicit switches, so a restored session's
-  // initial tab keeps its unread history (no auto-read on launch).
-  function markActiveTabRead() {
+  // Clear (remove) every notification on the active tab's leaves — the "viewed a
+  // tab" transition (U5). Removing the entries clears the panel rows, the unread
+  // badges, and the sidebar dot together, and the removal reaches disk. Called
+  // only on explicit switches, so a restored session's initial tab keeps its
+  // unread history (no auto-clear on launch). The in-pane ring is left to the
+  // backend ack (Raised→Acknowledged on visibility, → Idle on first keystroke).
+  function clearActiveTabNotifications() {
     if (!activeTab) return;
-    notifications = markReadForLeaves(
+    notifications = clearForLeaves(
       notifications,
       leaves(activeTab.tree).map((l) => l.key),
     );
@@ -450,8 +452,10 @@
     const n = newestUnread(notifications);
     if (!n) return;
     const loc = locateLeaf(n.leafKey);
-    if (loc) focusPane(loc.wsId, loc.tabId, n.leafKey); // also marks the tab read
-    notifications = markRead(notifications, [n.id]); // best-effort if pane is gone
+    if (loc) focusPane(loc.wsId, loc.tabId, n.leafKey); // also clears the tab (U5)
+    // Closed-pane fallback: when loc is null, focusPane/clearActiveTabNotifications
+    // never ran, so clear this entry by id — else `leader U` sticks on it.
+    notifications = clearNotifications(notifications, [n.id]);
   }
   function toggleMute() {
     muted = !muted;
@@ -467,7 +471,9 @@
   }
   function onPanelJump(id: number) {
     const n = notifications.find((x) => x.id === id);
-    notifications = markRead(notifications, [id]);
+    // Remove the clicked row by id (covers the closed-pane loc===null path);
+    // focusPane below also clears the rest of the destination tab's entries (U5).
+    notifications = clearNotifications(notifications, [id]);
     if (n) {
       const loc = locateLeaf(n.leafKey);
       if (loc) focusPane(loc.wsId, loc.tabId, n.leafKey);
@@ -814,6 +820,14 @@
     void onNotificationAdded((ev) => {
       const leafKey = leafByPaneId[ev.paneId];
       if (!leafKey) return; // unknown pane (already gone) — best effort
+      // Born-cleared (U5): a raise on the tab the user is currently viewing is
+      // never shown. `ev.read` is the backend's foreground-aware "user is
+      // viewing this pane" bit; gate on it AND the leaf being on the active tab,
+      // so a background-window raise (ev.read false) still records, and a
+      // switch-away in the same tick (leaf no longer visible) still records.
+      // Restore loads history via a different path, so the initial tab's unread
+      // survives launch.
+      if (ev.read && visibleLeafKeys.includes(leafKey)) return;
       notifications = addNotification(notifications, {
         id: ev.id,
         leafKey,

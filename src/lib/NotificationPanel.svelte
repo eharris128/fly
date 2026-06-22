@@ -139,7 +139,7 @@
           </li>
         {/each}
         {#if entries.length === 0}
-          <li class="empty">No notifications</li>
+          <li class="empty">No pending notifications — opening a tab clears them</li>
         {/if}
       </ul>
       <div class="hint">↑↓ navigate · Enter jump · Del clear · Esc close</div>

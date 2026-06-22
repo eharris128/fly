@@ -120,6 +120,22 @@ export function clear(list: Notification[], ids: number[]): Notification[] {
   return next.length === list.length ? list : next;
 }
 
+/**
+ * Clear (remove) every entry for the given leaf keys — the "user viewed the tab"
+ * removal (U5). Unlike `markReadForLeaves` (which flips unread→read but keeps the
+ * entry as history), this *removes* the entries, so they leave the panel and the
+ * unread badges and the removal reaches disk via `toPersisted`. Returns the
+ * original array unchanged when nothing matched, to avoid spurious reactivity.
+ */
+export function clearForLeaves(
+  list: Notification[],
+  leafKeys: Iterable<string>,
+): Notification[] {
+  const set = new Set(leafKeys);
+  const next = list.filter((n) => !set.has(n.leafKey));
+  return next.length === list.length ? list : next;
+}
+
 /** Clear the whole history. */
 export function clearAll(): Notification[] {
   return [];
