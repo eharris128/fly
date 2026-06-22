@@ -144,3 +144,55 @@ export function flattenRaised(
           out.push({ wsId: ws.id, tabId: tab.id, key: l.key });
   return out;
 }
+
+/**
+ * Move workspace `fromIndex` to `toIndex` (U-ID U2). Pure: returns a new array,
+ * but the **same reference** on a no-op (`from === to`) or out-of-range index, so
+ * a reorder that changes nothing never thrashes the `$derived` view-models or the
+ * debounced save (the identity-stable convention shared with `notifications.ts`).
+ * `toIndex` is an index into the post-removal array, so dropping at `len - 1`
+ * appends to the tail. Workspace order is persisted purely by array position, so
+ * reassigning the live array to this result is all that's needed (KTD3).
+ */
+export function reorderWorkspaces(
+  workspaces: Workspace[],
+  fromIndex: number,
+  toIndex: number,
+): Workspace[] {
+  const n = workspaces.length;
+  if (
+    fromIndex === toIndex ||
+    fromIndex < 0 ||
+    fromIndex >= n ||
+    toIndex < 0 ||
+    toIndex >= n
+  ) {
+    return workspaces;
+  }
+  const next = workspaces.slice();
+  const [moved] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, moved);
+  return next;
+}
+
+/**
+ * Map a drag pointer's Y to the target index for `reorderWorkspaces` (U-ID U2).
+ * `rowMidpoints` are the vertical midpoints of the workspace rows in order;
+ * `draggedIndex` is the row in flight. DOM-free (plain numbers) so it stays
+ * unit-testable and keeps this module free of DOM types — the Sidebar computes
+ * the midpoints from `getBoundingClientRect()` and passes them in. The result
+ * accounts for the dragged row being removed before re-insertion, so hovering
+ * the dragged row's own band returns its current index (a no-op).
+ */
+export function insertionIndex(
+  pointerY: number,
+  rowMidpoints: number[],
+  draggedIndex: number,
+): number {
+  const n = rowMidpoints.length;
+  if (n === 0) return 0;
+  let raw = 0;
+  for (const mid of rowMidpoints) if (mid < pointerY) raw++;
+  const target = raw > draggedIndex ? raw - 1 : raw;
+  return Math.min(Math.max(0, target), n - 1);
+}

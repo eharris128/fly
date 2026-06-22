@@ -8,6 +8,8 @@ import {
   deleteWorkspaceFrom,
   flattenRaised,
   unreadCountForLeaves,
+  reorderWorkspaces,
+  insertionIndex,
   type Tab,
   type Workspace,
 } from "./workspaces";
@@ -153,6 +155,64 @@ describe("unreadCountForLeaves", () => {
     expect(unreadCountForLeaves(["leaf-1", "leaf-2"], unread)).toBe(3);
     expect(unreadCountForLeaves(["leaf-1", "leaf-absent"], unread)).toBe(2);
     expect(unreadCountForLeaves([], unread)).toBe(0);
+  });
+});
+
+describe("reorderWorkspaces", () => {
+  const wsList = (n: number) =>
+    Array.from({ length: n }, (_, i) => makeWorkspace(`w${i}`, [makeTab()]));
+
+  it("moves a workspace down with a correct index shift", () => {
+    const out = reorderWorkspaces(wsList(4), 0, 2);
+    expect(out.map((w) => w.name)).toEqual(["w1", "w2", "w0", "w3"]);
+  });
+  it("moves a workspace up", () => {
+    const out = reorderWorkspaces(wsList(4), 3, 1);
+    expect(out.map((w) => w.name)).toEqual(["w0", "w3", "w1", "w2"]);
+  });
+  it("moves to the head and to the tail", () => {
+    const ws = wsList(4);
+    expect(reorderWorkspaces(ws, 2, 0).map((w) => w.name)).toEqual([
+      "w2", "w0", "w1", "w3",
+    ]);
+    expect(reorderWorkspaces(ws, 0, 3).map((w) => w.name)).toEqual([
+      "w1", "w2", "w3", "w0",
+    ]);
+  });
+  it("returns the same reference on a no-op (from === to)", () => {
+    const ws = wsList(3);
+    expect(reorderWorkspaces(ws, 1, 1)).toBe(ws);
+  });
+  it("returns the same reference on out-of-range indices", () => {
+    const ws = wsList(3);
+    expect(reorderWorkspaces(ws, -1, 1)).toBe(ws);
+    expect(reorderWorkspaces(ws, 1, 5)).toBe(ws);
+  });
+  it("returns the same reference for a single-element list", () => {
+    const ws = wsList(1);
+    expect(reorderWorkspaces(ws, 0, 0)).toBe(ws);
+  });
+});
+
+describe("insertionIndex", () => {
+  const mids = [10, 30, 50, 70]; // four rows, midpoints in order
+
+  it("returns 0 when the pointer is above the first row", () => {
+    expect(insertionIndex(5, mids, 2)).toBe(0);
+  });
+  it("returns the last index when the pointer is below the last row", () => {
+    expect(insertionIndex(100, mids, 1)).toBe(3);
+  });
+  it("is a no-op over the dragged row's own band", () => {
+    expect(insertionIndex(30, mids, 1)).toBe(1);
+    expect(insertionIndex(35, mids, 1)).toBe(1);
+  });
+  it("resolves to the gap between two other rows", () => {
+    expect(insertionIndex(45, mids, 0)).toBe(1); // drag row 0 down between 1 and 2
+    expect(insertionIndex(45, mids, 3)).toBe(2); // drag row 3 up between 1 and 2
+  });
+  it("handles an empty list", () => {
+    expect(insertionIndex(10, [], 0)).toBe(0);
   });
 });
 
