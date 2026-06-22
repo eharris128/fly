@@ -192,6 +192,22 @@ impl PtyManager {
         self.foreground_pid(id).and_then(crate::cwd::proc_cwd)
     }
 
+    /// Whether the pane's foreground process is a Claude Code agent (KTD-D, U2).
+    /// Resolves the foreground pid first — which drops the registry lock — then
+    /// reads `/proc` and runs the pure matcher outside any lock, the same
+    /// two-step shape as [`cwd`], so a blocking syscall never holds the `panes`
+    /// mutex every command and the read-thread teardown contend on.
+    pub fn is_agent(&self, id: PaneId) -> bool {
+        match self.foreground_pid(id) {
+            Some(pid) => {
+                let comm = crate::cwd::proc_comm(pid);
+                let argv = crate::cwd::proc_cmdline(pid);
+                crate::cwd::is_claude(comm.as_deref(), &argv)
+            }
+            None => false,
+        }
+    }
+
     /// Number of registered panes.
     pub fn count(&self) -> usize {
         self.panes.lock().unwrap().len()
