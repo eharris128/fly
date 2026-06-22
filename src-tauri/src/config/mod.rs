@@ -5,7 +5,7 @@
 
 mod schema;
 
-pub use schema::{Config, Renderer};
+pub use schema::{Config, ReasonEffectsConfig, Renderer};
 
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;

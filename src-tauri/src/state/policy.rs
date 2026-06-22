@@ -10,13 +10,17 @@
 //! free function over explicit inputs — no clock, no I/O — so every row of the
 //! decision matrix is unit-tested.
 
+use serde::{Deserialize, Serialize};
+
 /// Which effects a single attention `Reason` is even eligible to produce — the
 /// user-configured AND-mask. A `false` here forces that effect off regardless
 /// of runtime state (e.g. `desktop=false` ⇒ never banner on `finished`;
 /// `record=false` ⇒ skip history for a noisy reason). All default on; the
 /// persisted form is `config::ReasonEffectsConfig` (U23), one of these per
-/// `Reason`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Reason`. `#[serde(default)]` so a *partial* `{"desktop": false}` in a
+/// config file fills the omitted effects from `Default` (the nested-fill case).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ReasonEffects {
     pub desktop: bool,
     pub sound: bool,
