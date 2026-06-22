@@ -3,13 +3,13 @@
 //!
 //! Attention is `Idle → Raised → Acknowledged → Idle`, driven by agent signals
 //! plus the authoritative focus/foreground tuple replicated from the frontend.
-//! The notification decision runs through the suppression matrix
-//! ([`super::suppress`]); rapid duplicate signals coalesce within a debounce
+//! The "is the user looking?" predicate comes from [`super::policy`]
+//! ([`is_user_viewing`]); rapid duplicate signals coalesce within a debounce
 //! window. This is pure logic — time is passed in, so it is fully testable.
 
 use serde::{Deserialize, Serialize};
 
-use super::suppress::should_notify;
+use super::policy::is_user_viewing;
 
 /// What the agent needs from the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,9 +157,11 @@ impl AttentionMachine {
         self.reason = Some(sig.reason);
         self.tier = Some(sig.tier);
 
-        // Suppression matrix: if the user is already looking, acknowledge
-        // directly with no notification (Idle/Acknowledged → Acknowledged).
-        if !should_notify(self.focused, self.foregrounded) {
+        // If the user is already looking, acknowledge directly with no
+        // notification (Idle/Acknowledged → Acknowledged). `is_user_viewing` is
+        // the negation of the old `should_notify`, so the guard flips from
+        // `!should_notify(..)` to a direct `is_user_viewing(..)`.
+        if is_user_viewing(self.focused, self.foregrounded) {
             self.state = AttentionState::Acknowledged;
             self.last_raise_ms = None; // a later unfocused signal re-notifies
             return self.outcome(false);
