@@ -6,10 +6,15 @@
 //
 // Only panes detected as running Claude Code (`isAgent`) become rows; tabs and
 // workspaces with no agent row are omitted, so an empty model (no agents) is the
-// R7 empty state. The per-row `status` follows the KTD-E precedence:
-// attention wins (`waiting`), then an active output stretch (`working`), else
-// `idle`. A pane that exits drops out automatically — its foreground process is
-// no longer `claude`, so `isAgent` goes false on the next poll.
+// R7 empty state. The per-row `status` precedence (refined from KTD-E):
+//   - `raised`       → `waiting`  (the agent needs you and you HAVEN'T looked)
+//   - `acknowledged` → `idle`     (you're already viewing it — parked, not urgent,
+//                                  and never a stray "working" from residual output)
+//   - else a current output stretch → `working`, else `idle`.
+// Reserving `waiting` for unseen attention keeps a fresh, never-tasked claude
+// (which pings "ready for input" while you're looking at it → acknowledged) from
+// reading as `waiting`. A pane that exits drops out automatically — its
+// foreground process is no longer `claude`, so `isAgent` goes false next poll.
 
 import { leaves } from "./layout";
 import { tabDisplayTitle, type Workspace } from "./workspaces";
@@ -44,9 +49,11 @@ export interface HomeWorkspaceGroup {
   tabs: HomeTabGroup[];
 }
 
-/** Raised/acknowledged both mean "the user is needed" for the dashboard label. */
-function isAttentive(state: string | undefined): boolean {
-  return state === "raised" || state === "acknowledged";
+/** The dashboard's per-row status from attention + output stretch (see header). */
+function rowStatus(att: string | undefined, workingForMs: number | null): AgentStatus {
+  if (att === "raised") return "waiting"; // finished + unseen → needs you
+  if (att === "acknowledged") return "idle"; // you're viewing it → parked
+  return workingForMs != null ? "working" : "idle";
 }
 
 /**
@@ -55,9 +62,8 @@ function isAttentive(state: string | undefined): boolean {
  * workspaces are dropped (so `[]` ⟺ no agents running, the R7 empty state).
  *
  * The post-turn flicker grace (KTD-E) is applied upstream by App — it zeroes a
- * lingering `workingForMs` before this runs — so the `status` rule here is a
- * straight precedence: attention → `waiting`, else a stretch → `working`, else
- * `idle`.
+ * lingering `workingForMs` before this runs — so the `status` rule here is just
+ * `rowStatus` (raised → waiting, acknowledged → idle, else stretch → working).
  */
 export function buildHomeModel(
   workspaces: Workspace[],
@@ -74,13 +80,8 @@ export function buildHomeModel(
       for (const leaf of leaves(tab.tree)) {
         const activity = agentByLeaf[leaf.key];
         if (!activity?.isAgent) continue;
-        const needsAttention = isAttentive(attentionByLeaf[leaf.key]);
+        const att = attentionByLeaf[leaf.key];
         const workingForMs = activity.workingForMs;
-        const status: AgentStatus = needsAttention
-          ? "waiting"
-          : workingForMs != null
-            ? "working"
-            : "idle";
         rows.push({
           wsId: ws.id,
           tabId: tab.id,
@@ -88,8 +89,9 @@ export function buildHomeModel(
           tabTitle: title,
           cwd: cwdByLeaf[leaf.key] ?? null,
           workingForMs,
-          needsAttention,
-          status,
+          // Only "raised" (unseen) is urgent needs-you; acknowledged is "seen".
+          needsAttention: att === "raised",
+          status: rowStatus(att, workingForMs),
         });
       }
       if (rows.length > 0) tabs.push({ tabId: tab.id, title, rows });

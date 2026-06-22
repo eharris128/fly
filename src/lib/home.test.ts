@@ -71,42 +71,51 @@ describe("buildHomeModel", () => {
     expect(agentCount(model)).toBe(0);
   });
 
-  it("applies the status precedence: attention > working > idle", () => {
+  it("applies the status precedence: raised=waiting, acknowledged=idle, else stretch", () => {
     const workspaces = [
       ws("ws-1", "Alpha", [
-        tab("tab-1", split("s-1", leaf("a"), split("s-2", leaf("b"), leaf("c"))), "a"),
+        tab(
+          "tab-1",
+          split("s-1", leaf("a"), split("s-2", leaf("b"), split("s-3", leaf("c"), leaf("d")))),
+          "a",
+        ),
       ]),
     ];
     const model = buildHomeModel(
       workspaces,
       {
-        a: agent(true, 9000), // attention raised → waiting despite a stretch
+        a: agent(true, 9000), // raised → waiting despite a stretch
         b: agent(true, 3000), // idle attention + stretch → working
         c: agent(true, null), // idle attention + no stretch → idle
+        d: agent(true, 5000), // acknowledged (you're viewing) → idle, not working/waiting
       },
       {},
-      { a: "raised" },
+      { a: "raised", d: "acknowledged" },
     );
     const rows = model[0].tabs[0].rows;
     expect(rows.map((r) => [r.leafKey, r.status])).toEqual([
       ["a", "waiting"],
       ["b", "working"],
       ["c", "idle"],
+      ["d", "idle"],
     ]);
-    // attention wins even though `a` has a non-null stretch.
+    // raised is urgent needs-you; acknowledged (already seen) is not.
     expect(rows[0].needsAttention).toBe(true);
+    expect(rows[3].needsAttention).toBe(false);
     expect(rows[0].workingForMs).toBe(9000);
   });
 
-  it("treats acknowledged the same as raised for needs-attention", () => {
+  it("treats acknowledged as parked (idle), not waiting, even with a stretch", () => {
     const workspaces = [ws("ws-1", "Alpha", [tab("tab-1", leaf("leaf-1"), "leaf-1")])];
     const model = buildHomeModel(
       workspaces,
-      { "leaf-1": agent(true, 4000) },
+      { "leaf-1": agent(true, 4000) }, // a lingering stretch...
       {},
-      { "leaf-1": "acknowledged" },
+      { "leaf-1": "acknowledged" }, // ...but you're viewing it → neither working nor waiting
     );
-    expect(model[0].tabs[0].rows[0].status).toBe("waiting");
+    const row = model[0].tabs[0].rows[0];
+    expect(row.status).toBe("idle");
+    expect(row.needsAttention).toBe(false);
   });
 
   it("carries workingForMs through, null when idle", () => {
