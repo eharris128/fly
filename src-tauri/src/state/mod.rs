@@ -6,6 +6,7 @@
 //! attention machine, and the notification policy. The per-effect
 //! [`policy`] (KTD14, U16) absorbs the former single-boolean suppression matrix.
 
+pub mod activity;
 pub mod attention;
 pub mod lifecycle;
 pub mod manager;
