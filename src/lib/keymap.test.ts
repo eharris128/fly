@@ -248,3 +248,60 @@ describe("Keymap", () => {
     expect(a.calls).toEqual(["splitV"]);
   });
 });
+
+describe("Keymap digit chords (U1)", () => {
+  function withDigits() {
+    const a = spyActions();
+    const digits: number[] = [];
+    const km = new Keymap("ctrl+a", a, (n) => digits.push(n));
+    return { a, digits, km };
+  }
+
+  it("leader then 1–9 dispatches the digit (1-based) and consumes the chord", () => {
+    const { a, digits, km } = withDigits();
+    km.handle(ev("a", { ctrl: true }));
+    expect(km.handle(ev("3"))).toBe(true);
+    expect(digits).toEqual([3]);
+    km.handle(ev("a", { ctrl: true }));
+    km.handle(ev("1"));
+    expect(digits).toEqual([3, 1]); // 1-based, not 0-based
+    km.handle(ev("a", { ctrl: true }));
+    km.handle(ev("9"));
+    // 9 is passed through verbatim; the App resolver decides out-of-range is a
+    // no-op (it has no tab 9), so that lives at the App layer, not here.
+    expect(digits).toEqual([3, 1, 9]);
+    expect(a.calls).toEqual([]); // never fires a workspace or other action
+  });
+
+  it("leader then 0 is a consumed no-op (no digit dispatched, never leaks)", () => {
+    const { a, digits, km } = withDigits();
+    km.handle(ev("a", { ctrl: true }));
+    expect(km.handle(ev("0"))).toBe(true); // consumed
+    expect(digits).toEqual([]);
+    expect(a.calls).toEqual([]);
+  });
+
+  it("a bare digit with no pending leader passes through to the PTY", () => {
+    const { digits, km } = withDigits();
+    expect(km.handle(ev("5"))).toBe(false); // not consumed → reaches the shell
+    expect(digits).toEqual([]);
+  });
+
+  it("a shifted digit (Shift+1 → '!') does not select a tab", () => {
+    const { a, digits, km } = withDigits();
+    km.handle(ev("a", { ctrl: true }));
+    expect(km.handle(ev("!", { shift: true }))).toBe(true); // consumed no-op
+    expect(digits).toEqual([]);
+    expect(a.calls).toEqual([]);
+  });
+
+  it("the leader→digit chord survives a focus change between the keypresses", () => {
+    // One shared Keymap instance serves both the xterm and window key paths, so
+    // a leader pressed in one and the digit arriving via the other completes
+    // the chord exactly once.
+    const { digits, km } = withDigits();
+    km.handle(ev("a", { ctrl: true })); // leader, e.g. from a focused pane
+    km.handle(ev("2")); // digit, e.g. via the window listener after a click
+    expect(digits).toEqual([2]);
+  });
+});

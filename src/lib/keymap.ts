@@ -68,6 +68,20 @@ export const BINDINGS: Binding[] = [
 ];
 
 /**
+ * The digit tab-switch chord (U1): leader then `1`–`9` selects the Nth tab in
+ * the active workspace. It is intentionally NOT a `BINDINGS` entry — its action
+ * is parameterized (the digit picks the tab), which doesn't fit the uniform
+ * `() => void` action shape, and nine rows would clutter the menu/palette
+ * (tab-jump is already reachable by name in the palette). Dispatch handles the
+ * digits directly via the `onSelectTab` callback; this constant exists so the
+ * hotkey menu documents the chord from the same module (no drift). KTD1.
+ */
+export const DIGIT_CHORD = {
+  key: "1–9",
+  label: "Select tab N (no-op past tab count)",
+};
+
+/**
  * Turn a leader spec (`"ctrl+a"`, `"super+space"`) into a display string for
  * the hotkey menu: `"Ctrl-A"`, `"Super-Space"` (R6). Known modifier/key names
  * are title-cased to their conventional forms; anything else is upper-cased
@@ -128,6 +142,11 @@ export class Keymap {
   constructor(
     leaderKey: string,
     private actions: KeymapActions,
+    // Parameterized digit chord (leader 1–9 → select tab N). Kept separate from
+    // the uniform, parameterless `KeymapActions` so BINDINGS/dispatch/palette
+    // stay type-clean — a `(n: number) => void` member can't be called as the
+    // `() => void` the palette maps over. See DIGIT_CHORD / KTD1.
+    private onSelectTab?: (n: number) => void,
   ) {
     this.matchLeader = parseLeader(leaderKey);
   }
@@ -159,6 +178,15 @@ export class Keymap {
   }
 
   private dispatch(e: KeyboardEvent): void {
+    // Digit chords (leader 1–9) select the Nth tab in the active workspace (U1).
+    // Handled here, not via BINDINGS, because the action is parameterized. `0`,
+    // shifted digits (`!@#…`), and numpad keys with NumLock off arrive as
+    // something other than "1"–"9", so they fall through to the BINDINGS
+    // no-match path below and become a consumed no-op like any unbound chord.
+    if (this.onSelectTab && /^[1-9]$/.test(e.key)) {
+      this.onSelectTab(Number(e.key));
+      return;
+    }
     const lower = e.key.toLowerCase();
     // Prefer a case-sensitive (`upper`) binding when the literal key is the
     // uppercase form — this is what splits `leader X` (close tab) from

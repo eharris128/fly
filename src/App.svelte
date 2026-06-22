@@ -254,6 +254,13 @@
     );
     markActiveTabRead();
   }
+  // Digit chord (leader 1–9 → select tab N, U1). Resolves the Nth tab (1-based)
+  // in the ACTIVE workspace; out-of-range is a silent no-op. Routes through the
+  // same selectTab as a click, so it clears notifications identically (U5).
+  function selectTabByIndex(n: number) {
+    const tab = activeWorkspace?.tabs[n - 1];
+    if (tab) selectTab(activeWorkspaceId, tab.id);
+  }
   function selectWorkspace(wsId: string) {
     activeWorkspaceId = wsId;
     markActiveTabRead();
@@ -735,7 +742,7 @@
     // Seed global mute from the config default; the backend seeds the same value
     // at startup, so they start in sync (the runtime toggle keeps them so).
     muted = cfg.notificationsMutedDefault;
-    keymap = new Keymap(cfg.leaderKey, keymapActions);
+    keymap = new Keymap(cfg.leaderKey, keymapActions, selectTabByIndex);
 
     const saved = await loadSession();
     if (saved && saved.workspaces.length) {

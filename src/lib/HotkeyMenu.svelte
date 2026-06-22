@@ -4,7 +4,7 @@
   // so it can never drift from the real bindings (R3/KTD1). The parent owns the
   // open state and dismissal; this component is purely presentational and takes
   // no DOM focus (KTD3) — Escape is handled by the parent's window listener.
-  import { BINDINGS, formatLeader, type Binding } from "./keymap";
+  import { BINDINGS, DIGIT_CHORD, formatLeader, type Binding } from "./keymap";
 
   interface Props {
     open: boolean;
@@ -48,6 +48,15 @@
             <span class="label">{b.label}</span>
           </li>
         {/each}
+        <!-- The digit tab-switch chord (U1) isn't a BINDINGS entry (its action
+             is parameterized), so it's documented here from DIGIT_CHORD. -->
+        <li class="row">
+          <span class="keys">
+            <kbd>{formattedLeader}</kbd>
+            <kbd>{DIGIT_CHORD.key}</kbd>
+          </span>
+          <span class="label">{DIGIT_CHORD.label}</span>
+        </li>
       </ul>
     </div>
   </div>
