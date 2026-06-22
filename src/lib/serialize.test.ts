@@ -12,6 +12,7 @@ describe("migrateSession", () => {
       ],
       activeWorkspaceIndex: 0,
       sidebarCollapsed: true,
+      notifications: [],
     };
     expect(migrateSession(session)).toEqual(session);
   });
@@ -22,7 +23,20 @@ describe("migrateSession", () => {
       workspaces: [],
       activeWorkspaceIndex: 0,
       sidebarCollapsed: false,
+      notifications: [],
     });
+  });
+
+  it("carries valid notifications through and drops malformed ones", () => {
+    const out = migrateSession({
+      workspaces: [],
+      notifications: [
+        { id: 1, leafKey: "leaf-1", reason: "permission", title: "t", body: null, ts: 9, state: "unread" },
+        { id: "bad", leafKey: "leaf-2", reason: "permission", ts: 9 },
+      ],
+    });
+    expect(out?.notifications).toHaveLength(1);
+    expect(out?.notifications[0].id).toBe(1);
   });
 
   it("wraps a legacy {tabs, activeIndex} blob in one default workspace", () => {
@@ -47,6 +61,7 @@ describe("migrateSession", () => {
       ],
       activeWorkspaceIndex: 0,
       sidebarCollapsed: false,
+      notifications: [],
     });
   });
 

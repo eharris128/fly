@@ -34,11 +34,18 @@
     setWindowForeground,
     setVisiblePanes,
     setPaneWorkspace,
+    onNotificationAdded,
     paneCwd,
     type PaneId,
     type AttentionState,
     type AttentionReason,
   } from "./ipc";
+  import {
+    addNotification,
+    pruneToLeaves,
+    toPersisted,
+    type Notification,
+  } from "./lib/notifications";
   import { Keymap, type KeymapActions } from "./lib/keymap";
   import { actionCommands, navCommands, type PaletteCommand } from "./lib/palette";
   import { getConfig } from "./lib/config";
@@ -67,8 +74,16 @@
   let activeWorkspaceId = $state("");
   let ready = $state(false);
   let attentionByLeaf = $state<Record<string, AttentionState>>({});
+  // Notification history (U20). Owned here; the backend emits seed events and
+  // this list carries the read/unread/cleared lifecycle (KTD16).
+  let notifications = $state<Notification[]>([]);
   // leaf key → backend pane id (for cwd queries) and last-known cwd (auto names).
   let paneIdByLeaf: Record<string, PaneId> = {};
+  // Reverse index pane id → leaf key, to resolve a notification event's paneId
+  // to the stable leafKey it's stored under. Overwritten on each spawn, so a
+  // reused paneId maps to the new leaf; a now-exited pane's stale entry lingers
+  // (it helps the best-effort jump while the tab still exists).
+  let leafByPaneId: Record<number, string> = {};
   // leaf key → pane component handle, so the palette can return focus to the
   // active terminal when it closes. The palette takes DOM focus; the cheat-sheet
   // (KTD3) does not, so only the palette needs this.
@@ -166,6 +181,7 @@
       return;
     }
     setActiveTree(tree, leaves(tree)[0]?.key);
+    pruneNotifications(); // the removed pane's leaf is gone
   }
   function focusDir(dir: "left" | "right" | "up" | "down") {
     if (!activeTab) return;
@@ -218,6 +234,7 @@
   }
   function closeTab(tabId: string) {
     workspaces = closeTabIn(workspaces, tabId, makeTab);
+    pruneNotifications(); // drop history for the closed tab's leaves
   }
   function newWorkspace() {
     const ws = makeWorkspace(`workspace ${workspaces.length + 1}`);
@@ -228,6 +245,7 @@
     const res = deleteWorkspaceFrom(workspaces, wsId, () => makeWorkspace("default"));
     workspaces = res.workspaces;
     if (activeWorkspaceId === wsId) activeWorkspaceId = res.nextActiveId;
+    pruneNotifications(); // drop history for the deleted workspace's leaves
   }
   function shiftWorkspace(delta: number) {
     const idx = workspaces.findIndex((w) => w.id === activeWorkspaceId);
@@ -421,6 +439,7 @@
   }
   function onSpawned(key: string, paneId: PaneId) {
     paneIdByLeaf[key] = paneId;
+    leafByPaneId[paneId] = key; // overwrite: a reused paneId maps to the new leaf
     // paneIdByLeaf isn't $state, so the visible-set $effect won't re-fire on a
     // late-arriving paneId (async spawn) — re-push so a freshly-spawned visible
     // pane is included (else it would transiently over-banner a looked-at pane).
@@ -428,6 +447,17 @@
     // Register the pane's workspace so a per-workspace mute can scope to it.
     const wsId = workspaceIdForLeaf(key);
     if (wsId) void setPaneWorkspace(paneId, wsId);
+  }
+  // All leaf keys that still resolve to a live tab/workspace — used to prune
+  // notifications whose pane was deleted (else orphaned unread counts leak).
+  function allLiveLeafKeys(): Set<string> {
+    const set = new Set<string>();
+    for (const w of workspaces)
+      for (const t of w.tabs) for (const l of leaves(t.tree)) set.add(l.key);
+    return set;
+  }
+  function pruneNotifications() {
+    notifications = pruneToLeaves(notifications, allLiveLeafKeys());
   }
 
   function startDrag(d: DividerRect, ev: PointerEvent) {
@@ -499,6 +529,9 @@
         workspaces.findIndex((w) => w.id === activeWorkspaceId),
       ),
       sidebarCollapsed,
+      // Metadata-only unless saveScrollback is on (bodies can carry agent
+      // output); cleared entries are already gone (KTD16 privacy).
+      notifications: toPersisted(notifications, saveScrollbackEnabled),
     });
   }
 
@@ -508,6 +541,7 @@
     void workspaces;
     void activeWorkspaceId;
     void sidebarCollapsed;
+    void notifications; // persist the history as it changes too
     if (!ready) return;
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => void persist(), 800);
@@ -588,6 +622,10 @@
           Math.min(Math.max(0, saved.activeWorkspaceIndex), workspaces.length - 1)
         ]?.id ?? workspaces[0].id;
       sidebarCollapsed = saved.sidebarCollapsed;
+      // Restore is NOT auto-read: a notification missed last session stays
+      // unread on the tab you reopen into (markReadForLeaves only fires on an
+      // explicit tab switch / panel open, U21).
+      notifications = saved.notifications;
     } else {
       const ws = makeWorkspace("default");
       workspaces = [ws];
@@ -617,12 +655,30 @@
     window.addEventListener("keydown", onWindowKeydown, true);
     reportForeground();
     void restore();
+    // Own the notification history listener here (attention arrives prop-drilled
+    // from Terminal; this is a direct App listener). Resolve paneId → leafKey at
+    // ingestion via the reverse index, so the entry stores the stable key.
+    let unlistenNotify: (() => void) | undefined;
+    void onNotificationAdded((ev) => {
+      const leafKey = leafByPaneId[ev.paneId];
+      if (!leafKey) return; // unknown pane (already gone) — best effort
+      notifications = addNotification(notifications, {
+        id: ev.id,
+        leafKey,
+        reason: ev.reason,
+        title: ev.title,
+        body: ev.body,
+        ts: ev.ts,
+        read: ev.read,
+      });
+    }).then((un) => (unlistenNotify = un));
     const cwdTimer = setInterval(() => void refreshCwds(), 1500);
     return () => {
       window.removeEventListener("focus", reportForeground);
       window.removeEventListener("blur", reportForeground);
       window.removeEventListener("keydown", onWindowKeydown, true);
       clearInterval(cwdTimer);
+      unlistenNotify?.();
     };
   });
 </script>

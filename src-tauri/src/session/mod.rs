@@ -36,13 +36,20 @@ pub fn scrollback_dir() -> PathBuf {
 
 /// Persist the session: a `{version, layout}` document written atomically
 /// (temp + rename) so a crash mid-write can't truncate the live file.
+///
+/// The session can now carry notification titles/bodies (agent output) when
+/// `saveScrollback` is on, so it is written `0600` like the scrollback files —
+/// and the mode is set on the **temp file before the rename**, so there is never
+/// a world-readable window between rename and a chmod-after (U20/KTD16).
 pub fn write_session(path: &Path, layout: &Value) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
     let doc = serde_json::json!({ "version": SESSION_VERSION, "layout": layout });
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&doc)?)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }

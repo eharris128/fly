@@ -44,6 +44,18 @@ fn version_mismatch_falls_back_to_default() {
 }
 
 #[test]
+fn session_file_is_owner_only() {
+    // The session may carry notification bodies (agent output), so it is 0600
+    // like the scrollback files — set before the rename, no world-readable
+    // window (U20/KTD16).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.json");
+    write_session(&path, &json!({ "tabs": [] })).unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "session file must be 0600");
+}
+
+#[test]
 fn scrollback_round_trips_with_owner_only_perms() {
     let dir = tempfile::tempdir().unwrap();
     let sb = dir.path().join("scrollback");

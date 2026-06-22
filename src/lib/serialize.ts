@@ -3,6 +3,7 @@
 // happens here.
 import { invoke } from "@tauri-apps/api/core";
 import type { Node } from "./layout";
+import { coerceNotifications, type Notification } from "./notifications";
 
 export interface SavedPane {
   cwd: string | null;
@@ -23,6 +24,9 @@ export interface SavedSession {
   workspaces: SavedWorkspace[];
   activeWorkspaceIndex: number;
   sidebarCollapsed: boolean;
+  // Notification history (U20). Keyed by leafKey, so it resolves to a pane after
+  // restart; bodies persist only when saveScrollback is on (gated in App).
+  notifications: Notification[];
 }
 
 export function saveSession(session: SavedSession): Promise<void> {
@@ -48,6 +52,8 @@ export function migrateSession(raw: unknown): SavedSession | null {
       activeWorkspaceIndex:
         typeof v.activeWorkspaceIndex === "number" ? v.activeWorkspaceIndex : 0,
       sidebarCollapsed: v.sidebarCollapsed === true,
+      // Tolerant: missing → empty history; malformed entries dropped.
+      notifications: coerceNotifications(v.notifications),
     };
   }
 
@@ -68,6 +74,8 @@ export function migrateSession(raw: unknown): SavedSession | null {
       ],
       activeWorkspaceIndex: 0,
       sidebarCollapsed: false,
+      // Legacy sessions predate notifications → empty history.
+      notifications: coerceNotifications(v.notifications),
     };
   }
 

@@ -1,5 +1,6 @@
 // Typed wrappers over the Tauri command + Channel surface (U3).
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type PaneId = number;
 
@@ -32,6 +33,31 @@ export interface AttentionEvent {
   state: AttentionState;
   reason: AttentionReason | null;
   tier: AttentionTier | null;
+}
+
+/** A recorded notification, emitted when policy says `record` (KTD16, U18). */
+export interface NotificationAddedEvent {
+  id: number;
+  paneId: number;
+  reason: AttentionReason;
+  title: string | null;
+  body: string | null;
+  ts: number;
+  /** Backend-authored read-at-birth bit (the user was viewing the pane). */
+  read: boolean;
+}
+
+/**
+ * Subscribe to recorded notifications (the first `listen`-based wrapper here;
+ * mirrors the `pane://attention` listener pattern in Terminal.svelte). Returns
+ * an unlisten fn — the caller tears it down on unmount.
+ */
+export function onNotificationAdded(
+  handler: (ev: NotificationAddedEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<NotificationAddedEvent>("notification://added", (e) =>
+    handler(e.payload),
+  );
 }
 
 /**
