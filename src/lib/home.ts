@@ -101,6 +101,43 @@ export function buildHomeModel(
   return out;
 }
 
+/**
+ * Downgrade a *stale* `raised` attention to `idle` for the dashboard.
+ *
+ * Claude Code re-pings its "waiting for input" notification periodically while
+ * idle. On an agent you've already dealt with, that repeat ping re-raises the
+ * pane in the backend (acknowledged → raised), which would otherwise cycle the
+ * dashboard row back to `waiting` even though the agent did no new work. A raise
+ * only counts when the agent produced output *after* you last engaged with it
+ * (viewed it → `acknowledged`, or typed → `idle`, recorded in `lastEngagedByLeaf`);
+ * a raise with no newer output is a stale ping and presents as `idle`. Genuine
+ * raises — a real turn that finished while you weren't looking — pass through.
+ *
+ * Pure: `now` and the engaged map are injected. App applies it before
+ * `buildHomeModel` so the model's `raised → waiting` rule stays simple.
+ */
+export function effectiveAttention(
+  attentionByLeaf: Record<string, string>,
+  agentByLeaf: Record<string, PaneActivity>,
+  lastEngagedByLeaf: Record<string, number>,
+  now: number,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, att] of Object.entries(attentionByLeaf)) {
+    if (att === "raised") {
+      const ago = agentByLeaf[key]?.lastOutputAgoMs;
+      const lastOutputAt = ago != null ? now - ago : Number.NEGATIVE_INFINITY;
+      const engagedAt = lastEngagedByLeaf[key] ?? 0;
+      if (lastOutputAt <= engagedAt) {
+        out[key] = "idle"; // stale repeat ping on a parked agent — not "waiting"
+        continue;
+      }
+    }
+    out[key] = att;
+  }
+  return out;
+}
+
 /** Total agent rows across the model (for an at-a-glance count / empty check). */
 export function agentCount(model: HomeWorkspaceGroup[]): number {
   let n = 0;

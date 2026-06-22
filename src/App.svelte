@@ -35,7 +35,7 @@
     type Tab,
     type Workspace,
   } from "./lib/workspaces";
-  import { buildHomeModel } from "./lib/home";
+  import { buildHomeModel, effectiveAttention } from "./lib/home";
   import {
     setWindowForeground,
     setVisiblePanes,
@@ -103,11 +103,12 @@
   // reused paneId maps to the new leaf; a now-exited pane's stale entry lingers
   // (it helps the best-effort jump while the tab still exists).
   let leafByPaneId: Record<number, string> = {};
-  // Wall-clock ms when a leaf's attention last cleared to idle. A work stretch
-  // with no new output since then is the just-finished turn's residual — App
-  // zeroes its workingForMs before buildHomeModel so a dashboard row doesn't
-  // flicker from "waiting" back to "working" after an ack (KTD-E grace).
-  let attentionClearedAt: Record<string, number> = {};
+  // Wall-clock ms when you last *engaged* an agent leaf — viewed its raised pane
+  // (→ acknowledged) or typed/cleared it (→ idle). Drives two dashboard guards:
+  // the work-stretch grace (a residual stretch from before you engaged isn't
+  // "working") and stale-ping suppression (a repeat idle notification with no new
+  // output since isn't "waiting"). See gracedAgents / effectiveAttention.
+  let lastEngagedAt: Record<string, number> = {};
   // leaf key → pane component handle, so the palette can return focus to the
   // active terminal when it closes. The palette takes DOM focus; the cheat-sheet
   // (KTD3) does not, so only the palette needs this.
@@ -601,10 +602,12 @@
   }
 
   function onAttention(key: string, state: AttentionState, _reason: AttentionReason | null) {
-    const prev = attentionByLeaf[key];
-    // Remember when a raised/acknowledged leaf clears, for the dashboard grace.
-    if (state === "idle" && (prev === "raised" || prev === "acknowledged")) {
-      attentionClearedAt[key] = Date.now();
+    // You "engage" an agent by viewing its raised pane (→ acknowledged) or by
+    // typing / clearing it (→ idle). Recorded so the dashboard can quiet a
+    // residual work stretch and stale repeat idle-pings on agents you've already
+    // dealt with (see gracedAgents / effectiveAttention).
+    if (state === "acknowledged" || state === "idle") {
+      lastEngagedAt[key] = Date.now();
     }
     attentionByLeaf = { ...attentionByLeaf, [key]: state };
   }
@@ -709,17 +712,16 @@
     agentByLeaf = next;
     agentsPolledAt = Date.now();
   }
-  // KTD-E grace: drop a lingering work stretch for a leaf whose attention just
-  // cleared and that has produced no new output since — the just-finished turn's
-  // residual must not resurrect a "working" timer. Keeps buildHomeModel pure.
-  function gracedAgents(): Record<string, PaneActivity> {
-    const now = Date.now();
+  // Grace: drop a lingering work stretch for a leaf whose output all predates
+  // your last engagement — a residual stretch from a turn you've already seen
+  // must not resurrect a "working" timer. Keeps buildHomeModel pure.
+  function gracedAgents(now: number): Record<string, PaneActivity> {
     const out: Record<string, PaneActivity> = {};
     for (const [key, a] of Object.entries(agentByLeaf)) {
-      const clearedAt = attentionClearedAt[key];
-      if (a.workingForMs != null && clearedAt != null) {
+      const engagedAt = lastEngagedAt[key];
+      if (a.workingForMs != null && engagedAt != null) {
         const lastOutputAt = now - (a.lastOutputAgoMs ?? 0);
-        if (lastOutputAt <= clearedAt) {
+        if (lastOutputAt <= engagedAt) {
           out[key] = { ...a, workingForMs: null };
           continue;
         }
@@ -728,9 +730,14 @@
     }
     return out;
   }
-  let homeModel = $derived(
-    buildHomeModel(workspaces, gracedAgents(), cwdByLeaf, attentionByLeaf),
-  );
+  // Apply both engagement guards against the same `now`, then group: stale raises
+  // → idle (effectiveAttention), residual stretches → not working (gracedAgents).
+  let homeModel = $derived.by(() => {
+    const now = Date.now();
+    const agents = gracedAgents(now);
+    const att = effectiveAttention(attentionByLeaf, agentByLeaf, lastEngagedAt, now);
+    return buildHomeModel(workspaces, agents, cwdByLeaf, att);
+  });
   // Run the agent poll only while the dashboard is open (KTD-C): an immediate
   // fetch so it isn't blank, then every 1.5s; the cleanup tears down the timer.
   $effect(() => {

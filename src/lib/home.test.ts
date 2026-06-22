@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildHomeModel, formatDuration, agentCount } from "./home";
+import { buildHomeModel, effectiveAttention, formatDuration, agentCount } from "./home";
 import type { Tab, Workspace } from "./workspaces";
 import type { Node } from "./layout";
 import type { PaneActivity } from "../ipc";
@@ -127,6 +127,45 @@ describe("buildHomeModel", () => {
 
   it("returns [] for empty inputs", () => {
     expect(buildHomeModel([], {}, {}, {})).toEqual([]);
+  });
+});
+
+describe("effectiveAttention", () => {
+  const act = (lastOutputAgoMs: number | null): PaneActivity => ({
+    isAgent: true,
+    workingForMs: null,
+    lastOutputAgoMs,
+  });
+
+  it("keeps a raise with new output since you last engaged", () => {
+    // engaged at 1000; last output 100ms ago at now=5000 → output at 4900 > 1000.
+    const eff = effectiveAttention({ a: "raised" }, { a: act(100) }, { a: 1000 }, 5000);
+    expect(eff.a).toBe("raised");
+  });
+
+  it("downgrades a stale raise (no new output since you engaged) to idle", () => {
+    // engaged at 4000; last output 3000ms ago at now=5000 → output at 2000 ≤ 4000.
+    const eff = effectiveAttention({ a: "raised" }, { a: act(3000) }, { a: 4000 }, 5000);
+    expect(eff.a).toBe("idle");
+  });
+
+  it("passes acknowledged and idle through unchanged", () => {
+    const eff = effectiveAttention(
+      { a: "acknowledged", b: "idle" },
+      { a: act(0), b: act(0) },
+      {},
+      5000,
+    );
+    expect(eff).toEqual({ a: "acknowledged", b: "idle" });
+  });
+
+  it("downgrades a raise with no activity record to idle", () => {
+    expect(effectiveAttention({ a: "raised" }, {}, {}, 5000).a).toBe("idle");
+  });
+
+  it("keeps a raise on an agent you've never engaged", () => {
+    // never engaged → engagedAt defaults to 0; any real output (now - ago > 0) counts.
+    expect(effectiveAttention({ a: "raised" }, { a: act(500) }, {}, 5000).a).toBe("raised");
   });
 });
 
