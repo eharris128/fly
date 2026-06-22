@@ -154,6 +154,24 @@ describe("persistence + restore", () => {
     expect(relativeTime(now + 5000, now)).toBe("now"); // clamps future
   });
 
+  it("a fresh uniquely-id'd notification appends alongside low-id restored entries", () => {
+    // Regression guard for the restart id-collision bug: restored history from a
+    // prior session carries small ids (0,1); the backend now mints new ids from
+    // wall-clock, so a genuinely-new event never collides and must append (not
+    // be swallowed by the id dedup). The dedup still only fires on a true
+    // same-id repeat.
+    const restored = coerceNotifications([
+      { id: 0, leafKey: "leaf-1", reason: "permission", ts: 100, state: "read" },
+      { id: 1, leafKey: "leaf-1", reason: "finished", ts: 200, state: "read" },
+    ]);
+    const next = addNotification(
+      restored,
+      ev({ id: 1_700_000_000_123, leafKey: "leaf-1", ts: 999 }),
+    );
+    expect(next).toHaveLength(3);
+    expect(next.some((n) => n.id === 1_700_000_000_123)).toBe(true);
+  });
+
   it("coerceNotifications tolerates absence and drops malformed entries", () => {
     expect(coerceNotifications(undefined)).toEqual([]);
     expect(coerceNotifications("nope")).toEqual([]);

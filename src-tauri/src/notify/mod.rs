@@ -210,7 +210,16 @@ impl NotificationGate {
             coalesce_threshold,
             epoch: Instant::now(),
             last_fire_ms: Mutex::new(None),
-            id_counter: AtomicU64::new(0),
+            // Seed the id from wall-clock, NOT 0 — the id doubles as the
+            // frontend's persisted dedup key, so a counter that reset to 0 each
+            // launch would mint ids colliding with the *restored* history and
+            // `addNotification` would silently drop the first N new
+            // notifications after every restart-with-history. Wall-clock seeding
+            // keeps the live-id space disjoint from any restored id: notification
+            // count grows far slower than wall-clock ms (the per-pane debounce
+            // caps it), so a later launch's base always exceeds the prior
+            // session's max id.
+            id_counter: AtomicU64::new(now_unix_ms()),
         }
     }
 
@@ -218,8 +227,9 @@ impl NotificationGate {
         self.epoch.elapsed().as_millis() as u64
     }
 
-    /// A monotonic id for a recorded notification, so the frontend can key and
-    /// dedupe history entries.
+    /// A monotonic, wall-clock-seeded id for a recorded notification, unique
+    /// across process restarts so the frontend can key + dedupe history without
+    /// colliding with restored entries.
     pub fn next_id(&self) -> u64 {
         self.id_counter.fetch_add(1, Ordering::Relaxed)
     }
@@ -287,11 +297,16 @@ mod tests {
     }
 
     #[test]
-    fn ids_are_monotonic() {
+    fn ids_are_monotonic_and_wall_clock_seeded() {
         let gate = NotificationGate::new(3);
-        assert_eq!(gate.next_id(), 0);
-        assert_eq!(gate.next_id(), 1);
-        assert_eq!(gate.next_id(), 2);
+        let a = gate.next_id();
+        let b = gate.next_id();
+        let c = gate.next_id();
+        assert_eq!(b, a + 1);
+        assert_eq!(c, b + 1);
+        // Seeded from wall-clock (not 0), so the live-id space never collides
+        // with a restored history's ids after a restart. 1.7e12 ms ≈ 2023.
+        assert!(a >= 1_700_000_000_000, "id should be wall-clock-seeded, got {a}");
     }
 
     #[test]
