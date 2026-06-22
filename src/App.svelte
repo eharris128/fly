@@ -747,6 +747,7 @@
     openPalette,
     toggleSidebar: () => (sidebarCollapsed = !sidebarCollapsed),
     newWorkspace,
+    closeWorkspace: () => requestDeleteWorkspace(activeWorkspaceId),
     prevWorkspace: () => shiftWorkspace(-1),
     nextWorkspace: () => shiftWorkspace(1),
     renameTab: startRenameActiveTab,

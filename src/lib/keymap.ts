@@ -20,6 +20,7 @@ export interface KeymapActions {
   openPalette: () => void;
   toggleSidebar: () => void;
   newWorkspace: () => void;
+  closeWorkspace: () => void;
   prevWorkspace: () => void;
   nextWorkspace: () => void;
   renameTab: () => void;
@@ -60,6 +61,9 @@ export const BINDINGS: Binding[] = [
   { keys: ["m"], label: "Toggle mute", action: "toggleMute" },
   { keys: ["r"], label: "Rename tab", action: "renameTab" },
   { keys: ["w"], label: "New workspace", action: "newWorkspace" },
+  // Uppercase W is distinct from lowercase w (new workspace) via `upper`,
+  // exactly like x / X (pane vs tab): it deletes the active workspace.
+  { keys: ["w"], upper: true, label: "Close workspace", action: "closeWorkspace" },
   { keys: ["["], label: "Previous workspace", action: "prevWorkspace" },
   { keys: ["]"], label: "Next workspace", action: "nextWorkspace" },
   { keys: ["b"], label: "Toggle sidebar", action: "toggleSidebar" },

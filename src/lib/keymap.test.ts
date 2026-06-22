@@ -44,6 +44,7 @@ function spyActions(): KeymapActions & { calls: string[] } {
     openPalette: mk("openPalette"),
     toggleSidebar: mk("toggleSidebar"),
     newWorkspace: mk("newWorkspace"),
+    closeWorkspace: mk("closeWorkspace"),
     prevWorkspace: mk("prevWorkspace"),
     nextWorkspace: mk("nextWorkspace"),
     renameTab: mk("renameTab"),
@@ -72,6 +73,14 @@ describe("BINDINGS", () => {
     ]);
     expect(BINDINGS.find((b) => b.action === "closeTab")?.upper).toBe(true);
     expect(BINDINGS.find((b) => b.action === "closePane")?.upper).toBeUndefined();
+    // w and W are distinct entries — new workspace vs close workspace.
+    const wEntries = BINDINGS.filter((b) => b.keys.includes("w"));
+    expect(wEntries.map((b) => b.action).sort()).toEqual([
+      "closeWorkspace",
+      "newWorkspace",
+    ]);
+    expect(BINDINGS.find((b) => b.action === "closeWorkspace")?.upper).toBe(true);
+    expect(BINDINGS.find((b) => b.action === "newWorkspace")?.upper).toBeUndefined();
   });
 
   it("carries the notification chords with u/U disambiguated", () => {
@@ -179,13 +188,15 @@ describe("Keymap", () => {
       expect(km.handle(ev(k, mods))).toBe(true);
     };
     chord("b");
-    chord("w");
+    chord("w"); // lowercase → new workspace (no regression)
+    chord("W", { shift: true }); // uppercase → close workspace
     chord("[");
     chord("]");
     chord("r");
     expect(a.calls).toEqual([
       "toggleSidebar",
       "newWorkspace",
+      "closeWorkspace",
       "prevWorkspace",
       "nextWorkspace",
       "renameTab",
