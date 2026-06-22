@@ -5,6 +5,12 @@
   // `editing` target, so the leader `r` chord can start a rename the same way a
   // double-click does. Per-workspace expand/collapse is the one bit of local UI
   // state; it isn't worth persisting, so it lives here.
+  //
+  // Workspaces can be reordered by dragging (U3). The pure index math lives in
+  // workspaces.ts (insertionIndex); this component wires it to pointer events,
+  // mirroring App.svelte's split-divider `startDrag`. Order persistence is the
+  // parent's job — the reorder fires `onReorderWorkspace(from, to)`.
+  import { insertionIndex } from "./workspaces";
 
   interface SidebarTab {
     id: string;
@@ -38,6 +44,7 @@
     onCancelEdit: () => void;
     onToggleWorkspaceMute: (wsId: string) => void;
     onToggleCollapsed: () => void;
+    onReorderWorkspace: (fromIndex: number, toIndex: number) => void;
   }
   let {
     workspaces,
@@ -55,6 +62,7 @@
     onCancelEdit,
     onToggleWorkspaceMute,
     onToggleCollapsed,
+    onReorderWorkspace,
   }: Props = $props();
 
   // Collapsed workspace ids (expand/collapse of the tab list). Default expanded.
@@ -63,6 +71,69 @@
     const next = new Set(folded);
     next.has(id) ? next.delete(id) : next.add(id);
     folded = next;
+  }
+
+  // ---- workspace drag-reorder (U3) -----------------------------------------
+  // Transient, drag-only UI state — like `folded`, not worth persisting. The
+  // dragged row is dimmed; a thin accent line marks the drop position.
+  let treeEl: HTMLDivElement;
+  let draggedIndex = $state<number | null>(null);
+  let dropIndex = $state<number | null>(null);
+  // Show the insertion line only when the drop would actually move the row.
+  const showDrop = $derived(
+    draggedIndex !== null && dropIndex !== null && dropIndex !== draggedIndex,
+  );
+  // The post-removal `dropIndex` maps to a gap among the current (still-rendered)
+  // rows: landing below the dragged row sits one slot further down visually.
+  const visualGap = $derived(
+    dropIndex === null || draggedIndex === null
+      ? -1
+      : dropIndex < draggedIndex
+        ? dropIndex
+        : dropIndex + 1,
+  );
+
+  function wsMidpoints(): number[] {
+    if (!treeEl) return [];
+    const rows = treeEl.querySelectorAll<HTMLElement>(":scope > .ws");
+    return Array.from(rows, (el) => {
+      const r = el.getBoundingClientRect();
+      return r.top + r.height / 2;
+    });
+  }
+  function startWsDrag(index: number, ev: PointerEvent) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    draggedIndex = index;
+    dropIndex = index;
+    const move = (e: PointerEvent) => {
+      if (draggedIndex === null) return;
+      dropIndex = insertionIndex(e.clientY, wsMidpoints(), draggedIndex);
+    };
+    const finish = (commit: boolean) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+      window.removeEventListener("keydown", onKey, true);
+      if (commit && draggedIndex !== null && dropIndex !== null) {
+        onReorderWorkspace(draggedIndex, dropIndex); // no-ops if unchanged
+      }
+      draggedIndex = null;
+      dropIndex = null;
+    };
+    const up = () => finish(true);
+    const cancel = () => finish(false);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(false); // drop-cancel: leave order untouched, clear the indicator
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
+    window.addEventListener("keydown", onKey, true);
   }
 
   // Enter/Escape both unmount the input, which fires a trailing blur; suppress
@@ -99,10 +170,18 @@
 </script>
 
 <div class="sidebar">
-  <div class="tree">
-    {#each workspaces as ws (ws.id)}
+  <div class="tree" bind:this={treeEl}>
+    {#each workspaces as ws, i (ws.id)}
       {@const open = !folded.has(ws.id)}
-      <div class="ws" class:active={ws.id === activeWorkspaceId} class:muted={ws.muted}>
+      {#if showDrop && visualGap === i}
+        <div class="drop-line" aria-hidden="true"></div>
+      {/if}
+      <div
+        class="ws"
+        class:active={ws.id === activeWorkspaceId}
+        class:muted={ws.muted}
+        class:dragging={draggedIndex === i}
+      >
         <div
           class="ws-head"
           role="button"
@@ -111,6 +190,14 @@
           onkeydown={(e) =>
             (e.key === "Enter" || e.key === " ") && onSelectWorkspace(ws.id)}
         >
+          <button
+            type="button"
+            class="grip"
+            title="drag to reorder"
+            aria-label="drag to reorder workspace"
+            onpointerdown={(e) => startWsDrag(i, e)}
+            onclick={(e) => e.stopPropagation()}>⠿</button
+          >
           <button
             class="twisty"
             title={open ? "collapse" : "expand"}
@@ -232,6 +319,9 @@
         {/if}
       </div>
     {/each}
+    {#if showDrop && visualGap === workspaces.length}
+      <div class="drop-line" aria-hidden="true"></div>
+    {/if}
   </div>
 
   <div class="footer">
@@ -295,6 +385,36 @@
     width: 14px;
     padding: 0;
     line-height: 1;
+  }
+  /* Drag handle: faint by default (discoverable), brighter on row hover. */
+  .grip {
+    background: none;
+    border: none;
+    color: inherit;
+    opacity: 0.25;
+    cursor: grab;
+    font-size: 11px;
+    line-height: 1;
+    width: 11px;
+    flex: none;
+    padding: 0;
+    touch-action: none;
+  }
+  .ws-head:hover .grip {
+    opacity: 0.7;
+  }
+  .grip:active {
+    cursor: grabbing;
+  }
+  .ws.dragging {
+    opacity: 0.4;
+  }
+  /* Insertion indicator between rows while dragging. */
+  .drop-line {
+    height: 2px;
+    margin: 1px 6px;
+    background: #4da3ff;
+    border-radius: 1px;
   }
   .ws-name {
     flex: 1;

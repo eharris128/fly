@@ -30,6 +30,7 @@
     flattenRaised,
     unreadCountForLeaves,
     sourceLeafForNewTab,
+    reorderWorkspaces,
     type Tab,
     type Workspace,
   } from "./lib/workspaces";
@@ -899,6 +900,8 @@
         onCancelEdit={cancelEdit}
         onToggleWorkspaceMute={toggleWorkspaceMute}
         onToggleCollapsed={() => (sidebarCollapsed = true)}
+        onReorderWorkspace={(from, to) =>
+          (workspaces = reorderWorkspaces(workspaces, from, to))}
       />
     {/if}
     <div
