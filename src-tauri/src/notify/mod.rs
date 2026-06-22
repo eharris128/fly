@@ -14,8 +14,9 @@
 pub mod command;
 
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Manager};
@@ -93,24 +94,62 @@ pub fn play_sound(name: &str) {
     }
     let mut cmd = Command::new("canberra-gtk-play");
     cmd.arg("-i").arg(name);
+    // Handle ignored; the cap bounds the fan-out (see `spawn_detached`).
     spawn_detached(cmd);
 }
 
-/// Spawn a best-effort background process and reap it on a short-lived thread,
-/// so it never lingers as a zombie. Tauri/GTK may own process-global `SIGCHLD`,
-/// so each child is `wait`ed explicitly rather than via a global reaper. Shared
-/// by [`play_sound`] and the notification command runner ([`command`], U19).
-pub(crate) fn spawn_detached(mut command: Command) {
+/// Max concurrent in-flight detached helper processes (the chime). Without it, N
+/// panes raising at once would fan out N `canberra-gtk-play` processes with no
+/// aggregate bound — a milder version of the unbounded fan-out the command
+/// runner caps (KTD17). The per-pane attention debounce throttles a single
+/// looping pane; this caps the across-pane burst.
+const MAX_DETACHED: usize = 8;
+
+fn detached_inflight() -> &'static AtomicUsize {
+    static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+    &INFLIGHT
+}
+
+/// Spawn a best-effort background process, bounded by a concurrency cap and
+/// reaped on a short-lived thread so it never lingers as a zombie. Tauri/GTK may
+/// own process-global `SIGCHLD`, so each child is `wait`ed explicitly rather than
+/// via a global reaper. Returns the reaper handle (tests await it); callers
+/// ignore it. Used by [`play_sound`] (the notification command runner has its
+/// own equivalent cap in [`command`], U19).
+pub(crate) fn spawn_detached(command: Command) -> Option<JoinHandle<()>> {
+    spawn_detached_capped(command, detached_inflight(), MAX_DETACHED)
+}
+
+fn spawn_detached_capped(
+    mut command: Command,
+    inflight: &'static AtomicUsize,
+    cap: usize,
+) -> Option<JoinHandle<()>> {
+    if inflight.fetch_add(1, Ordering::SeqCst) >= cap {
+        inflight.fetch_sub(1, Ordering::SeqCst);
+        return None;
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Ok(mut child) = command.spawn() {
-        let _ = std::thread::Builder::new()
+    match command.spawn() {
+        Ok(mut child) => match std::thread::Builder::new()
             .name("fly-notify-reap".into())
             .spawn(move || {
                 let _ = child.wait();
-            });
+                inflight.fetch_sub(1, Ordering::SeqCst);
+            }) {
+            Ok(handle) => Some(handle),
+            Err(_) => {
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                None
+            }
+        },
+        Err(_) => {
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            None
+        }
     }
 }
 
@@ -302,5 +341,28 @@ mod tests {
         let a = surface_actions(ALL_ON, &Surfaced::Suppressed);
         assert!(!a.banner && !a.command);
         assert!(a.record && a.sound);
+    }
+
+    #[test]
+    fn detached_spawns_are_bounded_and_reaped() {
+        // The chime path (play_sound -> spawn_detached) must not fan out
+        // unboundedly when many panes raise at once; extra spawns are dropped
+        // and every child is reaped (no zombies, no slot leak).
+        use std::process::Command;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("0.3");
+            if let Some(h) = super::spawn_detached_capped(cmd, &INFLIGHT, 8) {
+                handles.push(h);
+            }
+        }
+        assert!(handles.len() <= 8, "detached spawns capped, got {}", handles.len());
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(INFLIGHT.load(Ordering::SeqCst), 0, "all slots released, no leak");
     }
 }
