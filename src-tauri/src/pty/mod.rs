@@ -21,6 +21,16 @@ use pane::Pane;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PaneId(pub u64);
 
+/// A pane's raw output-activity snapshot (U3): the current work stretch and how
+/// long since its last above-threshold output, both in ms. `working_for_ms` is
+/// `None` when the pane is idle. Combined with agent detection into the
+/// `PaneActivity` command payload in U4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneActivitySnapshot {
+    pub working_for_ms: Option<u64>,
+    pub last_output_ago_ms: Option<u64>,
+}
+
 /// Raw PTY output sink. The read thread calls this for each chunk of bytes.
 /// U3 wires a `tauri::ipc::Channel`; tests wire an mpsc sender.
 pub type OutputSink = Box<dyn FnMut(&[u8]) + Send>;
@@ -192,6 +202,13 @@ impl PtyManager {
         self.foreground_pid(id).and_then(crate::cwd::proc_cwd)
     }
 
+    /// The pane's output-activity snapshot (U3): work stretch + last-output age.
+    /// Reads only atomics, so it is safe under the registry lock. `None` if the
+    /// pane is gone.
+    pub fn pane_activity(&self, id: PaneId) -> Option<PaneActivitySnapshot> {
+        self.panes.lock().unwrap().get(&id).map(|p| p.activity())
+    }
+
     /// Whether the pane's foreground process is a Claude Code agent (KTD-D, U2).
     /// Resolves the foreground pid first — which drops the registry lock — then
     /// reads `/proc` and runs the pure matcher outside any lock, the same
@@ -297,4 +314,19 @@ pub fn pane_cwd(
     pane_id: PaneId,
 ) -> Option<String> {
     manager.cwd(pane_id).map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accessors_on_unknown_pane_are_graceful() {
+        // A stale id from a closed pane resolves to "gone", never a panic (U3/U4).
+        let m = PtyManager::new();
+        let ghost = PaneId(999);
+        assert_eq!(m.pane_activity(ghost), None);
+        assert!(!m.is_agent(ghost));
+        assert_eq!(m.lifecycle(ghost), None);
+    }
 }
