@@ -218,7 +218,20 @@ pub fn run() {
                         notify::play_sound(name);
                     }
                 }
-                // U19 runs the opt-in notification command here on actions.command.
+                // Opt-in notification command, gated on the *fired* banner
+                // (rides MIN_INTERVAL_MS) — non-blocking, sanitized, env-isolated
+                // (KTD17/U19). Title/body come from the hook; subtitle is the
+                // reason's default label.
+                if actions.command {
+                    if let Some(cmd) = config.notification_command.as_deref() {
+                        notify::command::run(
+                            cmd,
+                            banner_title,
+                            notify::reason_subtitle(reason),
+                            banner_body,
+                        );
+                    }
+                }
             });
             let server = HookServer::start(hook_socket_path(), tokens_for_hooks, dispatch)
                 .map_err(|e| format!("failed to start hook server: {e}"))?;

@@ -11,6 +11,8 @@
 //! concrete set of actions — so a foregrounded user can still hear a hidden
 //! pane raise even when no banner shows.
 
+pub mod command;
+
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -19,6 +21,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
+use crate::state::attention::Reason;
 use crate::state::policy::Effects;
 
 const TITLE_CAP: usize = 120;
@@ -67,6 +70,17 @@ pub fn banner(app: &AppHandle, title: &str, body: &str) {
         .show();
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
+    }
+}
+
+/// A human-readable subtitle for a reason, used as `FLY_NOTIFICATION_SUBTITLE`
+/// for the notification command (the reason's default title — KTD17/U19).
+pub fn reason_subtitle(reason: Reason) -> &'static str {
+    match reason {
+        Reason::Question => "An agent is waiting for you",
+        Reason::Permission => "An agent needs permission",
+        Reason::Finished => "An agent finished",
+        Reason::Error => "An agent hit an error",
     }
 }
 
