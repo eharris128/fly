@@ -101,16 +101,22 @@ pub fn run() {
     apply_linux_webview_env();
 
     let config = Arc::new(ConfigStore::load(config::default_path()));
+    // Immutable snapshot of settings (no runtime config reload in v1). The
+    // dispatch closure needs notification settings after `.manage(config)`
+    // consumes the Arc, so it captures this instead.
+    let cfg = config.get();
     let pty_manager = Arc::new(PtyManager::new());
     let tokens = Arc::new(TokenRegistry::new());
-    let attention = Arc::new(AttentionManager::new(config.get().attention_debounce_ms));
-    let gate = Arc::new(NotificationGate::new(
-        config.get().notification_coalesce_threshold,
+    let attention = Arc::new(AttentionManager::new(
+        cfg.attention_debounce_ms,
+        cfg.notifications_muted_default,
     ));
+    let gate = Arc::new(NotificationGate::new(cfg.notification_coalesce_threshold));
 
     // Clones for the hook server's dispatch (the originals are managed below).
     let tokens_for_hooks = Arc::clone(&tokens);
     let attention_for_hooks = Arc::clone(&attention);
+    let config_for_hooks = cfg;
 
     tauri::Builder::default()
         // single-instance must be registered first; a second launch focuses
@@ -143,30 +149,76 @@ pub fn run() {
             let handle = app.handle().clone();
             let attention = attention_for_hooks;
             let gate = gate;
+            let config = config_for_hooks;
+            // The per-effect dispatch (U18): decouple the in-app ring, the
+            // history record, the desktop banner, and the chime — each decided
+            // independently by the policy (KTD14), not fused behind one boolean.
             let dispatch: Dispatch = Arc::new(move |pane, hook: ValidatedHook| {
+                let reason = hook.reason;
                 let signal = Signal {
-                    reason: hook.reason,
+                    reason,
                     tier: Tier::Hook,
                 };
-                if let Some(outcome) = attention.signal(pane, signal) {
-                    stream::emit_attention(&handle, pane, &outcome);
-                    if outcome.notify {
-                        let title = hook.title.as_deref().unwrap_or("fly: an agent needs you");
-                        let body = hook.body.as_deref().unwrap_or("");
-                        // Coalesce when many panes are raised; rate-limit bursts.
-                        match gate.decide(attention.raised_count(), title, body, gate.now_ms()) {
-                            Surfaced::Individual { title, body } => {
-                                notify::surface(&handle, &title, &body)
-                            }
-                            Surfaced::Coalesced { count } => notify::surface(
-                                &handle,
-                                "fly",
-                                &format!("{count} agents need attention"),
-                            ),
-                            Surfaced::Suppressed => {}
+                let Some(outcome) = attention.signal(pane, signal) else {
+                    return;
+                };
+                stream::emit_attention(&handle, pane, &outcome);
+                // Only a fresh (non-debounced) raise surfaces; duplicates drop.
+                if !outcome.recordable {
+                    return;
+                }
+
+                let reason_effects = config.reason_effects.for_reason(reason);
+                let Some(decision) = attention.decide(pane, reason_effects) else {
+                    return;
+                };
+                let effects = decision.effects;
+
+                // History is decoupled from the banner gate (KTD16): record
+                // every fresh raise — even a coalesced or rate-limited one —
+                // carrying the read-at-birth bit. Text sanitized (R16/R24).
+                if effects.record {
+                    stream::emit_notification_added(
+                        &handle,
+                        gate.next_id(),
+                        pane,
+                        reason,
+                        hook.title.as_deref().map(notify::sanitize_title),
+                        hook.body.as_deref().map(notify::sanitize_body),
+                        notify::now_unix_ms(),
+                        decision.read,
+                    );
+                }
+
+                // Desktop banner: away-only, coalesced + rate-limited. Consult
+                // the gate only when the desktop effect is on, so a suppressed
+                // banner doesn't burn a rate-limit slot.
+                let banner_title = hook.title.as_deref().unwrap_or("fly: an agent needs you");
+                let banner_body = hook.body.as_deref().unwrap_or("");
+                let gate_verdict = if effects.desktop {
+                    gate.decide(attention.raised_count(), banner_title, banner_body, gate.now_ms())
+                } else {
+                    Surfaced::Suppressed
+                };
+                let actions = notify::surface_actions(effects, &gate_verdict);
+                if actions.banner {
+                    match &gate_verdict {
+                        Surfaced::Individual { title, body } => notify::banner(&handle, title, body),
+                        Surfaced::Coalesced { count } => {
+                            notify::banner(&handle, "fly", &format!("{count} agents need attention"))
                         }
+                        Surfaced::Suppressed => {}
                     }
                 }
+                // Chime follows effects.sound, independent of the banner: a
+                // foregrounded user still hears a hidden pane raise (the
+                // resolved audible-cue decision).
+                if effects.sound {
+                    if let Some(name) = config.notification_sound.as_deref() {
+                        notify::play_sound(name);
+                    }
+                }
+                // U19 runs the opt-in notification command here on actions.command.
             });
             let server = HookServer::start(hook_socket_path(), tokens_for_hooks, dispatch)
                 .map_err(|e| format!("failed to start hook server: {e}"))?;
@@ -177,8 +229,12 @@ pub fn run() {
             frontend_log,
             config::get_config,
             stream::spawn_pane,
-            stream::set_pane_focus,
+            stream::set_visible_panes,
             stream::set_window_foreground,
+            stream::set_panel_open,
+            stream::set_muted,
+            stream::set_workspace_muted,
+            stream::set_pane_workspace,
             pty::pty_write,
             pty::pty_resize,
             pty::close_pane,

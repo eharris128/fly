@@ -1,6 +1,8 @@
-//! U7 attention state machine + suppression matrix (R8, R12). Pure logic, so
-//! these are deterministic (time is passed in). Lifecycle transitions are
-//! exercised end-to-end in `pty_lifecycle.rs`.
+//! U7/U17 attention state machine (R8, R12). Pure logic, so these are
+//! deterministic (time is passed in). The machine now decides only the in-app
+//! ring + whether a raise is recordable; the desktop/sound/record *effects* are
+//! the policy's job (unit-tested in `state::policy` / `state::manager`).
+//! Lifecycle transitions are exercised end-to-end in `pty_lifecycle.rs`.
 
 use fly_lib::state::attention::{AttentionMachine, AttentionState, Reason, Signal, Tier};
 use fly_lib::state::lifecycle::LifecycleState;
@@ -17,16 +19,17 @@ fn hook(reason: Reason) -> Signal {
 #[test]
 fn full_cycle_idle_raised_acknowledged_idle() {
     let mut m = AttentionMachine::new(DEBOUNCE);
-    // Unfocused signal raises and notifies.
+    // A raise the user isn't looking at rings and is recordable.
     let o = m.signal(hook(Reason::Permission), 1000);
     assert_eq!(o.state, AttentionState::Raised);
-    assert!(o.notify);
+    assert!(o.recordable);
 
-    // Focusing the pane (and foregrounding the window) acknowledges it.
+    // Making the pane visible + foregrounding the window acknowledges it; a
+    // visibility change records nothing.
     m.set_foreground(true);
-    let o = m.set_focus(true);
+    let o = m.set_visible(true);
     assert_eq!(o.state, AttentionState::Acknowledged);
-    assert!(!o.notify);
+    assert!(!o.recordable);
 
     // Input clears to Idle (stage two).
     let o = m.on_input();
@@ -34,59 +37,61 @@ fn full_cycle_idle_raised_acknowledged_idle() {
 }
 
 #[test]
-fn signal_while_focused_and_foregrounded_acknowledges_without_notifying() {
+fn signal_while_visible_and_foregrounded_acknowledges_but_records() {
+    // The U17 decoupling: looking decides the ring (Acknowledged — no ring), but
+    // the raise is still recordable (the policy records it read).
     let mut m = AttentionMachine::new(DEBOUNCE);
-    m.set_focus(true);
+    m.set_visible(true);
     m.set_foreground(true);
     let o = m.signal(hook(Reason::Question), 1000);
     assert_eq!(o.state, AttentionState::Acknowledged);
-    assert!(!o.notify, "user is already looking → suppress");
+    assert!(o.recordable, "a visible raise still records (read at birth)");
 }
 
 #[test]
-fn suppression_matrix_all_quadrants() {
+fn ring_state_across_visibility_quadrants() {
+    // The machine rings (Raised) unless the user is looking (visible AND
+    // foregrounded), in which case it acknowledges. Every fresh raise records.
     let cases = [
-        (true, true, false), // focused + foreground → suppress
-        (true, false, true), // focused, backgrounded → notify
-        (false, true, true), // unfocused, foreground → notify
-        (false, false, true), // neither → notify
+        (true, true, AttentionState::Acknowledged), // looking → no ring
+        (true, false, AttentionState::Raised),      // visible tab, window backgrounded
+        (false, true, AttentionState::Raised),      // hidden pane, foregrounded
+        (false, false, AttentionState::Raised),     // neither
     ];
-    for (focused, fg, expect_notify) in cases {
+    for (visible, fg, expect) in cases {
         let mut m = AttentionMachine::new(DEBOUNCE);
-        m.set_focus(focused);
+        m.set_visible(visible);
         m.set_foreground(fg);
         let o = m.signal(hook(Reason::Error), 1000);
-        assert_eq!(
-            o.notify, expect_notify,
-            "focused={focused} fg={fg} should notify={expect_notify}"
-        );
+        assert_eq!(o.state, expect, "visible={visible} fg={fg}");
+        assert!(o.recordable, "a fresh raise is always recordable");
     }
 }
 
 #[test]
-fn rapid_duplicates_coalesce_to_one_notification() {
+fn rapid_duplicates_coalesce_to_one_record() {
     let mut m = AttentionMachine::new(DEBOUNCE);
-    assert!(m.signal(hook(Reason::Permission), 1000).notify);
-    // Within the debounce window: coalesced, no re-notify.
-    assert!(!m.signal(hook(Reason::Permission), 1100).notify);
-    assert!(!m.signal(hook(Reason::Permission), 1399).notify);
-    // Past the window: notifies again.
-    assert!(m.signal(hook(Reason::Permission), 1500).notify);
+    assert!(m.signal(hook(Reason::Permission), 1000).recordable);
+    // Within the debounce window: coalesced, not re-recorded.
+    assert!(!m.signal(hook(Reason::Permission), 1100).recordable);
+    assert!(!m.signal(hook(Reason::Permission), 1399).recordable);
+    // Past the window: records again.
+    assert!(m.signal(hook(Reason::Permission), 1500).recordable);
 }
 
 #[test]
-fn answer_then_new_signal_renotifies() {
+fn answer_then_new_signal_re_records() {
     let mut m = AttentionMachine::new(DEBOUNCE);
-    m.signal(hook(Reason::Question), 1000); // Raised + notify
-    m.set_focus(true);
+    m.signal(hook(Reason::Question), 1000); // Raised + recordable
+    m.set_visible(true);
     m.set_foreground(true); // → Acknowledged, debounce reset
     assert_eq!(m.state(), AttentionState::Acknowledged);
 
-    // User looks away, then a genuine follow-up arrives → re-notify.
-    m.set_focus(false);
+    // User looks away, then a genuine follow-up arrives → rings + records.
+    m.set_visible(false);
     let o = m.signal(hook(Reason::Permission), 1200);
     assert_eq!(o.state, AttentionState::Raised);
-    assert!(o.notify, "a new signal after acknowledge is not a duplicate");
+    assert!(o.recordable, "a new signal after acknowledge is not a duplicate");
 }
 
 #[test]
@@ -99,30 +104,33 @@ fn process_exit_forces_idle() {
 }
 
 #[test]
-fn focus_change_reevaluates_already_raised_pane() {
+fn visibility_change_reevaluates_already_raised_pane() {
     let mut m = AttentionMachine::new(DEBOUNCE);
     // Raised while not looking.
     m.signal(hook(Reason::Permission), 1000);
     assert_eq!(m.state(), AttentionState::Raised);
 
-    // Foreground alone (pane still unfocused) does not acknowledge.
+    // Foreground alone (pane still hidden) does not acknowledge.
     m.set_foreground(true);
     assert_eq!(m.state(), AttentionState::Raised);
 
-    // Focus arrives → acknowledged via the authoritative tuple.
-    let o = m.set_focus(true);
+    // Visibility arrives → acknowledged via the authoritative tuple.
+    let o = m.set_visible(true);
     assert_eq!(o.state, AttentionState::Acknowledged);
 }
 
 #[test]
-fn signal_uses_backend_authoritative_focus_tuple() {
-    // A signal racing a focus switch reads the tuple the backend holds, not a
-    // value carried on the signal.
+fn signal_uses_backend_authoritative_visibility_tuple() {
+    // A signal racing a visibility switch reads the tuple the backend holds, not
+    // a value carried on the signal: the backend believes the user is looking,
+    // so it acknowledges (no ring) rather than raising.
     let mut m = AttentionMachine::new(DEBOUNCE);
-    m.set_focus(true);
+    m.set_visible(true);
     m.set_foreground(true);
-    // Backend believes the user is looking → suppress despite the signal.
-    assert!(!m.signal(hook(Reason::Question), 1000).notify);
+    assert_eq!(
+        m.signal(hook(Reason::Question), 1000).state,
+        AttentionState::Acknowledged
+    );
 }
 
 #[test]

@@ -19,6 +19,7 @@ use crate::state::AttentionManager;
 
 pub const PANE_EXIT_EVENT: &str = "pane://exit";
 pub const PANE_ATTENTION_EVENT: &str = "pane://attention";
+pub const NOTIFICATION_ADDED_EVENT: &str = "notification://added";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +46,49 @@ pub fn emit_attention(app: &AppHandle, pane: PaneId, outcome: &Outcome) {
             state: outcome.state,
             reason: outcome.reason,
             tier: outcome.tier,
+        },
+    );
+}
+
+/// The seed event for one recorded notification (KTD16): the backend is the
+/// policy authority and emits this when policy says `record`; the frontend owns
+/// the read/unread/cleared lifecycle and resolves `paneId → leafKey`. `read` is
+/// the backend-authored read-at-birth bit (the user was viewing the pane).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationAddedEvent {
+    id: u64,
+    pane_id: u64,
+    reason: Reason,
+    title: Option<String>,
+    body: Option<String>,
+    ts: u64,
+    read: bool,
+}
+
+/// Emit a recorded notification to the frontend. Title/body are already
+/// sanitized (R16/R24) by the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_notification_added(
+    app: &AppHandle,
+    id: u64,
+    pane: PaneId,
+    reason: Reason,
+    title: Option<String>,
+    body: Option<String>,
+    ts: u64,
+    read: bool,
+) {
+    let _ = app.emit(
+        NOTIFICATION_ADDED_EVENT,
+        NotificationAddedEvent {
+            id,
+            pane_id: pane.0,
+            reason,
+            title,
+            body,
+            ts,
+            read,
         },
     );
 }
@@ -110,15 +154,16 @@ pub fn spawn_pane(
     pty.spawn_with_id(id, cfg, token, sink, on_exit)
 }
 
-/// Replicate a pane's keyboard focus to the backend (KTD8).
+/// Replicate the set of visible panes — the active tab's leaves in the active
+/// workspace (U17). Generalizes the old per-pane keyboard-focus replication:
+/// any visible pane counts as "looking" for the Acknowledged transition.
 #[tauri::command]
-pub fn set_pane_focus(
+pub fn set_visible_panes(
     app: AppHandle,
     attention: State<'_, Arc<AttentionManager>>,
-    pane_id: PaneId,
-    focused: bool,
+    pane_ids: Vec<PaneId>,
 ) {
-    for (pane, outcome) in attention.set_focus(pane_id, focused) {
+    for (pane, outcome) in attention.set_visible_panes(&pane_ids) {
         emit_attention(&app, pane, &outcome);
     }
 }
@@ -133,4 +178,38 @@ pub fn set_window_foreground(
     for (pane, outcome) in attention.set_foreground(foregrounded) {
         emit_attention(&app, pane, &outcome);
     }
+}
+
+/// Replicate whether the notification panel is open (a desktop/sound suppressor
+/// while foregrounded — KTD15). Affects only the policy, not attention state.
+#[tauri::command]
+pub fn set_panel_open(attention: State<'_, Arc<AttentionManager>>, open: bool) {
+    attention.set_panel_open(open);
+}
+
+/// Toggle global do-not-disturb (R17).
+#[tauri::command]
+pub fn set_muted(attention: State<'_, Arc<AttentionManager>>, muted: bool) {
+    attention.set_muted(muted);
+}
+
+/// Mute or unmute a single workspace (R18), scoped via the pane→workspace map.
+#[tauri::command]
+pub fn set_workspace_muted(
+    attention: State<'_, Arc<AttentionManager>>,
+    workspace: String,
+    muted: bool,
+) {
+    attention.set_workspace_muted(workspace, muted);
+}
+
+/// Record which workspace a pane belongs to, for per-workspace mute scoping.
+/// Pushed by the frontend once the pane's id is known (U17).
+#[tauri::command]
+pub fn set_pane_workspace(
+    attention: State<'_, Arc<AttentionManager>>,
+    pane_id: PaneId,
+    workspace: String,
+) {
+    attention.set_pane_workspace(pane_id, workspace);
 }

@@ -32,6 +32,8 @@
   } from "./lib/workspaces";
   import {
     setWindowForeground,
+    setVisiblePanes,
+    setPaneWorkspace,
     paneCwd,
     type PaneId,
     type AttentionState,
@@ -108,6 +110,13 @@
     workspaces.flatMap((w) =>
       w.tabs.flatMap((t) => leaves(t.tree).map((l) => ({ tabId: t.id, key: l.key }))),
     ),
+  );
+  // The visible panes = the active tab's leaves in the active workspace, pushed
+  // to the backend so a raise on any visible pane acknowledges in-app — the
+  // attention-suppression "looking" input, generalized from keyboard focus to
+  // tab visibility (U17).
+  const visibleLeafKeys = $derived(
+    activeTab ? leaves(activeTab.tree).map((l) => l.key) : [],
   );
   // View model for the sidebar: names resolved, attention rolled up per tab and
   // per workspace so a collapsed workspace still surfaces a raised agent.
@@ -396,8 +405,29 @@
   function onAttention(key: string, state: AttentionState, _reason: AttentionReason | null) {
     attentionByLeaf = { ...attentionByLeaf, [key]: state };
   }
+  // Push the visible-pane ids (active tab's leaves) to the backend. Reads the
+  // non-reactive paneIdByLeaf, so onSpawned must re-call it as ids arrive.
+  function pushVisiblePanes() {
+    const ids = visibleLeafKeys
+      .map((k) => paneIdByLeaf[k])
+      .filter((id): id is PaneId => id != null);
+    void setVisiblePanes(ids);
+  }
+  function workspaceIdForLeaf(key: string): string | null {
+    for (const w of workspaces)
+      for (const t of w.tabs)
+        if (leaves(t.tree).some((l) => l.key === key)) return w.id;
+    return null;
+  }
   function onSpawned(key: string, paneId: PaneId) {
     paneIdByLeaf[key] = paneId;
+    // paneIdByLeaf isn't $state, so the visible-set $effect won't re-fire on a
+    // late-arriving paneId (async spawn) — re-push so a freshly-spawned visible
+    // pane is included (else it would transiently over-banner a looked-at pane).
+    pushVisiblePanes();
+    // Register the pane's workspace so a per-workspace mute can scope to it.
+    const wsId = workspaceIdForLeaf(key);
+    if (wsId) void setPaneWorkspace(paneId, wsId);
   }
 
   function startDrag(d: DividerRect, ev: PointerEvent) {
@@ -481,6 +511,15 @@
     if (!ready) return;
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => void persist(), 800);
+  });
+
+  // Replicate the visible-pane set whenever it changes (tab/workspace switch,
+  // split, close). Late-arriving paneIds on spawn are covered by onSpawned's
+  // re-push (visibleLeafKeys is reactive; paneIdByLeaf is not).
+  $effect(() => {
+    void visibleLeafKeys;
+    if (!ready) return;
+    pushVisiblePanes();
   });
 
   // The single action map shared by the keymap and the palette. Both render

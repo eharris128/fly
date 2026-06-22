@@ -16,7 +16,6 @@
     closePane,
     ptyPause,
     ptyResume,
-    setPaneFocus,
     makeOutputChannel,
     loadScrollback,
     saveScrollback as persistScrollback,
@@ -96,11 +95,11 @@
     }
   }
 
-  // When this pane becomes the focused leaf, focus xterm and tell the backend.
+  // When this pane becomes the focused leaf, focus xterm. The backend learns
+  // "looking" from the visible-pane set App pushes (U17), not per-pane focus.
   $effect(() => {
-    if (focused && term && paneId !== null) {
+    if (focused && term) {
       term.focus();
-      void setPaneFocus(paneId, document.hasFocus());
     }
   });
 
@@ -210,7 +209,6 @@
     );
 
     if (focused) {
-      void setPaneFocus(paneId, document.hasFocus());
       term.focus();
     }
   });

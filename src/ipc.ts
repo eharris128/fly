@@ -34,14 +34,44 @@ export interface AttentionEvent {
   tier: AttentionTier | null;
 }
 
-/** Replicate a pane's keyboard focus to the backend (KTD8). */
-export function setPaneFocus(paneId: PaneId, focused: boolean): Promise<void> {
-  return invoke("set_pane_focus", { paneId, focused });
+/**
+ * Replicate the set of visible panes — the active tab's leaves in the active
+ * workspace (U17). Generalizes the old per-pane keyboard-focus replication: any
+ * visible pane counts as "looking" for the Acknowledged transition.
+ */
+export function setVisiblePanes(paneIds: PaneId[]): Promise<void> {
+  return invoke("set_visible_panes", { paneIds });
 }
 
 /** Replicate the window foreground state to the backend (KTD8). */
 export function setWindowForeground(foregrounded: boolean): Promise<void> {
   return invoke("set_window_foreground", { foregrounded });
+}
+
+/** Replicate whether the notification panel is open (desktop suppressor, KTD15). */
+export function setPanelOpen(open: boolean): Promise<void> {
+  return invoke("set_panel_open", { open });
+}
+
+/** Toggle global do-not-disturb (R17). */
+export function setMuted(muted: boolean): Promise<void> {
+  return invoke("set_muted", { muted });
+}
+
+/** Mute or unmute a single workspace (R18). */
+export function setWorkspaceMuted(
+  workspace: string,
+  muted: boolean,
+): Promise<void> {
+  return invoke("set_workspace_muted", { workspace, muted });
+}
+
+/** Tell the backend which workspace a pane belongs to, for mute scoping (U17). */
+export function setPaneWorkspace(
+  paneId: PaneId,
+  workspace: string,
+): Promise<void> {
+  return invoke("set_pane_workspace", { paneId, workspace });
 }
 
 /**
