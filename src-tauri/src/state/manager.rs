@@ -327,6 +327,18 @@ mod tests {
     }
 
     #[test]
+    fn decide_defaults_unregistered_workspace_to_unmuted() {
+        // A hook can raise in the window between pane registration and the
+        // frontend's set_pane_workspace push (onSpawned). With no workspace
+        // entry, the pane is treated as not workspace-muted (it banners), not
+        // dropped — the accepted spawn-race default.
+        let m = mgr(); // registers PANE, never calls set_pane_workspace
+        m.signal(PANE, hook(Reason::Permission)); // backgrounded raise
+        let dec = m.decide(PANE, ReasonEffects::default()).unwrap();
+        assert!(dec.effects.desktop, "unregistered workspace is not muted");
+    }
+
+    #[test]
     fn visible_set_membership_drives_looking() {
         let m = AttentionManager::new(DEBOUNCE, false);
         let a = PaneId(1);

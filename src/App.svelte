@@ -412,8 +412,12 @@
     void setPanelOpen(open);
   }
   function openNotifications() {
+    // Re-invoking toggles the panel closed — reachable via the control-bar bell
+    // button (onOpenNotifications). `leader n` only ever opens: while the panel
+    // holds DOM focus the window keydown handler bails, so the chord can't reach
+    // here. Esc / backdrop / the bell button close it (same as the palette).
     if (notificationPanelOpen) {
-      closeNotifications(); // leader n toggles
+      closeNotifications();
       return;
     }
     pendingConfirm = null;

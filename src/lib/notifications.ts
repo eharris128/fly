@@ -64,12 +64,19 @@ export function addNotification(
   ];
 }
 
-/** Mark specific entries (by id) read — e.g. a click in the panel. */
+/** Mark specific entries (by id) read — e.g. a click in the panel. Returns the
+ *  original array unchanged when nothing flips, to avoid spurious reactivity. */
 export function markRead(list: Notification[], ids: number[]): Notification[] {
   const set = new Set(ids);
-  return list.map((n) =>
-    set.has(n.id) && n.state === "unread" ? { ...n, state: "read" } : n,
-  );
+  let changed = false;
+  const next = list.map((n) => {
+    if (set.has(n.id) && n.state === "unread") {
+      changed = true;
+      return { ...n, state: "read" as const };
+    }
+    return n;
+  });
+  return changed ? next : list;
 }
 
 /**
@@ -82,20 +89,35 @@ export function markReadForLeaves(
   leafKeys: Iterable<string>,
 ): Notification[] {
   const set = new Set(leafKeys);
-  return list.map((n) =>
-    set.has(n.leafKey) && n.state === "unread" ? { ...n, state: "read" } : n,
-  );
+  let changed = false;
+  const next = list.map((n) => {
+    if (set.has(n.leafKey) && n.state === "unread") {
+      changed = true;
+      return { ...n, state: "read" as const };
+    }
+    return n;
+  });
+  return changed ? next : list;
 }
 
 /** Mark all unread entries read ("mark all read" panel action). */
 export function markAllRead(list: Notification[]): Notification[] {
-  return list.map((n) => (n.state === "unread" ? { ...n, state: "read" } : n));
+  let changed = false;
+  const next = list.map((n) => {
+    if (n.state === "unread") {
+      changed = true;
+      return { ...n, state: "read" as const };
+    }
+    return n;
+  });
+  return changed ? next : list;
 }
 
 /** Clear specific entries (by id) — removed from the list and from disk. */
 export function clear(list: Notification[], ids: number[]): Notification[] {
   const set = new Set(ids);
-  return list.filter((n) => !set.has(n.id));
+  const next = list.filter((n) => !set.has(n.id));
+  return next.length === list.length ? list : next;
 }
 
 /** Clear the whole history. */
