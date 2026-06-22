@@ -316,6 +316,41 @@ pub fn pane_cwd(
     manager.cwd(pane_id).map(|p| p.to_string_lossy().into_owned())
 }
 
+/// The agent dashboard payload for one pane (U4): whether it is a Claude Code
+/// agent, plus its current work stretch and last-output age. `working_for_ms`
+/// is `None` when the pane is idle or not an agent. Polled per pane while the
+/// dashboard is open (KTD-C).
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneActivity {
+    pub is_agent: bool,
+    pub working_for_ms: Option<u64>,
+    pub last_output_ago_ms: Option<u64>,
+}
+
+/// Per-pane agent state for the dashboard poll. Composes `/proc` agent detection
+/// (U2) with the output-activity snapshot (U3). A non-agent or gone pane reports
+/// `is_agent: false` with null timings — never a panic.
+#[tauri::command]
+pub fn pane_activity(
+    manager: tauri::State<'_, Arc<PtyManager>>,
+    pane_id: PaneId,
+) -> PaneActivity {
+    if !manager.is_agent(pane_id) {
+        return PaneActivity {
+            is_agent: false,
+            working_for_ms: None,
+            last_output_ago_ms: None,
+        };
+    }
+    let snap = manager.pane_activity(pane_id);
+    PaneActivity {
+        is_agent: true,
+        working_for_ms: snap.and_then(|s| s.working_for_ms),
+        last_output_ago_ms: snap.and_then(|s| s.last_output_ago_ms),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

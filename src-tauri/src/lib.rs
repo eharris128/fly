@@ -254,6 +254,7 @@ pub fn run() {
             pty::pty_pause,
             pty::pty_resume,
             pty::pane_cwd,
+            pty::pane_activity,
             session::save_session,
             session::load_session,
             session::save_scrollback,

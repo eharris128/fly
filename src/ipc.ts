@@ -158,6 +158,22 @@ export function paneCwd(paneId: PaneId): Promise<string | null> {
   return invoke<string | null>("pane_cwd", { paneId });
 }
 
+/**
+ * Per-pane agent state for the dashboard (U4): whether the pane runs a Claude
+ * Code agent, its current work stretch (ms; null when idle/not an agent), and
+ * how long since its last above-threshold output (ms).
+ */
+export interface PaneActivity {
+  isAgent: boolean;
+  workingForMs: number | null;
+  lastOutputAgoMs: number | null;
+}
+
+/** Poll a pane's agent/work-stretch state (U4). */
+export function paneActivity(paneId: PaneId): Promise<PaneActivity> {
+  return invoke<PaneActivity>("pane_activity", { paneId });
+}
+
 export function saveScrollback(paneKey: string, data: string): Promise<void> {
   return invoke("save_scrollback", { paneKey, data });
 }
