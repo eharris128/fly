@@ -51,6 +51,10 @@ pub struct SpawnConfig {
     pub cwd: Option<String>,
     /// Extra environment entries (e.g. `FLY_PANE_TOKEN`, `FLY_SOCKET_PATH`).
     pub env: Vec<(String, String)>,
+    /// The frontend's stable leaf key for this pane (U3) — the restart-stable
+    /// per-pane identity resume records are keyed by. `None` in tests/headless
+    /// spawns that don't carry one.
+    pub leaf_key: Option<String>,
     pub rows: u16,
     pub cols: u16,
 }
@@ -62,6 +66,7 @@ impl Default for SpawnConfig {
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
+            leaf_key: None,
             rows: 24,
             cols: 80,
         }
@@ -186,6 +191,16 @@ impl PtyManager {
             .unwrap()
             .get(&id)
             .map(|p| p.token().to_string())
+    }
+
+    /// The pane's stable frontend leaf key (U3), used by the hook dispatch to key
+    /// the pane's resume record. `None` if the pane is gone or carried no key.
+    pub fn leaf_key(&self, id: PaneId) -> Option<String> {
+        self.panes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|p| p.leaf_key().map(str::to_string))
     }
 
     /// The pane's foreground pid, for `/proc`-based cwd tracking (U10).

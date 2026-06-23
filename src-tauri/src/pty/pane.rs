@@ -154,6 +154,9 @@ pub struct Pane {
     /// Per-pane auth token for the hook channel (U8); registered before the
     /// child starts so no callback can race registration.
     token: String,
+    /// The frontend's stable leaf key (U3), so the hook dispatch can key this
+    /// pane's resume record. `None` for headless/test spawns.
+    leaf_key: Option<String>,
 }
 
 impl Pane {
@@ -168,6 +171,7 @@ impl Pane {
         sink: OutputSink,
         on_exit: ExitCallback,
     ) -> Result<Pane, String> {
+        let leaf_key = cfg.leaf_key.clone();
         let pty_system = native_pty_system();
         let size = PtySize {
             rows: cfg.rows.max(1),
@@ -259,6 +263,7 @@ impl Pane {
             reaped_rx,
             reader_handle: Some(handle),
             token,
+            leaf_key,
         })
     }
 
@@ -300,6 +305,11 @@ impl Pane {
     /// The pane's auth token (U8).
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// The pane's stable frontend leaf key (U3), if it carried one.
+    pub fn leaf_key(&self) -> Option<&str> {
+        self.leaf_key.as_deref()
     }
 
     /// The foreground process group leader pid, used by U10 for `/proc`-based

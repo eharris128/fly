@@ -8,6 +8,8 @@ export interface SpawnOpts {
   rows: number;
   cols: number;
   cwd?: string | null;
+  /** Stable leaf key, so the backend can key this pane's resume record (U3). */
+  leafKey: string;
 }
 
 /** Lifecycle state as serialized by the Rust `LifecycleState` enum. */
@@ -124,6 +126,7 @@ export function spawnPane(
     rows: opts.rows,
     cols: opts.cols,
     cwd: opts.cwd ?? null,
+    leafKey: opts.leafKey,
   });
 }
 

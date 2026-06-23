@@ -116,6 +116,8 @@ pub fn run() {
     // Clones for the hook server's dispatch (the originals are managed below).
     let tokens_for_hooks = Arc::clone(&tokens);
     let attention_for_hooks = Arc::clone(&attention);
+    // The dispatch resolves PaneId → leaf_key to key resume records (U3).
+    let pty_for_hooks = Arc::clone(&pty_manager);
     let config_for_hooks = cfg;
 
     tauri::Builder::default()
@@ -150,10 +152,31 @@ pub fn run() {
             let attention = attention_for_hooks;
             let gate = gate;
             let config = config_for_hooks;
+            let pty = pty_for_hooks;
             // The per-effect dispatch (U18): decouple the in-app ring, the
             // history record, the desktop banner, and the chime — each decided
             // independently by the policy (KTD14), not fused behind one boolean.
             let dispatch: Dispatch = Arc::new(move |pane, hook: ValidatedHook| {
+                // Resume capture (U3, KTD-A): a session_id-bearing hook upserts the
+                // pane's resume record (id + the payload's project cwd, KTD-H),
+                // keyed by its stable leaf key. Backend-owned, so it survives a
+                // renderer crash; write-through, so it survives an unclean kill.
+                // Done before the attention gate so a debounced/suppressed raise
+                // still captures. Best-effort — a write error never blocks the UI.
+                if let Some(session_id) = hook.session_id.clone() {
+                    if let Some(leaf_key) = pty.leaf_key(pane) {
+                        let _ = session::resume::upsert_at(
+                            &session::resume::resume_path(),
+                            &leaf_key,
+                            session::resume::ResumePartial {
+                                session_id: Some(session_id),
+                                session_cwd: hook.cwd.clone(),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+
                 let reason = hook.reason;
                 let signal = Signal {
                     reason,

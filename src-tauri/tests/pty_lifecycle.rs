@@ -222,3 +222,19 @@ fn spawn_failure_is_reported() {
     let res = mgr.spawn(cfg, "tok".into(), sink, Box::new(|_, _| {}));
     assert!(res.is_err(), "spawning a missing shell should fail");
 }
+
+#[test]
+fn leaf_key_is_stored_and_returned_by_the_accessor() {
+    // U3: the pane carries its frontend leaf key so the hook dispatch can key the
+    // pane's resume record; a stale/ghost id resolves to None, never a panic.
+    let mgr = PtyManager::new();
+    let (sink, _rx) = channel_sink();
+    let cfg = SpawnConfig {
+        leaf_key: Some("leaf-42".into()),
+        ..bash()
+    };
+    let id = mgr.spawn(cfg, "tok".into(), sink, Box::new(|_, _| {})).unwrap();
+    assert_eq!(mgr.leaf_key(id).as_deref(), Some("leaf-42"));
+    assert_eq!(mgr.leaf_key(PaneId(9999)), None);
+    mgr.close(id).unwrap();
+}

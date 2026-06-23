@@ -171,7 +171,7 @@
 
     const channel = makeOutputChannel(onOutput);
     // A missing/stale cwd falls back to $HOME (portable-pty filters non-dirs).
-    paneId = await spawnPane(channel, { rows, cols, cwd });
+    paneId = await spawnPane(channel, { rows, cols, cwd, leafKey });
     onSpawned?.(leafKey, paneId);
 
     term.onData((data) => {
