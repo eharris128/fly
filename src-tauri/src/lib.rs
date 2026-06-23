@@ -87,6 +87,50 @@ fn frontend_log(msg: String) {
     eprintln!("[fly-webview] {msg}");
 }
 
+/// How the app was launched (U7, KTD-B/G), read once by the frontend at restore.
+/// `resume` is an app *launch mode*, not a CLI subcommand: it falls through the
+/// `is_cli_subcommand` check and launches a window like a bare `fly`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LaunchMode {
+    /// Bare `fly` after a clean exit — fresh shells, inert scrollback (R1).
+    Normal,
+    /// Explicit `fly resume` — re-attach detected agents directly.
+    Resume,
+    /// The previous run crashed (clean-exit marker absent) — offer to resume,
+    /// never silently auto-run (KTD-G preserves KTD10's consent principle).
+    Offer,
+}
+
+/// The pure launch-mode decision (testable). Explicit `fly resume` always
+/// resumes; otherwise a missing marker (a prior crash) offers, and a present
+/// marker (a prior clean exit) is normal.
+fn decide_launch_mode(resume_requested: bool, prev_clean: bool) -> LaunchMode {
+    if resume_requested {
+        LaunchMode::Resume
+    } else if !prev_clean {
+        LaunchMode::Offer
+    } else {
+        LaunchMode::Normal
+    }
+}
+
+/// Resolve the launch mode from argv + the clean-exit marker, and **clear the
+/// marker** so an unclean exit of *this* run is detectable next launch (KTD-G).
+fn resolve_launch_mode(args: &[String]) -> LaunchMode {
+    let resume_requested = args.get(1).map(|s| s == "resume").unwrap_or(false);
+    let marker = session::resume::clean_exit_path();
+    let prev_clean = session::resume::took_clean_exit_at(&marker);
+    let _ = session::resume::set_clean_exit_at(&marker, false);
+    decide_launch_mode(resume_requested, prev_clean)
+}
+
+/// Command: the frontend reads how it was launched to decide whether to resume.
+#[tauri::command]
+fn get_launch_mode(mode: tauri::State<'_, LaunchMode>) -> LaunchMode {
+    *mode
+}
+
 /// Run the fly desktop application — or a `fly` CLI subcommand if argv selects
 /// one (KTD12).
 pub fn run() {
@@ -96,6 +140,10 @@ pub fn run() {
             std::process::exit(cli::run(&args));
         }
     }
+
+    // `resume` falls through here (it launches a window, not a CLI subcommand).
+    // Resolve the launch mode and clear the clean-exit marker up front (KTD-B/G).
+    let launch_mode = resolve_launch_mode(&args);
 
     #[cfg(target_os = "linux")]
     apply_linux_webview_env();
@@ -135,6 +183,7 @@ pub fn run() {
         .manage(pty_manager)
         .manage(tokens)
         .manage(attention)
+        .manage(launch_mode)
         .setup(move |app| {
             // A dev flavor (FLY_APP_NAME set) gets a distinct title so it's
             // obvious which window is the throwaway dev build next to a stable
@@ -263,6 +312,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             frontend_log,
+            get_launch_mode,
             config::get_config,
             stream::spawn_pane,
             stream::set_visible_panes,
@@ -294,4 +344,36 @@ pub fn run() {
                 lifecycle::shutdown(app_handle);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_resume_always_resumes() {
+        // `fly resume` resumes regardless of the marker (a clean prior exit too).
+        assert_eq!(decide_launch_mode(true, true), LaunchMode::Resume);
+        assert_eq!(decide_launch_mode(true, false), LaunchMode::Resume);
+    }
+
+    #[test]
+    fn clean_prior_exit_is_normal() {
+        // Bare `fly` after a clean shutdown (marker present) → fresh shells (R1).
+        assert_eq!(decide_launch_mode(false, true), LaunchMode::Normal);
+    }
+
+    #[test]
+    fn crashed_prior_run_offers_resume() {
+        // Bare `fly` with the marker absent (a prior crash) → offer (KTD-G, R9).
+        assert_eq!(decide_launch_mode(false, false), LaunchMode::Offer);
+    }
+
+    #[test]
+    fn resume_is_not_a_cli_subcommand() {
+        // `resume` falls through to a window launch, unlike notify/hooks (KTD-B).
+        assert!(!cli::is_cli_subcommand("resume"));
+        assert!(cli::is_cli_subcommand("notify"));
+        assert!(cli::is_cli_subcommand("hooks"));
+    }
 }

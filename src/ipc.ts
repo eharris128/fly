@@ -218,6 +218,19 @@ export function loadResumeRecords(): Promise<Record<string, ResumeRecord>> {
   return invoke<Record<string, ResumeRecord>>("load_resume_records");
 }
 
+/**
+ * How the app was launched (mirrors Rust `LaunchMode`, U7):
+ *  - `normal` — fresh shells (clean prior exit);
+ *  - `resume` — explicit `fly resume`, re-attach agents directly;
+ *  - `offer`  — the prior run crashed, so offer to resume.
+ */
+export type LaunchMode = "normal" | "resume" | "offer";
+
+/** Read how the app was launched, to decide whether to resume (U7/U8). */
+export function getLaunchMode(): Promise<LaunchMode> {
+  return invoke<LaunchMode>("get_launch_mode");
+}
+
 export function saveScrollback(paneKey: string, data: string): Promise<void> {
   return invoke("save_scrollback", { paneKey, data });
 }
