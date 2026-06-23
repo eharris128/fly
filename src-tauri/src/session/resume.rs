@@ -7,10 +7,10 @@
 //! renderer crash) skips fly's ordered teardown.
 //!
 //! Two writers serialize through the backend so they never race on the file:
-//! - the **hook path** upserts `session_id` + `session_cwd` (U3);
-//! - the **poll path** upserts `argv` + `is_agent` (U4).
-//! Upserts are field-merging — a partial sets only the fields it knows, leaving
-//! the other writer's fields intact.
+//! the **hook path** upserts `session_id` + `session_cwd` (U3), and the **poll
+//! path** upserts `argv` + `is_agent` (U4). Upserts are field-merging — a
+//! partial sets only the fields it knows, leaving the other writer's fields
+//! intact.
 //!
 //! The **clean-exit marker** is a tiny sentinel cleared at startup and written on
 //! the ordered shutdown (KTD-G): a marker that is *absent* at the next startup

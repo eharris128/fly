@@ -96,6 +96,7 @@ pub fn emit_notification_added(
 /// Spawn a pane: reserve its id, issue + inject its auth token, register it for
 /// attention, stream raw output over `channel`, and clean everything up on exit.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // a Tauri command surface — each arg is a wire field
 pub fn spawn_pane(
     app: AppHandle,
     pty: State<'_, Arc<PtyManager>>,
