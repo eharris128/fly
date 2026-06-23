@@ -65,14 +65,22 @@ pub fn claude_project_dir(cwd: &Path) -> Option<PathBuf> {
     Some(root.join(encode_cwd(&cwd.to_string_lossy())))
 }
 
+/// The session id of a transcript file name — its basename sans `.jsonl` — or
+/// `None` for a non-transcript or empty name. The filename *is* the session id
+/// (KTD-A), so this is the one place that knowledge lives.
+fn jsonl_id(name: &str) -> Option<&str> {
+    let id = name.strip_suffix(".jsonl")?;
+    (!id.is_empty()).then_some(id)
+}
+
 /// The session id of the **actively-written** transcript among `entries`
-/// (`(file-name, mtime)` pairs from the project dir): the basename — sans
-/// `.jsonl` — of the newest `.jsonl` whose mtime is within `max_age` of `now`
-/// (KTD-A). The recency floor is what keeps a fresh agent that has not written its
-/// own transcript yet from adopting an ancient unrelated session in the same dir:
-/// an all-stale set yields `None`, so the poll captures nothing and the restore
-/// path's stale-guard (U3) stays in charge. A future mtime (clock skew) counts as
-/// fresh, never stale. Pure over its arguments.
+/// (`(file-name, mtime)` pairs from the project dir): the basename of the newest
+/// `.jsonl` whose mtime is within `max_age` of `now` (KTD-A). The recency floor is
+/// what keeps a fresh agent that has not written its own transcript yet from
+/// adopting an ancient unrelated session in the same dir: an all-stale set yields
+/// `None`, so the poll captures nothing and the restore path's stale-guard (U3)
+/// stays in charge. A future mtime (clock skew) counts as fresh, never stale. Pure
+/// over its arguments.
 pub fn active_session_id(
     entries: &[(String, SystemTime)],
     now: SystemTime,
@@ -80,10 +88,7 @@ pub fn active_session_id(
 ) -> Option<String> {
     entries
         .iter()
-        .filter_map(|(name, mtime)| {
-            let id = name.strip_suffix(".jsonl")?;
-            (!id.is_empty()).then_some((id, *mtime))
-        })
+        .filter_map(|(name, mtime)| jsonl_id(name).map(|id| (id, *mtime)))
         .filter(|(_, mtime)| {
             now.duration_since(*mtime)
                 .map(|age| age <= max_age)
@@ -240,10 +245,7 @@ pub fn active_session_for_cwd(cwd: &Path) -> Option<String> {
 fn newest_session_basename(entries: &[(String, SystemTime)]) -> Option<String> {
     entries
         .iter()
-        .filter_map(|(name, mtime)| {
-            let id = name.strip_suffix(".jsonl")?;
-            (!id.is_empty()).then_some((id, *mtime))
-        })
+        .filter_map(|(name, mtime)| jsonl_id(name).map(|id| (id, *mtime)))
         .max_by_key(|(_, mtime)| *mtime)
         .map(|(id, _)| id.to_string())
 }
