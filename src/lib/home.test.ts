@@ -26,8 +26,12 @@ function tab(id: string, tree: Node, focusedLeafKey: string, title: string | nul
 function ws(id: string, name: string, tabs: Tab[]): Workspace {
   return { id, name, tabs, activeTabId: tabs[0]?.id ?? "" };
 }
-function agent(isAgent: boolean, workingForMs: number | null = null): PaneActivity {
-  return { isAgent, workingForMs, lastOutputAgoMs: workingForMs };
+function agent(
+  isAgent: boolean,
+  workingForMs: number | null = null,
+  liveTaskCount = 0,
+): PaneActivity {
+  return { isAgent, workingForMs, lastOutputAgoMs: workingForMs, liveTaskCount };
 }
 
 describe("buildHomeModel", () => {
@@ -192,6 +196,7 @@ describe("effectiveAttention", () => {
     isAgent: true,
     workingForMs: null,
     lastOutputAgoMs,
+    liveTaskCount: 0,
   });
 
   it("keeps a raise with new output since you last engaged", () => {

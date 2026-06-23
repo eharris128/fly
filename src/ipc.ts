@@ -189,14 +189,16 @@ export function pruneResumeRecords(liveLeafKeys: string[]): Promise<void> {
 }
 
 /**
- * Per-pane agent state for the dashboard (U4): whether the pane runs a Claude
- * Code agent, its current work stretch (ms; null when idle/not an agent), and
- * how long since its last above-threshold output (ms).
+ * Per-pane agent state for the dashboard (U4; running-state U3): whether the pane
+ * runs a Claude Code agent, its current work stretch (ms; null when idle/not an
+ * agent), how long since its last above-threshold output (ms), and the count of
+ * live background task groups beneath it (0 for a non-agent / gone pane).
  */
 export interface PaneActivity {
   isAgent: boolean;
   workingForMs: number | null;
   lastOutputAgoMs: number | null;
+  liveTaskCount: number;
 }
 
 /** Poll a pane's agent/work-stretch state (U4). */

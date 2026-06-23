@@ -251,6 +251,30 @@ impl PtyManager {
         crate::cwd::is_claude(comm.as_deref(), &argv).then_some(argv)
     }
 
+    /// Whether the pane runs a Claude agent and, if so, how many live background
+    /// task groups run beneath it (running-state plan U3, KTD2/KTD4) — the
+    /// dashboard's "N tasks" number. Resolves `foreground_pid` **once** (which
+    /// takes and drops the registry lock), then does every `/proc` read — agent
+    /// detection *and* the descendant-group scan — with no lock held: the same
+    /// resolve-then-drop discipline as [`pane_command`], not the atomics-only
+    /// [`pane_activity`](Self::pane_activity) pattern, because a process-tree scan
+    /// is many blocking syscalls and must never hold the `panes` mutex that every
+    /// command and the read-thread teardown contend on (KTD13/KTD4). `Some(n)` for
+    /// an agent (`n` may be 0); `None` for a bare shell or a gone pane — never a
+    /// panic. The whole table is one snapshot, so the count is internally
+    /// consistent against pid reuse within the call (KTD4).
+    pub fn agent_task_count(&self, id: PaneId) -> Option<u32> {
+        let pid = self.foreground_pid(id)?;
+        // No registry lock is held below — pure /proc reads off the hot path.
+        let comm = crate::cwd::proc_comm(pid);
+        let argv = crate::cwd::proc_cmdline(pid);
+        if !crate::cwd::is_claude(comm.as_deref(), &argv) {
+            return None;
+        }
+        let table = crate::cwd::read_proc_table();
+        Some(crate::cwd::count_background_task_groups(&table, pid))
+    }
+
     /// Number of registered panes.
     pub fn count(&self) -> usize {
         self.panes.lock().unwrap().len()
@@ -354,38 +378,46 @@ pub fn pane_command(
     manager.pane_command(pane_id)
 }
 
-/// The agent dashboard payload for one pane (U4): whether it is a Claude Code
-/// agent, plus its current work stretch and last-output age. `working_for_ms`
-/// is `None` when the pane is idle or not an agent. Polled per pane while the
-/// dashboard is open (KTD-C).
+/// The agent dashboard payload for one pane (U4; running-state U3): whether it is
+/// a Claude Code agent, its current work stretch and last-output age, and the
+/// count of live background task groups beneath it. `working_for_ms` is `None`
+/// when the pane is idle or not an agent; `live_task_count` is `0` for a non-agent
+/// or gone pane. Polled per pane while the dashboard is open (KTD-C).
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneActivity {
     pub is_agent: bool,
     pub working_for_ms: Option<u64>,
     pub last_output_ago_ms: Option<u64>,
+    pub live_task_count: u32,
 }
 
 /// Per-pane agent state for the dashboard poll. Composes `/proc` agent detection
-/// (U2) with the output-activity snapshot (U3). A non-agent or gone pane reports
-/// `is_agent: false` with null timings — never a panic.
+/// (U2) and the background-task-group count (running-state U3) — both from a
+/// single `foreground_pid` resolution via [`agent_task_count`](PtyManager::agent_task_count) —
+/// with the output-activity snapshot (U3 of the dashboard plan). A non-agent or
+/// gone pane reports `is_agent: false`, null timings, and `live_task_count: 0` —
+/// never a panic.
 #[tauri::command]
 pub fn pane_activity(
     manager: tauri::State<'_, Arc<PtyManager>>,
     pane_id: PaneId,
 ) -> PaneActivity {
-    if !manager.is_agent(pane_id) {
+    // One foreground-pid resolution gates agent-ness and roots the task count.
+    let Some(live_task_count) = manager.agent_task_count(pane_id) else {
         return PaneActivity {
             is_agent: false,
             working_for_ms: None,
             last_output_ago_ms: None,
+            live_task_count: 0,
         };
-    }
+    };
     let snap = manager.pane_activity(pane_id);
     PaneActivity {
         is_agent: true,
         working_for_ms: snap.and_then(|s| s.working_for_ms),
         last_output_ago_ms: snap.and_then(|s| s.last_output_ago_ms),
+        live_task_count,
     }
 }
 
@@ -401,6 +433,7 @@ mod tests {
         assert_eq!(m.pane_activity(ghost), None);
         assert!(!m.is_agent(ghost));
         assert_eq!(m.pane_command(ghost), None);
+        assert_eq!(m.agent_task_count(ghost), None); // count path: graceful, no panic
         assert_eq!(m.leaf_key(ghost), None);
         assert_eq!(m.lifecycle(ghost), None);
     }
