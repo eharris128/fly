@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildResumeCommand } from "./resume";
+import { buildResumeCommand, resumeCommandsForLeaves } from "./resume";
 import type { ResumeRecord } from "../ipc";
 
 // The configured flag floor (R8): replayed when no argv was captured.
@@ -123,5 +123,30 @@ describe("buildResumeCommand (U5)", () => {
   it("treats an empty argv as no argv (uses the floor)", () => {
     const out = buildResumeCommand(rec({ argv: [], sessionId: "x" }), DEFAULT);
     expect(out).toEqual(["claude", "--resume", "x", "--dangerously-skip-permissions"]);
+  });
+});
+
+describe("resumeCommandsForLeaves (U8)", () => {
+  it("maps each restored leaf to its command, omitting bare-shell leaves", () => {
+    const records = {
+      "leaf-1": rec({ argv: ["claude", "--model", "opus"], sessionId: "a" }),
+      "leaf-2": rec({ sessionId: "b", isAgent: true }), // no argv → floor
+      // leaf-3 has no record → bare shell, omitted from the result
+    };
+    const out = resumeCommandsForLeaves(["leaf-1", "leaf-2", "leaf-3"], records, DEFAULT);
+    expect(out).toEqual({
+      "leaf-1": ["claude", "--model", "opus", "--resume", "a"],
+      "leaf-2": ["claude", "--resume", "b", "--dangerously-skip-permissions"],
+    });
+    expect(out["leaf-3"]).toBeUndefined();
+  });
+
+  it("ignores orphan records whose leaf isn't in the layout", () => {
+    const records = {
+      "leaf-1": rec({ sessionId: "a", isAgent: true }),
+      "gone-leaf": rec({ sessionId: "z", isAgent: true }),
+    };
+    const out = resumeCommandsForLeaves(["leaf-1"], records, DEFAULT);
+    expect(Object.keys(out)).toEqual(["leaf-1"]);
   });
 });

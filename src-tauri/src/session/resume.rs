@@ -122,6 +122,22 @@ pub fn prune_at(path: &Path, leaf_key: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Keep only the records whose leaf key is still live, dropping orphans whose
+/// layout leaf is gone (U8) so the store stays bounded across sessions. Writes
+/// only when something was actually removed.
+pub fn retain_at(
+    path: &Path,
+    live: &std::collections::HashSet<String>,
+) -> std::io::Result<()> {
+    let mut records = read_records(path);
+    let before = records.len();
+    records.retain(|k, _| live.contains(k));
+    if records.len() != before {
+        write_records(path, &records)?;
+    }
+    Ok(())
+}
+
 /// Set (`true`) or clear (`false`) the clean-exit marker. Set on the ordered
 /// shutdown, cleared at startup (KTD-G).
 pub fn set_clean_exit_at(path: &Path, clean: bool) -> std::io::Result<()> {
@@ -179,6 +195,14 @@ pub fn save_resume_record(leaf_key: String, argv: Vec<String>) -> Result<(), Str
         },
     )
     .map_err(|e| e.to_string())
+}
+
+/// Command: at restore the frontend prunes the store to the live layout leaves
+/// (U8), dropping records orphaned by a closed pane or a pre-crash layout.
+#[tauri::command]
+pub fn prune_resume_records(live_leaf_keys: Vec<String>) -> Result<(), String> {
+    let live: std::collections::HashSet<String> = live_leaf_keys.into_iter().collect();
+    retain_at(&resume_path(), &live).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -299,6 +323,22 @@ mod tests {
         let loaded = read_records(&path);
         assert!(!loaded.contains_key("leaf-1"));
         assert_eq!(loaded["leaf-2"].session_id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn retain_drops_orphans_keeping_live_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resume.json");
+        upsert_at(&path, "leaf-1", record(Some("a"))).unwrap();
+        upsert_at(&path, "leaf-2", record(Some("b"))).unwrap();
+        upsert_at(&path, "orphan", record(Some("z"))).unwrap();
+        let live: std::collections::HashSet<String> =
+            ["leaf-1".to_string(), "leaf-2".to_string()].into_iter().collect();
+        retain_at(&path, &live).unwrap();
+        let loaded = read_records(&path);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains_key("leaf-1") && loaded.contains_key("leaf-2"));
+        assert!(!loaded.contains_key("orphan"));
     }
 
     #[test]

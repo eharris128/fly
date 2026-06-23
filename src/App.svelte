@@ -36,6 +36,7 @@
     type Workspace,
   } from "./lib/workspaces";
   import { buildHomeModel, effectiveAttention } from "./lib/home";
+  import { resumeCommandsForLeaves } from "./lib/resume";
   import {
     setWindowForeground,
     setVisiblePanes,
@@ -48,6 +49,9 @@
     paneCommand,
     paneActivity,
     saveResumeRecord,
+    loadResumeRecords,
+    pruneResumeRecords,
+    getLaunchMode,
     type PaneId,
     type PaneActivity,
     type AttentionState,
@@ -77,6 +81,7 @@
     type SavedTab,
     type SavedPane,
     type SavedWorkspace,
+    type SavedSession,
   } from "./lib/serialize";
 
   let nextTabId = 1;
@@ -116,6 +121,10 @@
   // (KTD3) does not, so only the palette needs this.
   let paneRefs: Record<string, { focus: () => void } | undefined> = {};
   let cwdByLeaf = $state<Record<string, string | null>>({});
+  // leaf key → resume command (U8). Populated once at restore when resuming; a
+  // missing entry means a bare shell (the normal case). Read once per Terminal
+  // at mount, so it must be set before workspaces are assigned.
+  let resumeCommandByLeaf = $state<Record<string, string[]>>({});
   let saveScrollbackEnabled = $state(false);
   let keymap = $state<Keymap | null>(null);
   let menuOpen = $state(false);
@@ -388,6 +397,17 @@
   let pendingConfirm = $state<{ message: string; onConfirm: () => void } | null>(
     null,
   );
+  // Crash-resume offer (U8, KTD-G): shown at launch when the prior run crashed
+  // and there are agents to resume. restore() awaits the answer before mounting
+  // panes, so accepting spawns them as resumed agents (declining → bare shells).
+  let resumeOffer = $state<{ count: number } | null>(null);
+  let resolveResumeOffer: ((accept: boolean) => void) | null = null;
+  function answerResumeOffer(accept: boolean) {
+    resumeOffer = null;
+    const r = resolveResumeOffer;
+    resolveResumeOffer = null;
+    r?.(accept);
+  }
   function paneCount(ws: Workspace): number {
     return ws.tabs.reduce((n, t) => n + leaves(t.tree).length, 0);
   }
@@ -576,6 +596,20 @@
       }
     });
   });
+  $effect(() => {
+    if (resumeOffer === null) return; // resume offer: Enter resumes / Escape fresh
+    return captureKeys((e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        answerResumeOffer(false);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        answerResumeOffer(true);
+      }
+    });
+  });
 
   // App-wide leader handling (R6). Each xterm already runs the keymap to gate the
   // PTY (Terminal.svelte), but that only fires when a pane holds DOM focus — so
@@ -592,6 +626,7 @@
       menuOpen ||
       homeViewOpen ||
       pendingConfirm ||
+      resumeOffer ||
       paletteOpen ||
       notificationPanelOpen
     )
@@ -881,6 +916,47 @@
     ...navCommands(sidebarWorkspaces, selectWorkspace, selectTab),
   ]);
 
+  // Decide whether to resume and, if so, compute each restored leaf's command
+  // (U8). Awaits the crash offer (KTD-G) before returning, mutates `cwds` to
+  // prefer each agent's captured session cwd (KTD-H), and always prunes the
+  // store to the live leaves. Returns the per-leaf command map (empty when not
+  // resuming). Called before workspaces mount, so panes spawn already resumed.
+  async function computeResumeForRestore(
+    saved: SavedSession,
+    cwds: Record<string, string | null>,
+    defaultArgs: string[],
+  ): Promise<Record<string, string[]>> {
+    const savedKeys = saved.workspaces.flatMap((w) =>
+      w.tabs.flatMap((t) => collectKeys(t.tree)),
+    );
+    // Keep the store bounded regardless of mode (drop closed-pane orphans).
+    void pruneResumeRecords(savedKeys);
+
+    const mode = await getLaunchMode();
+    if (mode === "normal") return {}; // R1: a clean launch never auto-runs
+
+    const records = await loadResumeRecords();
+    const commands = resumeCommandsForLeaves(savedKeys, records, defaultArgs);
+    if (Object.keys(commands).length === 0) return {}; // nothing resumable
+
+    // Explicit `fly resume` resumes immediately; a detected crash offers first.
+    let resuming = mode === "resume";
+    if (mode === "offer") {
+      resuming = await new Promise<boolean>((res) => {
+        resolveResumeOffer = res;
+        resumeOffer = { count: Object.keys(commands).length };
+      });
+    }
+    if (!resuming) return {};
+
+    // KTD-H: resume each agent in its captured session cwd when we have one.
+    for (const key of Object.keys(commands)) {
+      const cwd = records[key]?.sessionCwd;
+      if (cwd) cwds[key] = cwd;
+    }
+    return commands;
+  }
+
   async function restore() {
     const cfg = await getConfig();
     saveScrollbackEnabled = cfg.saveScrollback;
@@ -901,6 +977,14 @@
       for (const w of saved.workspaces)
         for (const st of w.tabs)
           for (const [k, p] of Object.entries(st.panes)) cwds[k] = p.cwd;
+      // Resume wiring (U8): may await the crash offer, populate resume commands,
+      // and override spawn cwds — all before workspaces mount so panes spawn as
+      // resumed agents. In normal mode this returns {} → every pane a bare shell.
+      resumeCommandByLeaf = await computeResumeForRestore(
+        saved,
+        cwds,
+        cfg.resumeDefaultArgs,
+      );
       cwdByLeaf = cwds;
       workspaces = saved.workspaces.map((sw) => {
         const tabs = sw.tabs.map((st) => ({
@@ -1046,6 +1130,7 @@
             leafKey={p.key}
             focused={p.tabId === activeTab?.id && activeTab?.focusedLeafKey === p.key}
             cwd={cwdByLeaf[p.key] ?? null}
+            command={resumeCommandByLeaf[p.key] ?? null}
             saveScrollback={saveScrollbackEnabled}
             {keymap}
             onFocusRequest={setActiveFocus}
@@ -1090,6 +1175,33 @@
           <button class="btn" onclick={cancelPending}>Cancel</button>
         </div>
         <p class="confirm-hint">Enter to confirm · Esc to cancel</p>
+      </div>
+    </div>
+  {/if}
+
+  {#if resumeOffer !== null}
+    <div class="backdrop" role="presentation">
+      <div
+        class="confirm"
+        role="alertdialog"
+        aria-label="Resume agents"
+        tabindex="-1"
+      >
+        <p class="confirm-msg">
+          fly didn't shut down cleanly. Resume {resumeOffer.count} Claude agent{resumeOffer.count ===
+          1
+            ? ""
+            : "s"} from your last session?
+        </p>
+        <div class="confirm-actions">
+          <button class="btn danger" onclick={() => answerResumeOffer(true)}>
+            Resume
+          </button>
+          <button class="btn" onclick={() => answerResumeOffer(false)}>
+            Start fresh
+          </button>
+        </div>
+        <p class="confirm-hint">Enter to resume · Esc to start fresh</p>
       </div>
     </div>
   {/if}

@@ -183,6 +183,11 @@ export function saveResumeRecord(
   return invoke("save_resume_record", { leafKey, argv });
 }
 
+/** Prune the resume store to the live layout leaves, dropping orphans (U8). */
+export function pruneResumeRecords(liveLeafKeys: string[]): Promise<void> {
+  return invoke("prune_resume_records", { liveLeafKeys });
+}
+
 /**
  * Per-pane agent state for the dashboard (U4): whether the pane runs a Claude
  * Code agent, its current work stretch (ms; null when idle/not an agent), and

@@ -131,3 +131,22 @@ export function buildResumeCommand(
   }
   return ["claude", ...resumeFlag, ...defaultArgs];
 }
+
+/**
+ * Build the resume command for each restored leaf that has a record producing
+ * one (U8). Leaves with no record (or whose record yields no command) are
+ * omitted, so the caller treats a missing entry as "bare shell". Pure, so the
+ * restore wiring is testable without the app.
+ */
+export function resumeCommandsForLeaves(
+  leafKeys: Iterable<string>,
+  records: Record<string, ResumeRecord | undefined>,
+  defaultArgs: string[],
+): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const key of leafKeys) {
+    const cmd = buildResumeCommand(records[key], defaultArgs);
+    if (cmd) out[key] = cmd;
+  }
+  return out;
+}
