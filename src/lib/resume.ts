@@ -132,6 +132,69 @@ export function buildResumeCommand(
   return ["claude", ...resumeFlag, ...defaultArgs];
 }
 
+/** How a restored agent leaf re-attached: precisely (`--resume <id>`) or not. */
+export type ResumeTier = "precise" | "imprecise";
+
+/**
+ * Whether a `--continue` candidate is fresh enough to be this pane's session, or
+ * stale and must not be resurrected (fix-003 U3, KTD-C). The signal is the
+ * candidate's **last real turn** vs the pane's own captured activity — NOT file
+ * mtime, which a metadata-only `--continue` open bumps without adding a turn
+ * (exactly why the 06-19 session looked "recent"). Stale when the candidate's last
+ * turn predates the pane's activity by more than `marginMs` (a small clock-jitter
+ * allowance). A missing candidate timestamp is treated as stale: prefer a clean
+ * shell over a wrong session (R4). Pure, so the exact bug is pinned by a test.
+ */
+export function resumeStaleVerdict({
+  candidateLastTurnMs,
+  paneActivityMs,
+  marginMs,
+}: {
+  candidateLastTurnMs: number | null;
+  paneActivityMs: number;
+  marginMs: number;
+}): "fresh" | "stale" {
+  if (candidateLastTurnMs == null) return "stale";
+  return candidateLastTurnMs >= paneActivityMs - marginMs ? "fresh" : "stale";
+}
+
+/**
+ * Whether a resumed leaf re-attached precisely (a captured session id →
+ * `--resume <id>`) or imprecisely (no id → `--continue`, most-recent-in-folder),
+ * so the degraded path is never silently presented as exact (fix-003 U3/U4,
+ * KTD-D). Pure over the record.
+ */
+export function classifyResumeTier(
+  record: ResumeRecord | null | undefined,
+): ResumeTier {
+  return record?.sessionId ? "precise" : "imprecise";
+}
+
+/**
+ * The keep/drop decision for one restored leaf (fix-003 U3). Given the leaf's
+ * record and — for an imprecise leaf — the `--continue` target's last-turn time,
+ * returns its tier and whether it survives the stale-guard. A **precise** leaf
+ * always keeps: the pane ran that exact session, so re-attaching it bypasses the
+ * guard. An **imprecise** leaf keeps only when its `--continue` candidate is fresh
+ * vs the pane's own activity (KTD-C); a stale candidate drops to a bare shell (R4).
+ * Pure (the candidate timestamp is injected, the IPC fetch stays in the caller), so
+ * the orchestration's core decision is tested without the app.
+ */
+export function resumeLeafDecision(
+  record: ResumeRecord | null | undefined,
+  candidateLastTurnMs: number | null,
+  marginMs: number,
+): { tier: ResumeTier; keep: boolean } {
+  const tier = classifyResumeTier(record);
+  if (tier === "precise") return { tier, keep: true };
+  const verdict = resumeStaleVerdict({
+    candidateLastTurnMs,
+    paneActivityMs: record?.updatedAt ?? 0,
+    marginMs,
+  });
+  return { tier, keep: verdict === "fresh" };
+}
+
 /**
  * Whether the poll should capture a leaf's resolved session id (fix-003 U2,
  * KTD-B). Unlike argv — fixed for a pane's life, captured once — a session id

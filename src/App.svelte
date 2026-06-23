@@ -36,7 +36,13 @@
     type Workspace,
   } from "./lib/workspaces";
   import { buildHomeModel, effectiveAttention, effectiveTaskCount } from "./lib/home";
-  import { resumeCommandsForLeaves, shouldCaptureSession } from "./lib/resume";
+  import {
+    resumeCommandsForLeaves,
+    shouldCaptureSession,
+    classifyResumeTier,
+    resumeLeafDecision,
+    type ResumeTier,
+  } from "./lib/resume";
   import {
     setWindowForeground,
     setVisiblePanes,
@@ -52,6 +58,7 @@
     saveResumeRecord,
     saveResumeSession,
     loadResumeRecords,
+    continueTarget,
     pruneResumeRecords,
     getLaunchMode,
     type PaneId,
@@ -133,6 +140,10 @@
   // missing entry means a bare shell (the normal case). Read once per Terminal
   // at mount, so it must be set before workspaces are assigned.
   let resumeCommandByLeaf = $state<Record<string, string[]>>({});
+  // leaf key → how it re-attached (fix-003 U3/U4): "precise" (--resume <id>) or
+  // "imprecise" (--continue, most-recent-in-folder). Only resumed leaves appear;
+  // drives the tier transparency so a degraded resume is never passed off as exact.
+  let resumeTierByLeaf = $state<Record<string, ResumeTier>>({});
   let saveScrollbackEnabled = $state(false);
   let keymap = $state<Keymap | null>(null);
   let menuOpen = $state(false);
@@ -997,28 +1008,71 @@
     ...navCommands(sidebarWorkspaces, selectWorkspace, selectTab),
   ]);
 
-  // Decide whether to resume and, if so, compute each restored leaf's command
-  // (U8). Awaits the crash offer (KTD-G) before returning, mutates `cwds` to
-  // prefer each agent's captured session cwd (KTD-H), and always prunes the
-  // store to the live leaves. Returns the per-leaf command map (empty when not
-  // resuming). Called before workspaces mount, so panes spawn already resumed.
+  // Clock-jitter allowance for the stale-guard (fix-003 U3, KTD-C): a `--continue`
+  // candidate counts as fresh if its last real turn is no more than this before the
+  // pane's own captured activity. Generous enough to absorb the gap between a turn
+  // and the poll that stamps the pane's record, tight enough that a day-old session
+  // is still caught. Tunable (plan Open Questions: stale-guard margin).
+  const RESUME_STALE_MARGIN_MS = 60_000;
+
+  // Decide whether to resume and, if so, compute each restored leaf's command +
+  // its resume tier (U8; fix-003 U3). Awaits the crash offer (KTD-G) before
+  // returning, mutates `cwds` to prefer each agent's captured session cwd (KTD-H),
+  // stale-guards the imprecise (`--continue`) leaves so a session older than the
+  // pane's life is dropped to a bare shell (KTD-C, R4), and always prunes the store
+  // to the live leaves. Returns the per-leaf command map (empty when not resuming)
+  // alongside the tier map. Called before workspaces mount, so panes spawn resumed.
   async function computeResumeForRestore(
     saved: SavedSession,
     cwds: Record<string, string | null>,
     defaultArgs: string[],
-  ): Promise<Record<string, string[]>> {
+  ): Promise<{
+    commands: Record<string, string[]>;
+    tierByLeaf: Record<string, ResumeTier>;
+  }> {
     const savedKeys = saved.workspaces.flatMap((w) =>
       w.tabs.flatMap((t) => collectKeys(t.tree)),
     );
     // Keep the store bounded regardless of mode (drop closed-pane orphans).
     void pruneResumeRecords(savedKeys);
+    const empty = { commands: {}, tierByLeaf: {} };
 
     const mode = await getLaunchMode();
-    if (mode === "normal") return {}; // R1: a clean launch never auto-runs
+    if (mode === "normal") return empty; // R1: a clean launch never auto-runs
 
     const records = await loadResumeRecords();
     const commands = resumeCommandsForLeaves(savedKeys, records, defaultArgs);
-    if (Object.keys(commands).length === 0) return {}; // nothing resumable
+    if (Object.keys(commands).length === 0) return empty; // nothing resumable
+
+    // Stale-guard each imprecise (no-id → `--continue`) leaf and classify the tier
+    // (KTD-C/D). A precise (`--resume <id>`) leaf bypasses the guard — the pane ran
+    // that session, so re-attaching it is exact. An imprecise leaf consults the
+    // session `--continue` would re-open in its spawn cwd; if that session's last
+    // real turn predates the pane's own activity it is dropped from `commands` (→ a
+    // bare shell, R4), never silently resurrected. Done before the offer so its
+    // count reflects what will actually resume.
+    const tierByLeaf: Record<string, ResumeTier> = {};
+    for (const key of Object.keys(commands)) {
+      const record = records[key];
+      // Only an imprecise leaf needs the `--continue` candidate; a precise leaf
+      // bypasses the guard (and the IPC). The candidate runs in the leaf's spawn
+      // cwd — `cwds[key]`, since an imprecise leaf has no sessionCwd override yet.
+      const candidateLastTurnMs =
+        classifyResumeTier(record) === "imprecise"
+          ? (await continueTarget(cwds[key] ?? ""))?.lastTurnMs ?? null
+          : null;
+      const { tier, keep } = resumeLeafDecision(
+        record,
+        candidateLastTurnMs,
+        RESUME_STALE_MARGIN_MS,
+      );
+      if (!keep) {
+        delete commands[key]; // → bare shell, not a wrong session (R4/R6)
+        continue;
+      }
+      tierByLeaf[key] = tier;
+    }
+    if (Object.keys(commands).length === 0) return empty; // all stale → nothing
 
     // Explicit `fly resume` resumes immediately; a detected crash offers first.
     let resuming = mode === "resume";
@@ -1028,14 +1082,14 @@
         resumeOffer = { count: Object.keys(commands).length };
       });
     }
-    if (!resuming) return {};
+    if (!resuming) return empty;
 
     // KTD-H: resume each agent in its captured session cwd when we have one.
     for (const key of Object.keys(commands)) {
       const cwd = records[key]?.sessionCwd;
       if (cwd) cwds[key] = cwd;
     }
-    return commands;
+    return { commands, tierByLeaf };
   }
 
   async function restore() {
@@ -1058,14 +1112,17 @@
       for (const w of saved.workspaces)
         for (const st of w.tabs)
           for (const [k, p] of Object.entries(st.panes)) cwds[k] = p.cwd;
-      // Resume wiring (U8): may await the crash offer, populate resume commands,
-      // and override spawn cwds — all before workspaces mount so panes spawn as
-      // resumed agents. In normal mode this returns {} → every pane a bare shell.
-      resumeCommandByLeaf = await computeResumeForRestore(
+      // Resume wiring (U8; fix-003 U3): may await the crash offer, populate resume
+      // commands + their tiers, drop stale `--continue` leaves to bare shells, and
+      // override spawn cwds — all before workspaces mount so panes spawn as resumed
+      // agents. In normal mode this returns empty → every pane a bare shell.
+      const resumeResult = await computeResumeForRestore(
         saved,
         cwds,
         cfg.resumeDefaultArgs,
       );
+      resumeCommandByLeaf = resumeResult.commands;
+      resumeTierByLeaf = resumeResult.tierByLeaf;
       cwdByLeaf = cwds;
       workspaces = saved.workspaces.map((sw) => {
         const tabs = sw.tabs.map((st) => ({

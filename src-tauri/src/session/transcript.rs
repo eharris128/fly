@@ -232,6 +232,53 @@ pub fn active_session_for_cwd(cwd: &Path) -> Option<String> {
     active_session_id(&entries, SystemTime::now(), ACTIVE_SESSION_MAX_AGE)
 }
 
+/// The basename (sans `.jsonl`) of the most-recently-modified transcript among
+/// `entries`, with **no** recency floor — the session `claude --continue` would
+/// re-open in this project dir (it always opens the newest transcript, however old
+/// its last real turn). Pure; the freshness judgment is the restore-time
+/// stale-guard's job (U3, KTD-C), not this pick's.
+fn newest_session_basename(entries: &[(String, SystemTime)]) -> Option<String> {
+    entries
+        .iter()
+        .filter_map(|(name, mtime)| {
+            let id = name.strip_suffix(".jsonl")?;
+            (!id.is_empty()).then_some((id, *mtime))
+        })
+        .max_by_key(|(_, mtime)| *mtime)
+        .map(|(id, _)| id.to_string())
+}
+
+/// The session `claude --continue` would re-open in a project dir (the newest
+/// transcript) paired with its **last real-turn** timestamp — the freshness signal
+/// the restore-time stale-guard compares against the pane's own activity (U3,
+/// KTD-C). `last_turn_ms` is `None` for a transcript with no timestamped turn; the
+/// guard treats that as stale, so a contentless candidate never resurrects a pane.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinueTarget {
+    pub session_id: String,
+    pub last_turn_ms: Option<u64>,
+}
+
+/// Path-taking core of [`continue_target`]: the newest transcript in `dir` plus
+/// its last real-turn time. `None` for a missing/empty dir (no `--continue` target
+/// → the leaf falls to a bare shell).
+fn continue_target_in_dir(dir: &Path) -> Option<ContinueTarget> {
+    let entries = read_project_entries(dir);
+    let session_id = newest_session_basename(&entries)?;
+    let last_turn_ms = session_last_turn_ms(&dir.join(format!("{session_id}.jsonl")));
+    Some(ContinueTarget { session_id, last_turn_ms })
+}
+
+/// Command: the session `claude --continue` would re-open in `cwd`, plus its last
+/// real-turn time, so the frontend's stale-guard can decide keep-vs-bare-shell in
+/// one round-trip (U3, KTD-C). `None` when the project dir is unresolvable/empty.
+#[tauri::command]
+pub fn continue_target(cwd: String) -> Option<ContinueTarget> {
+    let dir = claude_project_dir(Path::new(&cwd))?;
+    continue_target_in_dir(&dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +447,40 @@ mod tests {
         assert_eq!(session_last_turn_ms(&path), Some(1_781_896_636_402));
         // A missing file degrades to None.
         assert_eq!(session_last_turn_ms(&dir.path().join("gone.jsonl")), None);
+    }
+
+    // ---- newest_session_basename / continue_target_in_dir (U3, KTD-C) ------
+
+    #[test]
+    fn newest_session_has_no_recency_floor() {
+        // Unlike active_session_id, --continue's pick ignores age: an ancient
+        // transcript is still the target if it is the newest present.
+        let entries = vec![("ancient.jsonl".to_string(), at(10))];
+        assert_eq!(newest_session_basename(&entries), Some("ancient".to_string()));
+        // Newest wins; non-jsonl ignored; empty → None.
+        let entries = vec![
+            ("notes.txt".to_string(), at(999)),
+            ("a.jsonl".to_string(), at(100)),
+            ("b.jsonl".to_string(), at(200)),
+        ];
+        assert_eq!(newest_session_basename(&entries), Some("b".to_string()));
+        assert_eq!(newest_session_basename(&[]), None);
+    }
+
+    #[test]
+    fn continue_target_reports_the_newest_session_and_its_last_real_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // A single transcript whose tail is metadata-only after a 06-19 turn — the
+        // exact play-bug shape: a recent mtime but an ancient last real turn.
+        std::fs::write(dir.path().join("04d56f41.jsonl"), METADATA_TAIL_FIXTURE).unwrap();
+        let target = continue_target_in_dir(dir.path()).expect("a target exists");
+        assert_eq!(target.session_id, "04d56f41");
+        assert_eq!(target.last_turn_ms, Some(1_781_896_636_402)); // 06-19, not mtime
+    }
+
+    #[test]
+    fn continue_target_is_none_for_an_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(continue_target_in_dir(dir.path()), None);
     }
 }

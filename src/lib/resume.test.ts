@@ -3,6 +3,9 @@ import {
   buildResumeCommand,
   resumeCommandsForLeaves,
   shouldCaptureSession,
+  resumeStaleVerdict,
+  classifyResumeTier,
+  resumeLeafDecision,
 } from "./resume";
 import type { ResumeRecord } from "../ipc";
 
@@ -147,6 +150,117 @@ describe("shouldCaptureSession (fix-003 U2, KTD-B)", () => {
     // A transient miss (no active transcript) must not clear what we have.
     expect(shouldCaptureSession("sess-A", null)).toBe(false);
     expect(shouldCaptureSession(null, null)).toBe(false);
+  });
+});
+
+describe("resumeStaleVerdict (fix-003 U3, KTD-C)", () => {
+  const MARGIN = 60_000;
+
+  it("is stale when the candidate's last turn predates pane activity − margin", () => {
+    expect(
+      resumeStaleVerdict({
+        candidateLastTurnMs: 1_000_000,
+        paneActivityMs: 5_000_000,
+        marginMs: MARGIN,
+      }),
+    ).toBe("stale");
+  });
+
+  it("is fresh when the candidate's last turn is within/after pane activity", () => {
+    // Equal-to-activity → fresh; slightly-before but within margin → fresh.
+    expect(
+      resumeStaleVerdict({
+        candidateLastTurnMs: 5_000_000,
+        paneActivityMs: 5_000_000,
+        marginMs: MARGIN,
+      }),
+    ).toBe("fresh");
+    expect(
+      resumeStaleVerdict({
+        candidateLastTurnMs: 5_000_000 - 30_000,
+        paneActivityMs: 5_000_000,
+        marginMs: MARGIN,
+      }),
+    ).toBe("fresh");
+  });
+
+  it("treats a missing candidate timestamp as stale (prefer a clean shell)", () => {
+    expect(
+      resumeStaleVerdict({
+        candidateLastTurnMs: null,
+        paneActivityMs: 5_000_000,
+        marginMs: MARGIN,
+      }),
+    ).toBe("stale");
+  });
+
+  it("the AE1/AE3 fixture: a 06-19 last turn vs a 06-23 pane activity is stale", () => {
+    // The reported bug, as the guard sees it: a metadata-only --continue open
+    // bumped the file's mtime to 06-23, but the last real turn is 06-19, before
+    // the pane's own captured activity → stale → bare shell, not resurrection.
+    const lastTurn0619 = Date.parse("2026-06-19T19:17:16.402Z");
+    const paneActivity0623 = Date.parse("2026-06-23T17:36:00.000Z");
+    expect(
+      resumeStaleVerdict({
+        candidateLastTurnMs: lastTurn0619,
+        paneActivityMs: paneActivity0623,
+        marginMs: MARGIN,
+      }),
+    ).toBe("stale");
+  });
+});
+
+describe("classifyResumeTier (fix-003 U3/U4)", () => {
+  it("is precise when the record carries a session id", () => {
+    expect(classifyResumeTier(rec({ sessionId: "x", isAgent: true }))).toBe("precise");
+  });
+
+  it("is imprecise without a session id", () => {
+    expect(classifyResumeTier(rec({ isAgent: true }))).toBe("imprecise");
+    expect(classifyResumeTier(rec({ argv: ["claude"], isAgent: true }))).toBe("imprecise");
+  });
+
+  it("is imprecise for a null/undefined record", () => {
+    expect(classifyResumeTier(null)).toBe("imprecise");
+    expect(classifyResumeTier(undefined)).toBe("imprecise");
+  });
+});
+
+describe("resumeLeafDecision (fix-003 U3 keep/drop)", () => {
+  const MARGIN = 60_000;
+
+  it("keeps a precise leaf and bypasses the guard (candidate irrelevant)", () => {
+    // A precise leaf keeps even if the (ignored) candidate would look stale.
+    expect(
+      resumeLeafDecision(rec({ sessionId: "x", updatedAt: 9_000_000 }), 1_000, MARGIN),
+    ).toEqual({ tier: "precise", keep: true });
+  });
+
+  it("keeps a fresh imprecise leaf (--continue candidate within pane activity)", () => {
+    expect(
+      resumeLeafDecision(
+        rec({ isAgent: true, updatedAt: 5_000_000 }),
+        5_000_000,
+        MARGIN,
+      ),
+    ).toEqual({ tier: "imprecise", keep: true });
+  });
+
+  it("drops a stale imprecise leaf (candidate predates pane activity)", () => {
+    // The play bug: a 06-19 candidate vs a 06-23 pane → imprecise, dropped.
+    expect(
+      resumeLeafDecision(
+        rec({ isAgent: true, updatedAt: Date.parse("2026-06-23T17:36:00.000Z") }),
+        Date.parse("2026-06-19T19:17:16.402Z"),
+        MARGIN,
+      ),
+    ).toEqual({ tier: "imprecise", keep: false });
+  });
+
+  it("drops an imprecise leaf with no candidate (no --continue target)", () => {
+    expect(
+      resumeLeafDecision(rec({ isAgent: true, updatedAt: 5_000_000 }), null, MARGIN),
+    ).toEqual({ tier: "imprecise", keep: false });
   });
 });
 

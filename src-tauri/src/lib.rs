@@ -338,6 +338,7 @@ pub fn run() {
             session::resume::save_resume_record,
             session::resume::save_resume_session,
             session::resume::prune_resume_records,
+            session::transcript::continue_target,
         ])
         .build(tauri::generate_context!())
         .expect("error while building fly")
