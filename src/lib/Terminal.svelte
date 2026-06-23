@@ -31,6 +31,9 @@
     focused: boolean;
     keymap?: Keymap | null;
     cwd?: string | null;
+    /** Program to run instead of the shell — set only when resuming a Claude
+     * agent (U6/U8, KTD-E). Read once at mount; null → a bare shell. */
+    command?: string[] | null;
     saveScrollback?: boolean;
     onFocusRequest: (leafKey: string) => void;
     onSpawned?: (leafKey: string, paneId: PaneId) => void;
@@ -46,6 +49,7 @@
     focused,
     keymap,
     cwd = null,
+    command = null,
     saveScrollback = false,
     onFocusRequest,
     onSpawned,
@@ -160,8 +164,10 @@
     const rows = term.rows >= 2 ? term.rows : 24;
 
     // Replay prior scrollback as inert text before the live shell starts — no
-    // command is ever re-run (R14, KTD10).
-    if (saveScrollback) {
+    // command is ever re-run (R14, KTD10). Skipped when resuming an agent
+    // (command set): the resumed claude TUI repaints the screen, so stale inert
+    // scrollback under it would just be noise.
+    if (saveScrollback && !command) {
       const prev = await loadScrollback(leafKey);
       if (prev) {
         term.write(prev);
@@ -171,7 +177,9 @@
 
     const channel = makeOutputChannel(onOutput);
     // A missing/stale cwd falls back to $HOME (portable-pty filters non-dirs).
-    paneId = await spawnPane(channel, { rows, cols, cwd, leafKey });
+    // `command` (resume only) runs a known `claude` invocation instead of the
+    // shell — the scoped KTD10 auto-run exception (KTD-E).
+    paneId = await spawnPane(channel, { rows, cols, cwd, leafKey, command });
     onSpawned?.(leafKey, paneId);
 
     term.onData((data) => {

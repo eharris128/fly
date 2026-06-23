@@ -183,14 +183,25 @@ impl Pane {
             .openpty(size)
             .map_err(|e| format!("openpty failed: {e}"))?;
 
-        let shell = cfg
-            .shell
-            .clone()
-            .or_else(|| std::env::var("SHELL").ok())
-            .unwrap_or_else(|| "/bin/bash".to_string());
+        // A resume spawn (U6/KTD-E) runs `command[0] command[1..]`; otherwise the
+        // interactive shell, exactly as before. `command: None` reproduces the
+        // old `$SHELL`/`/bin/bash` path byte-for-byte.
+        let (program, args): (String, Vec<String>) = match &cfg.command {
+            Some(command) if !command.is_empty() => {
+                (command[0].clone(), command[1..].to_vec())
+            }
+            _ => {
+                let shell = cfg
+                    .shell
+                    .clone()
+                    .or_else(|| std::env::var("SHELL").ok())
+                    .unwrap_or_else(|| "/bin/bash".to_string());
+                (shell, cfg.args.clone())
+            }
+        };
 
-        let mut cmd = CommandBuilder::new(&shell);
-        for arg in &cfg.args {
+        let mut cmd = CommandBuilder::new(&program);
+        for arg in &args {
             cmd.arg(arg);
         }
         if let Some(cwd) = &cfg.cwd {
@@ -220,7 +231,7 @@ impl Pane {
         let child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| format!("failed to spawn shell {shell:?}: {e}"))?;
+            .map_err(|e| format!("failed to spawn {program:?}: {e}"))?;
         let pid = child.process_id();
 
         // Drop the slave so the master observes EOF once the child exits

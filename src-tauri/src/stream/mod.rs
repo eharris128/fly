@@ -107,6 +107,7 @@ pub fn spawn_pane(
     cols: u16,
     cwd: Option<String>,
     leaf_key: String,
+    command: Option<Vec<String>>,
 ) -> Result<PaneId, String> {
     let id = pty.reserve_id();
     // Register the token before the child starts so no callback can race it.
@@ -142,6 +143,7 @@ pub fn spawn_pane(
     };
 
     let cfg = SpawnConfig {
+        command,
         cwd,
         rows,
         cols,

@@ -10,6 +10,11 @@ export interface SpawnOpts {
   cwd?: string | null;
   /** Stable leaf key, so the backend can key this pane's resume record (U3). */
   leafKey: string;
+  /**
+   * Program to run instead of the default shell (U6): `command[0]` + args. Set
+   * only when resuming a Claude agent (KTD-E); null/undefined → a bare shell.
+   */
+  command?: string[] | null;
 }
 
 /** Lifecycle state as serialized by the Rust `LifecycleState` enum. */
@@ -127,6 +132,7 @@ export function spawnPane(
     cols: opts.cols,
     cwd: opts.cwd ?? null,
     leafKey: opts.leafKey,
+    command: opts.command ?? null,
   });
 }
 

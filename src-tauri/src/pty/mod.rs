@@ -43,6 +43,12 @@ pub type ExitCallback = Box<dyn FnOnce(PaneId, LifecycleState) + Send>;
 /// How to spawn a pane's shell.
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
+    /// Program to run instead of the `$SHELL` default (U6): `command[0]` is the
+    /// program, `command[1..]` its args. `None` (the default) runs an
+    /// interactive shell exactly as before; `Some` is used only to auto-run a
+    /// resumed Claude agent — the scoped KTD10 exception (KTD-E). Takes
+    /// precedence over `shell`/`args`.
+    pub command: Option<Vec<String>>,
     /// Shell to run; defaults to `$SHELL`, then `/bin/bash`.
     pub shell: Option<String>,
     /// Extra arguments to the shell (empty = a plain interactive shell).
@@ -62,6 +68,7 @@ pub struct SpawnConfig {
 impl Default for SpawnConfig {
     fn default() -> Self {
         Self {
+            command: None,
             shell: None,
             args: Vec::new(),
             cwd: None,

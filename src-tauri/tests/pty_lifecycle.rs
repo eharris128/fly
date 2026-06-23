@@ -226,6 +226,28 @@ fn spawn_failure_is_reported() {
 }
 
 #[test]
+fn command_override_runs_a_program_instead_of_the_shell() {
+    // U6: a pane with `command` set runs that program — env injected so it
+    // resolves via PATH — instead of the default shell. This is the mechanism
+    // resume uses to auto-run `claude` (KTD-E). `command: None` (every other
+    // test here) still spawns the shell exactly as before.
+    let mgr = PtyManager::new();
+    let (sink, rx) = channel_sink();
+    let cfg = SpawnConfig {
+        command: Some(vec!["echo".into(), "FLYCMDRUN".into()]),
+        ..Default::default()
+    };
+    let id = mgr.spawn(cfg, "tok".into(), sink, Box::new(|_, _| {})).unwrap();
+    let out = wait_for(&rx, b"FLYCMDRUN", Duration::from_secs(5));
+    assert!(
+        find(&out, b"FLYCMDRUN").is_some(),
+        "the override program should run, got: {}",
+        String::from_utf8_lossy(&out)
+    );
+    mgr.close(id).unwrap();
+}
+
+#[test]
 fn leaf_key_is_stored_and_returned_by_the_accessor() {
     // U3: the pane carries its frontend leaf key so the hook dispatch can key the
     // pane's resume record; a stale/ghost id resolves to None, never a panic.
