@@ -12,11 +12,17 @@ use crate::state::policy::ReasonEffects;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Renderer {
-    /// WebGL with a DOM fallback (KTD6) — the default.
+    /// Try WebGL, falling back to the DOM renderer on construction failure or a
+    /// context-loss event. Opt-in, *not* the default: with multiple panes each
+    /// holding a live WebGL context, WebKitGTK fails to keep them all composited
+    /// and an inactive pane blanks until it next repaints. The KTD6 eviction
+    /// policy meant to bound live contexts was never built, so WebGL is opt-in.
     Auto,
-    /// Force WebGL.
+    /// Force WebGL (same WebKitGTK multi-context caveat as [`Renderer::Auto`]).
     Webgl,
-    /// Force the DOM renderer.
+    /// Force the DOM renderer — the default. No GL context to contend, so panes
+    /// never blank; the cost is no GPU-accelerated glyph rendering (U4 flow
+    /// control already bounds output floods, so this is rarely the bottleneck).
     Dom,
 }
 
@@ -109,7 +115,9 @@ impl Default for Config {
             attention_debounce_ms: 400,
             notification_coalesce_threshold: 3,
             osc_bel_fallback: false,
-            renderer: Renderer::Auto,
+            // DOM by default (KTD6, superseded): WebGL blanks inactive panes on
+            // WebKitGTK with multiple live contexts. WebGL is opt-in (auto/webgl).
+            renderer: Renderer::Dom,
             scrollback_lines: 10_000,
             font_size: 15,
             save_scrollback: false,
@@ -119,5 +127,19 @@ impl Default for Config {
             reason_effects: ReasonEffectsConfig::default(),
             resume_default_args: vec!["--dangerously-skip-permissions".into()],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default renderer is DOM, not WebGL (KTD6, superseded). Multiple live
+    /// WebGL contexts blank inactive panes on WebKitGTK and the KTD6 eviction
+    /// policy was never built, so DOM is the safe default; WebGL stays opt-in via
+    /// `auto`/`webgl`. Guards against an accidental revert to the blanking default.
+    #[test]
+    fn default_renderer_is_dom() {
+        assert_eq!(Config::default().renderer, Renderer::Dom);
     }
 }

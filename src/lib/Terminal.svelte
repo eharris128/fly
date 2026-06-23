@@ -162,6 +162,11 @@
       return true;
     });
 
+    // Renderer (KTD6): DOM is the default (see `Renderer` in config/schema.rs),
+    // so this WebGL path runs only when the user opts in (`auto`/`webgl`). WebGL
+    // is not the default because multiple live contexts blank inactive panes on
+    // WebKitGTK and the KTD6 per-pane eviction policy was never built; on a
+    // context-loss event we dispose the addon, dropping this pane to DOM.
     if (config.renderer !== "dom") {
       try {
         const webgl = new WebglAddon();
