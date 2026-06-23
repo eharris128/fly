@@ -7,6 +7,9 @@ import {
   classifyResumeTier,
   resumeLeafDecision,
   resumeTierSummary,
+  planResumeLeaves,
+  resumeOfferBreakdown,
+  resumeNoticeText,
 } from "./resume";
 import type { ResumeRecord } from "../ipc";
 
@@ -262,6 +265,114 @@ describe("resumeLeafDecision (fix-003 U3 keep/drop)", () => {
     expect(
       resumeLeafDecision(rec({ isAgent: true, updatedAt: 5_000_000 }), null, MARGIN),
     ).toEqual({ tier: "imprecise", keep: false });
+  });
+});
+
+describe("planResumeLeaves (fix-003 U3 — the orchestration core)", () => {
+  const MARGIN = 60_000;
+  // The plan's U3 "Logic" scenario: keep a precise leaf, keep a fresh imprecise
+  // leaf as --continue, drop a stale one — all in one fixture.
+  const records = {
+    "leaf-precise": rec({ sessionId: "sess-x", isAgent: true }),
+    "leaf-fresh": rec({ isAgent: true, updatedAt: 5_000_000 }),
+    "leaf-stale": rec({ isAgent: true, updatedAt: 5_000_000 }),
+  };
+  const commands = {
+    "leaf-precise": ["claude", "--resume", "sess-x"],
+    "leaf-fresh": ["claude", "--continue"],
+    "leaf-stale": ["claude", "--continue"],
+  };
+  const candidates = {
+    "leaf-fresh": 5_000_000, // last turn == pane activity → fresh
+    "leaf-stale": 1_000_000, // last turn well before pane activity → stale
+    // leaf-precise needs no candidate (bypasses the guard)
+  };
+
+  it("keeps precise + fresh imprecise, drops stale, counts the drop", () => {
+    const out = planResumeLeaves(commands, records, candidates, MARGIN);
+    expect(out.commands).toEqual({
+      "leaf-precise": ["claude", "--resume", "sess-x"],
+      "leaf-fresh": ["claude", "--continue"],
+    });
+    expect(out.tierByLeaf).toEqual({
+      "leaf-precise": "precise",
+      "leaf-fresh": "imprecise",
+    });
+    expect(out.staleDropped).toBe(1);
+    expect(out.commands["leaf-stale"]).toBeUndefined(); // → bare shell
+  });
+
+  it("a precise leaf keeps even with a missing candidate (guard bypassed)", () => {
+    const out = planResumeLeaves(
+      { "leaf-precise": ["claude", "--resume", "sess-x"] },
+      { "leaf-precise": rec({ sessionId: "sess-x" }) },
+      {}, // no candidate fetched for a precise leaf
+      MARGIN,
+    );
+    expect(out.tierByLeaf).toEqual({ "leaf-precise": "precise" });
+    expect(out.staleDropped).toBe(0);
+  });
+
+  it("drops every imprecise leaf when all candidates are stale/missing", () => {
+    const out = planResumeLeaves(
+      { a: ["claude", "--continue"], b: ["claude", "--continue"] },
+      { a: rec({ isAgent: true, updatedAt: 9_000_000 }), b: rec({ isAgent: true, updatedAt: 9_000_000 }) },
+      { a: 1_000, b: null },
+      MARGIN,
+    );
+    expect(out.commands).toEqual({});
+    expect(out.staleDropped).toBe(2);
+  });
+});
+
+describe("resumeOfferBreakdown (fix-003 U4)", () => {
+  it("is null when every resumable leaf is exact", () => {
+    expect(resumeOfferBreakdown({ precise: 3, imprecise: 0 }, 0)).toBeNull();
+  });
+
+  it("lists exact + most-recent-in-folder + stale", () => {
+    expect(resumeOfferBreakdown({ precise: 2, imprecise: 1 }, 1)).toBe(
+      "2 exact · 1 most-recent-in-folder · 1 stale, started fresh",
+    );
+  });
+
+  it("shows just the imprecise part when there are no exact or stale", () => {
+    expect(resumeOfferBreakdown({ precise: 0, imprecise: 2 }, 0)).toBe(
+      "2 most-recent-in-folder",
+    );
+  });
+
+  it("shows a stale-only breakdown even with no imprecise resumes", () => {
+    expect(resumeOfferBreakdown({ precise: 1, imprecise: 0 }, 2)).toBe(
+      "1 exact · 2 stale, started fresh",
+    );
+  });
+});
+
+describe("resumeNoticeText (fix-003 U4)", () => {
+  it("is null when everything resumed exactly", () => {
+    expect(resumeNoticeText({ precise: 2, imprecise: 0 }, 0)).toBeNull();
+  });
+
+  it("names the imprecise resumes (with plural agreement)", () => {
+    expect(resumeNoticeText({ precise: 1, imprecise: 1 }, 0)).toBe(
+      "1 agent resumed by most-recent session in folder.",
+    );
+    expect(resumeNoticeText({ precise: 0, imprecise: 2 }, 0)).toBe(
+      "2 agents resumed by most-recent session in folder.",
+    );
+  });
+
+  it("names stale-dropped agents (the AE3 disclosure)", () => {
+    expect(resumeNoticeText({ precise: 0, imprecise: 0 }, 1)).toBe(
+      "1 agent started fresh — no recent session to resume.",
+    );
+  });
+
+  it("joins imprecise and stale clauses", () => {
+    expect(resumeNoticeText({ precise: 1, imprecise: 1 }, 2)).toBe(
+      "1 agent resumed by most-recent session in folder; 2 agents started fresh — no recent session to resume.",
+    );
   });
 });
 

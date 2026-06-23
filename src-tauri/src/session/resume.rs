@@ -205,7 +205,8 @@ pub fn save_resume_record(leaf_key: String, argv: Vec<String>) -> Result<(), Str
 /// `session_cwd` partial the hook path does (`lib.rs`), so the two precise sources
 /// are interchangeable; field-merging, so it never clobbers the poll's
 /// `argv`/`is_agent`. All writers target the pane's one active session, so
-/// last-writer-wins is harmless (KTD-A/B).
+/// last-writer-wins is harmless (KTD-A/B). Writes through `resume_path()` under
+/// the `FLY_APP_NAME` root, so `fly`/`fly-dev` stay isolated (R7).
 #[tauri::command]
 pub fn save_resume_session(
     leaf_key: String,

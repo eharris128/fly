@@ -265,26 +265,26 @@ fn newest_session_basename(entries: &[(String, SystemTime)]) -> Option<String> {
         .map(|(id, _)| id.to_string())
 }
 
-/// The session `claude --continue` would re-open in a project dir (the newest
-/// transcript) paired with its **last real-turn** timestamp — the freshness signal
+/// The freshness signal for the session `claude --continue` would re-open in a
+/// project dir (the newest transcript): its **last real-turn** timestamp, which
 /// the restore-time stale-guard compares against the pane's own activity (U3,
 /// KTD-C). `last_turn_ms` is `None` for a transcript with no timestamped turn; the
 /// guard treats that as stale, so a contentless candidate never resurrects a pane.
+/// The session id itself is intentionally **not** returned — the imprecise path
+/// resumes via `--continue`, not by id, so the frontend needs only the freshness.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContinueTarget {
-    pub session_id: String,
     pub last_turn_ms: Option<u64>,
 }
 
-/// Path-taking core of [`continue_target`]: the newest transcript in `dir` plus
-/// its last real-turn time. `None` for a missing/empty dir (no `--continue` target
-/// → the leaf falls to a bare shell).
+/// Path-taking core of [`continue_target`]: the last real-turn time of the newest
+/// transcript in `dir`. `None` for a missing/empty dir (no `--continue` target →
+/// the leaf falls to a bare shell).
 fn continue_target_in_dir(dir: &Path) -> Option<ContinueTarget> {
-    let entries = read_project_entries(dir);
-    let session_id = newest_session_basename(&entries)?;
+    let session_id = newest_session_basename(&read_project_entries(dir))?;
     let last_turn_ms = session_last_turn_ms(&dir.join(format!("{session_id}.jsonl")));
-    Some(ContinueTarget { session_id, last_turn_ms })
+    Some(ContinueTarget { last_turn_ms })
 }
 
 /// Command: the session `claude --continue` would re-open in `cwd`, plus its last
@@ -509,8 +509,9 @@ mod tests {
         // exact play-bug shape: a recent mtime but an ancient last real turn.
         std::fs::write(dir.path().join("04d56f41.jsonl"), METADATA_TAIL_FIXTURE).unwrap();
         let target = continue_target_in_dir(dir.path()).expect("a target exists");
-        assert_eq!(target.session_id, "04d56f41");
-        assert_eq!(target.last_turn_ms, Some(1_781_896_636_402)); // 06-19, not mtime
+        // Reports the newest transcript's last REAL turn (06-19), not its mtime.
+        // (Which session is picked is covered by newest_session_has_no_recency_floor.)
+        assert_eq!(target.last_turn_ms, Some(1_781_896_636_402));
     }
 
     #[test]

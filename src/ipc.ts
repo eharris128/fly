@@ -260,15 +260,14 @@ export function loadResumeRecords(): Promise<Record<string, ResumeRecord>> {
 }
 
 /**
- * The session `claude --continue` would re-open in `cwd` (the newest transcript
- * in its project dir) plus that session's last real-turn time in Unix ms (null
- * when the transcript has no timestamped turn), or null when no target exists
- * (fix-resume-session-selection U3). The restore-time stale-guard compares
- * `lastTurnMs` against the pane's own activity to reject resurrecting a session
- * older than the pane's life (KTD-C).
+ * The freshness of the session `claude --continue` would re-open in `cwd` (the
+ * newest transcript in its project dir): its last real-turn time in Unix ms, or
+ * null when the transcript has no timestamped turn — and the whole result is null
+ * when no target exists (fix-resume-session-selection U3). The restore-time
+ * stale-guard compares `lastTurnMs` against the pane's own activity to reject
+ * resurrecting a session older than the pane's life (KTD-C).
  */
 export interface ContinueTarget {
-  sessionId: string;
   lastTurnMs: number | null;
 }
 export function continueTarget(cwd: string): Promise<ContinueTarget | null> {

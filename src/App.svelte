@@ -40,8 +40,10 @@
     resumeCommandsForLeaves,
     shouldCaptureSession,
     classifyResumeTier,
-    resumeLeafDecision,
+    planResumeLeaves,
     resumeTierSummary,
+    resumeOfferBreakdown,
+    resumeNoticeText,
     type ResumeTier,
   } from "./lib/resume";
   import {
@@ -439,24 +441,24 @@
   // and there are agents to resume. restore() awaits the answer before mounting
   // panes, so accepting spawns them as resumed agents (declining → bare shells).
   // `tiers` (fix-003 U4) breaks the count into exact (`--resume <id>`) vs
-  // most-recent-in-folder (`--continue`) so a degraded resume is never silently
-  // offered as exact (R5).
+  // most-recent-in-folder (`--continue`); `staleDropped` is how many leaves were
+  // dropped to a bare shell by the stale-guard — so a degraded resume is never
+  // silently offered as exact, and a dropped session is disclosed (R5/AE3).
   let resumeOffer = $state<{
     count: number;
     tiers: { precise: number; imprecise: number };
+    staleDropped: number;
   } | null>(null);
   let resolveResumeOffer: ((accept: boolean) => void) | null = null;
   // Transient post-resume notice for the explicit `fly resume` path, which shows
-  // no offer dialog (fix-003 U4, R5): names how many panes re-attached imprecisely
-  // (`--continue`, most-recent-in-folder) so that tier is surfaced, not hidden.
-  // Auto-dismisses; click to clear. The offer path uses the in-dialog breakdown.
+  // no offer dialog (fix-003 U4, R5/AE3): names imprecise (`--continue`) and
+  // stale-dropped panes so neither tier is hidden. Auto-dismisses; click to clear.
+  // The offer path uses the in-dialog breakdown instead.
   let resumeNotice = $state<string | null>(null);
   let resumeNoticeTimer: ReturnType<typeof setTimeout> | null = null;
-  function showResumeNotice(summary: { precise: number; imprecise: number }) {
-    if (summary.imprecise === 0) return; // all exact → nothing to disclose
-    const exact = summary.precise > 0 ? `, ${summary.precise} exact` : "";
-    const s = summary.imprecise === 1 ? "" : "s";
-    resumeNotice = `Resumed ${summary.imprecise} agent${s} by most-recent session in folder${exact}.`;
+  function showResumeNotice(text: string | null) {
+    if (text == null) return; // everything resumed exactly → nothing to disclose
+    resumeNotice = text;
     if (resumeNoticeTimer) clearTimeout(resumeNoticeTimer);
     resumeNoticeTimer = setTimeout(() => (resumeNotice = null), 8000);
   }
@@ -831,11 +833,16 @@
   // (non-agent, or no active transcript) never clears a captured id. The pane's cwd
   // doubles as the session cwd (the project dir resume runs in, KTD-H).
   async function captureResumeSession(entries: [string, PaneId][]) {
-    for (const [key, pid] of entries) {
-      const id = await paneSessionId(pid);
+    // Read every pane's session id in parallel (each is an IPC round-trip), like
+    // refreshCwds does for cwds, so poll latency doesn't scale with pane count.
+    const results = await Promise.all(
+      entries.map(async ([key, pid]) => [key, await paneSessionId(pid)] as const),
+    );
+    for (const [key, id] of results) {
+      if (id == null) continue; // not an agent / no active transcript
       if (!shouldCaptureSession(resumeSessionByLeaf.get(key) ?? null, id)) continue;
-      resumeSessionByLeaf.set(key, id!);
-      void saveResumeSession(key, id!, cwdByLeaf[key] ?? null);
+      resumeSessionByLeaf.set(key, id);
+      void saveResumeSession(key, id, cwdByLeaf[key] ?? null);
     }
   }
 
@@ -1063,53 +1070,59 @@
     if (mode === "normal") return empty; // R1: a clean launch never auto-runs
 
     const records = await loadResumeRecords();
-    const commands = resumeCommandsForLeaves(savedKeys, records, defaultArgs);
-    if (Object.keys(commands).length === 0) return empty; // nothing resumable
+    const baseCommands = resumeCommandsForLeaves(savedKeys, records, defaultArgs);
+    if (Object.keys(baseCommands).length === 0) return empty; // nothing resumable
 
-    // Stale-guard each imprecise (no-id → `--continue`) leaf and classify the tier
-    // (KTD-C/D). A precise (`--resume <id>`) leaf bypasses the guard — the pane ran
-    // that session, so re-attaching it is exact. An imprecise leaf consults the
-    // session `--continue` would re-open in its spawn cwd; if that session's last
-    // real turn predates the pane's own activity it is dropped from `commands` (→ a
-    // bare shell, R4), never silently resurrected. Done before the offer so its
-    // count reflects what will actually resume.
-    const tierByLeaf: Record<string, ResumeTier> = {};
-    for (const key of Object.keys(commands)) {
-      const record = records[key];
-      // Only an imprecise leaf needs the `--continue` candidate; a precise leaf
-      // bypasses the guard (and the IPC). The candidate runs in the leaf's spawn
-      // cwd — `cwds[key]`, since an imprecise leaf has no sessionCwd override yet.
-      const candidateLastTurnMs =
-        classifyResumeTier(record) === "imprecise"
-          ? (await continueTarget(cwds[key] ?? ""))?.lastTurnMs ?? null
-          : null;
-      const { tier, keep } = resumeLeafDecision(
-        record,
-        candidateLastTurnMs,
-        RESUME_STALE_MARGIN_MS,
-      );
-      if (!keep) {
-        delete commands[key]; // → bare shell, not a wrong session (R4/R6)
-        continue;
-      }
-      tierByLeaf[key] = tier;
-    }
-    if (Object.keys(commands).length === 0) return empty; // all stale → nothing
+    // Probe the `--continue` candidate's freshness for each imprecise (no-id) leaf
+    // — a precise (`--resume <id>`) leaf bypasses the guard, so it needs no probe.
+    // The probes run in PARALLEL (each is a Tauri round-trip + a transcript read),
+    // and each is ISOLATED: a rejection degrades that leaf to a null candidate →
+    // stale → bare shell, never aborting the whole restore (fix-003 review). The
+    // candidate runs in the leaf's spawn cwd (`cwds[key]`, since an imprecise leaf
+    // has no sessionCwd override yet).
+    const impreciseLeaves = Object.keys(baseCommands).filter(
+      (k) => classifyResumeTier(records[k]) === "imprecise",
+    );
+    const candidateLastTurnByLeaf: Record<string, number | null> = Object.fromEntries(
+      await Promise.all(
+        impreciseLeaves.map(async (k) => {
+          try {
+            const target = await continueTarget(cwds[k] ?? "");
+            return [k, target?.lastTurnMs ?? null] as const;
+          } catch {
+            return [k, null] as const; // probe failed → treat as stale
+          }
+        }),
+      ),
+    );
+
+    // Stale-guard + tier-classify (KTD-C/D): a precise leaf keeps (exact
+    // re-attach); a fresh imprecise leaf keeps as `--continue`; a stale imprecise
+    // leaf is dropped to a bare shell (R4) and counted for disclosure (R5/AE3).
+    const { commands, tierByLeaf, staleDropped } = planResumeLeaves(
+      baseCommands,
+      records,
+      candidateLastTurnByLeaf,
+      RESUME_STALE_MARGIN_MS,
+    );
+    const hasResumable = Object.keys(commands).length > 0;
+    if (!hasResumable && staleDropped === 0) return empty; // nothing happened
 
     // Explicit `fly resume` resumes immediately; a detected crash offers first.
     const summary = resumeTierSummary(tierByLeaf);
     let resuming = mode === "resume";
     if (mode === "offer") {
+      if (!hasResumable) return empty; // all stale → bare shells, no offer to show
       resuming = await new Promise<boolean>((res) => {
         resolveResumeOffer = res;
-        resumeOffer = { count: Object.keys(commands).length, tiers: summary };
+        resumeOffer = { count: Object.keys(commands).length, tiers: summary, staleDropped };
       });
     }
     if (!resuming) return empty;
 
-    // Explicit `fly resume` shows no dialog, so surface an imprecise resume as a
-    // transient notice (R5); the offer path already discloses the breakdown.
-    if (mode === "resume") showResumeNotice(summary);
+    // Explicit `fly resume` shows no dialog, so surface the imprecise/stale tiers
+    // as a transient notice (R5/AE3); the offer path discloses them in-dialog.
+    if (mode === "resume") showResumeNotice(resumeNoticeText(summary, staleDropped));
 
     // KTD-H: resume each agent in its captured session cwd when we have one.
     for (const key of Object.keys(commands)) {
@@ -1366,6 +1379,10 @@
   {/if}
 
   {#if resumeOffer !== null}
+    {@const breakdown = resumeOfferBreakdown(
+      resumeOffer.tiers,
+      resumeOffer.staleDropped,
+    )}
     <div class="backdrop" role="presentation">
       <div
         class="confirm"
@@ -1379,14 +1396,12 @@
             ? ""
             : "s"} from your last session?
         </p>
-        {#if resumeOffer.tiers.imprecise > 0}
-          <!-- Tier breakdown (fix-003 U4, R5): disclose how many re-attach exactly
-               vs by most-recent-session-in-folder, so the degraded path is never
-               passed off as exact. Shown only when some pane is imprecise. -->
-          <p class="confirm-sub">
-            {#if resumeOffer.tiers.precise > 0}{resumeOffer.tiers.precise} exact ·
-            {/if}{resumeOffer.tiers.imprecise} most-recent-in-folder
-          </p>
+        {#if breakdown}
+          <!-- Tier breakdown (fix-003 U4, R5/AE3): disclose how many re-attach
+               exactly vs by most-recent-session-in-folder, and how many stale
+               sessions were dropped to a fresh shell — so the degraded path is
+               never passed off as exact. Null (hidden) when every pane is exact. -->
+          <p class="confirm-sub">{breakdown}</p>
         {/if}
         <div class="confirm-actions">
           <button class="btn danger" onclick={() => answerResumeOffer(true)}>

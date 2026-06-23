@@ -214,6 +214,86 @@ export function resumeTierSummary(
 }
 
 /**
+ * Decide which restored leaves resume, with what tier, and how many were dropped
+ * to a bare shell by the stale-guard (fix-003 U3). Pure: each imprecise leaf's
+ * `--continue` candidate freshness (`candidateLastTurnByLeaf`, pre-fetched by the
+ * caller) is injected, so the keep/drop/classify composition — the heart of the
+ * fix, and the plan's U3 "Logic" scenario — is tested without IPC. Takes the
+ * already-built `commands` (from {@link resumeCommandsForLeaves}); a precise leaf
+ * keeps and stays `--resume <id>`; an imprecise leaf keeps only when fresh, else
+ * it is removed (→ bare shell, R4) and counted in `staleDropped` so the caller can
+ * disclose it (R5/AE3).
+ */
+export function planResumeLeaves(
+  commands: Record<string, string[]>,
+  records: Record<string, ResumeRecord | undefined>,
+  candidateLastTurnByLeaf: Record<string, number | null>,
+  marginMs: number,
+): {
+  commands: Record<string, string[]>;
+  tierByLeaf: Record<string, ResumeTier>;
+  staleDropped: number;
+} {
+  const kept: Record<string, string[]> = {};
+  const tierByLeaf: Record<string, ResumeTier> = {};
+  let staleDropped = 0;
+  for (const key of Object.keys(commands)) {
+    const { tier, keep } = resumeLeafDecision(
+      records[key],
+      candidateLastTurnByLeaf[key] ?? null,
+      marginMs,
+    );
+    if (!keep) {
+      staleDropped++; // stale → bare shell, but disclosed (R5/AE3)
+      continue;
+    }
+    kept[key] = commands[key];
+    tierByLeaf[key] = tier;
+  }
+  return { commands: kept, tierByLeaf, staleDropped };
+}
+
+/**
+ * The resume-offer dialog's tier breakdown (fix-003 U4, R5): `null` when every
+ * resumable leaf is exact (nothing to disclose), else a terse "M exact ·
+ * K most-recent-in-folder · J stale, started fresh" line. Pure.
+ */
+export function resumeOfferBreakdown(
+  tiers: { precise: number; imprecise: number },
+  staleDropped: number,
+): string | null {
+  if (tiers.imprecise === 0 && staleDropped === 0) return null;
+  const parts: string[] = [];
+  if (tiers.precise > 0) parts.push(`${tiers.precise} exact`);
+  if (tiers.imprecise > 0) parts.push(`${tiers.imprecise} most-recent-in-folder`);
+  if (staleDropped > 0) parts.push(`${staleDropped} stale, started fresh`);
+  return parts.join(" · ");
+}
+
+/**
+ * The transient post-resume disclosure for the explicit `fly resume` path, which
+ * shows no offer dialog (fix-003 U4, R5/AE3): names how many panes re-attached
+ * imprecisely (`--continue`) and how many were dropped to a fresh shell because
+ * their only candidate session was stale. `null` when everything resumed exactly.
+ * Pure, so the wording is unit-tested.
+ */
+export function resumeNoticeText(
+  summary: { precise: number; imprecise: number },
+  staleDropped: number,
+): string | null {
+  const parts: string[] = [];
+  if (summary.imprecise > 0) {
+    const s = summary.imprecise === 1 ? "" : "s";
+    parts.push(`${summary.imprecise} agent${s} resumed by most-recent session in folder`);
+  }
+  if (staleDropped > 0) {
+    const s = staleDropped === 1 ? "" : "s";
+    parts.push(`${staleDropped} agent${s} started fresh — no recent session to resume`);
+  }
+  return parts.length ? parts.join("; ") + "." : null;
+}
+
+/**
  * Whether the poll should capture a leaf's resolved session id (fix-003 U2,
  * KTD-B). Unlike argv — fixed for a pane's life, captured once — a session id
  * rotates within a pane's life (`/clear`, a new conversation), so capture is

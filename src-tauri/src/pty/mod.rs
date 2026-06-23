@@ -237,61 +237,53 @@ impl PtyManager {
         self.pane_command(id).is_some()
     }
 
-    /// The pane's foreground argv **only when it is a Claude agent** (U4, the
-    /// flag source captured into the resume store, R2/R5). Resolves the
-    /// foreground pid first — which drops the registry lock — then reads `/proc`
-    /// and runs the pure matcher outside any lock, the same two-step shape as
-    /// [`cwd`], so a blocking syscall never holds the `panes` mutex every command
-    /// and the read-thread teardown contend on (KTD13). Returns `None` for a bare
-    /// shell or a gone pane — never a non-agent's argv.
-    pub fn pane_command(&self, id: PaneId) -> Option<Vec<String>> {
+    /// The pane's foreground pid **and** argv when its foreground process is a
+    /// Claude agent, else `None` — the shared `is_claude`-gated prologue of
+    /// [`pane_command`], [`pane_session_id`], and [`agent_task_count`]. Resolves
+    /// the foreground pid (which takes and drops the registry lock), then reads
+    /// `/proc` and runs the pure matcher with **no** lock held — the two-step shape
+    /// of [`cwd`], so a blocking syscall never holds the `panes` mutex every command
+    /// and the read-thread teardown contend on (KTD13). Returns the pid alongside
+    /// the argv so a caller that needs the pid (cwd / session / task-count
+    /// resolution) doesn't re-resolve it.
+    fn claude_foreground(&self, id: PaneId) -> Option<(u32, Vec<String>)> {
         let pid = self.foreground_pid(id)?;
         let comm = crate::cwd::proc_comm(pid);
         let argv = crate::cwd::proc_cmdline(pid);
-        crate::cwd::is_claude(comm.as_deref(), &argv).then_some(argv)
+        crate::cwd::is_claude(comm.as_deref(), &argv).then_some((pid, argv))
+    }
+
+    /// The pane's foreground argv **only when it is a Claude agent** (U4, the flag
+    /// source captured into the resume store, R2/R5). `None` for a bare shell or a
+    /// gone pane — never a non-agent's argv. See [`claude_foreground`] for the
+    /// shared pid-resolve + `is_claude`-gate + lock discipline.
+    pub fn pane_command(&self, id: PaneId) -> Option<Vec<String>> {
+        self.claude_foreground(id).map(|(_, argv)| argv)
     }
 
     /// The pane's active Claude `session_id`, resolved from Claude's transcript
-    /// store (fix-resume-session-selection U1, KTD-A) — `is_claude`-gated like
-    /// [`pane_command`], so a bare shell never resolves an id. Two-step (resolve
-    /// the foreground pid — which takes and drops the registry lock — then read
-    /// `~/.claude/projects` with no lock held), mirroring [`cwd`]/[`pane_command`],
-    /// because the dir read is blocking I/O that must never hold the `panes` mutex
-    /// every command and the read-thread teardown contend on (KTD13). Reads the pid
-    /// directly (not [`cwd`], which would re-resolve it) so agent-ness and cwd come
-    /// from one pid. `None` for a non-agent, a gone pane, or when no active
-    /// transcript is found — never a non-agent's id.
+    /// store (fix-resume-session-selection U1, KTD-A) — `is_claude`-gated, so a
+    /// bare shell never resolves an id. Reads the agent pid directly (not [`cwd`],
+    /// which would re-resolve it) so agent-ness and cwd come from one pid; the dir
+    /// read of `~/.claude/projects` runs with no registry lock held (see
+    /// [`claude_foreground`]). `None` for a non-agent, a gone pane, or when no
+    /// active transcript is found — never a non-agent's id.
     pub fn pane_session_id(&self, id: PaneId) -> Option<String> {
-        let pid = self.foreground_pid(id)?;
-        let comm = crate::cwd::proc_comm(pid);
-        let argv = crate::cwd::proc_cmdline(pid);
-        if !crate::cwd::is_claude(comm.as_deref(), &argv) {
-            return None;
-        }
+        let (pid, _) = self.claude_foreground(id)?;
         let cwd = crate::cwd::proc_cwd(pid)?;
         crate::session::transcript::active_session_for_cwd(&cwd)
     }
 
     /// Whether the pane runs a Claude agent and, if so, how many live background
     /// task groups run beneath it (running-state plan U3, KTD2/KTD4) — the
-    /// dashboard's "N tasks" number. Resolves `foreground_pid` **once** (which
-    /// takes and drops the registry lock), then does every `/proc` read — agent
-    /// detection *and* the descendant-group scan — with no lock held: the same
-    /// resolve-then-drop discipline as [`pane_command`], not the atomics-only
-    /// [`pane_activity`](Self::pane_activity) pattern, because a process-tree scan
-    /// is many blocking syscalls and must never hold the `panes` mutex that every
-    /// command and the read-thread teardown contend on (KTD13/KTD4). `Some(n)` for
-    /// an agent (`n` may be 0); `None` for a bare shell or a gone pane — never a
-    /// panic. The whole table is one snapshot, so the count is internally
-    /// consistent against pid reuse within the call (KTD4).
+    /// dashboard's "N tasks" number. Reuses the agent pid from [`claude_foreground`]
+    /// to root the descendant scan; the whole `/proc` table read + walk runs with
+    /// no registry lock held (KTD13/KTD4). `Some(n)` for an agent (`n` may be 0);
+    /// `None` for a bare shell or a gone pane — never a panic. The table is one
+    /// snapshot, so the count is internally consistent against pid reuse within the
+    /// call (KTD4).
     pub fn agent_task_count(&self, id: PaneId) -> Option<u32> {
-        let pid = self.foreground_pid(id)?;
-        // No registry lock is held below — pure /proc reads off the hot path.
-        let comm = crate::cwd::proc_comm(pid);
-        let argv = crate::cwd::proc_cmdline(pid);
-        if !crate::cwd::is_claude(comm.as_deref(), &argv) {
-            return None;
-        }
+        let (pid, _) = self.claude_foreground(id)?;
         let table = crate::cwd::read_proc_table();
         Some(crate::cwd::count_background_task_groups(&table, pid))
     }
