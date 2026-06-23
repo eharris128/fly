@@ -146,6 +146,26 @@ export function agentCount(model: HomeWorkspaceGroup[]): number {
 }
 
 /**
+ * Resolve a dashboard workspace-number keypress (U7) to a jump target: the first
+ * tab's first agent row in the Nth *displayed* workspace group. `n` is 1-based,
+ * to match the on-screen badges (workspace 1..N) and the `leader 1-9` tab chord —
+ * and it indexes the model, so agent-less workspaces (dropped by `buildHomeModel`)
+ * are skipped, not counted. Returns null when `n` is out of range, so the caller
+ * no-ops on an unmapped digit. Every group has ≥1 tab and every tab ≥1 row
+ * (empties are dropped), so a resolved target always lands on a real agent pane,
+ * never a bare tab.
+ */
+export function workspaceJumpTarget(
+  model: HomeWorkspaceGroup[],
+  n: number,
+): { wsId: string; tabId: string; leafKey: string } | null {
+  const ws = model[n - 1];
+  if (!ws) return null;
+  const tab = ws.tabs[0];
+  return { wsId: ws.wsId, tabId: tab.tabId, leafKey: tab.rows[0].leafKey };
+}
+
+/**
  * Compact elapsed duration: `"0s"`, `"45s"`, `"5m"`, `"1h 5m"`, `"2h"`. Minutes
  * and hours floor (a glance metric, not a stopwatch). Negative inputs clamp to
  * `"0s"`. Mirrors the relative-time style in `notifications.ts`.

@@ -3,7 +3,7 @@
   // model from `home.ts` and owns only its keyboard selection + a 1s tick for
   // the live "working for" timer. All data + the never-unmount hide live in
   // App.svelte; jumping and closing are prop callbacks.
-  import { formatDuration, type HomeWorkspaceGroup } from "./home";
+  import { formatDuration, workspaceJumpTarget, type HomeWorkspaceGroup } from "./home";
 
   let {
     model,
@@ -81,6 +81,13 @@
     } else if (e.key === "Escape") {
       e.preventDefault();
       onClose();
+    } else if (!e.ctrlKey && !e.metaKey && !e.altKey && /^[1-9]$/.test(e.key)) {
+      // Bare 1–9 → jump to the first tab in the Nth displayed workspace, 1-based
+      // to match the badges. The dashboard owns these digits, so consume any;
+      // an out-of-range one resolves to null and just no-ops.
+      e.preventDefault();
+      const target = workspaceJumpTarget(model, Number(e.key));
+      if (target) onJump(target.wsId, target.tabId, target.leafKey);
     }
     // Enter is handled by the focused row button's native click.
   }
@@ -95,7 +102,7 @@
 >
   <header class="home-head">
     <h1>Agents</h1>
-    <span class="hint">Esc to close · ↑↓ to move · Enter to jump</span>
+    <span class="hint">Esc to close · ↑↓ to move · Enter to jump · 1–9 workspace</span>
   </header>
 
   {#if flatRows.length === 0}
@@ -105,9 +112,12 @@
     </div>
   {:else}
     <div class="groups">
-      {#each model as ws (ws.wsId)}
+      {#each model as ws, i (ws.wsId)}
         <section class="ws">
-          <h2 class="ws-name">{ws.name}</h2>
+          <h2 class="ws-name">
+            {#if i < 9}<kbd class="ws-num">{i + 1}</kbd>{/if}
+            <span class="ws-label">{ws.name}</span>
+          </h2>
           {#each ws.tabs as tab (tab.tabId)}
             <div class="tab">
               <h3 class="tab-title">{tab.title}</h3>
@@ -181,11 +191,31 @@
     max-width: 720px;
   }
   .ws-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     font-size: 12px;
+    margin: 0 0 8px;
+  }
+  .ws-label {
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: #8b93b2;
-    margin: 0 0 8px;
+  }
+  /* Keycap badge: the 0-based number that jumps to this workspace's first tab. */
+  .ws-num {
+    flex: none;
+    min-width: 14px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: #2a3350;
+    color: #cdd3ea;
+    font: inherit;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.45;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
   }
   .tab {
     margin-bottom: 10px;

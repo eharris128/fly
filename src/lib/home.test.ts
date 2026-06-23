@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { buildHomeModel, effectiveAttention, formatDuration, agentCount } from "./home";
+import {
+  buildHomeModel,
+  effectiveAttention,
+  formatDuration,
+  agentCount,
+  workspaceJumpTarget,
+} from "./home";
 import type { Tab, Workspace } from "./workspaces";
 import type { Node } from "./layout";
 import type { PaneActivity } from "../ipc";
@@ -127,6 +133,57 @@ describe("buildHomeModel", () => {
 
   it("returns [] for empty inputs", () => {
     expect(buildHomeModel([], {}, {}, {})).toEqual([]);
+  });
+});
+
+describe("workspaceJumpTarget", () => {
+  const model = buildHomeModel(
+    [
+      ws("ws-1", "Alpha", [tab("tab-1", leaf("a"), "a")]),
+      ws("ws-2", "Beta", [
+        tab("tab-2", leaf("b"), "b"),
+        tab("tab-3", leaf("c"), "c"),
+      ]),
+    ],
+    { a: agent(true), b: agent(true), c: agent(true) },
+    {},
+    {},
+  );
+
+  it("resolves the Nth (1-based) displayed workspace's first tab + first row", () => {
+    expect(workspaceJumpTarget(model, 1)).toEqual({
+      wsId: "ws-1",
+      tabId: "tab-1",
+      leafKey: "a",
+    });
+    // ws-2's FIRST tab/row — "the first tab in that workspace", not its second.
+    expect(workspaceJumpTarget(model, 2)).toEqual({
+      wsId: "ws-2",
+      tabId: "tab-2",
+      leafKey: "b",
+    });
+  });
+
+  it("returns null for an out-of-range digit or an empty model", () => {
+    expect(workspaceJumpTarget(model, 3)).toBeNull();
+    expect(workspaceJumpTarget(model, 0)).toBeNull(); // 1-based: 0 is no workspace
+    expect(workspaceJumpTarget([], 1)).toBeNull();
+  });
+
+  it("indexes the DISPLAYED groups, skipping agent-less workspaces", () => {
+    // ws-mid has no agent → dropped by buildHomeModel, so digit 2 is ws-3.
+    const m = buildHomeModel(
+      [
+        ws("ws-1", "Alpha", [tab("t1", leaf("a"), "a")]),
+        ws("ws-mid", "NoAgents", [tab("t2", leaf("x"), "x")]),
+        ws("ws-3", "Gamma", [tab("t3", leaf("c"), "c")]),
+      ],
+      { a: agent(true), x: agent(false), c: agent(true) },
+      {},
+      {},
+    );
+    expect(m).toHaveLength(2); // ws-mid dropped
+    expect(workspaceJumpTarget(m, 2)?.wsId).toBe("ws-3");
   });
 });
 
