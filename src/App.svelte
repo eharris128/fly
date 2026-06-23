@@ -243,12 +243,29 @@
     updateActiveTab((t) => ({ ...t, focusedLeafKey: key }));
   }
 
-  function split(orientation: Orientation) {
+  async function split(orientation: Orientation) {
     if (!activeTab) return;
     const rect = rects.get(activeTab.focusedLeafKey);
     if (rect && !canSplit(rect, orientation)) return; // min-size clamp (R7)
-    const res = splitLeaf(activeTab.tree, activeTab.focusedLeafKey, orientation);
-    if (res) setActiveTree(res.tree, res.added.key);
+    // Inherit the focused pane's cwd (U4), exactly like newTab: query fresh so a
+    // just-issued `cd` is honored, falling back to the polled cache then $HOME
+    // (null). Capture the source synchronously before the await (paneIdByLeaf is
+    // non-$state, read directly).
+    const srcTabId = activeTab.id;
+    const srcKey = activeTab.focusedLeafKey;
+    const srcPid = paneIdByLeaf[srcKey];
+    const cwd =
+      (srcPid != null ? await paneCwd(srcPid) : null) ?? (cwdByLeaf[srcKey] ?? null);
+    // The active tab/focus may have changed during the await — bail unless the
+    // source is still the focused leaf of the active tab, so we never split a
+    // stale tree (the user can simply re-issue the split).
+    if (activeTab?.id !== srcTabId || activeTab.focusedLeafKey !== srcKey) return;
+    const res = splitLeaf(activeTab.tree, srcKey, orientation);
+    if (!res) return;
+    // Seed the new leaf's cwd in the same synchronous block that updates the tree,
+    // so it's present before the Terminal mounts (Terminal reads cwd once at mount).
+    cwdByLeaf = { ...cwdByLeaf, [res.added.key]: cwd };
+    setActiveTree(res.tree, res.added.key);
   }
   function closePane() {
     if (!activeTab) return;
@@ -924,8 +941,8 @@
   }
   const keymapActions: KeymapActions = {
     newTab: () => void newTab(),
-    splitHorizontal: () => split("horizontal"),
-    splitVertical: () => split("vertical"),
+    splitHorizontal: () => void split("horizontal"),
+    splitVertical: () => void split("vertical"),
     closePane,
     closeTab: () => requestCloseTab(),
     focusLeft: () => focusDir("left"),
@@ -1120,8 +1137,8 @@
     {muted}
     unreadTotal={unreadTotal(notifications)}
     onToggleSidebar={() => (sidebarCollapsed = !sidebarCollapsed)}
-    onSplitH={() => split("horizontal")}
-    onSplitV={() => split("vertical")}
+    onSplitH={() => void split("horizontal")}
+    onSplitV={() => void split("vertical")}
     onClosePane={closePane}
     onToggleMute={toggleMute}
     onOpenNotifications={openNotifications}
