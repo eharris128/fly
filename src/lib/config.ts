@@ -35,6 +35,9 @@ export interface Config {
   notificationCommand: string | null;
   /** Per-reason, per-effect notification mask (R18). */
   reasonEffects: ReasonEffectsConfig;
+  /** Flag floor replayed on resume when an agent's launch argv wasn't captured
+   * (R8/KTD-C); default ["--dangerously-skip-permissions"]. */
+  resumeDefaultArgs: string[];
 }
 
 let cached: Config | null = null;

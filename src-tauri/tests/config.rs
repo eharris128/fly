@@ -65,6 +65,11 @@ fn old_config_without_notification_keys_loads_new_defaults() {
         Some("message-new-instant")
     );
     assert_eq!(config.notification_command, None);
+    // A config predating resume also fills the flag floor (R8).
+    assert_eq!(
+        config.resume_default_args,
+        vec!["--dangerously-skip-permissions".to_string()]
+    );
     for reason in [
         Reason::Question,
         Reason::Permission,

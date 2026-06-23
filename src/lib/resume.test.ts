@@ -1,0 +1,127 @@
+import { describe, it, expect } from "vitest";
+import { buildResumeCommand } from "./resume";
+import type { ResumeRecord } from "../ipc";
+
+// The configured flag floor (R8): replayed when no argv was captured.
+const DEFAULT = ["--dangerously-skip-permissions"];
+
+function rec(over: Partial<ResumeRecord>): ResumeRecord {
+  return {
+    sessionId: null,
+    sessionCwd: null,
+    argv: null,
+    isAgent: false,
+    updatedAt: 0,
+    ...over,
+  };
+}
+
+describe("buildResumeCommand (U5)", () => {
+  it("returns null for no record → bare shell", () => {
+    expect(buildResumeCommand(null, DEFAULT)).toBeNull();
+    expect(buildResumeCommand(undefined, DEFAULT)).toBeNull();
+  });
+
+  it("appends --resume <id> after replayed flags, preserving the skip flag", () => {
+    const out = buildResumeCommand(
+      rec({ argv: ["claude", "--dangerously-skip-permissions"], sessionId: "x" }),
+      DEFAULT,
+    );
+    expect(out).toEqual(["claude", "--dangerously-skip-permissions", "--resume", "x"]);
+  });
+
+  it("preserves a --model value flag", () => {
+    const out = buildResumeCommand(
+      rec({ argv: ["claude", "--model", "opus", "--dangerously-skip-permissions"], sessionId: "x" }),
+      DEFAULT,
+    );
+    expect(out).toEqual([
+      "claude",
+      "--model",
+      "opus",
+      "--dangerously-skip-permissions",
+      "--resume",
+      "x",
+    ]);
+  });
+
+  it("falls back to the flag floor with --resume <id> when no argv was captured", () => {
+    const out = buildResumeCommand(rec({ sessionId: "abc", isAgent: true }), DEFAULT);
+    expect(out).toEqual(["claude", "--resume", "abc", "--dangerously-skip-permissions"]);
+  });
+
+  it("uses --continue + flag floor for an agent with neither id nor argv", () => {
+    const out = buildResumeCommand(rec({ isAgent: true }), DEFAULT);
+    expect(out).toEqual(["claude", "--continue", "--dangerously-skip-permissions"]);
+  });
+
+  it("strips an existing --continue and appends --resume <id>", () => {
+    const out = buildResumeCommand(
+      rec({ argv: ["claude", "--continue"], sessionId: "x" }),
+      DEFAULT,
+    );
+    expect(out).toEqual(["claude", "--resume", "x"]);
+  });
+
+  it("strips a pre-existing --resume and its id value", () => {
+    const out = buildResumeCommand(
+      rec({ argv: ["claude", "-r", "stale-id", "--model", "opus"], sessionId: "new" }),
+      DEFAULT,
+    );
+    expect(out).toEqual(["claude", "--model", "opus", "--resume", "new"]);
+  });
+
+  it("strips the --resume=<id> form", () => {
+    const out = buildResumeCommand(
+      rec({ argv: ["claude", "--resume=stale"], sessionId: "new" }),
+      DEFAULT,
+    );
+    expect(out).toEqual(["claude", "--resume", "new"]);
+  });
+
+  it("strips a trailing positional prompt after a boolean flag (no re-send)", () => {
+    const out = buildResumeCommand(
+      rec({ argv: ["claude", "--dangerously-skip-permissions", "write a poem"], sessionId: "x" }),
+      DEFAULT,
+    );
+    expect(out).toEqual(["claude", "--dangerously-skip-permissions", "--resume", "x"]);
+  });
+
+  it("strips a trailing prompt but keeps a value-flag's value", () => {
+    const out = buildResumeCommand(
+      rec({ argv: ["claude", "--model", "opus", "explain this code"], sessionId: "x" }),
+      DEFAULT,
+    );
+    expect(out).toEqual(["claude", "--model", "opus", "--resume", "x"]);
+  });
+
+  it("preserves a node-wrapper argv[0..2] and appends --resume <id>", () => {
+    const out = buildResumeCommand(
+      rec({
+        argv: ["node", "/home/u/.npm/lib/node_modules/claude/cli.js", "--dangerously-skip-permissions"],
+        sessionId: "x",
+      }),
+      DEFAULT,
+    );
+    expect(out).toEqual([
+      "node",
+      "/home/u/.npm/lib/node_modules/claude/cli.js",
+      "--dangerously-skip-permissions",
+      "--resume",
+      "x",
+    ]);
+  });
+
+  it("uses --continue with replayed flags when argv is present but no id", () => {
+    const out = buildResumeCommand(
+      rec({ argv: ["claude", "--model", "opus"], isAgent: true }),
+      DEFAULT,
+    );
+    expect(out).toEqual(["claude", "--model", "opus", "--continue"]);
+  });
+
+  it("treats an empty argv as no argv (uses the floor)", () => {
+    const out = buildResumeCommand(rec({ argv: [], sessionId: "x" }), DEFAULT);
+    expect(out).toEqual(["claude", "--resume", "x", "--dangerously-skip-permissions"]);
+  });
+});

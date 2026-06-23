@@ -95,6 +95,11 @@ pub struct Config {
     pub notification_command: Option<String>,
     /// Per-reason, per-effect notification mask (R18). All effects on by default.
     pub reason_effects: ReasonEffectsConfig,
+    /// Flag floor replayed when resuming an agent whose launch argv was not
+    /// captured (renderer crash, or a pane the poll never saw) — R8/KTD-C.
+    /// Defaults to `--dangerously-skip-permissions` so the permission posture is
+    /// never silently lost on resume (Claude drops it across `--resume`, #21974).
+    pub resume_default_args: Vec<String>,
 }
 
 impl Default for Config {
@@ -112,6 +117,7 @@ impl Default for Config {
             notification_sound: Some("message-new-instant".into()),
             notification_command: None,
             reason_effects: ReasonEffectsConfig::default(),
+            resume_default_args: vec!["--dangerously-skip-permissions".into()],
         }
     }
 }
