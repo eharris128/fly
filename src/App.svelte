@@ -45,7 +45,9 @@
     setWorkspaceMuted,
     onNotificationAdded,
     paneCwd,
+    paneCommand,
     paneActivity,
+    saveResumeRecord,
     type PaneId,
     type PaneActivity,
     type AttentionState,
@@ -677,9 +679,16 @@
   }
 
   // ---- live cwd (auto tab names) -------------------------------------------
+  // Leaf keys whose launch argv we've already captured into the resume store
+  // (U4). A pane's launch command is fixed, so once captured it never changes —
+  // recording once per leaf keeps the write-through store churn-free while still
+  // catching a bash pane that later becomes a `claude` agent (uncaptured until
+  // then). Non-reactive bookkeeping, like paneIdByLeaf.
+  let resumeArgvCaptured = new Set<string>();
   // Poll each live pane's cwd so an auto-named tab tracks `cd` without needing a
   // layout change to trigger a save. Cheap (/proc read per pane); only writes
-  // state when something actually changed.
+  // state when something actually changed. This always-on poll is also the
+  // capture point for each agent's launch argv (U4) — see captureResumeArgv.
   async function refreshCwds() {
     const entries = Object.entries(paneIdByLeaf);
     if (entries.length === 0) return;
@@ -695,6 +704,22 @@
       }
     }
     if (changed) cwdByLeaf = { ...cwdByLeaf, ...updates };
+    void captureResumeArgv(entries);
+  }
+  // Capture each agent leaf's launch argv (the resume flag source) write-through,
+  // once per leaf (U4). pane_command returns the argv only for a detected Claude
+  // pane, so a bare shell upserts nothing. Best-effort: if the renderer dies the
+  // poll stops, but the hook path (U3) still captures the session id, and the
+  // builder's flag floor (U5) covers a missing argv.
+  async function captureResumeArgv(entries: [string, PaneId][]) {
+    for (const [key, pid] of entries) {
+      if (resumeArgvCaptured.has(key)) continue;
+      const argv = await paneCommand(pid);
+      if (argv && argv.length > 0) {
+        resumeArgvCaptured.add(key);
+        void saveResumeRecord(key, argv);
+      }
+    }
   }
 
   // ---- agent dashboard (U7) -------------------------------------------------

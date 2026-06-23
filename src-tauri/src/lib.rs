@@ -277,12 +277,14 @@ pub fn run() {
             pty::pty_pause,
             pty::pty_resume,
             pty::pane_cwd,
+            pty::pane_command,
             pty::pane_activity,
             session::save_session,
             session::load_session,
             session::save_scrollback,
             session::load_scrollback,
             session::resume::load_resume_records,
+            session::resume::save_resume_record,
         ])
         .build(tauri::generate_context!())
         .expect("error while building fly")

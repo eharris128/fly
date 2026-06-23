@@ -116,8 +116,10 @@ fn agent_detection_and_activity_on_a_real_pane() {
     let out = wait_for(&rx, b"FLYACT5", Duration::from_secs(5));
     assert!(find(&out, b"FLYACT5").is_some(), "expected command output");
 
-    // A plain bash shell is not a Claude Code agent (U2, AE4).
+    // A plain bash shell is not a Claude Code agent (U2, AE4), so its argv is
+    // never captured into the resume store (U4, AE6).
     assert!(!mgr.is_agent(id), "bash must not be detected as an agent");
+    assert_eq!(mgr.pane_command(id), None, "a bare shell's argv is not captured");
 
     // Output through the read thread recorded a current work stretch (U3/U4).
     let snap = mgr.pane_activity(id).expect("pane exists");

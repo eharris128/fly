@@ -162,6 +162,22 @@ export function paneCwd(paneId: PaneId): Promise<string | null> {
 }
 
 /**
+ * The pane's foreground argv when it is a Claude agent, else null (U4). The
+ * always-on poll uses this to capture each agent's launch flags for resume.
+ */
+export function paneCommand(paneId: PaneId): Promise<string[] | null> {
+  return invoke<string[] | null>("pane_command", { paneId });
+}
+
+/** Upsert a captured agent leaf's launch argv into the resume store (U4). */
+export function saveResumeRecord(
+  leafKey: string,
+  argv: string[],
+): Promise<void> {
+  return invoke("save_resume_record", { leafKey, argv });
+}
+
+/**
  * Per-pane agent state for the dashboard (U4): whether the pane runs a Claude
  * Code agent, its current work stretch (ms; null when idle/not an agent), and
  * how long since its last above-threshold output (ms).

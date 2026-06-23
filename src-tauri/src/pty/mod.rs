@@ -224,20 +224,24 @@ impl PtyManager {
         self.panes.lock().unwrap().get(&id).map(|p| p.activity())
     }
 
-    /// Whether the pane's foreground process is a Claude Code agent (KTD-D, U2).
-    /// Resolves the foreground pid first — which drops the registry lock — then
-    /// reads `/proc` and runs the pure matcher outside any lock, the same
-    /// two-step shape as [`cwd`], so a blocking syscall never holds the `panes`
-    /// mutex every command and the read-thread teardown contend on.
+    /// Whether the pane's foreground process is a Claude Code agent (KTD-D, U2):
+    /// true exactly when [`PtyManager::pane_command`] resolves an agent argv.
     pub fn is_agent(&self, id: PaneId) -> bool {
-        match self.foreground_pid(id) {
-            Some(pid) => {
-                let comm = crate::cwd::proc_comm(pid);
-                let argv = crate::cwd::proc_cmdline(pid);
-                crate::cwd::is_claude(comm.as_deref(), &argv)
-            }
-            None => false,
-        }
+        self.pane_command(id).is_some()
+    }
+
+    /// The pane's foreground argv **only when it is a Claude agent** (U4, the
+    /// flag source captured into the resume store, R2/R5). Resolves the
+    /// foreground pid first — which drops the registry lock — then reads `/proc`
+    /// and runs the pure matcher outside any lock, the same two-step shape as
+    /// [`cwd`], so a blocking syscall never holds the `panes` mutex every command
+    /// and the read-thread teardown contend on (KTD13). Returns `None` for a bare
+    /// shell or a gone pane — never a non-agent's argv.
+    pub fn pane_command(&self, id: PaneId) -> Option<Vec<String>> {
+        let pid = self.foreground_pid(id)?;
+        let comm = crate::cwd::proc_comm(pid);
+        let argv = crate::cwd::proc_cmdline(pid);
+        crate::cwd::is_claude(comm.as_deref(), &argv).then_some(argv)
     }
 
     /// Number of registered panes.
@@ -331,6 +335,18 @@ pub fn pane_cwd(
     manager.cwd(pane_id).map(|p| p.to_string_lossy().into_owned())
 }
 
+/// The pane's foreground argv when it is a Claude agent, else `None` (U4). The
+/// always-on cwd poll reads this to capture each agent's launch flags
+/// write-through into the resume store; a bare shell or gone pane yields `None`,
+/// so a non-agent's argv is never persisted.
+#[tauri::command]
+pub fn pane_command(
+    manager: tauri::State<'_, Arc<PtyManager>>,
+    pane_id: PaneId,
+) -> Option<Vec<String>> {
+    manager.pane_command(pane_id)
+}
+
 /// The agent dashboard payload for one pane (U4): whether it is a Claude Code
 /// agent, plus its current work stretch and last-output age. `working_for_ms`
 /// is `None` when the pane is idle or not an agent. Polled per pane while the
@@ -377,6 +393,8 @@ mod tests {
         let ghost = PaneId(999);
         assert_eq!(m.pane_activity(ghost), None);
         assert!(!m.is_agent(ghost));
+        assert_eq!(m.pane_command(ghost), None);
+        assert_eq!(m.leaf_key(ghost), None);
         assert_eq!(m.lifecycle(ghost), None);
     }
 }

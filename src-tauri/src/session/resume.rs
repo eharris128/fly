@@ -164,6 +164,23 @@ pub fn load_resume_records() -> ResumeRecords {
     read_records(&resume_path())
 }
 
+/// Command: the always-on poll captures an agent leaf's launch argv (U4). The
+/// poll only calls this for a detected Claude pane, so `is_agent` is implied
+/// `true`. Field-merging, so it never clobbers the hook writer's session id/cwd.
+#[tauri::command]
+pub fn save_resume_record(leaf_key: String, argv: Vec<String>) -> Result<(), String> {
+    upsert_at(
+        &resume_path(),
+        &leaf_key,
+        ResumePartial {
+            argv: Some(argv),
+            is_agent: Some(true),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
