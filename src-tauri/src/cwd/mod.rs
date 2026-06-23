@@ -37,6 +37,60 @@ pub fn proc_cmdline(pid: u32) -> Vec<String> {
     }
 }
 
+/// Snapshot the live process table for the background-task count (running-state
+/// plan U2, KTD4) — one `/proc` scan per call, off the PTY hot path.
+///
+/// Enumerates `/proc`, keeps the all-numeric entries, and parses each
+/// `/proc/<pid>/stat` via [`parse_stat_line`]. Best-effort: a directory that
+/// vanishes mid-scan (the process exited), an unreadable `stat`, or a line that
+/// fails to parse is silently skipped — it returns whatever was readable and never
+/// panics, matching the thin-reader contract of [`proc_cmdline`]. The single
+/// snapshot is what [`count_background_task_groups`] resolves the root and its
+/// descendants against, so a per-call count is internally consistent against pid
+/// reuse (KTD4).
+pub fn read_proc_table() -> Vec<ProcEntry> {
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{name}/stat")) {
+            if let Some(e) = parse_stat_line(&stat) {
+                out.push(e);
+            }
+        }
+    }
+    out
+}
+
+/// Parse one `/proc/<pid>/stat` line into a [`ProcEntry`] (U2). Factored out and
+/// unit-tested directly because the format is a parsing trap: field 2 (`comm`) is
+/// wrapped in parens **and may itself contain spaces and parens**. So we split on
+/// the **last** `')'` — `comm` is everything between the first `'('` and that last
+/// `')'`; the `pid` is the token before the first `'('`; and the space-separated
+/// remainder after the last `')'` is `state` (field 0), `ppid` (1), `pgrp` (2),
+/// per `proc(5)`. Any missing/non-numeric field yields `None` (a truncated read or
+/// a line we don't understand is skipped, never a panic).
+fn parse_stat_line(line: &str) -> Option<ProcEntry> {
+    let lparen = line.find('(')?;
+    let rparen = line.rfind(')')?;
+    if rparen < lparen {
+        return None;
+    }
+    let pid: u32 = line[..lparen].trim().parse().ok()?;
+    let comm = line[lparen + 1..rparen].to_string();
+    let mut rest = line[rparen + 1..].split_whitespace();
+    let state = rest.next()?.chars().next()?;
+    let ppid: u32 = rest.next()?.parse().ok()?;
+    let pgid: u32 = rest.next()?.parse().ok()?;
+    Some(ProcEntry { pid, ppid, pgid, state, comm })
+}
+
 /// The basename of a `/`-separated path (the part after the last `/`).
 fn basename(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
@@ -351,5 +405,59 @@ mod tests {
             proc(400, 300, 400, 'S'), // Y: parent is X (cycle, not under root)
         ];
         assert_eq!(count_background_task_groups(&table, 100), 1);
+    }
+
+    // ---- read_proc_table / parse_stat_line (U2, R3) ------------------------
+
+    #[test]
+    fn read_proc_table_includes_self() {
+        // Thin-I/O sanity: our own process is in the table, live, with a real
+        // parent and group. (The count logic itself is U1's synthetic-table tests.)
+        let me = std::process::id();
+        let table = read_proc_table();
+        let mine = table
+            .iter()
+            .find(|e| e.pid == me)
+            .expect("self should appear in the /proc table");
+        assert!(mine.ppid >= 1, "self has a real parent pid");
+        assert!(mine.pgid >= 1, "self has a real process group");
+        assert!(
+            !matches!(mine.state, 'Z' | 'X'),
+            "self is live, got state {:?}",
+            mine.state
+        );
+    }
+
+    #[test]
+    fn parse_stat_line_parses_a_plain_line() {
+        let e = parse_stat_line("1 (systemd) S 0 1 1 0 -1 4194560 1234").unwrap();
+        assert_eq!(e.pid, 1);
+        assert_eq!(e.comm, "systemd");
+        assert_eq!(e.state, 'S');
+        assert_eq!(e.ppid, 0);
+        assert_eq!(e.pgid, 1);
+    }
+
+    #[test]
+    fn parse_stat_line_handles_spaces_and_parens_in_comm() {
+        // The real risk: comm with spaces AND nested parens. Splitting on the last
+        // ')' keeps state/ppid/pgrp correct where a naive first-')' split would not.
+        let e = parse_stat_line("4242 (weird (proc) name) R 4200 4242 4242 0 -1 0")
+            .expect("parses despite parens in comm");
+        assert_eq!(e.pid, 4242);
+        assert_eq!(e.comm, "weird (proc) name");
+        assert_eq!(e.state, 'R');
+        assert_eq!(e.ppid, 4200);
+        assert_eq!(e.pgid, 4242);
+    }
+
+    #[test]
+    fn parse_stat_line_rejects_malformed_lines() {
+        assert!(parse_stat_line("").is_none()); // empty
+        assert!(parse_stat_line("no parens here").is_none()); // no comm parens
+        assert!(parse_stat_line("123 (only-comm)").is_none()); // truncated: no fields
+        assert!(parse_stat_line("123 (c) S 456").is_none()); // missing pgrp
+        assert!(parse_stat_line("abc (c) S 1 1").is_none()); // non-numeric pid
+        assert!(parse_stat_line("123 (c) S xx 1").is_none()); // non-numeric ppid
     }
 }
