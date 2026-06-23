@@ -13,18 +13,28 @@ use std::path::Path;
 use crate::state::attention::Reason;
 
 /// Post a callback to the hook socket.
+///
+/// `session_id`/`cwd` ride the same authenticated message (U1, R6): they come
+/// from the Claude payload and feed the resume store. Both are optional — a
+/// manual `fly notify` (no `--claude`) sends neither, and an older installed
+/// binary that predates these fields still deserializes server-side.
+#[allow(clippy::too_many_arguments)]
 pub fn send(
     socket_path: &Path,
     token: &str,
     reason: Reason,
     title: Option<&str>,
     body: Option<&str>,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
 ) -> std::io::Result<()> {
     let payload = serde_json::json!({
         "token": token,
         "reason": reason.as_str(),
         "title": title,
         "body": body,
+        "session_id": session_id,
+        "cwd": cwd,
     });
     let bytes = serde_json::to_vec(&payload)?;
     let mut stream = UnixStream::connect(socket_path)?;
@@ -39,6 +49,9 @@ pub fn run(args: &[String]) -> i32 {
     let mut from_claude = false;
     let mut title: Option<String> = None;
     let mut body: Option<String> = None;
+    // Captured from the Claude payload and forwarded to the app for resume (U1).
+    let mut session_id: Option<String> = None;
+    let mut cwd: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -57,16 +70,18 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
 
-    // Refine reason/body from the Claude hook payload on stdin.
+    // Refine reason/body and capture session_id/cwd from the Claude hook payload.
     if from_claude {
         if let Some(payload) = read_stdin_payload() {
-            let (refined, msg) = parse_claude_payload(&payload);
-            if let Some(r) = refined {
+            let parsed = parse_claude_payload(&payload);
+            if let Some(r) = parsed.reason {
                 reason = Some(r);
             }
             if body.is_none() {
-                body = msg;
+                body = parsed.message;
             }
+            session_id = parsed.session_id;
+            cwd = parsed.cwd;
         }
     }
 
@@ -93,6 +108,8 @@ pub fn run(args: &[String]) -> i32 {
         reason,
         title.as_deref(),
         body.as_deref(),
+        session_id.as_deref(),
+        cwd.as_deref(),
     ) {
         Ok(()) => 0,
         Err(e) => {
@@ -126,16 +143,32 @@ fn read_stdin_payload() -> Option<String> {
     }
 }
 
-/// Map a Claude Code Notification/Stop payload to a refined reason + message.
-pub fn parse_claude_payload(json: &str) -> (Option<Reason>, Option<String>) {
+/// The fields fly extracts from a Claude Code Notification/Stop payload: the
+/// refined attention reason + message (as before), plus the `session_id` and
+/// `cwd` that ride the same payload and drive resume capture (U1, R2/R4/R6).
+/// fly used to parse the payload for the reason and discard the rest.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ClaudePayload {
+    pub reason: Option<Reason>,
+    pub message: Option<String>,
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+}
+
+/// Map a Claude Code Notification/Stop payload to the fields fly cares about.
+/// `session_id` and `cwd` are top-level strings on both event types; a payload
+/// missing them (or any unparseable JSON) yields `None` for those fields with
+/// the others unaffected.
+pub fn parse_claude_payload(json: &str) -> ClaudePayload {
     let v: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
-        Err(_) => return (None, None),
+        Err(_) => return ClaudePayload::default(),
     };
-    let message = v
-        .get("message")
-        .and_then(|m| m.as_str())
-        .map(|s| s.to_string());
+    let str_field = |key: &str| {
+        v.get(key)
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string())
+    };
 
     // `Stop` events resolve to "finished"; Notification types refine question
     // vs permission when present.
@@ -147,5 +180,52 @@ pub fn parse_claude_payload(json: &str) -> (Option<Reason>, Option<String>) {
             _ => None,
         },
     };
-    (reason, message)
+    ClaudePayload {
+        reason,
+        message: str_field("message"),
+        session_id: str_field("session_id"),
+        cwd: str_field("cwd"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_payload_extracts_session_id_and_cwd() {
+        let p = parse_claude_payload(
+            r#"{"hook_event_name":"Stop","message":"all done",
+                "session_id":"sess-abc","cwd":"/home/u/proj"}"#,
+        );
+        assert_eq!(p.reason, Some(Reason::Finished));
+        assert_eq!(p.message.as_deref(), Some("all done"));
+        assert_eq!(p.session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(p.cwd.as_deref(), Some("/home/u/proj"));
+    }
+
+    #[test]
+    fn notification_payload_extracts_session_id_and_cwd() {
+        let p = parse_claude_payload(
+            r#"{"hook_event_name":"Notification","notification_type":"permission_request",
+                "session_id":"sess-xyz","cwd":"/srv/code"}"#,
+        );
+        assert_eq!(p.reason, Some(Reason::Permission));
+        assert_eq!(p.session_id.as_deref(), Some("sess-xyz"));
+        assert_eq!(p.cwd.as_deref(), Some("/srv/code"));
+    }
+
+    #[test]
+    fn payload_without_session_fields_yields_none() {
+        // The reason mapping is unaffected when session_id/cwd are absent.
+        let p = parse_claude_payload(r#"{"hook_event_name":"Stop","message":"done"}"#);
+        assert_eq!(p.reason, Some(Reason::Finished));
+        assert_eq!(p.session_id, None);
+        assert_eq!(p.cwd, None);
+    }
+
+    #[test]
+    fn malformed_json_yields_default() {
+        assert_eq!(parse_claude_payload("{ not json"), ClaudePayload::default());
+    }
 }

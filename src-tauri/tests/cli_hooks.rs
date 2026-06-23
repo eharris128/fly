@@ -121,6 +121,8 @@ fn notify_send_reaches_the_socket() {
         Reason::Permission,
         Some("title"),
         Some("body"),
+        None,
+        None,
     )
     .unwrap();
 
@@ -133,16 +135,15 @@ fn notify_send_reaches_the_socket() {
 
 #[test]
 fn claude_payload_maps_stop_to_finished() {
-    let (reason, msg) =
-        notify::parse_claude_payload(r#"{"hook_event_name":"Stop","message":"all done"}"#);
-    assert_eq!(reason, Some(Reason::Finished));
-    assert_eq!(msg.as_deref(), Some("all done"));
+    let p = notify::parse_claude_payload(r#"{"hook_event_name":"Stop","message":"all done"}"#);
+    assert_eq!(p.reason, Some(Reason::Finished));
+    assert_eq!(p.message.as_deref(), Some("all done"));
 }
 
 #[test]
 fn claude_payload_maps_permission_notification() {
-    let (reason, _) = notify::parse_claude_payload(
+    let p = notify::parse_claude_payload(
         r#"{"hook_event_name":"Notification","notification_type":"permission_request"}"#,
     );
-    assert_eq!(reason, Some(Reason::Permission));
+    assert_eq!(p.reason, Some(Reason::Permission));
 }

@@ -25,6 +25,11 @@ pub struct ValidatedHook {
     pub reason: Reason,
     pub title: Option<String>,
     pub body: Option<String>,
+    /// The Claude session id + cwd carried by the payload (U1), consumed by the
+    /// dispatch to upsert the pane's resume record. `None` on a manual/older
+    /// `fly notify`.
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
 }
 
 /// Sink for authenticated callbacks. The app wires this to the attention
@@ -144,6 +149,8 @@ fn handle_conn(stream: UnixStream, tokens: &TokenRegistry, dispatch: &Dispatch) 
                 reason: msg.reason,
                 title: msg.title,
                 body: msg.body,
+                session_id: msg.session_id,
+                cwd: msg.cwd,
             },
         );
     }
