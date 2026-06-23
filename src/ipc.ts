@@ -174,6 +174,25 @@ export function paneActivity(paneId: PaneId): Promise<PaneActivity> {
   return invoke<PaneActivity>("pane_activity", { paneId });
 }
 
+/**
+ * One agent leaf's resume mapping (mirrors Rust `ResumeRecord`, U2). `argv` is
+ * the captured launch command (the flag source); `sessionCwd` is the project dir
+ * the resumed agent runs in (KTD-H). All optional — a record may hold only the
+ * hook's session fields, or only the poll's argv, before both writers have run.
+ */
+export interface ResumeRecord {
+  sessionId: string | null;
+  sessionCwd: string | null;
+  argv: string[] | null;
+  isAgent: boolean;
+  updatedAt: number;
+}
+
+/** Load the write-through resume store, keyed by leaf key (U2/U8). */
+export function loadResumeRecords(): Promise<Record<string, ResumeRecord>> {
+  return invoke<Record<string, ResumeRecord>>("load_resume_records");
+}
+
 export function saveScrollback(paneKey: string, data: string): Promise<void> {
   return invoke("save_scrollback", { paneKey, data });
 }

@@ -16,6 +16,15 @@ use crate::pty::PtyManager;
 /// its close-requested handler) before this runs, while the shells are still
 /// alive so their cwds are captured (R13/R14).
 pub fn shutdown(app: &AppHandle) {
+    // Write the clean-exit marker *before* reaping (KTD-G): reaching this ordered
+    // path at all means the quit was clean, so the next launch sees the marker and
+    // stays in normal mode. An unclean exit never runs this, leaving the marker
+    // absent → the next launch offers resume (U7/U2). Best-effort; a failure to
+    // write it just makes the next launch over-offer, never under-offer.
+    let _ = crate::session::resume::set_clean_exit_at(
+        &crate::session::resume::clean_exit_path(),
+        true,
+    );
     if let Some(pty) = app.try_state::<Arc<PtyManager>>() {
         pty.close_all();
     }

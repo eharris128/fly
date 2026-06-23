@@ -259,6 +259,7 @@ pub fn run() {
             session::load_session,
             session::save_scrollback,
             session::load_scrollback,
+            session::resume::load_resume_records,
         ])
         .build(tauri::generate_context!())
         .expect("error while building fly")

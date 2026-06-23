@@ -6,6 +6,11 @@
 //! The backend persists an opaque layout blob (the frontend owns the tree) plus
 //! per-pane scrollback files. State lives under the XDG data dir — a *separate*
 //! tree from the config store (U13), so a corrupt session never wipes settings.
+//!
+//! Resume state (the crash-durable agent mapping) lives in a sibling
+//! write-through store, [`resume`], decoupled from this debounced layout blob.
+
+pub mod resume;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
