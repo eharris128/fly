@@ -193,6 +193,21 @@ export function saveResumeRecord(
   return invoke("save_resume_record", { leafKey, argv });
 }
 
+/**
+ * Upsert a captured agent leaf's active session id (+ its cwd) into the resume
+ * store (fix-resume-session-selection U2). The poll calls this when a Claude
+ * pane's transcript-derived session id first appears or changes, keeping the
+ * stored id current across `/clear` and new conversations (KTD-B). Field-merging,
+ * so it never clobbers the leaf's captured argv.
+ */
+export function saveResumeSession(
+  leafKey: string,
+  sessionId: string,
+  sessionCwd: string | null,
+): Promise<void> {
+  return invoke("save_resume_session", { leafKey, sessionId, sessionCwd });
+}
+
 /** Prune the resume store to the live layout leaves, dropping orphans (U8). */
 export function pruneResumeRecords(liveLeafKeys: string[]): Promise<void> {
   return invoke("prune_resume_records", { liveLeafKeys });

@@ -336,6 +336,7 @@ pub fn run() {
             session::load_scrollback,
             session::resume::load_resume_records,
             session::resume::save_resume_record,
+            session::resume::save_resume_session,
             session::resume::prune_resume_records,
         ])
         .build(tauri::generate_context!())

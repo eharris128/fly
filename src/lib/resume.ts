@@ -133,6 +133,23 @@ export function buildResumeCommand(
 }
 
 /**
+ * Whether the poll should capture a leaf's resolved session id (fix-003 U2,
+ * KTD-B). Unlike argv — fixed for a pane's life, captured once — a session id
+ * rotates within a pane's life (`/clear`, a new conversation), so capture is
+ * change-tracked: write through only when the resolved id is present **and**
+ * differs from the last one seen for that leaf. A `null` resolution (no active
+ * transcript / not an agent) is a skip, so a transient miss never clears a
+ * previously-captured id. Pure, so the poll's guard is tested without the app.
+ */
+export function shouldCaptureSession(
+  lastSeen: string | null,
+  resolved: string | null,
+): boolean {
+  if (resolved == null) return false;
+  return resolved !== lastSeen;
+}
+
+/**
  * Build the resume command for each restored leaf that has a record producing
  * one (U8). Leaves with no record (or whose record yields no command) are
  * omitted, so the caller treats a missing entry as "bare shell". Pure, so the

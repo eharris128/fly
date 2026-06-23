@@ -197,6 +197,33 @@ pub fn save_resume_record(leaf_key: String, argv: Vec<String>) -> Result<(), Str
     .map_err(|e| e.to_string())
 }
 
+/// Command: the always-on poll captures an agent leaf's active session id
+/// write-through (fix-resume-session-selection U2). The id comes from Claude's
+/// transcript store (KTD-A), so capture is independent of the installed `fly`
+/// binary's version — the skew that silently disabled the hook path — and fires
+/// before the first `Notification`/`Stop`. Writes the **same** `session_id` +
+/// `session_cwd` partial the hook path does (`lib.rs`), so the two precise sources
+/// are interchangeable; field-merging, so it never clobbers the poll's
+/// `argv`/`is_agent`. All writers target the pane's one active session, so
+/// last-writer-wins is harmless (KTD-A/B).
+#[tauri::command]
+pub fn save_resume_session(
+    leaf_key: String,
+    session_id: String,
+    session_cwd: Option<String>,
+) -> Result<(), String> {
+    upsert_at(
+        &resume_path(),
+        &leaf_key,
+        ResumePartial {
+            session_id: Some(session_id),
+            session_cwd,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Command: at restore the frontend prunes the store to the live layout leaves
 /// (U8), dropping records orphaned by a closed pane or a pre-crash layout.
 #[tauri::command]
@@ -262,6 +289,69 @@ mod tests {
             "poll field merged in"
         );
         assert!(rec.is_agent);
+    }
+
+    #[test]
+    fn session_capture_merges_over_argv_and_rotates_in_place() {
+        // U2 (fix-003): the argv poll captures argv+isAgent once; the session poll
+        // then upserts the transcript-derived id (the partial save_resume_session
+        // builds). The id must merge in without clobbering argv/isAgent — and a
+        // later /clear that rotates the active session must overwrite only the id.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resume.json");
+
+        // argv path (save_resume_record): captured once, early.
+        upsert_at(
+            &path,
+            "leaf-5",
+            ResumePartial {
+                argv: Some(vec!["claude".into(), "--continue".into()]),
+                is_agent: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // session path (save_resume_session): id + cwd, no argv/is_agent.
+        upsert_at(
+            &path,
+            "leaf-5",
+            ResumePartial {
+                session_id: Some("sess-A".into()),
+                session_cwd: Some("/home/evan/projects/play".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let rec = &read_records(&path)["leaf-5"];
+        assert_eq!(rec.session_id.as_deref(), Some("sess-A"));
+        assert_eq!(rec.session_cwd.as_deref(), Some("/home/evan/projects/play"));
+        assert_eq!(
+            rec.argv.as_deref(),
+            Some(["claude".to_string(), "--continue".into()].as_slice()),
+            "argv survived the session upsert"
+        );
+        assert!(rec.is_agent, "is_agent survived the session upsert");
+
+        // /clear rotates the active session → a new id overwrites only session_id.
+        upsert_at(
+            &path,
+            "leaf-5",
+            ResumePartial {
+                session_id: Some("sess-B".into()),
+                session_cwd: Some("/home/evan/projects/play".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let rec = &read_records(&path)["leaf-5"];
+        assert_eq!(rec.session_id.as_deref(), Some("sess-B"), "id rotated in place");
+        assert!(rec.is_agent, "is_agent still intact after rotation");
+        assert_eq!(
+            rec.argv.as_deref(),
+            Some(["claude".to_string(), "--continue".into()].as_slice()),
+        );
     }
 
     #[test]

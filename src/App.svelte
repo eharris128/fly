@@ -36,7 +36,7 @@
     type Workspace,
   } from "./lib/workspaces";
   import { buildHomeModel, effectiveAttention, effectiveTaskCount } from "./lib/home";
-  import { resumeCommandsForLeaves } from "./lib/resume";
+  import { resumeCommandsForLeaves, shouldCaptureSession } from "./lib/resume";
   import {
     setWindowForeground,
     setVisiblePanes,
@@ -47,8 +47,10 @@
     onNotificationAdded,
     paneCwd,
     paneCommand,
+    paneSessionId,
     paneActivity,
     saveResumeRecord,
+    saveResumeSession,
     loadResumeRecords,
     pruneResumeRecords,
     getLaunchMode,
@@ -743,6 +745,13 @@
   // catching a bash pane that later becomes a `claude` agent (uncaptured until
   // then). Non-reactive bookkeeping, like paneIdByLeaf.
   let resumeArgvCaptured = new Set<string>();
+  // Last session id captured per leaf (fix-003 U2, KTD-B). Unlike argv — fixed for
+  // a pane's life, captured once — a session id rotates within a pane's life
+  // (`/clear`, a new conversation), so this tracks the last id seen and re-captures
+  // on a change, keeping the stored id current. The in-memory guard keeps the
+  // write-through store churn-free at the ~1.5s cadence. Non-reactive, like
+  // resumeArgvCaptured.
+  let resumeSessionByLeaf = new Map<string, string>();
   // Poll each live pane's cwd so an auto-named tab tracks `cd` without needing a
   // layout change to trigger a save. Cheap (/proc read per pane); only writes
   // state when something actually changed. This always-on poll is also the
@@ -763,6 +772,7 @@
     }
     if (changed) cwdByLeaf = { ...cwdByLeaf, ...updates };
     void captureResumeArgv(entries);
+    void captureResumeSession(entries);
   }
   // Capture each agent leaf's launch argv (the resume flag source) write-through,
   // once per leaf (U4). pane_command returns the argv only for a detected Claude
@@ -777,6 +787,22 @@
         resumeArgvCaptured.add(key);
         void saveResumeRecord(key, argv);
       }
+    }
+  }
+  // Capture each agent leaf's active session id write-through, re-capturing
+  // whenever it changes (fix-003 U2, KTD-A/B). paneSessionId reads Claude's
+  // transcript store, so capture is independent of the installed `fly` binary's
+  // version — the skew that silently disabled the hook path — and fires before the
+  // first Notification/Stop. Change-tracked (shouldCaptureSession), so the store is
+  // touched only when the active session actually rotates; a null resolution
+  // (non-agent, or no active transcript) never clears a captured id. The pane's cwd
+  // doubles as the session cwd (the project dir resume runs in, KTD-H).
+  async function captureResumeSession(entries: [string, PaneId][]) {
+    for (const [key, pid] of entries) {
+      const id = await paneSessionId(pid);
+      if (!shouldCaptureSession(resumeSessionByLeaf.get(key) ?? null, id)) continue;
+      resumeSessionByLeaf.set(key, id!);
+      void saveResumeSession(key, id!, cwdByLeaf[key] ?? null);
     }
   }
 

@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { buildResumeCommand, resumeCommandsForLeaves } from "./resume";
+import {
+  buildResumeCommand,
+  resumeCommandsForLeaves,
+  shouldCaptureSession,
+} from "./resume";
 import type { ResumeRecord } from "../ipc";
 
 // The configured flag floor (R8): replayed when no argv was captured.
@@ -123,6 +127,26 @@ describe("buildResumeCommand (U5)", () => {
   it("treats an empty argv as no argv (uses the floor)", () => {
     const out = buildResumeCommand(rec({ argv: [], sessionId: "x" }), DEFAULT);
     expect(out).toEqual(["claude", "--resume", "x", "--dangerously-skip-permissions"]);
+  });
+});
+
+describe("shouldCaptureSession (fix-003 U2, KTD-B)", () => {
+  it("captures the first time an id is seen (lastSeen null)", () => {
+    expect(shouldCaptureSession(null, "sess-A")).toBe(true);
+  });
+
+  it("skips when the id is unchanged", () => {
+    expect(shouldCaptureSession("sess-A", "sess-A")).toBe(false);
+  });
+
+  it("captures when the id changes (/clear, new conversation)", () => {
+    expect(shouldCaptureSession("sess-A", "sess-B")).toBe(true);
+  });
+
+  it("skips a null resolution, preserving the last captured id", () => {
+    // A transient miss (no active transcript) must not clear what we have.
+    expect(shouldCaptureSession("sess-A", null)).toBe(false);
+    expect(shouldCaptureSession(null, null)).toBe(false);
   });
 });
 
