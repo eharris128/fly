@@ -11,6 +11,10 @@
 //   - `acknowledged` → `idle`     (you're already viewing it — parked, not urgent,
 //                                  and never a stray "working" from residual output)
 //   - else a current output stretch → `working`, else `idle`.
+// On top of that base, a pane that would otherwise read `idle` but has live
+// background work (`liveTaskCount > 0`, already rise-debounced upstream by App)
+// is upgraded to `running` — purely additive, so it only ever replaces `idle` and
+// never competes with `working`/`waiting` (KTD1 of the running-state plan).
 // Reserving `waiting` for unseen attention keeps a fresh, never-tasked claude
 // (which pings "ready for input" while you're looking at it → acknowledged) from
 // reading as `waiting`. A pane that exits drops out automatically — its
@@ -20,7 +24,7 @@ import { leaves } from "./layout";
 import { tabDisplayTitle, type Workspace } from "./workspaces";
 import type { PaneActivity } from "../ipc";
 
-export type AgentStatus = "working" | "waiting" | "idle";
+export type AgentStatus = "working" | "waiting" | "idle" | "running";
 
 export interface AgentRow {
   wsId: string;
@@ -32,6 +36,12 @@ export interface AgentRow {
   cwd: string | null;
   /** Current work stretch in ms, or null when idle. */
   workingForMs: number | null;
+  /**
+   * Effective (rise-debounced) count of live background task groups — the
+   * `running · N tasks` number. `0` for any non-`running` row (a `> 0` count is
+   * exactly what upgrades an `idle` base to `running`).
+   */
+  liveTaskCount: number;
   /** The pane is raised/acknowledged in the attention model (needs the user). */
   needsAttention: boolean;
   status: AgentStatus;
@@ -49,11 +59,27 @@ export interface HomeWorkspaceGroup {
   tabs: HomeTabGroup[];
 }
 
-/** The dashboard's per-row status from attention + output stretch (see header). */
-function rowStatus(att: string | undefined, workingForMs: number | null): AgentStatus {
-  if (att === "raised") return "waiting"; // finished + unseen → needs you
-  if (att === "acknowledged") return "idle"; // you're viewing it → parked
-  return workingForMs != null ? "working" : "idle";
+/**
+ * The dashboard's per-row status (see header). Computes today's base from
+ * attention + output stretch, then applies the one additive upgrade: a base of
+ * `idle` with live background work becomes `running`. `waiting` and `working` are
+ * never reached by the upgrade, so the new state cannot regress them (R4, KTD1).
+ * `liveTaskCount` is the already-effective (rise-debounced) count.
+ */
+function rowStatus(
+  att: string | undefined,
+  workingForMs: number | null,
+  liveTaskCount: number,
+): AgentStatus {
+  const base: AgentStatus =
+    att === "raised"
+      ? "waiting" // finished + unseen → needs you
+      : att === "acknowledged"
+        ? "idle" // you're viewing it → parked
+        : workingForMs != null
+          ? "working"
+          : "idle";
+  return base === "idle" && liveTaskCount > 0 ? "running" : base;
 }
 
 /**
@@ -61,9 +87,12 @@ function rowStatus(att: string | undefined, workingForMs: number | null): AgentS
  * the four App-held maps. Only `isAgent` leaves become rows; empty tabs and
  * workspaces are dropped (so `[]` ⟺ no agents running, the R7 empty state).
  *
- * The post-turn flicker grace (KTD-E) is applied upstream by App — it zeroes a
- * lingering `workingForMs` before this runs — so the `status` rule here is just
- * `rowStatus` (raised → waiting, acknowledged → idle, else stretch → working).
+ * The post-turn flicker grace (KTD-E) and the background-task rise-debounce
+ * (KTD5) are both applied upstream by App — it zeroes a lingering `workingForMs`
+ * and overwrites `liveTaskCount` with its effective value before this runs — so
+ * the `status` rule here is just `rowStatus` over already-effective inputs
+ * (raised → waiting, acknowledged → idle, else stretch → working, then the
+ * additive idle → running upgrade).
  */
 export function buildHomeModel(
   workspaces: Workspace[],
@@ -82,6 +111,9 @@ export function buildHomeModel(
         if (!activity?.isAgent) continue;
         const att = attentionByLeaf[leaf.key];
         const workingForMs = activity.workingForMs;
+        // Already rise-debounced by App (mirrors the workingForMs grace); a
+        // `> 0` value here upgrades an idle base to `running`.
+        const liveTaskCount = activity.liveTaskCount;
         rows.push({
           wsId: ws.id,
           tabId: tab.id,
@@ -89,9 +121,10 @@ export function buildHomeModel(
           tabTitle: title,
           cwd: cwdByLeaf[leaf.key] ?? null,
           workingForMs,
+          liveTaskCount,
           // Only "raised" (unseen) is urgent needs-you; acknowledged is "seen".
           needsAttention: att === "raised",
-          status: rowStatus(att, workingForMs),
+          status: rowStatus(att, workingForMs, liveTaskCount),
         });
       }
       if (rows.length > 0) tabs.push({ tabId: tab.id, title, rows });
@@ -136,6 +169,28 @@ export function effectiveAttention(
     out[key] = att;
   }
   return out;
+}
+
+/**
+ * Rise-debounce a raw background-task count (running-state plan KTD5, R5). A
+ * count only "counts" once it has persisted past `windowMs` since it first rose
+ * above zero (`riseAt`), so a transient turn-start helper spawn, a pid-reuse blip,
+ * or a resume/restart process swap does not flash `running`. The fall is
+ * immediate: App clears `riseAt` the instant the raw count returns to 0, so a `0`
+ * raw here yields `0` regardless of `riseAt` (R7 — no fall debounce).
+ *
+ * Pure: `now` and `riseAt` are injected. App owns the per-leaf `riseAt` map and
+ * overwrites each PaneActivity's `liveTaskCount` with this result before
+ * `buildHomeModel`, so the model reads an already-effective count (same upstream-
+ * massage shape as `effectiveAttention` / the `workingForMs` grace).
+ */
+export function effectiveTaskCount(
+  raw: number,
+  riseAt: number | null,
+  now: number,
+  windowMs: number,
+): number {
+  return raw > 0 && riseAt != null && now - riseAt >= windowMs ? raw : 0;
 }
 
 /** Total agent rows across the model (for an at-a-glance count / empty check). */

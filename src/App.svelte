@@ -35,7 +35,7 @@
     type Tab,
     type Workspace,
   } from "./lib/workspaces";
-  import { buildHomeModel, effectiveAttention } from "./lib/home";
+  import { buildHomeModel, effectiveAttention, effectiveTaskCount } from "./lib/home";
   import { resumeCommandsForLeaves } from "./lib/resume";
   import {
     setWindowForeground,
@@ -116,6 +116,12 @@
   // "working") and stale-ping suppression (a repeat idle notification with no new
   // output since isn't "waiting"). See gracedAgents / effectiveAttention.
   let lastEngagedAt: Record<string, number> = {};
+  // leaf key → wall-clock ms when this leaf's raw background-task count last rose
+  // 0 → >0, or null while it sits at 0 (running-state KTD5). Non-reactive, updated
+  // each poll (refreshAgents); drives the rise-debounce so a transient tool/helper
+  // spawn doesn't flash `running`. Mirrors lastEngagedAt; an exited pane reports a
+  // 0 count, which clears its entry, so a leaf-key reuse re-arms the debounce.
+  let taskRiseAt: Record<string, number | null> = {};
   // leaf key → pane component handle, so the palette can return focus to the
   // active terminal when it closes. The palette takes DOM focus; the cheat-sheet
   // (KTD3) does not, so only the palette needs this.
@@ -758,6 +764,11 @@
   }
 
   // ---- agent dashboard (U7) -------------------------------------------------
+  // Rise-debounce window for the background-task count (running-state KTD5): a raw
+  // count must persist this long (~2 polls at the 1.5s cadence) before it surfaces
+  // as `running`, so transient turn-start/tool spawns and pid-reuse blips don't
+  // flash. The fall is immediate. Tunable (plan Open Question).
+  const TASK_DEBOUNCE_MS = 3000;
   // Poll each live pane's agent state. Gated to while the home view is open (the
   // $effect below) so a toggle-only surface adds no always-on IPC. Rebuilt each
   // poll from the live panes, so an exited pane drops out (its process is no
@@ -769,8 +780,18 @@
     );
     const next: Record<string, PaneActivity> = {};
     for (const [key, a] of results) next[key] = a;
+    const now = Date.now();
+    // Rise/fall bookkeeping for the debounce (KTD5): stamp the rise on a 0 → >0
+    // transition (riseAt currently null), clear it the instant the count hits 0.
+    for (const [key, a] of results) {
+      if (a.liveTaskCount > 0) {
+        if (taskRiseAt[key] == null) taskRiseAt[key] = now;
+      } else {
+        taskRiseAt[key] = null;
+      }
+    }
     agentByLeaf = next;
-    agentsPolledAt = Date.now();
+    agentsPolledAt = now;
   }
   // Grace: drop a lingering work stretch for a leaf whose output all predates
   // your last engagement — a residual stretch from a turn you've already seen
@@ -790,11 +811,28 @@
     }
     return out;
   }
-  // Apply both engagement guards against the same `now`, then group: stale raises
-  // → idle (effectiveAttention), residual stretches → not working (gracedAgents).
+  // Rise-debounce each leaf's raw liveTaskCount (KTD5), overwriting the count on a
+  // copy so buildHomeModel reads the already-effective value (mirrors gracedAgents
+  // rewriting workingForMs). A count only surfaces once it has outlived the window;
+  // a fall to 0 takes effect immediately (effectiveTaskCount handles both).
+  function debouncedAgents(
+    agents: Record<string, PaneActivity>,
+    now: number,
+  ): Record<string, PaneActivity> {
+    const out: Record<string, PaneActivity> = {};
+    for (const [key, a] of Object.entries(agents)) {
+      const eff = effectiveTaskCount(a.liveTaskCount, taskRiseAt[key] ?? null, now, TASK_DEBOUNCE_MS);
+      out[key] = eff === a.liveTaskCount ? a : { ...a, liveTaskCount: eff };
+    }
+    return out;
+  }
+  // Apply all three engagement/liveness guards against the same `now`, then group:
+  // stale raises → idle (effectiveAttention), residual stretches → not working
+  // (gracedAgents), and the raw task count → debounced (debouncedAgents) so an
+  // idle pane with persistent background work reads `running`.
   let homeModel = $derived.by(() => {
     const now = Date.now();
-    const agents = gracedAgents(now);
+    const agents = debouncedAgents(gracedAgents(now), now);
     const att = effectiveAttention(attentionByLeaf, agentByLeaf, lastEngagedAt, now);
     return buildHomeModel(workspaces, agents, cwdByLeaf, att);
   });

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   buildHomeModel,
   effectiveAttention,
+  effectiveTaskCount,
   formatDuration,
   agentCount,
   workspaceJumpTarget,
@@ -247,5 +248,117 @@ describe("formatDuration", () => {
 
   it("clamps negative input to 0s", () => {
     expect(formatDuration(-5000)).toBe("0s");
+  });
+});
+
+describe("running state (additive background-task upgrade)", () => {
+  it("upgrades only an idle base to running; waiting/working survive (decision table)", () => {
+    // a–f cover every row of the plan's decision table. liveTaskCount here is the
+    // already-effective (debounced) count buildHomeModel reads.
+    const workspaces = [
+      ws("ws-1", "Alpha", [
+        tab(
+          "tab-1",
+          split(
+            "s1",
+            leaf("a"),
+            split(
+              "s2",
+              leaf("b"),
+              split("s3", leaf("c"), split("s4", leaf("d"), split("s5", leaf("e"), leaf("f")))),
+            ),
+          ),
+          "a",
+        ),
+      ]),
+    ];
+    const model = buildHomeModel(
+      workspaces,
+      {
+        a: agent(true, 4000, 2), // raised + tasks → waiting (attention wins, not running)
+        b: agent(true, null, 0), // acknowledged + no tasks → idle
+        c: agent(true, null, 3), // acknowledged + tasks → running
+        d: agent(true, 5000, 2), // idle-attn + output stretch + tasks → working (output wins)
+        e: agent(true, null, 0), // idle-attn + no stretch + no tasks → idle
+        f: agent(true, null, 1), // idle-attn + no stretch + tasks → running
+      },
+      {},
+      { a: "raised", b: "acknowledged", c: "acknowledged" },
+    );
+    const rows = model[0].tabs[0].rows;
+    expect(rows.map((r) => [r.leafKey, r.status])).toEqual([
+      ["a", "waiting"],
+      ["b", "idle"],
+      ["c", "running"],
+      ["d", "working"],
+      ["e", "idle"],
+      ["f", "running"],
+    ]);
+  });
+
+  it("never shows running when the base is working or waiting, for any count", () => {
+    const workspaces = [
+      ws("ws-1", "Alpha", [tab("tab-1", split("s1", leaf("w"), leaf("r")), "w")]),
+    ];
+    const model = buildHomeModel(
+      workspaces,
+      { w: agent(true, 8000, 9), r: agent(true, 1000, 9) },
+      {},
+      { r: "raised" },
+    );
+    const byKey = Object.fromEntries(model[0].tabs[0].rows.map((r) => [r.leafKey, r.status]));
+    expect(byKey.w).toBe("working"); // working base + tasks → still working (AE3)
+    expect(byKey.r).toBe("waiting"); // raised base + tasks → still waiting (AE4)
+  });
+
+  it("carries liveTaskCount onto the row; running shows the count, idle is 0", () => {
+    const workspaces = [
+      ws("ws-1", "Alpha", [tab("tab-1", split("s1", leaf("run"), leaf("idle")), "run")]),
+    ];
+    const model = buildHomeModel(
+      workspaces,
+      { run: agent(true, null, 3), idle: agent(true, null, 0) },
+      {},
+      {},
+    );
+    const rows = Object.fromEntries(model[0].tabs[0].rows.map((r) => [r.leafKey, r]));
+    expect(rows.run.status).toBe("running");
+    expect(rows.run.liveTaskCount).toBe(3);
+    expect(rows.idle.status).toBe("idle");
+    expect(rows.idle.liveTaskCount).toBe(0);
+  });
+
+  it("running·0 is unreachable: a 0 effective count stays idle", () => {
+    const workspaces = [ws("ws-1", "Alpha", [tab("tab-1", leaf("x"), "x")])];
+    const model = buildHomeModel(workspaces, { x: agent(true, null, 0) }, {}, {});
+    expect(model[0].tabs[0].rows[0].status).toBe("idle");
+  });
+});
+
+describe("effectiveTaskCount (rise-debounce)", () => {
+  const WINDOW = 3000;
+
+  it("suppresses a count still inside the debounce window", () => {
+    // rose at 1000, now 3500 → 2500 < 3000 → not yet surfaced (AE7).
+    expect(effectiveTaskCount(2, 1000, 3500, WINDOW)).toBe(0);
+  });
+
+  it("surfaces the raw count once the window has elapsed", () => {
+    expect(effectiveTaskCount(2, 1000, 4000, WINDOW)).toBe(2);
+    expect(effectiveTaskCount(5, 1000, 9000, WINDOW)).toBe(5);
+  });
+
+  it("returns 0 for a 0 raw count regardless of riseAt (immediate fall, R7/AE6)", () => {
+    expect(effectiveTaskCount(0, 1000, 9999, WINDOW)).toBe(0);
+    expect(effectiveTaskCount(0, null, 9999, WINDOW)).toBe(0);
+  });
+
+  it("returns 0 when no rise has been recorded yet (riseAt null)", () => {
+    expect(effectiveTaskCount(3, null, 9999, WINDOW)).toBe(0);
+  });
+
+  it("boundary: exactly windowMs elapsed surfaces (inclusive)", () => {
+    expect(effectiveTaskCount(1, 1000, 4000, WINDOW)).toBe(1); // 3000 == window
+    expect(effectiveTaskCount(1, 1000, 3999, WINDOW)).toBe(0); // 2999 < window
   });
 });
