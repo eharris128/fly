@@ -4,6 +4,15 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type PaneId = number;
 
+/**
+ * Forward a frontend message to the app's stderr (the webview console is
+ * invisible outside devtools). Mirrors the global handler in `main.ts`; used on
+ * recoverable error paths that still want a breadcrumb.
+ */
+export function frontendLog(msg: string): Promise<void> {
+  return invoke("frontend_log", { msg });
+}
+
 export interface SpawnOpts {
   rows: number;
   cols: number;

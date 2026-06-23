@@ -62,6 +62,7 @@
     continueTarget,
     pruneResumeRecords,
     getLaunchMode,
+    frontendLog,
     type PaneId,
     type PaneActivity,
     type AttentionState,
@@ -1142,11 +1143,20 @@
       // commands + their tiers, drop stale `--continue` leaves to bare shells, and
       // override spawn cwds — all before workspaces mount so panes spawn as resumed
       // agents. In normal mode this returns empty → every pane a bare shell.
-      const resumeResult = await computeResumeForRestore(
-        saved,
-        cwds,
-        cfg.resumeDefaultArgs,
-      );
+      // A resume-probe failure (a rejecting IPC) must never blank the UI: fall
+      // back to bare shells so the saved layout still mounts, rather than aborting
+      // restore (fix-003 review). The per-leaf probe is itself guarded inside the
+      // function; this is the outer belt-and-suspenders.
+      let resumeResult: {
+        commands: Record<string, string[]>;
+        tierByLeaf: Record<string, ResumeTier>;
+      };
+      try {
+        resumeResult = await computeResumeForRestore(saved, cwds, cfg.resumeDefaultArgs);
+      } catch (e) {
+        void frontendLog(`resume restore failed, falling back to bare shells: ${String(e)}`);
+        resumeResult = { commands: {}, tierByLeaf: {} };
+      }
       resumeCommandByLeaf = resumeResult.commands;
       resumeTierByLeaf = resumeResult.tierByLeaf;
       cwdByLeaf = cwds;
@@ -1201,7 +1211,18 @@
     window.addEventListener("blur", reportForeground);
     window.addEventListener("keydown", onWindowKeydown, true);
     reportForeground();
-    void restore();
+    // Last-resort safety net: if restore() throws before mounting anything, the
+    // app must still come up usable (a default workspace) rather than a blank
+    // window stuck at ready=false (fix-003 review).
+    void restore().catch((e) => {
+      void frontendLog(`restore failed: ${String(e)}`);
+      if (!ready) {
+        const ws = makeWorkspace("default");
+        workspaces = [ws];
+        activeWorkspaceId = ws.id;
+        ready = true;
+      }
+    });
     // Own the notification history listener here (attention arrives prop-drilled
     // from Terminal; this is a direct App listener). Resolve paneId → leafKey at
     // ingestion via the reverse index, so the entry stores the stable key.

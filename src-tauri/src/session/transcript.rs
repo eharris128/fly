@@ -179,7 +179,17 @@ fn iso8601_to_ms(s: &str) -> Option<u64> {
         return None;
     }
 
-    // Defensive range checks (not a full calendar validator).
+    // Defensive range checks (not a full calendar validator). The year bound is
+    // load-bearing, not cosmetic: without it a corrupt/garbage year (a partial
+    // transcript write, a foreign file, a future format change) overflows the i64
+    // ms arithmetic below — and release builds compile with `overflow-checks =
+    // false`, so the multiply *wraps silently* into a huge positive value that the
+    // stale-guard then reads as "fresh", resurrecting the very stale session this
+    // fix exists to block (debug builds panic instead). 9999 keeps every product
+    // far inside i64 (fix-003 review).
+    if !(1..=9999).contains(&year) {
+        return None;
+    }
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
@@ -187,9 +197,14 @@ fn iso8601_to_ms(s: &str) -> Option<u64> {
         return None;
     }
 
+    // Checked arithmetic as belt-and-suspenders with the year bound: any
+    // unanticipated overflow degrades to `None` rather than wrapping.
     let days = days_from_civil(year, month, day);
-    let secs = days * 86_400 + hour * 3_600 + min * 60 + sec;
-    let ms = secs * 1_000 + frac_ms;
+    let ms = days
+        .checked_mul(86_400)
+        .and_then(|d| d.checked_add(hour * 3_600 + min * 60 + sec))
+        .and_then(|s| s.checked_mul(1_000))
+        .and_then(|s| s.checked_add(frac_ms))?;
     (ms >= 0).then_some(ms as u64)
 }
 
@@ -396,6 +411,24 @@ mod tests {
         assert_eq!(iso8601_to_ms("2026-06-19T19:17:16"), None); // no trailing 'Z'
         assert_eq!(iso8601_to_ms("2026-13-01T00:00:00Z"), None); // month out of range
         assert_eq!(iso8601_to_ms("2026-06-19T19:17Z"), None); // missing seconds
+    }
+
+    #[test]
+    fn rejects_out_of_range_year_without_overflowing() {
+        // A garbage/corrupt year must degrade to None, never wrap to a huge
+        // "fresh" timestamp that defeats the stale-guard (fix-003 review). In a
+        // release build the unbounded multiply would wrap silently; the year bound
+        // turns it into a clean rejection. (This test also asserts no panic in a
+        // debug build, where the overflow would otherwise abort.)
+        assert_eq!(iso8601_to_ms("999999-12-31T23:59:59.999Z"), None);
+        assert_eq!(iso8601_to_ms("0000-01-01T00:00:00Z"), None); // year 0 rejected
+    }
+
+    #[test]
+    fn rejects_pre_epoch_dates() {
+        // A pre-1970 date yields negative ms; the `ms >= 0` guard rejects it so the
+        // `as u64` cast never sees a negative value. Claude never writes these.
+        assert_eq!(iso8601_to_ms("1969-12-31T23:59:59Z"), None);
     }
 
     // ---- session_last_turn_ms / last_turn_ms_from_str (KTD-C) --------------
