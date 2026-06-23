@@ -4,6 +4,7 @@ import {
   effectiveAttention,
   effectiveTaskCount,
   formatDuration,
+  formatTaskCount,
   agentCount,
   workspaceJumpTarget,
 } from "./home";
@@ -360,5 +361,14 @@ describe("effectiveTaskCount (rise-debounce)", () => {
   it("boundary: exactly windowMs elapsed surfaces (inclusive)", () => {
     expect(effectiveTaskCount(1, 1000, 4000, WINDOW)).toBe(1); // 3000 == window
     expect(effectiveTaskCount(1, 1000, 3999, WINDOW)).toBe(0); // 2999 < window
+  });
+});
+
+describe("formatTaskCount", () => {
+  it("pluralizes the task count (singular only at 1)", () => {
+    expect(formatTaskCount(1)).toBe("1 task");
+    expect(formatTaskCount(2)).toBe("2 tasks");
+    expect(formatTaskCount(0)).toBe("0 tasks");
+    expect(formatTaskCount(10)).toBe("10 tasks");
   });
 });

@@ -234,3 +234,13 @@ export function formatDuration(ms: number): string {
   const m = totalMin % 60;
   return m > 0 ? `${h}h ${m}m` : `${h}h`;
 }
+
+/**
+ * Pluralize the background-task count for the `running` row's label
+ * (running-state plan R2): `1 → "1 task"`, otherwise `"N tasks"`. A pure
+ * presentational helper the HomeView imports — mirrors `formatDuration`'s shape,
+ * so the dashboard's `running · N tasks` reading stays unit-tested.
+ */
+export function formatTaskCount(n: number): string {
+  return `${n} ${n === 1 ? "task" : "tasks"}`;
+}

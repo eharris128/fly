@@ -3,7 +3,12 @@
   // model from `home.ts` and owns only its keyboard selection + a 1s tick for
   // the live "working for" timer. All data + the never-unmount hide live in
   // App.svelte; jumping and closing are prop callbacks.
-  import { formatDuration, workspaceJumpTarget, type HomeWorkspaceGroup } from "./home";
+  import {
+    formatDuration,
+    formatTaskCount,
+    workspaceJumpTarget,
+    type HomeWorkspaceGroup,
+  } from "./home";
 
   let {
     model,
@@ -134,9 +139,11 @@
                 >
                   <span class="status {row.status}">{row.status}</span>
                   <span class="dur">
-                    {row.status === "working" && elapsed != null
-                      ? formatDuration(elapsed)
-                      : ""}
+                    {#if row.status === "working" && elapsed != null}
+                      {formatDuration(elapsed)}
+                    {:else if row.status === "running"}
+                      {formatTaskCount(row.liveTaskCount)}
+                    {/if}
                   </span>
                   <span class="cwd">{row.cwd ?? ""}</span>
                 </button>
@@ -262,6 +269,11 @@
   }
   .status.idle {
     color: #7b84a3;
+  }
+  /* Busy-but-quiet: live background work, no output stretch. A cyan/teal distinct
+     from working(green), waiting(amber), idle(gray). */
+  .status.running {
+    color: #38bdf8;
   }
   .dur {
     font-variant-numeric: tabular-nums;
