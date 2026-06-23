@@ -11,6 +11,7 @@
 //! write-through store, [`resume`], decoupled from this debounced layout blob.
 
 pub mod resume;
+pub mod transcript;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

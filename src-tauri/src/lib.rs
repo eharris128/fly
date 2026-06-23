@@ -328,6 +328,7 @@ pub fn run() {
             pty::pty_resume,
             pty::pane_cwd,
             pty::pane_command,
+            pty::pane_session_id,
             pty::pane_activity,
             session::save_session,
             session::load_session,

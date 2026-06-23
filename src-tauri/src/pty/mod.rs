@@ -251,6 +251,27 @@ impl PtyManager {
         crate::cwd::is_claude(comm.as_deref(), &argv).then_some(argv)
     }
 
+    /// The pane's active Claude `session_id`, resolved from Claude's transcript
+    /// store (fix-resume-session-selection U1, KTD-A) — `is_claude`-gated like
+    /// [`pane_command`], so a bare shell never resolves an id. Two-step (resolve
+    /// the foreground pid — which takes and drops the registry lock — then read
+    /// `~/.claude/projects` with no lock held), mirroring [`cwd`]/[`pane_command`],
+    /// because the dir read is blocking I/O that must never hold the `panes` mutex
+    /// every command and the read-thread teardown contend on (KTD13). Reads the pid
+    /// directly (not [`cwd`], which would re-resolve it) so agent-ness and cwd come
+    /// from one pid. `None` for a non-agent, a gone pane, or when no active
+    /// transcript is found — never a non-agent's id.
+    pub fn pane_session_id(&self, id: PaneId) -> Option<String> {
+        let pid = self.foreground_pid(id)?;
+        let comm = crate::cwd::proc_comm(pid);
+        let argv = crate::cwd::proc_cmdline(pid);
+        if !crate::cwd::is_claude(comm.as_deref(), &argv) {
+            return None;
+        }
+        let cwd = crate::cwd::proc_cwd(pid)?;
+        crate::session::transcript::active_session_for_cwd(&cwd)
+    }
+
     /// Whether the pane runs a Claude agent and, if so, how many live background
     /// task groups run beneath it (running-state plan U3, KTD2/KTD4) — the
     /// dashboard's "N tasks" number. Resolves `foreground_pid` **once** (which
@@ -378,6 +399,19 @@ pub fn pane_command(
     manager.pane_command(pane_id)
 }
 
+/// The pane's active Claude `session_id` from the transcript store, else `None`
+/// (fix-resume-session-selection U1). The always-on poll reads this to capture
+/// each agent's precise session id write-through into the resume store —
+/// hook-independent, so it works under installed-binary version skew (KTD-A). A
+/// bare shell or gone pane yields `None`, so a non-agent never gets an id.
+#[tauri::command]
+pub fn pane_session_id(
+    manager: tauri::State<'_, Arc<PtyManager>>,
+    pane_id: PaneId,
+) -> Option<String> {
+    manager.pane_session_id(pane_id)
+}
+
 /// The agent dashboard payload for one pane (U4; running-state U3): whether it is
 /// a Claude Code agent, its current work stretch and last-output age, and the
 /// count of live background task groups beneath it. `working_for_ms` is `None`
@@ -433,6 +467,7 @@ mod tests {
         assert_eq!(m.pane_activity(ghost), None);
         assert!(!m.is_agent(ghost));
         assert_eq!(m.pane_command(ghost), None);
+        assert_eq!(m.pane_session_id(ghost), None); // transcript path: graceful
         assert_eq!(m.agent_task_count(ghost), None); // count path: graceful, no panic
         assert_eq!(m.leaf_key(ghost), None);
         assert_eq!(m.lifecycle(ghost), None);

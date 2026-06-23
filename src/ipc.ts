@@ -175,6 +175,16 @@ export function paneCommand(paneId: PaneId): Promise<string[] | null> {
   return invoke<string[] | null>("pane_command", { paneId });
 }
 
+/**
+ * The pane's active Claude session id from the transcript store, else null
+ * (fix-resume-session-selection U1). The always-on poll reads this to capture
+ * each agent's precise session id without depending on the installed `fly`
+ * binary's version (KTD-A).
+ */
+export function paneSessionId(paneId: PaneId): Promise<string | null> {
+  return invoke<string | null>("pane_session_id", { paneId });
+}
+
 /** Upsert a captured agent leaf's launch argv into the resume store (U4). */
 export function saveResumeRecord(
   leafKey: string,
