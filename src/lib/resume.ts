@@ -196,6 +196,24 @@ export function resumeLeafDecision(
 }
 
 /**
+ * Fold a tier map to its counts (fix-003 U4): how many resumed leaves re-attached
+ * precisely (`--resume <id>`) vs imprecisely (`--continue`). Drives the offer
+ * breakdown and the explicit-resume notice, so a degraded resume is surfaced and
+ * never silently presented as exact (R5). Pure.
+ */
+export function resumeTierSummary(
+  tierByLeaf: Record<string, ResumeTier>,
+): { precise: number; imprecise: number } {
+  let precise = 0;
+  let imprecise = 0;
+  for (const tier of Object.values(tierByLeaf)) {
+    if (tier === "precise") precise++;
+    else imprecise++;
+  }
+  return { precise, imprecise };
+}
+
+/**
  * Whether the poll should capture a leaf's resolved session id (fix-003 U2,
  * KTD-B). Unlike argv — fixed for a pane's life, captured once — a session id
  * rotates within a pane's life (`/clear`, a new conversation), so capture is

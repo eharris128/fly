@@ -8,6 +8,7 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getConfig } from "./config";
   import type { Keymap } from "./keymap";
+  import type { ResumeTier } from "./resume";
   import "@xterm/xterm/css/xterm.css";
   import {
     spawnPane,
@@ -34,6 +35,10 @@
     /** Program to run instead of the shell — set only when resuming a Claude
      * agent (U6/U8, KTD-E). Read once at mount; null → a bare shell. */
     command?: string[] | null;
+    /** How this pane re-attached (fix-003 U4): "imprecise" (`--continue`,
+     * most-recent-in-folder) surfaces a brief disclosure banner so it is never
+     * mistaken for an exact re-attach (R5/AE4); "precise"/null shows none. */
+    resumeTier?: ResumeTier | null;
     saveScrollback?: boolean;
     onFocusRequest: (leafKey: string) => void;
     onSpawned?: (leafKey: string, paneId: PaneId) => void;
@@ -50,12 +55,20 @@
     keymap,
     cwd = null,
     command = null,
+    resumeTier = null,
     saveScrollback = false,
     onFocusRequest,
     onSpawned,
     onExit,
     onAttention,
   }: Props = $props();
+
+  // Imprecise-resume disclosure (fix-003 U4, R5/AE4): a pane re-attached via
+  // `--continue` shows a brief, dismissible banner naming the most-recent-in-folder
+  // fallback so it is never read as an exact re-attach. A precise `--resume <id>`
+  // pane needs none — it IS exact. Auto-dismisses; click clears it early.
+  let resumeBannerDismissed = $state(false);
+  let resumeBannerTimer: ReturnType<typeof setTimeout> | null = null;
 
   let serializer: SerializeAddon | undefined;
 
@@ -219,9 +232,15 @@
     if (focused) {
       term.focus();
     }
+
+    // Briefly disclose an imprecise resume, then fade it (R5).
+    if (resumeTier === "imprecise") {
+      resumeBannerTimer = setTimeout(() => (resumeBannerDismissed = true), 10000);
+    }
   });
 
   onDestroy(() => {
+    if (resumeBannerTimer) clearTimeout(resumeBannerTimer);
     resizeObs?.disconnect();
     unlisteners.forEach((u) => u());
     // Persist scrollback if opted in (off by default for privacy, KTD10).
@@ -244,6 +263,18 @@
   <div class="terminal" bind:this={container}></div>
   {#if attention === "raised"}
     <div class="badge">{reason ? REASON_LABEL[reason] : "needs you"}</div>
+  {/if}
+  {#if resumeTier === "imprecise" && !resumeBannerDismissed}
+    <button
+      class="resume-banner"
+      title="Dismiss"
+      onclick={(e) => {
+        e.stopPropagation();
+        resumeBannerDismissed = true;
+      }}
+    >
+      resumed most-recent session in {cwd ?? "this folder"}
+    </button>
   {/if}
 </div>
 
@@ -298,5 +329,31 @@
     border-radius: 10px;
     pointer-events: none;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+  }
+  /* Imprecise-resume disclosure banner (fix-003 U4): quiet, bottom-left so it
+     clears the top-right attention badge; dismissible. */
+  .resume-banner {
+    position: absolute;
+    bottom: 6px;
+    left: 8px;
+    max-width: calc(100% - 16px);
+    padding: 3px 9px;
+    font:
+      11px/1.4 ui-monospace,
+      monospace;
+    color: #c9d1d9;
+    background: #11182b;
+    border: 1px solid #2b3a55;
+    border-radius: 10px;
+    cursor: pointer;
+    opacity: 0.85;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .resume-banner:hover {
+    opacity: 1;
+    background: #1a2740;
   }
 </style>

@@ -6,6 +6,7 @@ import {
   resumeStaleVerdict,
   classifyResumeTier,
   resumeLeafDecision,
+  resumeTierSummary,
 } from "./resume";
 import type { ResumeRecord } from "../ipc";
 
@@ -261,6 +262,29 @@ describe("resumeLeafDecision (fix-003 U3 keep/drop)", () => {
     expect(
       resumeLeafDecision(rec({ isAgent: true, updatedAt: 5_000_000 }), null, MARGIN),
     ).toEqual({ tier: "imprecise", keep: false });
+  });
+});
+
+describe("resumeTierSummary (fix-003 U4)", () => {
+  it("counts a mixed map into precise/imprecise", () => {
+    expect(
+      resumeTierSummary({
+        "leaf-1": "precise",
+        "leaf-2": "precise",
+        "leaf-3": "imprecise",
+      }),
+    ).toEqual({ precise: 2, imprecise: 1 });
+  });
+
+  it("is zeros for an empty map", () => {
+    expect(resumeTierSummary({})).toEqual({ precise: 0, imprecise: 0 });
+  });
+
+  it("an all-precise map has no imprecise count (no degraded labeling)", () => {
+    expect(resumeTierSummary({ a: "precise", b: "precise" })).toEqual({
+      precise: 2,
+      imprecise: 0,
+    });
   });
 });
 

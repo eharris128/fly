@@ -41,6 +41,7 @@
     shouldCaptureSession,
     classifyResumeTier,
     resumeLeafDecision,
+    resumeTierSummary,
     type ResumeTier,
   } from "./lib/resume";
   import {
@@ -436,8 +437,28 @@
   // Crash-resume offer (U8, KTD-G): shown at launch when the prior run crashed
   // and there are agents to resume. restore() awaits the answer before mounting
   // panes, so accepting spawns them as resumed agents (declining → bare shells).
-  let resumeOffer = $state<{ count: number } | null>(null);
+  // `tiers` (fix-003 U4) breaks the count into exact (`--resume <id>`) vs
+  // most-recent-in-folder (`--continue`) so a degraded resume is never silently
+  // offered as exact (R5).
+  let resumeOffer = $state<{
+    count: number;
+    tiers: { precise: number; imprecise: number };
+  } | null>(null);
   let resolveResumeOffer: ((accept: boolean) => void) | null = null;
+  // Transient post-resume notice for the explicit `fly resume` path, which shows
+  // no offer dialog (fix-003 U4, R5): names how many panes re-attached imprecisely
+  // (`--continue`, most-recent-in-folder) so that tier is surfaced, not hidden.
+  // Auto-dismisses; click to clear. The offer path uses the in-dialog breakdown.
+  let resumeNotice = $state<string | null>(null);
+  let resumeNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+  function showResumeNotice(summary: { precise: number; imprecise: number }) {
+    if (summary.imprecise === 0) return; // all exact → nothing to disclose
+    const exact = summary.precise > 0 ? `, ${summary.precise} exact` : "";
+    const s = summary.imprecise === 1 ? "" : "s";
+    resumeNotice = `Resumed ${summary.imprecise} agent${s} by most-recent session in folder${exact}.`;
+    if (resumeNoticeTimer) clearTimeout(resumeNoticeTimer);
+    resumeNoticeTimer = setTimeout(() => (resumeNotice = null), 8000);
+  }
   function answerResumeOffer(accept: boolean) {
     resumeOffer = null;
     const r = resolveResumeOffer;
@@ -1075,14 +1096,19 @@
     if (Object.keys(commands).length === 0) return empty; // all stale → nothing
 
     // Explicit `fly resume` resumes immediately; a detected crash offers first.
+    const summary = resumeTierSummary(tierByLeaf);
     let resuming = mode === "resume";
     if (mode === "offer") {
       resuming = await new Promise<boolean>((res) => {
         resolveResumeOffer = res;
-        resumeOffer = { count: Object.keys(commands).length };
+        resumeOffer = { count: Object.keys(commands).length, tiers: summary };
       });
     }
     if (!resuming) return empty;
+
+    // Explicit `fly resume` shows no dialog, so surface an imprecise resume as a
+    // transient notice (R5); the offer path already discloses the breakdown.
+    if (mode === "resume") showResumeNotice(summary);
 
     // KTD-H: resume each agent in its captured session cwd when we have one.
     for (const key of Object.keys(commands)) {
@@ -1269,6 +1295,7 @@
             focused={p.tabId === activeTab?.id && activeTab?.focusedLeafKey === p.key}
             cwd={cwdByLeaf[p.key] ?? null}
             command={resumeCommandByLeaf[p.key] ?? null}
+            resumeTier={resumeTierByLeaf[p.key] ?? null}
             saveScrollback={saveScrollbackEnabled}
             {keymap}
             onFocusRequest={setActiveFocus}
@@ -1331,6 +1358,15 @@
             ? ""
             : "s"} from your last session?
         </p>
+        {#if resumeOffer.tiers.imprecise > 0}
+          <!-- Tier breakdown (fix-003 U4, R5): disclose how many re-attach exactly
+               vs by most-recent-session-in-folder, so the degraded path is never
+               passed off as exact. Shown only when some pane is imprecise. -->
+          <p class="confirm-sub">
+            {#if resumeOffer.tiers.precise > 0}{resumeOffer.tiers.precise} exact ·
+            {/if}{resumeOffer.tiers.imprecise} most-recent-in-folder
+          </p>
+        {/if}
         <div class="confirm-actions">
           <button class="btn danger" onclick={() => answerResumeOffer(true)}>
             Resume
@@ -1342,6 +1378,14 @@
         <p class="confirm-hint">Enter to resume · Esc to start fresh</p>
       </div>
     </div>
+  {/if}
+
+  {#if resumeNotice !== null}
+    <!-- Explicit `fly resume` (no offer dialog) tier disclosure (fix-003 U4, R5).
+         Passive + auto-dismissing; click to clear early. -->
+    <button class="resume-notice" onclick={() => (resumeNotice = null)}>
+      {resumeNotice}
+    </button>
   {/if}
 
   <HotkeyMenu
@@ -1438,6 +1482,12 @@
   .confirm-msg {
     margin: 0 0 14px;
   }
+  /* Resume-offer tier breakdown (fix-003 U4): a quiet sub-line under the prompt. */
+  .confirm-sub {
+    margin: -8px 0 14px;
+    opacity: 0.6;
+    font-size: 12px;
+  }
   .confirm-actions {
     display: flex;
     gap: 8px;
@@ -1466,5 +1516,29 @@
     margin: 12px 0 0;
     opacity: 0.5;
     font-size: 11px;
+  }
+  /* Transient explicit-resume tier notice (fix-003 U4): a quiet, dismissible toast
+     pinned bottom-centre, styled like the passive cheat-sheet rather than a modal. */
+  .resume-notice {
+    position: fixed;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 50;
+    max-width: 80vw;
+    background: #11182b;
+    border: 1px solid #2b3a55;
+    color: #c9d1d9;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+    opacity: 0.92;
+  }
+  .resume-notice:hover {
+    opacity: 1;
+    background: #1a2740;
   }
 </style>
