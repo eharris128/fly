@@ -152,21 +152,28 @@ pub struct ProcEntry {
 /// `root_pid` is the pane's foreground pid which — being the foreground
 /// process-group leader (`tcgetpgrp`) — equals the agent's pgid. The count is the
 /// number of distinct `pgid` values among the agent's **transitive descendants**
-/// (walked via `ppid` edges) that are both:
-///   - **live** — state is not `Z` (zombie) or `X` (dead); and
-///   - **backgrounded** — `pgid != root_pid`.
+/// (walked via `ppid` edges) that are all of:
+///   - **live** — state is not `Z` (zombie) or `X` (dead);
+///   - **backgrounded** — `pgid != root_pid`; and
+///   - **top-level** — anchored directly off the agent's group: some live member
+///     has a parent in the root's group (`pgid == root_pid`, the root included),
+///     so it is not nested inside another background group.
 ///
 /// Backgrounding *is* "a descendant in a different process group", so the pgid
-/// filter excludes the agent's own foreground children/same-group helpers while
-/// distinct-pgid collapses a pipeline (N procs, one group) or a job's subtree to a
-/// single logical task — matching the user's mental model and Claude Code's
-/// "N shells still running" line.
+/// filter excludes the agent's own foreground children/same-group helpers, and
+/// distinct-pgid collapses a pipeline (N procs, one group) to one task. The
+/// top-level filter then collapses a *job that spans nested groups* to one task:
+/// Claude Code wraps every command in a `bash -c` child (its own group/session)
+/// whose real command re-forks into a further group, so one job is two nested
+/// groups — only the wrapper, anchored at the agent, counts. This matches the
+/// user's mental model and Claude Code's "N shells still running" line.
 ///
 /// Pure over its argument table (no `/proc` I/O — that is [`read_proc_table`]),
 /// mirroring [`is_claude`]. A reparented (double-forked) task reparents to pid 1,
-/// escaping the descendant walk, and is undercounted — accepted (KTD3). A
-/// background job that itself calls `setsid` re-inflates the count — accepted
-/// (KTD2). Traversal carries a visited set, so a malformed table (self-parent,
+/// escaping the descendant walk, and is undercounted — accepted (KTD3). A nested
+/// background group (a job's inner `setsid`/re-forked group) folds into its
+/// top-level parent group rather than re-inflating the count (KTD2). Traversal
+/// carries a visited set, so a malformed table (self-parent,
 /// `ppid` cycle, duplicate pid) cannot infinite-loop.
 pub fn count_background_task_groups(table: &[ProcEntry], root_pid: u32) -> u32 {
     use std::collections::{HashMap, HashSet};
@@ -195,11 +202,25 @@ pub fn count_background_task_groups(table: &[ProcEntry], root_pid: u32) -> u32 {
         }
     }
 
-    // Distinct process groups among the live, backgrounded descendants.
+    // Distinct *top-level* background groups among the live descendants. A live,
+    // backgrounded descendant counts its group as a real task only when it is
+    // anchored directly off the agent's own group — i.e. its parent sits in the
+    // root's foreground group (`pgid == root_pid`, which includes the root
+    // itself). A backgrounded descendant whose parent is in *another* background
+    // group is the inner group of a job the agent already launched, not a second
+    // job: Claude Code runs every command through a `bash -c` wrapper (the
+    // wrapper is the agent's child in its own group/session; the real command
+    // re-forks into a further group), so one job spans two nested groups. Anchor
+    // gating collapses that pair to one — without it, every background task
+    // double-counts (KTD2).
+    let anchored_to_agent = |ppid: u32| {
+        ppid == root_pid || by_pid.get(&ppid).is_some_and(|e| e.pgid == root_pid)
+    };
     let mut groups: HashSet<u32> = HashSet::new();
     for pid in &descendants {
         if let Some(e) = by_pid.get(pid) {
-            if e.state != 'Z' && e.state != 'X' && e.pgid != root_pid {
+            if e.state != 'Z' && e.state != 'X' && e.pgid != root_pid && anchored_to_agent(e.ppid)
+            {
                 groups.insert(e.pgid);
             }
         }
@@ -325,6 +346,36 @@ mod tests {
             proc(403, 400, 400, 'S'),
         ];
         assert_eq!(count_background_task_groups(&table, 100), 1);
+    }
+
+    #[test]
+    fn a_claude_wrapper_job_spanning_two_nested_groups_is_one_task() {
+        // Empirically, one Claude Code background job is a `bash -c` wrapper in its
+        // own group (a direct child of the agent) plus the real command, which
+        // re-forks into a *further* group below the wrapper. Both are backgrounded
+        // (pgid != root), but only the wrapper is anchored at the agent — the inner
+        // group folds in, so the job counts once, not twice. (Regression: a single
+        // `ping &` was read as "2 tasks".)
+        let table = vec![
+            proc(100, 1, 100, 'R'),   // claude (root)
+            proc(110, 100, 110, 'S'), // bash -c wrapper: agent's child, own group
+            proc(120, 110, 120, 'S'), // ping: child of the wrapper, its own group
+        ];
+        assert_eq!(count_background_task_groups(&table, 100), 1);
+    }
+
+    #[test]
+    fn two_wrapper_jobs_each_spanning_nested_groups_are_two_tasks() {
+        // Two independent background jobs, each a wrapper+command nested pair → 2,
+        // not 4: each wrapper anchors one task; each inner command group folds in.
+        let table = vec![
+            proc(100, 1, 100, 'R'),
+            proc(110, 100, 110, 'S'), // job A wrapper
+            proc(120, 110, 120, 'S'), // job A command (nested)
+            proc(210, 100, 210, 'S'), // job B wrapper
+            proc(220, 210, 220, 'S'), // job B command (nested)
+        ];
+        assert_eq!(count_background_task_groups(&table, 100), 2);
     }
 
     #[test]
