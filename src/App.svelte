@@ -1234,6 +1234,12 @@
       activeWorkspaceId = ws.id;
     }
     ready = true;
+    // Open to the dashboard as the home base (R1/KTD5): set synchronously here,
+    // right after `ready`, so the dashboard is the first painted view rather than
+    // flashing the restored grid first. The crash-resume offer was already
+    // awaited above (inside computeResumeForRestore), so opening underneath it
+    // never clobbers it; panes stay mounted and run hidden behind the dashboard.
+    homeViewOpen = true;
 
     // Flush a final save before the window closes, while the shells are still
     // alive so their cwds are captured (R13/R14). Then the backend reaps panes.
