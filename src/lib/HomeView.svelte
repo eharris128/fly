@@ -6,13 +6,20 @@
   import {
     formatDuration,
     formatTaskCount,
+    formatResetTime,
+    usageLimitLabel,
     workspaceJumpTarget,
     type HomeWorkspaceGroup,
   } from "./home";
+  import type { UsageSnapshot } from "../ipc";
 
   let {
     model,
     polledAt,
+    usage,
+    usageError,
+    usageLoading,
+    onRefresh,
     onJump,
     onClose,
   }: {
@@ -20,6 +27,14 @@
     /** Wall-clock ms when `model`'s workingForMs values were measured, for the
      *  re-anchored local tick. */
     polledAt: number;
+    /** Live `/usage` gauges, fetched on dashboard open; null until the first
+     *  fetch resolves or after a failure (see `usageError`). */
+    usage: UsageSnapshot | null;
+    /** One-line reason the usage fetch failed (not signed in, offline, …). */
+    usageError: string | null;
+    usageLoading: boolean;
+    /** Re-fetch the usage gauges on demand (the panel's refresh button). */
+    onRefresh: () => void;
     onJump: (wsId: string, tabId: string, leafKey: string) => void;
     onClose: () => void;
   } = $props();
@@ -98,13 +113,14 @@
   }
 </script>
 
-<div
-  class="home"
-  role="listbox"
-  tabindex="-1"
-  aria-label="Agent dashboard"
-  onkeydown={onKeydown}
->
+<div class="dash">
+  <div
+    class="home"
+    role="listbox"
+    tabindex="-1"
+    aria-label="Agent dashboard"
+    onkeydown={onKeydown}
+  >
   <header class="home-head">
     <h1>Agents</h1>
     <span class="hint">Esc to close · ↑↓ to move · Enter to jump · 1–9 workspace</span>
@@ -154,9 +170,64 @@
       {/each}
     </div>
   {/if}
+  </div>
+
+  <aside class="usage-panel" aria-label="Plan usage">
+    <header class="usage-head">
+      <h2>Usage</h2>
+      <div class="usage-actions">
+        {#if usage?.plan}<span class="plan">{usage.plan}</span>{/if}
+        <button
+          type="button"
+          class="refresh"
+          class:spinning={usageLoading}
+          onclick={onRefresh}
+          disabled={usageLoading}
+          title="Refresh usage"
+          aria-label="Refresh usage"
+        >↻</button>
+      </div>
+    </header>
+
+    {#if usageError}
+      <p class="usage-msg error">{usageError}</p>
+    {:else if usage == null}
+      <p class="usage-msg">{usageLoading ? "Loading…" : "—"}</p>
+    {:else if usage.limits.length === 0}
+      <p class="usage-msg">No active plan limits.</p>
+    {:else}
+      <ul class="limits">
+        {#each usage.limits as lim (lim.kind + (lim.scopeLabel ?? ""))}
+          {@const reset = formatResetTime(lim.resetsAt, now)}
+          {@const pct = Math.min(100, Math.max(0, lim.percent))}
+          <li class="limit" class:active={lim.isActive}>
+            <div class="limit-top">
+              <span class="limit-label">{usageLimitLabel(lim)}</span>
+              <span class="limit-pct">{Math.round(lim.percent)}%</span>
+            </div>
+            <div class="bar" role="progressbar" aria-valuenow={Math.round(pct)}>
+              <div class="bar-fill sev-{lim.severity ?? 'normal'}" style="width: {pct}%"></div>
+            </div>
+            {#if reset}<span class="limit-reset">{reset}</span>{/if}
+          </li>
+        {/each}
+      </ul>
+      <p class="usage-foot">Refreshed on open · from <code>/usage</code></p>
+    {/if}
+  </aside>
 </div>
 
 <style>
+  /* Two columns: the agent list (left, grows) + the usage panel (right, fixed).
+     Mirrors the sizing the .home root used to carry so it slots into App's
+     layout identically. */
+  .dash {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: row;
+  }
   .home {
     flex: 1;
     min-width: 0;
@@ -166,6 +237,149 @@
     color: #e6e9f2;
     padding: 20px 24px;
     outline: none;
+  }
+  .usage-panel {
+    flex: none;
+    width: 300px;
+    min-height: 0;
+    overflow-y: auto;
+    background: #12172480;
+    border-left: 1px solid #262d44;
+    color: #e6e9f2;
+    padding: 20px 18px;
+  }
+  .usage-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  .usage-head h2 {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #aeb6d4;
+    margin: 0;
+  }
+  .usage-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .plan {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: capitalize;
+    color: #cdd3ea;
+    background: #2a3350;
+    border-radius: 4px;
+    padding: 1px 7px;
+  }
+  /* Manual re-fetch — spins while a fetch is in flight, disabled meanwhile. */
+  .refresh {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid #2a3350;
+    border-radius: 5px;
+    background: #1d2336;
+    color: #aeb6d4;
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .refresh:hover:not(:disabled) {
+    background: #232a40;
+    color: #e6e9f2;
+  }
+  .refresh:disabled {
+    cursor: default;
+    opacity: 0.7;
+  }
+  .refresh.spinning {
+    animation: refresh-spin 0.8s linear infinite;
+  }
+  @keyframes refresh-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .usage-msg {
+    font-size: 13px;
+    color: #7b84a3;
+    margin: 0;
+  }
+  .usage-msg.error {
+    color: #f0a8a8;
+  }
+  .limits {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .limit-top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .limit-label {
+    font-size: 13px;
+    color: #cdd3ea;
+  }
+  /* The currently-binding window stands out from the others. */
+  .limit.active .limit-label {
+    font-weight: 600;
+    color: #e6e9f2;
+  }
+  .limit-pct {
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: #aeb6d4;
+  }
+  .bar {
+    height: 6px;
+    border-radius: 3px;
+    background: #2a3350;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: #4d7cff;
+    transition: width 0.3s ease;
+  }
+  /* Severity tints, escalating as a window fills (Claude's `severity`). */
+  .bar-fill.sev-warning {
+    background: #fbbf24;
+  }
+  .bar-fill.sev-critical {
+    background: #f87171;
+  }
+  .limit-reset {
+    display: block;
+    margin-top: 5px;
+    font-size: 11px;
+    color: #7b84a3;
+  }
+  .usage-foot {
+    margin: 20px 0 0;
+    font-size: 11px;
+    color: #5d667f;
+  }
+  .usage-foot code {
+    font-size: 11px;
+    color: #8b93b2;
   }
   .home-head {
     display: flex;

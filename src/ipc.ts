@@ -241,6 +241,39 @@ export function paneActivity(paneId: PaneId): Promise<PaneActivity> {
 }
 
 /**
+ * One plan-limit gauge behind Claude Code's `/usage` (mirrors Rust
+ * `UsageLimit`). `kind` is `session` / `weekly_all` / `weekly_scoped` / `overage`;
+ * `percent` is 0–100; `scopeLabel` carries the model name for a per-model weekly
+ * limit; `isActive` flags the window currently binding.
+ */
+export interface UsageLimit {
+  kind: string | null;
+  group: string | null;
+  percent: number;
+  severity: string | null;
+  resetsAt: string | null;
+  scopeLabel: string | null;
+  isActive: boolean;
+}
+
+/**
+ * The live plan-usage snapshot for the dashboard (mirrors Rust `UsageSnapshot`):
+ * the gauges behind `/usage`, fetched from Claude Code's own
+ * `GET /api/oauth/usage` with the stored subscription OAuth token. `plan` is the
+ * subscription tier. Fetched on dashboard open only — the command rejects (a
+ * one-line `Err`) when not signed in or the endpoint is unreachable.
+ */
+export interface UsageSnapshot {
+  limits: UsageLimit[];
+  plan: string | null;
+}
+
+/** Fetch the live `/usage` gauges for the dashboard usage panel. */
+export function usageSnapshot(): Promise<UsageSnapshot> {
+  return invoke<UsageSnapshot>("usage_snapshot");
+}
+
+/**
  * One agent leaf's resume mapping (mirrors Rust `ResumeRecord`, U2). `argv` is
  * the captured launch command (the flag source); `sessionCwd` is the project dir
  * the resumed agent runs in (KTD-H). All optional — a record may hold only the

@@ -22,6 +22,10 @@ tauri-plugin-store = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Usage panel (dashboard) — calls Claude Code's own /api/oauth/usage endpoint.
+# reqwest is already in the tree via Tauri but built without TLS; `json` keeps
+# default features (incl. default-tls via system openssl, already a build dep).
+reqwest = { version = "0.13", features = ["json"] }
 portable-pty = "0.9"
 rand = "0.8"
 subtle = "2"

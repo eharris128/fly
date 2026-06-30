@@ -7,6 +7,8 @@ import {
   formatTaskCount,
   agentCount,
   workspaceJumpTarget,
+  usageLimitLabel,
+  formatResetTime,
 } from "./home";
 import type { Tab, Workspace } from "./workspaces";
 import type { Node } from "./layout";
@@ -370,5 +372,59 @@ describe("formatTaskCount", () => {
     expect(formatTaskCount(2)).toBe("2 tasks");
     expect(formatTaskCount(0)).toBe("0 tasks");
     expect(formatTaskCount(10)).toBe("10 tasks");
+  });
+});
+
+describe("usageLimitLabel", () => {
+  it("maps the known /usage limit kinds to their wording", () => {
+    expect(usageLimitLabel({ kind: "session", scopeLabel: null })).toBe("Session");
+    expect(usageLimitLabel({ kind: "weekly_all", scopeLabel: null })).toBe("Weekly · all models");
+    expect(usageLimitLabel({ kind: "overage", scopeLabel: null })).toBe("Usage credits");
+  });
+
+  it("folds the model name into a per-model (weekly_scoped) limit", () => {
+    expect(usageLimitLabel({ kind: "weekly_scoped", scopeLabel: "Sonnet" })).toBe("Weekly · Sonnet");
+    // scoped with no model name still reads sensibly
+    expect(usageLimitLabel({ kind: "weekly_scoped", scopeLabel: null })).toBe("Weekly · scoped");
+  });
+
+  it("degrades an unknown kind to a humanized label (so a new type still renders)", () => {
+    expect(usageLimitLabel({ kind: "some_new_kind", scopeLabel: null })).toBe("Some new kind");
+    expect(usageLimitLabel({ kind: null, scopeLabel: null })).toBe("Usage");
+    // an unknown kind that carries a scope prefers the model name
+    expect(usageLimitLabel({ kind: "future_thing", scopeLabel: "Opus" })).toBe("Weekly · Opus");
+  });
+});
+
+describe("formatResetTime", () => {
+  // America/Cancun is UTC-5 year-round (no DST), so these are deterministic.
+  const tz = "America/Cancun";
+  // 2026-06-30T12:00:00Z → 07:00 local, June 30.
+  const now = Date.parse("2026-06-30T12:00:00Z");
+
+  it("shows time only for a reset later the same local day (matches /usage)", () => {
+    // 12:50Z → 07:50 local, same day.
+    expect(formatResetTime("2026-06-30T12:50:00Z", now, tz)).toBe(
+      "Resets 7:50am (America/Cancun)",
+    );
+  });
+
+  it("drops :00 minutes ('8am', not '8:00am')", () => {
+    // 13:00Z → 08:00 local, same day.
+    expect(formatResetTime("2026-06-30T13:00:00Z", now, tz)).toBe(
+      "Resets 8am (America/Cancun)",
+    );
+  });
+
+  it("prefixes the date when the reset is on another local day", () => {
+    // 2026-07-03T13:00:00Z → 08:00 local, July 3.
+    expect(formatResetTime("2026-07-03T13:00:00Z", now, tz)).toBe(
+      "Resets Jul 3, 8am (America/Cancun)",
+    );
+  });
+
+  it("returns null for a null or unparseable timestamp", () => {
+    expect(formatResetTime(null, now, tz)).toBeNull();
+    expect(formatResetTime("not a date", now, tz)).toBeNull();
   });
 });

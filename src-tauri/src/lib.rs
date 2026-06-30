@@ -13,6 +13,7 @@ pub mod pty;
 pub mod session;
 pub mod state;
 pub mod stream;
+pub mod usage;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -339,6 +340,7 @@ pub fn run() {
             session::resume::save_resume_session,
             session::resume::prune_resume_records,
             session::transcript::continue_target,
+            usage::usage_snapshot,
         ])
         .build(tauri::generate_context!())
         .expect("error while building fly")

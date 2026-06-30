@@ -22,7 +22,7 @@
 
 import { leaves } from "./layout";
 import { tabDisplayTitle, type Workspace } from "./workspaces";
-import type { PaneActivity } from "../ipc";
+import type { PaneActivity, UsageLimit } from "../ipc";
 
 export type AgentStatus = "working" | "waiting" | "idle" | "running";
 
@@ -243,4 +243,78 @@ export function formatDuration(ms: number): string {
  */
 export function formatTaskCount(n: number): string {
   return `${n} ${n === 1 ? "task" : "tasks"}`;
+}
+
+/**
+ * Human label for a `/usage` plan-limit gauge (usage panel). Maps the known
+ * `kind`s Claude Code returns to the same wording `/usage` shows; a per-model
+ * (`weekly_scoped`) limit folds in its model name, and an unknown kind degrades
+ * to a humanized form of the kind string so a new limit type still renders.
+ */
+export function usageLimitLabel(limit: Pick<UsageLimit, "kind" | "scopeLabel">): string {
+  switch (limit.kind) {
+    case "session":
+      return "Session";
+    case "weekly_all":
+      return "Weekly · all models";
+    case "weekly_scoped":
+      return limit.scopeLabel ? `Weekly · ${limit.scopeLabel}` : "Weekly · scoped";
+    case "overage":
+      return "Usage credits";
+    default:
+      if (limit.scopeLabel) return `Weekly · ${limit.scopeLabel}`;
+      if (!limit.kind) return "Usage";
+      // Humanize: "some_new_kind" → "Some new kind".
+      const words = limit.kind.replace(/_/g, " ");
+      return words.charAt(0).toUpperCase() + words.slice(1);
+  }
+}
+
+/**
+ * Absolute reset time for a limit's ISO 8601 reset timestamp, formatted to match
+ * Claude Code's `/usage`: `"Resets 7:50am (America/Cancun)"` for a reset later
+ * today, `"Resets Jul 3, 8am (America/Cancun)"` for one on another day. The hour
+ * drops `:00` ("8am", not "8:00am"); the `Mon D` date is shown only when the
+ * reset falls on a different local calendar day than `nowMs`; the IANA zone is
+ * appended. `timeZone` is injectable for deterministic tests and defaults to the
+ * browser's resolved zone. Returns null for a null/unparseable timestamp so the
+ * caller omits the line. Pure (`nowMs` + `timeZone` injected).
+ */
+export function formatResetTime(
+  resetsAt: string | null,
+  nowMs: number,
+  timeZone?: string,
+): string | null {
+  if (!resetsAt) return null;
+  const resetMs = Date.parse(resetsAt);
+  if (Number.isNaN(resetMs)) return null;
+  const tz = timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const reset = new Date(resetMs);
+
+  // Time: "7:50am" / "8am" (drop :00), lowercase meridiem, no space — as /usage.
+  const timeParts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).formatToParts(reset);
+  const part = (t: string) => timeParts.find((p) => p.type === t)?.value ?? "";
+  const hour = part("hour");
+  const minute = part("minute");
+  const meridiem = part("dayPeriod").toLowerCase();
+  const time = minute === "00" ? `${hour}${meridiem}` : `${hour}:${minute}${meridiem}`;
+
+  // Date prefix only when the reset is on a different local calendar day.
+  const dayKey = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+  });
+  const datePrefix =
+    dayKey.format(reset) === dayKey.format(new Date(nowMs))
+      ? ""
+      : `${new Intl.DateTimeFormat("en-US", { timeZone: tz, month: "short", day: "numeric" }).format(reset)}, `;
+
+  return `Resets ${datePrefix}${time} (${tz})`;
 }

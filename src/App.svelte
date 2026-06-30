@@ -58,6 +58,7 @@
     paneCommand,
     paneSessionId,
     paneActivity,
+    usageSnapshot,
     saveResumeRecord,
     saveResumeSession,
     loadResumeRecords,
@@ -67,6 +68,7 @@
     frontendLog,
     type PaneId,
     type PaneActivity,
+    type UsageSnapshot,
     type AttentionState,
     type AttentionReason,
   } from "./ipc";
@@ -158,6 +160,13 @@
   // open. `agentsPolledAt` anchors the live "working for" tick in HomeView.
   let agentByLeaf = $state<Record<string, PaneActivity>>({});
   let agentsPolledAt = $state(0);
+  // Live `/usage` gauges for the dashboard's right-hand panel. Unlike the agent
+  // poll, this is fetched once each time the dashboard opens (not on a timer):
+  // it hits Claude Code's own `/api/oauth/usage`, so it stays well under any
+  // rate limit. `usageError` carries the one-line failure reason to display.
+  let usage = $state<UsageSnapshot | null>(null);
+  let usageError = $state<string | null>(null);
+  let usageLoading = $state(false);
   let paletteOpen = $state(false);
   let notificationPanelOpen = $state(false);
   // Global do-not-disturb. Seeded from the config default on restore; the
@@ -927,6 +936,25 @@
     const timer = setInterval(() => void refreshAgents(), 1500);
     return () => clearInterval(timer);
   });
+  // Fetch the live `/usage` gauges once per dashboard open (no timer): this
+  // effect re-runs only when `homeViewOpen` flips, so reopening re-fetches while
+  // an open dashboard never re-polls a remote endpoint.
+  async function refreshUsage() {
+    usageLoading = true;
+    try {
+      usage = await usageSnapshot();
+      usageError = null;
+    } catch (e) {
+      usageError = String(e);
+      usage = null;
+    } finally {
+      usageLoading = false;
+    }
+  }
+  $effect(() => {
+    if (!homeViewOpen) return;
+    void refreshUsage();
+  });
 
   // ---- persistence (U12) ---------------------------------------------------
   async function persist() {
@@ -1353,6 +1381,10 @@
       <HomeView
         model={homeModel}
         polledAt={agentsPolledAt}
+        usage={usage}
+        usageError={usageError}
+        usageLoading={usageLoading}
+        onRefresh={() => void refreshUsage()}
         onJump={jumpFromHome}
         onClose={toggleHome}
       />
