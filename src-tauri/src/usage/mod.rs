@@ -32,7 +32,13 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// The OAuth beta header Claude Code sends with `/api/oauth/*` calls.
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Total round-trip budget for the fetch. `/api/oauth/usage` has highly variable
+/// latency (observed 2.8s–9.2s back-to-back), so a tight cap clips the slow tail
+/// and surfaces a *false* "usage request failed: …timed out" in the panel even
+/// though the endpoint is fine. Fetched on open only (KTD-C), so a generous
+/// budget just means a longer "Loading…" spinner on a genuinely dead network,
+/// which beats a transient error flash.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `<claude config dir>/.credentials.json`. Honors `CLAUDE_CONFIG_DIR` (Claude's
 /// own config-dir override) when set, else `$HOME/.claude` — mirroring
