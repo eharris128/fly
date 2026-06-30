@@ -210,6 +210,12 @@
   let nudgeMovedOn = false; // it resumed working or finished since you engaged
   let nudgePrevWorking: number | null = null; // last poll's workingForMs (deriveBusyIdle)
   let nudgeSuppressed = false; // Esc dismissed it this idle episode (U6)
+  // Episode generation + in-flight guard for the focused-pane poll: an async
+  // paneActivity() from a prior focus episode must not write back after the
+  // episode was reset (it would corrupt the new pane's transition history), and
+  // same-episode polls must not overlap and reorder their writes.
+  let nudgeGen = 0;
+  let nudgeTickBusy = false;
   // Focused-pane nudge poll cadence — tighter than the 1.5s dashboard poll since
   // it polls one pane and gates the nudge's responsiveness.
   const NUDGE_POLL_MS = 1000;
@@ -764,10 +770,14 @@
       pendingConfirm ||
       resumeOffer ||
       paletteOpen ||
-      notificationPanelOpen ||
-      nudgeActive
+      notificationPanelOpen
     )
       return;
+    // NB: do NOT bail on nudgeActive here. When a pane is focused the next check
+    // bails anyway (the nudge's own capture effect handles Tab/Esc/passthrough);
+    // and when focus is OFF a pane, the leader must still work while the nudge
+    // shows (R6) — the nudge handler stopPropagations Tab/Esc, so a leader chord
+    // consumed here never double-fires.
     if (document.activeElement?.closest(".xterm")) return; // xterm will handle it
     if (keymap.handle(e)) {
       e.preventDefault();
@@ -1039,22 +1049,31 @@
   $effect(() => {
     const open = homeViewOpen;
     const leaf = activeTab?.focusedLeafKey ?? null;
-    // New focus context → reset the episode (non-reactive bookkeeping).
+    // New focus context → bump the generation and reset the episode (non-reactive
+    // bookkeeping). A still-pending tick from a prior episode captured an older
+    // gen and bails after its await, so it can't write into this episode.
+    const gen = ++nudgeGen;
     nudgeActive = false;
     nudgeEngaged = false;
     nudgeMovedOn = false;
     nudgeSuppressed = false;
     nudgePrevWorking = null;
+    nudgeTickBusy = false;
     if (open || !leaf) return; // no nudge while the dashboard is the view (R11)
     const tick = async () => {
+      if (nudgeTickBusy) return; // don't overlap polls within an episode
       const pid = paneIdByLeaf[leaf];
       if (pid == null) return; // pane not spawned yet — try again next tick
+      nudgeTickBusy = true;
       let a: PaneActivity;
       try {
         a = await paneActivity(pid);
       } catch {
+        nudgeTickBusy = false;
         return; // a transient poll failure must not wedge the trigger
       }
+      nudgeTickBusy = false;
+      if (gen !== nudgeGen) return; // a newer focus episode superseded this tick
       const transition = deriveBusyIdle(nudgePrevWorking, a.workingForMs);
       nudgePrevWorking = a.workingForMs;
       const att = attentionByLeaf[leaf] ?? "idle";
