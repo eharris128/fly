@@ -45,6 +45,11 @@ export interface AgentRow {
   /** The pane is raised/acknowledged in the attention model (needs the user). */
   needsAttention: boolean;
   status: AgentStatus;
+  /** Stable jump number by flat workspace→tab→pane position (R4/R8): `1`–`9` then
+   *  `0` for the tenth agent; undefined past ten (reachable by click/Tab only).
+   *  Fixed against attention changes, reshuffles only when a pane is added/removed
+   *  (KTD3). */
+  num?: number;
 }
 
 export interface HomeTabGroup {
@@ -101,6 +106,8 @@ export function buildHomeModel(
   attentionByLeaf: Record<string, string>,
 ): HomeWorkspaceGroup[] {
   const out: HomeWorkspaceGroup[] = [];
+  // Flat agent index across all workspaces → the stable jump number (R4/R8).
+  let flatIndex = 0;
   for (const ws of workspaces) {
     const tabs: HomeTabGroup[] = [];
     for (const tab of ws.tabs) {
@@ -125,6 +132,7 @@ export function buildHomeModel(
           // Only "raised" (unseen) is urgent needs-you; acknowledged is "seen".
           needsAttention: att === "raised",
           status: rowStatus(att, workingForMs, liveTaskCount),
+          num: jumpNumberFor(flatIndex++),
         });
       }
       if (rows.length > 0) tabs.push({ tabId: tab.id, title, rows });
@@ -132,6 +140,16 @@ export function buildHomeModel(
     if (tabs.length > 0) out.push({ wsId: ws.id, name: ws.name, tabs });
   }
   return out;
+}
+
+/**
+ * Map a 0-based flat agent index to its jump number: `1`–`9` for the first nine,
+ * `0` for the tenth, undefined past ten (no number key — click/Tab only, R8).
+ */
+function jumpNumberFor(flatIndex: number): number | undefined {
+  if (flatIndex < 9) return flatIndex + 1;
+  if (flatIndex === 9) return 0;
+  return undefined;
 }
 
 /**
@@ -201,23 +219,35 @@ export function agentCount(model: HomeWorkspaceGroup[]): number {
 }
 
 /**
- * Resolve a dashboard workspace-number keypress (U7) to a jump target: the first
- * tab's first agent row in the Nth *displayed* workspace group. `n` is 1-based,
- * to match the on-screen badges (workspace 1..N) and the `leader 1-9` tab chord —
- * and it indexes the model, so agent-less workspaces (dropped by `buildHomeModel`)
- * are skipped, not counted. Returns null when `n` is out of range, so the caller
- * no-ops on an unmapped digit. Every group has ≥1 tab and every tab ≥1 row
- * (empties are dropped), so a resolved target always lands on a real agent pane,
- * never a bare tab.
+ * Resolve a dashboard digit keypress (U4, R6/R8) to a jump target: the agent at
+ * the flat workspace→tab→pane position the digit addresses. `1`–`9` are 1-based
+ * positions; `0` is the tenth — mirroring the per-row `num` badges. Returns null
+ * when the digit addresses no agent (out of range, including `0` with fewer than
+ * ten agents), so the caller no-ops on an unmapped digit.
  */
-export function workspaceJumpTarget(
+export function agentJumpTarget(
   model: HomeWorkspaceGroup[],
-  n: number,
+  digit: number,
 ): { wsId: string; tabId: string; leafKey: string } | null {
-  const ws = model[n - 1];
-  if (!ws) return null;
-  const tab = ws.tabs[0];
-  return { wsId: ws.wsId, tabId: tab.tabId, leafKey: tab.rows[0].leafKey };
+  const flat = model.flatMap((ws) => ws.tabs.flatMap((t) => t.rows));
+  const idx = digit === 0 ? 9 : digit - 1;
+  const row = idx >= 0 ? flat[idx] : undefined;
+  return row ? { wsId: row.wsId, tabId: row.tabId, leafKey: row.leafKey } : null;
+}
+
+/**
+ * The first agent needing attention in flat rotation order (U4, R7) — the target
+ * of Enter on the dashboard. Null when no agent needs attention, so Enter no-ops.
+ */
+export function firstRaised(
+  model: HomeWorkspaceGroup[],
+): { wsId: string; tabId: string; leafKey: string } | null {
+  for (const ws of model)
+    for (const tab of ws.tabs)
+      for (const row of tab.rows)
+        if (row.needsAttention)
+          return { wsId: ws.wsId, tabId: tab.tabId, leafKey: row.leafKey };
+  return null;
 }
 
 /**

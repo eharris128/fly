@@ -8,7 +8,8 @@
     formatTaskCount,
     formatResetTime,
     usageLimitLabel,
-    workspaceJumpTarget,
+    agentJumpTarget,
+    firstRaised,
     type HomeWorkspaceGroup,
   } from "./home";
   import type { UsageSnapshot } from "../ipc";
@@ -101,15 +102,20 @@
     } else if (e.key === "Escape") {
       e.preventDefault();
       onClose();
-    } else if (!e.ctrlKey && !e.metaKey && !e.altKey && /^[1-9]$/.test(e.key)) {
-      // Bare 1–9 → jump to the first tab in the Nth displayed workspace, 1-based
-      // to match the badges. The dashboard owns these digits, so consume any;
-      // an out-of-range one resolves to null and just no-ops.
+    } else if (e.key === "Enter") {
+      // Enter jumps to the first agent needing attention (R7) — intercept before
+      // the focused row button's native click. No-op when none need attention.
       e.preventDefault();
-      const target = workspaceJumpTarget(model, Number(e.key));
+      const target = firstRaised(model);
+      if (target) onJump(target.wsId, target.tabId, target.leafKey);
+    } else if (!e.ctrlKey && !e.metaKey && !e.altKey && /^[0-9]$/.test(e.key)) {
+      // Bare 0–9 → jump to that agent by its stable number (1–9 then 0 for the
+      // tenth, R6/R8). The dashboard owns these digits, so consume any; an
+      // out-of-range one resolves to null and just no-ops.
+      e.preventDefault();
+      const target = agentJumpTarget(model, Number(e.key));
       if (target) onJump(target.wsId, target.tabId, target.leafKey);
     }
-    // Enter is handled by the focused row button's native click.
   }
 </script>
 
@@ -123,7 +129,7 @@
   >
   <header class="home-head">
     <h1>Agents</h1>
-    <span class="hint">Esc to close · ↑↓ to move · Enter to jump · 1–9 workspace</span>
+    <span class="hint">Esc to close · ↑↓ to move · 1–9/0 to jump · Enter → first needing you</span>
   </header>
 
   {#if flatRows.length === 0}
@@ -133,10 +139,9 @@
     </div>
   {:else}
     <div class="groups">
-      {#each model as ws, i (ws.wsId)}
+      {#each model as ws (ws.wsId)}
         <section class="ws">
           <h2 class="ws-name">
-            {#if i < 9}<kbd class="ws-num">{i + 1}</kbd>{/if}
             <span class="ws-label">{ws.name}</span>
           </h2>
           {#each ws.tabs as tab (tab.tabId)}
@@ -148,11 +153,17 @@
                   type="button"
                   class="row"
                   class:selected={row.leafKey === selectedKey}
+                  class:attn={row.needsAttention}
                   role="option"
                   aria-selected={row.leafKey === selectedKey}
                   bind:this={rowEls[row.leafKey]}
                   onclick={() => activate(row.wsId, row.tabId, row.leafKey)}
                 >
+                  {#if row.num != null}
+                    <kbd class="num">{row.num}</kbd>
+                  {:else}
+                    <span class="num"></span>
+                  {/if}
                   <span class="status {row.status}">{row.status}</span>
                   <span class="dur">
                     {#if row.status === "working" && elapsed != null}
@@ -423,21 +434,6 @@
     letter-spacing: 0.06em;
     color: #8b93b2;
   }
-  /* Keycap badge: the 0-based number that jumps to this workspace's first tab. */
-  .ws-num {
-    flex: none;
-    min-width: 14px;
-    padding: 1px 5px;
-    border-radius: 4px;
-    background: #2a3350;
-    color: #cdd3ea;
-    font: inherit;
-    font-size: 11px;
-    font-weight: 700;
-    line-height: 1.45;
-    text-align: center;
-    font-variant-numeric: tabular-nums;
-  }
   .tab {
     margin-bottom: 10px;
   }
@@ -449,7 +445,7 @@
   }
   .row {
     display: grid;
-    grid-template-columns: 84px 64px 1fr;
+    grid-template-columns: 28px 84px 64px 1fr;
     align-items: center;
     gap: 12px;
     width: 100%;
@@ -466,9 +462,35 @@
   .row:hover {
     background: #232a40;
   }
+  /* Raised agents stand out even when not selected (R5): an amber accent that
+     echoes the in-pane attention ring. Defined before .selected so the active
+     cursor's blue border wins when a row is both raised and selected. */
+  .row.attn {
+    border-color: #f5a623;
+  }
   .row.selected {
     border-color: #4d7cff;
     background: #232a40;
+  }
+  /* Per-agent jump keycap (R4/R8). The empty placeholder span holds the column
+     for un-numbered rows past ten so the grid stays aligned. */
+  .num {
+    min-width: 18px;
+    height: 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 4px;
+    border-radius: 4px;
+    background: #2a3350;
+    color: #cdd3ea;
+    font: inherit;
+    font-size: 11px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  span.num {
+    background: transparent;
   }
   .status {
     font-size: 12px;

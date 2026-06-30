@@ -6,7 +6,8 @@ import {
   formatDuration,
   formatTaskCount,
   agentCount,
-  workspaceJumpTarget,
+  agentJumpTarget,
+  firstRaised,
   usageLimitLabel,
   formatResetTime,
 } from "./home";
@@ -144,7 +145,8 @@ describe("buildHomeModel", () => {
   });
 });
 
-describe("workspaceJumpTarget", () => {
+describe("agentJumpTarget", () => {
+  // ws-1 holds agent a (1); ws-2 holds b (2), c (3) — flat order across groups.
   const model = buildHomeModel(
     [
       ws("ws-1", "Alpha", [tab("tab-1", leaf("a"), "a")]),
@@ -158,40 +160,79 @@ describe("workspaceJumpTarget", () => {
     {},
   );
 
-  it("resolves the Nth (1-based) displayed workspace's first tab + first row", () => {
-    expect(workspaceJumpTarget(model, 1)).toEqual({
-      wsId: "ws-1",
-      tabId: "tab-1",
-      leafKey: "a",
-    });
-    // ws-2's FIRST tab/row — "the first tab in that workspace", not its second.
-    expect(workspaceJumpTarget(model, 2)).toEqual({
+  it("resolves a 1-based digit to the agent at that flat position", () => {
+    expect(agentJumpTarget(model, 1)).toEqual({ wsId: "ws-1", tabId: "tab-1", leafKey: "a" });
+    expect(agentJumpTarget(model, 2)).toEqual({ wsId: "ws-2", tabId: "tab-2", leafKey: "b" });
+    expect(agentJumpTarget(model, 3)).toEqual({ wsId: "ws-2", tabId: "tab-3", leafKey: "c" });
+  });
+
+  it("returns null for an out-of-range digit or an empty model", () => {
+    expect(agentJumpTarget(model, 4)).toBeNull();
+    expect(agentJumpTarget(model, 0)).toBeNull(); // 0 = tenth; only three agents
+    expect(agentJumpTarget([], 1)).toBeNull();
+  });
+
+  it("maps 0 to the tenth agent", () => {
+    const ten = buildHomeModel(
+      [ws("ws", "W", Array.from({ length: 10 }, (_, i) => tab(`t${i}`, leaf(`l${i}`), `l${i}`)))],
+      Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`l${i}`, agent(true)])),
+      {},
+      {},
+    );
+    expect(agentJumpTarget(ten, 0)).toEqual({ wsId: "ws", tabId: "t9", leafKey: "l9" });
+  });
+});
+
+describe("per-agent num assignment", () => {
+  const nums = (model: ReturnType<typeof buildHomeModel>) =>
+    model.flatMap((w) => w.tabs.flatMap((t) => t.rows.map((r) => r.num)));
+
+  it("numbers agents 1–9 then 0 by flat order; undefined past ten", () => {
+    const model = buildHomeModel(
+      [ws("ws", "W", Array.from({ length: 12 }, (_, i) => tab(`t${i}`, leaf(`l${i}`), `l${i}`)))],
+      Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`l${i}`, agent(true)])),
+      {},
+      {},
+    );
+    expect(nums(model)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 0, undefined, undefined]);
+  });
+
+  it("numbers are unchanged when attention states flip (R4)", () => {
+    const mk = (att: Record<string, string>) =>
+      buildHomeModel(
+        [ws("ws", "W", [tab("t1", leaf("a"), "a"), tab("t2", leaf("b"), "b")])],
+        { a: agent(true), b: agent(true) },
+        {},
+        att,
+      );
+    expect(nums(mk({}))).toEqual([1, 2]);
+    expect(nums(mk({ a: "raised", b: "raised" }))).toEqual([1, 2]);
+  });
+});
+
+describe("firstRaised", () => {
+  const mk = (att: Record<string, string>) =>
+    buildHomeModel(
+      [
+        ws("ws-1", "Alpha", [tab("t1", leaf("a"), "a")]),
+        ws("ws-2", "Beta", [tab("t2", leaf("b"), "b"), tab("t3", leaf("c"), "c")]),
+      ],
+      { a: agent(true), b: agent(true), c: agent(true) },
+      {},
+      att,
+    );
+
+  it("returns the first needs-attention row in flat order", () => {
+    expect(firstRaised(mk({ b: "raised", c: "raised" }))).toEqual({
       wsId: "ws-2",
-      tabId: "tab-2",
+      tabId: "t2",
       leafKey: "b",
     });
   });
 
-  it("returns null for an out-of-range digit or an empty model", () => {
-    expect(workspaceJumpTarget(model, 3)).toBeNull();
-    expect(workspaceJumpTarget(model, 0)).toBeNull(); // 1-based: 0 is no workspace
-    expect(workspaceJumpTarget([], 1)).toBeNull();
-  });
-
-  it("indexes the DISPLAYED groups, skipping agent-less workspaces", () => {
-    // ws-mid has no agent → dropped by buildHomeModel, so digit 2 is ws-3.
-    const m = buildHomeModel(
-      [
-        ws("ws-1", "Alpha", [tab("t1", leaf("a"), "a")]),
-        ws("ws-mid", "NoAgents", [tab("t2", leaf("x"), "x")]),
-        ws("ws-3", "Gamma", [tab("t3", leaf("c"), "c")]),
-      ],
-      { a: agent(true), x: agent(false), c: agent(true) },
-      {},
-      {},
-    );
-    expect(m).toHaveLength(2); // ws-mid dropped
-    expect(workspaceJumpTarget(m, 2)?.wsId).toBe("ws-3");
+  it("returns null when no agent needs attention (acknowledged is not raised)", () => {
+    expect(firstRaised(mk({}))).toBeNull();
+    expect(firstRaised(mk({ b: "acknowledged" }))).toBeNull();
   });
 });
 
