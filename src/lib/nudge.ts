@@ -51,17 +51,22 @@ export function userIdleMs(now: number, lastActivityAt: number): number {
 }
 
 /**
- * Whether the focused agent is currently waiting on YOU — raised with a question
- * or permission prompt. While this holds, the nudge stays silent (R10): you
- * answer it in place rather than being rotated away. A `finished` raise is NOT
- * "needs you" — it's done, which is exactly when the nudge should fire.
+ * Whether the focused agent is currently waiting on YOU — a question or
+ * permission raise you haven't answered. While this holds, the nudge stays silent
+ * (R10): you answer in place rather than being rotated away. A `finished` raise
+ * is NOT "needs you" — it's done, which is exactly when the nudge should fire.
+ *
+ * The focused pane collapses a raise to `acknowledged` (it's visible), so both
+ * `raised` and `acknowledged` count — the discriminator is the reason, which the
+ * backend keeps set until your keystroke clears the pane to `idle` (reason null).
  */
 export function needsYouNow(
   attention: AttentionState,
   reason: AttentionReason | null,
 ): boolean {
   return (
-    attention === "raised" && (reason === "question" || reason === "permission")
+    (attention === "raised" || attention === "acknowledged") &&
+    (reason === "question" || reason === "permission")
   );
 }
 

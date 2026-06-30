@@ -37,6 +37,12 @@
   } from "./lib/workspaces";
   import { buildHomeModel, effectiveAttention, effectiveTaskCount } from "./lib/home";
   import {
+    shouldShowNudge,
+    deriveBusyIdle,
+    userIdleMs,
+    needsYouNow,
+  } from "./lib/nudge";
+  import {
     resumeCommandsForLeaves,
     shouldCaptureSession,
     classifyResumeTier,
@@ -115,6 +121,11 @@
   let activeWorkspaceId = $state("");
   let ready = $state(false);
   let attentionByLeaf = $state<Record<string, AttentionState>>({});
+  // Last-raise reason per leaf (U5), kept current by onAttention — it carries the
+  // reason even when a focused raise collapses to acknowledged, the finished-vs-
+  // question discriminator the attention STATE can't express (KTD1). Cleared to
+  // null when the backend's on_input takes the pane to Idle (you replied).
+  let reasonByLeaf = $state<Record<string, AttentionReason | null>>({});
   // Notification history (U20). Owned here; the backend emits seed events and
   // this list carries the read/unread/cleared lifecycle (KTD16).
   let notifications = $state<Notification[]>([]);
@@ -184,6 +195,22 @@
   // Idle delay (ms) before the attention-triage nudge appears once the focused
   // agent stops needing you (R16). Seeded from config on restore.
   let nudgeIdleMs = $state(4000);
+  // Whether the "move along" nudge overlay is showing for the focused pane (U6).
+  let nudgeActive = $state(false);
+  // Keystroke-only idle clock (R9, KTD6): wall-clock ms of your last keydown.
+  // Non-reactive — the nudge tick re-reads it each interval. Stamped at the top of
+  // onWindowKeydown (before its early-returns) so typing into a pane counts; a
+  // pointer listener is deliberately omitted so reading output never defers it.
+  let lastUserActivityAt = Date.now();
+  // Per-episode nudge bookkeeping for the focused pane (non-reactive; the focus
+  // $effect resets them, the tick owns them).
+  let nudgeEngaged = false; // you've typed into the focused pane this episode
+  let nudgeMovedOn = false; // it resumed working or finished since you engaged
+  let nudgePrevWorking: number | null = null; // last poll's workingForMs (deriveBusyIdle)
+  let nudgeSuppressed = false; // Esc dismissed it this idle episode (U6)
+  // Focused-pane nudge poll cadence — tighter than the 1.5s dashboard poll since
+  // it polls one pane and gates the nudge's responsiveness.
+  const NUDGE_POLL_MS = 1000;
   let layoutEl: HTMLDivElement;
   let layoutW = $state(1000);
   let layoutH = $state(600);
@@ -692,6 +719,15 @@
   // instance). We also bail while a rename field or overlay is up so they keep
   // their own keys.
   function onWindowKeydown(e: KeyboardEvent) {
+    // Stamp the keystroke-only idle clock first, before any early-return, so
+    // typing into a focused pane still counts as activity (R9/KTD6). Typing into
+    // an xterm also marks this nudge episode engaged and clears any Esc
+    // suppression — a fresh keystroke is a fresh interaction.
+    lastUserActivityAt = Date.now();
+    if (document.activeElement?.closest(".xterm")) {
+      nudgeEngaged = true;
+      nudgeSuppressed = false;
+    }
     if (
       !keymap ||
       editing ||
@@ -700,7 +736,8 @@
       pendingConfirm ||
       resumeOffer ||
       paletteOpen ||
-      notificationPanelOpen
+      notificationPanelOpen ||
+      nudgeActive
     )
       return;
     if (document.activeElement?.closest(".xterm")) return; // xterm will handle it
@@ -710,7 +747,7 @@
     }
   }
 
-  function onAttention(key: string, state: AttentionState, _reason: AttentionReason | null) {
+  function onAttention(key: string, state: AttentionState, reason: AttentionReason | null) {
     // You "engage" an agent by viewing its raised pane (→ acknowledged) or by
     // typing / clearing it (→ idle). Recorded so the dashboard can quiet a
     // residual work stretch and stale repeat idle-pings on agents you've already
@@ -719,6 +756,11 @@
       lastEngagedAt[key] = Date.now();
     }
     attentionByLeaf = { ...attentionByLeaf, [key]: state };
+    // Keep the per-leaf reason current for the nudge trigger (U5/KTD1): the
+    // backend carries it on every event (including a focused acknowledged raise),
+    // and nulls it on Idle (your keystroke), so this tracks "what, if anything,
+    // the agent is currently asking for".
+    reasonByLeaf = { ...reasonByLeaf, [key]: reason };
   }
   // Push the visible-pane ids (active tab's leaves) to the backend. Reads the
   // non-reactive paneIdByLeaf, so onSpawned must re-call it as ids arrive.
@@ -957,6 +999,66 @@
   $effect(() => {
     if (!homeViewOpen) return;
     void refreshUsage();
+  });
+
+  // ---- attention-triage nudge trigger (U5) ---------------------------------
+  // Watch the focused pane while the dashboard is closed and decide whether the
+  // "move along" nudge should show. Re-runs (resetting the episode) on focus or
+  // dashboard change; its own interval ticks the time-based trigger, so it never
+  // piggybacks the homeModel $derived (KTD6). The became-busy edge comes from the
+  // pane_activity poll (the attention stream has no output transition, KTD1); the
+  // finished/question signal comes from reasonByLeaf.
+  $effect(() => {
+    const open = homeViewOpen;
+    const leaf = activeTab?.focusedLeafKey ?? null;
+    // New focus context → reset the episode (non-reactive bookkeeping).
+    nudgeActive = false;
+    nudgeEngaged = false;
+    nudgeMovedOn = false;
+    nudgeSuppressed = false;
+    nudgePrevWorking = null;
+    if (open || !leaf) return; // no nudge while the dashboard is the view (R11)
+    const tick = async () => {
+      const pid = paneIdByLeaf[leaf];
+      if (pid == null) return; // pane not spawned yet — try again next tick
+      let a: PaneActivity;
+      try {
+        a = await paneActivity(pid);
+      } catch {
+        return; // a transient poll failure must not wedge the trigger
+      }
+      const transition = deriveBusyIdle(nudgePrevWorking, a.workingForMs);
+      nudgePrevWorking = a.workingForMs;
+      const att = attentionByLeaf[leaf] ?? "idle";
+      const rsn = reasonByLeaf[leaf] ?? null;
+      if (needsYouNow(att, rsn)) {
+        // The focused agent is awaiting your answer — reset and stay silent (R10).
+        nudgeMovedOn = false;
+        nudgeSuppressed = false;
+        nudgeActive = false;
+        return;
+      }
+      // Latch "moved on" only after you've engaged (typed), so a residual
+      // pre-engagement work stretch doesn't read as a fresh resumed-working.
+      if (nudgeEngaged && (transition !== "none" || rsn === "finished")) {
+        nudgeMovedOn = true;
+      }
+      if (nudgeSuppressed) {
+        nudgeActive = false;
+        return;
+      }
+      nudgeActive = shouldShowNudge({
+        engaged: nudgeEngaged,
+        attention: att,
+        reason: rsn,
+        movedOn: nudgeMovedOn,
+        userIdleMs: userIdleMs(Date.now(), lastUserActivityAt),
+        nudgeIdleMs,
+      });
+    };
+    void tick();
+    const timer = setInterval(() => void tick(), NUDGE_POLL_MS);
+    return () => clearInterval(timer);
   });
 
   // ---- persistence (U12) ---------------------------------------------------

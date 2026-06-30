@@ -70,17 +70,24 @@ describe("shouldShowNudge", () => {
 });
 
 describe("needsYouNow", () => {
-  it("is true only for a raised question/permission", () => {
+  it("is true for a question/permission raise", () => {
     expect(needsYouNow("raised", "question")).toBe(true);
     expect(needsYouNow("raised", "permission")).toBe(true);
   });
+  it("counts a focused pane (acknowledged) awaiting an answer", () => {
+    // A raise on the visible focused pane collapses to acknowledged; reason is
+    // the discriminator (KTD1), so it must still suppress the nudge.
+    expect(needsYouNow("acknowledged", "question")).toBe(true);
+    expect(needsYouNow("acknowledged", "permission")).toBe(true);
+  });
   it("is false for a finished/error raise (done, not waiting on you)", () => {
     expect(needsYouNow("raised", "finished")).toBe(false);
+    expect(needsYouNow("acknowledged", "finished")).toBe(false);
     expect(needsYouNow("raised", "error")).toBe(false);
   });
-  it("is false when not raised", () => {
+  it("is false once cleared to idle (you replied — reason is null)", () => {
     expect(needsYouNow("idle", "question")).toBe(false);
-    expect(needsYouNow("acknowledged", "permission")).toBe(false);
+    expect(needsYouNow("idle", null)).toBe(false);
   });
 });
 
