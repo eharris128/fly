@@ -21,6 +21,8 @@ export interface ReasonEffectsConfig {
 export interface Config {
   leaderKey: string;
   attentionDebounceMs: number;
+  /** Idle delay (ms) before the attention-triage nudge appears (R16). */
+  nudgeIdleMs: number;
   notificationCoalesceThreshold: number;
   oscBelFallback: boolean;
   renderer: Renderer;

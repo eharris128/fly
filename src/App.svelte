@@ -181,6 +181,9 @@
   // Initialised to the config default so the menu never shows an empty leader
   // if it is somehow opened before restore() resolves (R6).
   let leaderKey = $state("ctrl+a");
+  // Idle delay (ms) before the attention-triage nudge appears once the focused
+  // agent stops needing you (R16). Seeded from config on restore.
+  let nudgeIdleMs = $state(4000);
   let layoutEl: HTMLDivElement;
   let layoutW = $state(1000);
   let layoutH = $state(600);
@@ -1164,6 +1167,7 @@
     const cfg = await getConfig();
     saveScrollbackEnabled = cfg.saveScrollback;
     leaderKey = cfg.leaderKey;
+    nudgeIdleMs = cfg.nudgeIdleMs;
     // Seed global mute from the config default; the backend seeds the same value
     // at startup, so they start in sync (the runtime toggle keeps them so).
     muted = cfg.notificationsMutedDefault;

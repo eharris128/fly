@@ -75,6 +75,9 @@ pub struct Config {
     pub leader_key: String,
     /// Attention debounce window in ms (KTD8).
     pub attention_debounce_ms: u64,
+    /// Idle delay in ms before the attention-triage nudge appears once the
+    /// focused agent stops needing you (R16). Integer so `Config` keeps `Eq`.
+    pub nudge_idle_ms: u32,
     /// Above this many simultaneously-raised panes, coalesce notifications (U11).
     pub notification_coalesce_threshold: usize,
     /// Generic OSC/BEL attention fallback for hookless agents — deferred, off.
@@ -113,6 +116,7 @@ impl Default for Config {
         Self {
             leader_key: "ctrl+a".into(),
             attention_debounce_ms: 400,
+            nudge_idle_ms: 4000,
             notification_coalesce_threshold: 3,
             osc_bel_fallback: false,
             // DOM by default (KTD6, superseded): WebGL blanks inactive panes on
