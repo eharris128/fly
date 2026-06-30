@@ -7,6 +7,7 @@
   import CommandPalette from "./lib/CommandPalette.svelte";
   import NotificationPanel from "./lib/NotificationPanel.svelte";
   import HomeView from "./lib/HomeView.svelte";
+  import NudgeOverlay from "./lib/NudgeOverlay.svelte";
   import {
     newLeaf,
     splitLeaf,
@@ -41,6 +42,7 @@
     deriveBusyIdle,
     userIdleMs,
     needsYouNow,
+    keyAction,
   } from "./lib/nudge";
   import {
     resumeCommandsForLeaves,
@@ -709,6 +711,32 @@
       }
     });
   });
+  // The attention-triage nudge's permeable capture (U6, KTD2): Tab rotates, Esc
+  // dismisses-and-stays (suppressing re-fire this episode), and EVERY OTHER key
+  // dismisses the nudge and passes straight through to the focused xterm (R14) —
+  // the one capture effect that does NOT stopPropagation on the keys it lets by,
+  // so no keystroke is lost. Registered only while the nudge shows, so Tab/Esc
+  // reach the PTY normally at every other time (R15).
+  $effect(() => {
+    if (!nudgeActive) return;
+    return captureKeys((e) => {
+      const action = keyAction(e.key);
+      if (action === "rotate") {
+        e.preventDefault(); // also suppresses browser focus traversal for Tab
+        e.stopPropagation();
+        nudgeRotate();
+      } else if (action === "dismiss-stay") {
+        e.preventDefault();
+        e.stopPropagation();
+        nudgeActive = false;
+        nudgeSuppressed = true; // don't re-fire this idle episode (until re-raise + answer)
+      } else {
+        // Dismiss and let the key through to the PTY — no preventDefault /
+        // stopPropagation, so the keystroke lands in the agent with nothing lost.
+        nudgeActive = false;
+      }
+    });
+  });
 
   // App-wide leader handling (R6). Each xterm already runs the keymap to gate the
   // PTY (Terminal.svelte), but that only fires when a pane holds DOM focus — so
@@ -1138,6 +1166,30 @@
     focusPane(wsId, tabId, key);
     focusActivePane();
   }
+  // Tab from the nudge rotates to the next agent needing attention, or back to the
+  // dashboard when none remain (R2/R12). Uses the raw raised set via flattenRaised
+  // — identical to cycleAttention (leader u) and robust without the dashboard's
+  // fresh activity poll (effectiveAttention needs that, and it isn't running while
+  // the dashboard is closed). The current pane is excluded so the last agent's Tab
+  // goes home rather than rotating to itself (AE5). Focus change / opening the
+  // dashboard both reset the nudge episode via its $effect.
+  function nudgeRotate() {
+    const others = flattenRaised(workspaces, attentionByLeaf).filter(
+      (r) =>
+        !(
+          r.wsId === activeWorkspaceId &&
+          r.tabId === activeTab?.id &&
+          r.key === activeTab?.focusedLeafKey
+        ),
+    );
+    nudgeActive = false;
+    if (others.length === 0) {
+      homeViewOpen = true; // terminus: back to the home base
+    } else {
+      focusPane(others[0].wsId, others[0].tabId, others[0].key);
+      focusActivePane();
+    }
+  }
   const keymapActions: KeymapActions = {
     newTab: () => void newTab(),
     splitHorizontal: () => void split("horizontal"),
@@ -1488,6 +1540,11 @@
           onpointerdown={(e) => startDrag(d, e)}
         ></div>
       {/each}
+      {#if nudgeActive}
+        <NudgeOverlay
+          rect={activeTab ? (rects.get(activeTab.focusedLeafKey) ?? null) : null}
+        />
+      {/if}
     </div>
     {#if homeViewOpen}
       <HomeView
