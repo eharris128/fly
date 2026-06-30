@@ -73,6 +73,12 @@ export function needsYouNow(
 export interface NudgeInput {
   /** Have you engaged this focused agent this episode (viewed / typed to it)? */
   engaged: boolean;
+  /** Did the agent actually raise for you this episode (a question/permission/
+   *  finished/error event)? You came to triage it — you didn't merely launch it.
+   *  R9's "once it *stops* needing you" presupposes it needed you: with no raise
+   *  there is nothing to "move along" from, so starting a fresh agent (type +
+   *  startup work burst + idle) must NOT nudge. Latched by the caller. */
+  sawRaise: boolean;
   /** Effective attention state of the focused leaf. */
   attention: AttentionState;
   /** Last-raise reason of the focused leaf — the finished-vs-question
@@ -90,12 +96,15 @@ export interface NudgeInput {
 
 /**
  * Decide whether the nudge overlay should show for the focused agent (R9–R11).
- * Show when: you've engaged it, it has moved on (resumed working or finished),
- * you've been idle at least N, and it is not currently re-raised needing an
- * answer. The re-raise check wins over `movedOn` so a follow-up question always
- * suppresses the nudge (R10/AE3).
+ * Show when: the agent actually raised for you this episode, you've engaged it, it
+ * has moved on (resumed working or finished), you've been idle at least N, and it
+ * is not currently re-raised needing an answer. The `sawRaise` gate keeps a
+ * freshly-launched agent (which you typed to and which then did startup work) from
+ * nudging when you never had anything to handle. The re-raise check wins over
+ * `movedOn` so a follow-up question always suppresses the nudge (R10/AE3).
  */
 export function shouldShowNudge(input: NudgeInput): boolean {
+  if (!input.sawRaise) return false;
   if (!input.engaged) return false;
   if (needsYouNow(input.attention, input.reason)) return false;
   if (!input.movedOn) return false;

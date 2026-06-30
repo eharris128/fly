@@ -116,7 +116,7 @@ impl Default for Config {
         Self {
             leader_key: "ctrl+a".into(),
             attention_debounce_ms: 400,
-            nudge_idle_ms: 4000,
+            nudge_idle_ms: 1500,
             notification_coalesce_threshold: 3,
             osc_bel_fallback: false,
             // DOM by default (KTD6, superseded): WebGL blanks inactive panes on

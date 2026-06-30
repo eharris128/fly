@@ -13,6 +13,7 @@ import {
 function input(over: Partial<NudgeInput> = {}): NudgeInput {
   return {
     engaged: true,
+    sawRaise: true,
     attention: "idle",
     reason: null,
     movedOn: true,
@@ -62,6 +63,14 @@ describe("shouldShowNudge", () => {
 
   it("does not show before you've engaged the focused agent", () => {
     expect(shouldShowNudge(input({ engaged: false }))).toBe(false);
+  });
+
+  it("does not show for an agent that never raised this episode (you launched it, didn't triage it)", () => {
+    // Type `claude` → engaged; its startup work burst → movedOn; you idle past N.
+    // With no raise to handle, the nudge must stay silent (R9 presupposes a raise).
+    expect(
+      shouldShowNudge(input({ sawRaise: false, engaged: true, movedOn: true })),
+    ).toBe(false);
   });
 
   it("does not show until the agent has moved on (resumed working or finished)", () => {

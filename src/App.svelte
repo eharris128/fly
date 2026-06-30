@@ -196,7 +196,7 @@
   let leaderKey = $state("ctrl+a");
   // Idle delay (ms) before the attention-triage nudge appears once the focused
   // agent stops needing you (R16). Seeded from config on restore.
-  let nudgeIdleMs = $state(4000);
+  let nudgeIdleMs = $state(1500);
   // Whether the "move along" nudge overlay is showing for the focused pane (U6).
   let nudgeActive = $state(false);
   // Keystroke-only idle clock (R9, KTD6): wall-clock ms of your last keydown.
@@ -210,6 +210,7 @@
   let nudgeMovedOn = false; // it resumed working or finished since you engaged
   let nudgePrevWorking: number | null = null; // last poll's workingForMs (deriveBusyIdle)
   let nudgeSuppressed = false; // Esc dismissed it this idle episode (U6)
+  let nudgeSawRaise = false; // it raised for you this episode (triage, not a fresh launch)
   // Episode generation + in-flight guard for the focused-pane poll: an async
   // paneActivity() from a prior focus episode must not write back after the
   // episode was reset (it would corrupt the new pane's transition history), and
@@ -248,9 +249,12 @@
   // The visible panes = the active tab's leaves in the active workspace, pushed
   // to the backend so a raise on any visible pane acknowledges in-app — the
   // attention-suppression "looking" input, generalized from keyboard focus to
-  // tab visibility (U17).
+  // tab visibility (U17). The dashboard (home view) covers the terminal grid, so
+  // while it's open NO pane is visible — report an empty set. Otherwise a raise on
+  // the pane you opened the dashboard *from* would acknowledge ("you're looking at
+  // it") and never surface as "waiting" on the dashboard itself, defeating triage.
   const visibleLeafKeys = $derived(
-    activeTab ? leaves(activeTab.tree).map((l) => l.key) : [],
+    homeViewOpen || !activeTab ? [] : leaves(activeTab.tree).map((l) => l.key),
   );
   // View model for the sidebar: names resolved, attention rolled up per tab and
   // per workspace so a collapsed workspace still surfaces a raised agent.
@@ -1058,6 +1062,7 @@
     nudgeMovedOn = false;
     nudgeSuppressed = false;
     nudgePrevWorking = null;
+    nudgeSawRaise = false;
     nudgeTickBusy = false;
     if (open || !leaf) return; // no nudge while the dashboard is the view (R11)
     const tick = async () => {
@@ -1078,6 +1083,11 @@
       nudgePrevWorking = a.workingForMs;
       const att = attentionByLeaf[leaf] ?? "idle";
       const rsn = reasonByLeaf[leaf] ?? null;
+      // Latch that this agent actually raised for you this episode — you're
+      // triaging it, not merely launching it. Set before the needsYouNow return
+      // so arriving on a question/permission raise still counts (you came to
+      // handle it). Without a raise there's nothing to "move along" from (R9).
+      if (att === "raised" || rsn !== null) nudgeSawRaise = true;
       if (needsYouNow(att, rsn)) {
         // The focused agent is awaiting your answer — reset and stay silent (R10).
         nudgeMovedOn = false;
@@ -1096,6 +1106,7 @@
       }
       nudgeActive = shouldShowNudge({
         engaged: nudgeEngaged,
+        sawRaise: nudgeSawRaise,
         attention: att,
         reason: rsn,
         movedOn: nudgeMovedOn,
