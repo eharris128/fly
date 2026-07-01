@@ -388,7 +388,8 @@
   }
   function cycleAttention() {
     // Payoff order (R9): question/permission before finished, positional within a
-    // tier. Same comparator the dashboard Enter and the nudge Tab use.
+    // tier. Same comparator the dashboard Enter and the nudge Tab use. Sorts the
+    // raw raised set — see nudgeRotate for the stale-re-ping residual this shares.
     const raised = sortByAttentionPriority(
       flattenRaised(workspaces, attentionByLeaf),
       reasonByLeaf,
@@ -1212,6 +1213,11 @@
   function nudgeRotate() {
     // Payoff order (R9): rotate to the next agent by reason priority
     // (question/permission before finished), positional within a tier.
+    // Known residual: this sorts the *raw* raised set, so a stale idle re-ping on
+    // an already-handled agent (which effectiveAttention would downgrade for the
+    // dashboard) can be promoted to the front here. Aligning rotation membership
+    // with effectiveAttention is the deferred follow-up (needs the activity poll
+    // to cover non-focused panes while the dashboard is closed).
     const others = sortByAttentionPriority(
       flattenRaised(workspaces, attentionByLeaf),
       reasonByLeaf,

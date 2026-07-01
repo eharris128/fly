@@ -517,8 +517,9 @@
   }
   /* Reason-typed triage badge (R4): on a raised row the status slot shows *why*
      the agent needs you instead of the generic "waiting", so the row never reads
-     a contradictory "waiting … finished". Three distinct hues; the label word
-     itself carries the meaning, so the distinction is not color-only. */
+     a contradictory "waiting … finished". Distinct hue per reason; the label word
+     itself carries the meaning, so the distinction is not color-only. (`error` is
+     unfed in v1 but styled for completeness.) */
   .status.reason-question {
     color: #fbbf24;
   }
