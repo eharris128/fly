@@ -25,6 +25,20 @@ pub fn shutdown(app: &AppHandle) {
         &crate::session::resume::clean_exit_path(),
         true,
     );
+    // Automations (R5), BEFORE the PTY reap: (1) stop and join the sweep
+    // thread — joined here with no store lock held (KTD-B), and once joined no
+    // new claim can race the closes below; (2) kill in-flight script groups
+    // (the U5 killer seam; killer runs outside the store lock) and close every
+    // in-flight run row failed("interrupted") in one final flush. Ordered
+    // before `pty.close_all()` so an in-flight *agent* run's row closes while
+    // its pane teardown is still pending — the row must never record a pane
+    // exit as the outcome of a shutdown.
+    if let Some(sweep) = app.try_state::<crate::automations::SweepHandle>() {
+        sweep.stop_and_join();
+    }
+    if let Some(automations) = app.try_state::<Arc<crate::automations::AutomationManager>>() {
+        automations.shutdown();
+    }
     if let Some(pty) = app.try_state::<Arc<PtyManager>>() {
         pty.close_all();
     }

@@ -19,7 +19,7 @@ pub mod usage;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use config::ConfigStore;
 use hooks::{Dispatch, HookServer, TokenRegistry, ValidatedHook};
@@ -310,6 +310,30 @@ pub fn run() {
             let server = HookServer::start(hook_socket_path(), tokens_for_hooks, dispatch)
                 .map_err(|e| format!("failed to start hook server: {e}"))?;
             app.manage(server);
+
+            // Automations (U4): manager over the write-through store, with the
+            // real clock and a Tauri-event changed-emitter. The dispatcher is
+            // the unwired placeholder until U5 (scripts) / U7 (agents) replace
+            // it — a claimed run closes failed("dispatch not wired…"), visible
+            // in the dashboard rather than silent. Construction runs startup
+            // recovery (R5: orphaned Running rows close failed("interrupted")).
+            let changed_handle = app.handle().clone();
+            let automations_mgr = Arc::new(automations::AutomationManager::new(
+                automations::store::Store::load_default(),
+                Arc::new(automations::UnwiredDispatcher),
+                Box::new(notify::now_unix_ms),
+                Box::new(move |id: &str| {
+                    let _ = changed_handle.emit(automations::AUTOMATION_CHANGED_EVENT, id);
+                }),
+            ));
+            app.manage(Arc::clone(&automations_mgr));
+            // The sweep starts unconditionally (R5): script automations run
+            // even if the webview never loads; agent dispatch waits for the
+            // automations_frontend_ready command. Stopped + joined in
+            // lifecycle::shutdown before the PTY reap.
+            let sweep = automations::start_sweep(automations_mgr)
+                .map_err(|e| format!("failed to start automation sweep: {e}"))?;
+            app.manage(sweep);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -342,6 +366,7 @@ pub fn run() {
             session::resume::prune_resume_records,
             session::transcript::continue_target,
             usage::usage_snapshot,
+            automations::automations_frontend_ready,
         ])
         .build(tauri::generate_context!())
         .expect("error while building fly")
