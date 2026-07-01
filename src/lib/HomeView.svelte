@@ -164,7 +164,11 @@
                   {:else}
                     <span class="num"></span>
                   {/if}
-                  <span class="status {row.status}">{row.status}</span>
+                  {#if row.reason}
+                    <span class="status reason-{row.reason}">{row.reason}</span>
+                  {:else}
+                    <span class="status {row.status}">{row.status}</span>
+                  {/if}
                   <span class="dur">
                     {#if row.status === "working" && elapsed != null}
                       {formatDuration(elapsed)}
@@ -510,6 +514,22 @@
      from working(green), waiting(amber), idle(gray). */
   .status.running {
     color: #38bdf8;
+  }
+  /* Reason-typed triage badge (R4): on a raised row the status slot shows *why*
+     the agent needs you instead of the generic "waiting", so the row never reads
+     a contradictory "waiting … finished". Three distinct hues; the label word
+     itself carries the meaning, so the distinction is not color-only. */
+  .status.reason-question {
+    color: #fbbf24;
+  }
+  .status.reason-permission {
+    color: #fb923c;
+  }
+  .status.reason-finished {
+    color: #818cf8;
+  }
+  .status.reason-error {
+    color: #f87171;
   }
   .dur {
     font-variant-numeric: tabular-nums;

@@ -1013,7 +1013,7 @@
     const now = Date.now();
     const agents = debouncedAgents(gracedAgents(now), now);
     const att = effectiveAttention(attentionByLeaf, agentByLeaf, lastEngagedAt, now);
-    return buildHomeModel(workspaces, agents, cwdByLeaf, att);
+    return buildHomeModel(workspaces, agents, cwdByLeaf, att, reasonByLeaf);
   });
   // Run the agent poll only while the dashboard is open (KTD-C): an immediate
   // fetch so it isn't blank, then every 1.5s; the cleanup tears down the timer.

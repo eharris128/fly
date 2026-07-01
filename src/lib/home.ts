@@ -22,7 +22,7 @@
 
 import { leaves } from "./layout";
 import { tabDisplayTitle, type Workspace } from "./workspaces";
-import type { PaneActivity, UsageLimit } from "../ipc";
+import type { AttentionReason, PaneActivity, UsageLimit } from "../ipc";
 
 export type AgentStatus = "working" | "waiting" | "idle" | "running";
 
@@ -44,6 +44,12 @@ export interface AgentRow {
   liveTaskCount: number;
   /** The pane is raised/acknowledged in the attention model (needs the user). */
   needsAttention: boolean;
+  /**
+   * Why the agent needs you, for the triage badge (R4/R6): `question` /
+   * `permission` / `finished`. Non-null only on a raised row — a non-raised or
+   * stale-downgraded row carries `null` so it shows no badge. `error` is unfed
+   * in v1. */
+  reason: AttentionReason | null;
   status: AgentStatus;
   /** Stable jump number by flat workspace→tab→pane position (R4/R8): `1`–`9` then
    *  `0` for the tenth agent; undefined past ten (reachable by click/Tab only).
@@ -104,6 +110,7 @@ export function buildHomeModel(
   agentByLeaf: Record<string, PaneActivity>,
   cwdByLeaf: Record<string, string | null>,
   attentionByLeaf: Record<string, string>,
+  reasonByLeaf: Record<string, AttentionReason | null> = {},
 ): HomeWorkspaceGroup[] {
   const out: HomeWorkspaceGroup[] = [];
   // Flat agent index across all workspaces → the stable jump number (R4/R8).
@@ -131,6 +138,9 @@ export function buildHomeModel(
           liveTaskCount,
           // Only "raised" (unseen) is urgent needs-you; acknowledged is "seen".
           needsAttention: att === "raised",
+          // Reason badge only on a raised row (R6); a stale-downgraded or
+          // acknowledged row carries null and shows no badge (KTD3).
+          reason: att === "raised" ? (reasonByLeaf[leaf.key] ?? null) : null,
           status: rowStatus(att, workingForMs, liveTaskCount),
           num: jumpNumberFor(flatIndex++),
         });

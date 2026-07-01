@@ -13,7 +13,7 @@ import {
 } from "./home";
 import type { Tab, Workspace } from "./workspaces";
 import type { Node } from "./layout";
-import type { PaneActivity } from "../ipc";
+import type { AttentionReason, PaneActivity } from "../ipc";
 
 const leaf = (key: string): Node => ({ kind: "leaf", key });
 const split = (key: string, first: Node, second: Node): Node => ({
@@ -207,6 +207,47 @@ describe("per-agent num assignment", () => {
       );
     expect(nums(mk({}))).toEqual([1, 2]);
     expect(nums(mk({ a: "raised", b: "raised" }))).toEqual([1, 2]);
+  });
+});
+
+describe("reason badge (R4/R6)", () => {
+  const mk = (
+    att: Record<string, string>,
+    reason: Record<string, AttentionReason | null>,
+  ) =>
+    buildHomeModel(
+      [ws("ws", "W", [tab("t1", leaf("a"), "a"), tab("t2", leaf("b"), "b")])],
+      { a: agent(true), b: agent(true) },
+      {},
+      att,
+      reason,
+    );
+  const rows = (model: ReturnType<typeof buildHomeModel>) =>
+    model.flatMap((w) => w.tabs.flatMap((t) => t.rows));
+
+  it("sets reason only on raised rows", () => {
+    const [a, b] = rows(mk({ a: "raised", b: "acknowledged" }, { a: "question", b: "permission" }));
+    expect(a.reason).toBe("question");
+    expect(b.reason).toBeNull(); // acknowledged → no badge (R6)
+  });
+
+  it("leaves reason null on a raised row with no known reason", () => {
+    const [a] = rows(mk({ a: "raised" }, {}));
+    expect(a.reason).toBeNull();
+  });
+
+  it("ignores a stale reason on a non-raised row", () => {
+    // reasonByLeaf still holds an old value for an idle pane → still no badge.
+    const [, b] = rows(mk({ a: "raised", b: "idle" }, { a: "finished", b: "question" }));
+    expect(b.reason).toBeNull();
+  });
+
+  it("keeps num stable when only the reason changes (R5)", () => {
+    const before = rows(mk({ a: "raised", b: "raised" }, { a: "question", b: "finished" }));
+    const after = rows(mk({ a: "raised", b: "raised" }, { a: "permission", b: "finished" }));
+    expect(before.map((r) => r.num)).toEqual([1, 2]);
+    expect(after.map((r) => r.num)).toEqual([1, 2]);
+    expect(after[0].reason).toBe("permission"); // reason updated, num unchanged
   });
 });
 
