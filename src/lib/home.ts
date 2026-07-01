@@ -21,7 +21,7 @@
 // foreground process is no longer `claude`, so `isAgent` goes false next poll.
 
 import { leaves } from "./layout";
-import { tabDisplayTitle, type Workspace } from "./workspaces";
+import { attentionPriority, tabDisplayTitle, type Workspace } from "./workspaces";
 import type { AttentionReason, PaneActivity, UsageLimit } from "../ipc";
 
 export type AgentStatus = "working" | "waiting" | "idle" | "running";
@@ -246,18 +246,28 @@ export function agentJumpTarget(
 }
 
 /**
- * The first agent needing attention in flat rotation order (U4, R7) — the target
- * of Enter on the dashboard. Null when no agent needs attention, so Enter no-ops.
+ * The highest-payoff agent needing attention — the target of Enter on the
+ * dashboard (R8). Ranks by reason (question/permission before finished, R7) and
+ * breaks ties by flat rotation order; scanning in flat order with a strict `<`
+ * keeps the first agent of the top tier. Null when no agent needs attention, so
+ * Enter no-ops.
  */
 export function firstRaised(
   model: HomeWorkspaceGroup[],
 ): { wsId: string; tabId: string; leafKey: string } | null {
+  let best: { wsId: string; tabId: string; leafKey: string } | null = null;
+  let bestPriority = Infinity;
   for (const ws of model)
     for (const tab of ws.tabs)
       for (const row of tab.rows)
-        if (row.needsAttention)
-          return { wsId: ws.wsId, tabId: tab.tabId, leafKey: row.leafKey };
-  return null;
+        if (row.needsAttention) {
+          const p = attentionPriority(row.reason);
+          if (p < bestPriority) {
+            bestPriority = p;
+            best = { wsId: ws.wsId, tabId: tab.tabId, leafKey: row.leafKey };
+          }
+        }
+  return best;
 }
 
 /**

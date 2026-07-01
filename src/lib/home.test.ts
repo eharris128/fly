@@ -252,7 +252,11 @@ describe("reason badge (R4/R6)", () => {
 });
 
 describe("firstRaised", () => {
-  const mk = (att: Record<string, string>) =>
+  // Flat order is a (ws-1/t1), b (ws-2/t2), c (ws-2/t3).
+  const mk = (
+    att: Record<string, string>,
+    reason: Record<string, AttentionReason | null> = {},
+  ) =>
     buildHomeModel(
       [
         ws("ws-1", "Alpha", [tab("t1", leaf("a"), "a")]),
@@ -261,9 +265,10 @@ describe("firstRaised", () => {
       { a: agent(true), b: agent(true), c: agent(true) },
       {},
       att,
+      reason,
     );
 
-  it("returns the first needs-attention row in flat order", () => {
+  it("falls back to flat order when reasons are absent", () => {
     expect(firstRaised(mk({ b: "raised", c: "raised" }))).toEqual({
       wsId: "ws-2",
       tabId: "t2",
@@ -274,6 +279,26 @@ describe("firstRaised", () => {
   it("returns null when no agent needs attention (acknowledged is not raised)", () => {
     expect(firstRaised(mk({}))).toBeNull();
     expect(firstRaised(mk({ b: "acknowledged" }))).toBeNull();
+  });
+
+  it("prefers a question over a positionally-earlier finished (AE1)", () => {
+    // a is first in flat order but finished; b is a question → b wins (R7/R8).
+    expect(firstRaised(mk({ a: "raised", b: "raised" }, { a: "finished", b: "question" }))).toEqual(
+      { wsId: "ws-2", tabId: "t2", leafKey: "b" },
+    );
+  });
+
+  it("breaks a question/permission tie by flat order (AE2)", () => {
+    // Co-equal top tier → the positionally-first (a) wins.
+    expect(
+      firstRaised(mk({ a: "raised", b: "raised" }, { a: "question", b: "permission" })),
+    ).toEqual({ wsId: "ws-1", tabId: "t1", leafKey: "a" });
+  });
+
+  it("returns the positionally-first agent when all raised are finished", () => {
+    expect(
+      firstRaised(mk({ b: "raised", c: "raised" }, { b: "finished", c: "finished" })),
+    ).toEqual({ wsId: "ws-2", tabId: "t2", leafKey: "b" });
   });
 });
 

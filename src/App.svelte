@@ -30,6 +30,7 @@
     closeTabIn,
     deleteWorkspaceFrom,
     flattenRaised,
+    sortByAttentionPriority,
     unreadCountForLeaves,
     sourceLeafForNewTab,
     reorderWorkspaces,
@@ -386,7 +387,12 @@
     clearActiveTabNotifications();
   }
   function cycleAttention() {
-    const raised = flattenRaised(workspaces, attentionByLeaf);
+    // Payoff order (R9): question/permission before finished, positional within a
+    // tier. Same comparator the dashboard Enter and the nudge Tab use.
+    const raised = sortByAttentionPriority(
+      flattenRaised(workspaces, attentionByLeaf),
+      reasonByLeaf,
+    );
     if (raised.length === 0) return;
     const cur = raised.findIndex(
       (r) =>
@@ -1197,14 +1203,19 @@
     focusActivePane();
   }
   // Tab from the nudge rotates to the next agent needing attention, or back to the
-  // dashboard when none remain (R2/R12). Uses the raw raised set via flattenRaised
-  // — identical to cycleAttention (leader u) and robust without the dashboard's
+  // dashboard when none remain (R2/R12). Uses the raw raised set via flattenRaised,
+  // ordered by reason payoff (R9) — identical to cycleAttention (leader u) and robust without the dashboard's
   // fresh activity poll (effectiveAttention needs that, and it isn't running while
   // the dashboard is closed). The current pane is excluded so the last agent's Tab
   // goes home rather than rotating to itself (AE5). Focus change / opening the
   // dashboard both reset the nudge episode via its $effect.
   function nudgeRotate() {
-    const others = flattenRaised(workspaces, attentionByLeaf).filter(
+    // Payoff order (R9): rotate to the next agent by reason priority
+    // (question/permission before finished), positional within a tier.
+    const others = sortByAttentionPriority(
+      flattenRaised(workspaces, attentionByLeaf),
+      reasonByLeaf,
+    ).filter(
       (r) =>
         !(
           r.wsId === activeWorkspaceId &&
