@@ -228,4 +228,44 @@ mod tests {
     fn malformed_json_yields_default() {
         assert_eq!(parse_claude_payload("{ not json"), ClaudePayload::default());
     }
+
+    #[test]
+    fn notification_idle_prompt_is_question() {
+        // `idle_prompt` (Claude waiting for your input) refines to Question — the
+        // fast-unlock reason the dashboard triage ranks ahead of finished (R1/R2).
+        let p = parse_claude_payload(
+            r#"{"hook_event_name":"Notification","notification_type":"idle_prompt",
+                "session_id":"sess-1","cwd":"/w"}"#,
+        );
+        assert_eq!(p.reason, Some(Reason::Question));
+    }
+
+    #[test]
+    fn notification_unrecognized_type_yields_no_reason() {
+        // An unrecognized or absent notification_type leaves reason None, so the
+        // installed hook's CLI-arg fallback (Permission) stands (KTD5). It never
+        // silently refines to Question.
+        let unknown = parse_claude_payload(
+            r#"{"hook_event_name":"Notification","notification_type":"auth_success"}"#,
+        );
+        assert_eq!(unknown.reason, None);
+        let absent =
+            parse_claude_payload(r#"{"hook_event_name":"Notification","message":"hi"}"#);
+        assert_eq!(absent.reason, None);
+    }
+
+    #[test]
+    fn error_reason_is_never_derived() {
+        // Error is not produced from a hook payload in v1 (R3); no input shape
+        // yields it.
+        for json in [
+            r#"{"hook_event_name":"Stop"}"#,
+            r#"{"hook_event_name":"Notification","notification_type":"idle_prompt"}"#,
+            r#"{"hook_event_name":"Notification","notification_type":"permission_prompt"}"#,
+            r#"{"hook_event_name":"Notification","notification_type":"whatever"}"#,
+            "{ not json",
+        ] {
+            assert_ne!(parse_claude_payload(json).reason, Some(Reason::Error));
+        }
+    }
 }
