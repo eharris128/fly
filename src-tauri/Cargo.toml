@@ -27,6 +27,12 @@ serde_json = "1"
 # default features (incl. default-tls via system openssl, already a build dep).
 reqwest = { version = "0.13", features = ["json"] }
 portable-pty = "0.9"
+# Automations (docs/plans/2026-07-01-002, KTD-A): croner is the 5-field cron
+# engine with a documented DST contract; chrono-tz supplies the IANA zones all
+# occurrence math must stay in (never naive-then-convert).
+croner = "3"
+chrono = "0.4"
+chrono-tz = "0.10"
 rand = "0.8"
 subtle = "2"
 libc = "0.2"

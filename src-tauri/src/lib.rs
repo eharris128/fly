@@ -3,6 +3,7 @@
 //! This library backs both the desktop app and the `fly` CLI subcommands
 //! (KTD12); `main.rs` is a thin shim over [`run`].
 
+pub mod automations;
 pub mod cli;
 pub mod config;
 pub mod cwd;
