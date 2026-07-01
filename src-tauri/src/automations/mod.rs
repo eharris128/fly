@@ -32,6 +32,7 @@
 
 pub mod model;
 pub mod schedule;
+pub mod script;
 pub mod store;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -85,7 +86,7 @@ pub type ChangedEmitter = Box<dyn Fn(&str) + Send + Sync>;
 
 /// U5 seam: kill the in-flight script process group for a **run id**. Called
 /// on delete (R23) and shutdown (R5), always outside the store lock (KTD-B).
-/// Default: no-op until U5 injects the real group killer.
+/// Default: no-op; `lib.rs` injects [`script::ScriptRunner::kill_run`] (U5).
 pub type ScriptKiller = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// U7 seam widening R7's in-flight check: whether a *terminal* agent row
@@ -98,7 +99,7 @@ pub type PaneAliveProbe = Arc<dyn Fn(&RunRow) -> bool + Send + Sync>;
 /// U5 seam: whether global script capacity is available (in-flight cap).
 /// Consulted inside the sweep's mutate closure so the KTD-D pre-claim skip is
 /// atomic with the claim: same constraints as [`PaneAliveProbe`]. Default:
-/// `true` until U5 wires `inflight_count()`.
+/// `true`; `lib.rs` wires [`script::ScriptRunner::has_capacity`] (U5).
 pub type CapacityProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// How claimed runs leave the manager (KTD-C/E): the sweep claims + flushes
@@ -115,10 +116,12 @@ pub trait Dispatcher: Send + Sync {
     fn dispatch_script(&self, automation: &Automation, run_id: &str) -> Result<(), String>;
 }
 
-/// Placeholder dispatcher wired by `lib.rs` until the real runners land:
-/// every dispatch fails, so claimed runs close failed and the schedule
-/// recomputes (R3) — visible, never silent. U5 (scripts) and U7 (agents)
-/// replace it via [`AutomationManager::set_dispatcher`] or at construction.
+/// Placeholder dispatcher: every dispatch fails, so claimed runs close
+/// failed and the schedule recomputes (R3) — visible, never silent. `lib.rs`
+/// constructs the manager with it (the [`script::ScriptRunner`] needs the
+/// manager's `Arc` for its row closer, so it is injected right after via
+/// [`AutomationManager::set_dispatcher`]); the runner keeps the agent arm
+/// unwired until U7.
 pub struct UnwiredDispatcher;
 
 impl Dispatcher for UnwiredDispatcher {
@@ -496,6 +499,52 @@ impl AutomationManager {
         }
         (self.emit_changed)(id);
         Ok(outcome)
+    }
+
+    /// U5/U7 seam: close a run row with a terminal outcome — how the script
+    /// reaper (and later the agent lifecycle) reports results back. KTD-B
+    /// discipline: mutate + flush under one lock hold, emit
+    /// `automation://changed` after release. Callers run on their own
+    /// threads (the runner's reaper), never under the store lock.
+    ///
+    /// Terminal rows stay closed ([`model::CloseResult::AlreadyClosed`]) —
+    /// a reaper reporting after delete/shutdown already closed the row is a
+    /// benign no-op. An unknown automation id (deleted mid-run) reports
+    /// [`model::CloseResult::NotFound`].
+    pub fn close_run(
+        &self,
+        automation_id: &str,
+        run_id: &str,
+        outcome: RunOutcome,
+    ) -> model::CloseResult {
+        let now = (self.clock)();
+        let result = flush_tolerant(
+            self.store.mutate(|map| {
+                map.get_mut(automation_id)
+                    .map(|a| a.close(run_id, outcome, now))
+            }),
+            // Flush failed but the mutation applied (KTD-B store contract):
+            // re-derive the result from the authoritative map. A terminal
+            // row reads as Closed (indistinguishable from AlreadyClosed
+            // here; callers treat both as done).
+            || {
+                self.store.get(automation_id).map(|a| {
+                    match a.runs.iter().find(|r| r.id == run_id) {
+                        Some(r) if r.status.is_terminal() => model::CloseResult::Closed,
+                        _ => model::CloseResult::NotFound,
+                    }
+                })
+            },
+        );
+        match result {
+            Some(res) => {
+                if res == model::CloseResult::Closed {
+                    (self.emit_changed)(automation_id); // after the lock (KTD-B)
+                }
+                res
+            }
+            None => model::CloseResult::NotFound,
+        }
     }
 
     /// Snapshot of every automation (dashboard/CLI list reads).
@@ -1360,6 +1409,59 @@ mod tests {
         let outcome = h.mgr.manual_run(&id).unwrap(); // manual-dispatch path
         assert!(matches!(outcome, ManualRun::Started { .. }));
         assert_eq!(h.dispatcher.count(), 2);
+    }
+
+    // U5: close_run is the runner's report-back seam — it closes the Running
+    // row with the outcome, flushes, and emits automation://changed after
+    // the lock; terminal rows stay closed; unknown ids report NotFound.
+    #[test]
+    fn close_run_closes_running_row_flushes_and_emits_changed_u5() {
+        let h = harness();
+        let id = create_due(&h, script_spec("reporting"));
+        h.sweep(); // claim → Running
+        let run_id = h.runs(&id)[0].id.clone();
+        h.events.lock().unwrap().clear();
+
+        let res = h.mgr.close_run(
+            &id,
+            &run_id,
+            RunOutcome::Succeeded {
+                output: Some("[stderr]\nwarn".into()),
+            },
+        );
+        assert_eq!(res, model::CloseResult::Closed);
+        let row = &h.runs(&id)[0];
+        assert_eq!(row.status, RunStatus::Succeeded);
+        assert_eq!(row.output.as_deref(), Some("[stderr]\nwarn"));
+        assert_eq!(row.finished_at, Some(h.now()));
+        assert_eq!(*h.events.lock().unwrap(), vec![id.clone()], "emitted once");
+        // Flushed: a raw reload agrees.
+        assert_eq!(
+            store_in(&h.dir).get(&id).unwrap().runs[0].status,
+            RunStatus::Succeeded
+        );
+
+        // Terminal rows stay closed (a reaper reporting after delete/
+        // shutdown already closed the row): no second emit.
+        let res = h.mgr.close_run(
+            &id,
+            &run_id,
+            RunOutcome::Failed {
+                error: "late".into(),
+                exit_code: Some(1),
+                output: None,
+            },
+        );
+        assert_eq!(res, model::CloseResult::AlreadyClosed);
+        assert_eq!(h.runs(&id)[0].status, RunStatus::Succeeded, "first close wins");
+        assert_eq!(h.events.lock().unwrap().len(), 1, "no emit for a no-op");
+
+        // Unknown automation (deleted mid-run) reports NotFound calmly.
+        assert_eq!(
+            h.mgr
+                .close_run("ghost", "r1", RunOutcome::Succeeded { output: None }),
+            model::CloseResult::NotFound
+        );
     }
 
     // R10 scaffolding: an agent run whose spawn is never acked (no pane

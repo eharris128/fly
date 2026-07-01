@@ -312,10 +312,10 @@ pub fn run() {
             app.manage(server);
 
             // Automations (U4): manager over the write-through store, with the
-            // real clock and a Tauri-event changed-emitter. The dispatcher is
-            // the unwired placeholder until U5 (scripts) / U7 (agents) replace
-            // it — a claimed run closes failed("dispatch not wired…"), visible
-            // in the dashboard rather than silent. Construction runs startup
+            // real clock and a Tauri-event changed-emitter. Constructed with
+            // the unwired placeholder dispatcher, then handed the real script
+            // runner below (the runner's row closer needs the manager's Arc,
+            // so injection is post-construction). Construction runs startup
             // recovery (R5: orphaned Running rows close failed("interrupted")).
             let changed_handle = app.handle().clone();
             let automations_mgr = Arc::new(automations::AutomationManager::new(
@@ -326,6 +326,31 @@ pub fn run() {
                     let _ = changed_handle.emit(automations::AUTOMATION_CHANGED_EVENT, id);
                 }),
             ));
+            // Script runner (U5): the real dispatcher for script-mode runs
+            // (agent dispatch stays the unwired error until U7). Its reaper
+            // threads close rows via `close_run` — the Weak breaks the
+            // manager↔runner Arc cycle (both live for the app's lifetime; a
+            // post-shutdown reaper close simply drops). The killer/capacity
+            // seams route delete/shutdown group kills and the sweep's KTD-D
+            // pre-claim capacity skip to the runner's in-flight registry.
+            // TODO(U6): `set_alert_sink` replaces the runner's no-op alert
+            // sink with the alerts-log + Reason::Alert raise.
+            let closer_mgr = Arc::downgrade(&automations_mgr);
+            let script_runner = Arc::new(automations::script::ScriptRunner::new(Arc::new(
+                move |automation_id: &str, run_id: &str, outcome: automations::model::RunOutcome| {
+                    if let Some(mgr) = closer_mgr.upgrade() {
+                        let _ = mgr.close_run(automation_id, run_id, outcome);
+                    }
+                },
+            )));
+            automations_mgr
+                .set_dispatcher(Arc::clone(&script_runner) as Arc<dyn automations::Dispatcher>);
+            let killer_runner = Arc::clone(&script_runner);
+            automations_mgr
+                .set_script_killer(Arc::new(move |run_id: &str| killer_runner.kill_run(run_id)));
+            let capacity_runner = Arc::clone(&script_runner);
+            automations_mgr.set_script_capacity(Arc::new(move || capacity_runner.has_capacity()));
+            app.manage(script_runner);
             app.manage(Arc::clone(&automations_mgr));
             // The sweep starts unconditionally (R5): script automations run
             // even if the webview never loads; agent dispatch waits for the
