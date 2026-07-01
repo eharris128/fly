@@ -7,6 +7,8 @@ import {
   closeTabIn,
   deleteWorkspaceFrom,
   flattenRaised,
+  attentionPriority,
+  sortByAttentionPriority,
   unreadCountForLeaves,
   reorderWorkspaces,
   insertionIndex,
@@ -248,6 +250,63 @@ describe("flattenRaised", () => {
     expect(flattenRaised([wsA, wsB], att)).toEqual([
       { wsId: wsA.id, tabId: a.id, key: "leaf-1" },
       { wsId: wsB.id, tabId: c.id, key: "leaf-3" },
+    ]);
+  });
+});
+
+describe("attentionPriority", () => {
+  it("ranks question and permission co-equal, ahead of finished, ahead of error/unknown", () => {
+    expect(attentionPriority("question")).toBe(0);
+    expect(attentionPriority("permission")).toBe(0);
+    expect(attentionPriority("finished")).toBe(1);
+    expect(attentionPriority("error")).toBe(2);
+    expect(attentionPriority(null)).toBe(2);
+    expect(attentionPriority(undefined)).toBe(2);
+  });
+});
+
+describe("sortByAttentionPriority", () => {
+  const list = (...keys: string[]) => keys.map((key) => ({ key }));
+
+  it("orders question/permission before finished, then error/unknown", () => {
+    const out = sortByAttentionPriority(list("a", "b", "c", "d"), {
+      a: "finished",
+      b: "question",
+      c: "error",
+      d: "permission",
+    });
+    expect(out.map((e) => e.key)).toEqual(["b", "d", "a", "c"]);
+  });
+
+  it("preserves positional order within a tier (AE2 tie-break)", () => {
+    // Two co-equal top-tier reasons keep their input order.
+    const out = sortByAttentionPriority(list("first", "second"), {
+      first: "question",
+      second: "permission",
+    });
+    expect(out.map((e) => e.key)).toEqual(["first", "second"]);
+  });
+
+  it("treats an absent reason as lowest priority", () => {
+    const out = sortByAttentionPriority(list("known", "missing"), {
+      known: "finished",
+    });
+    expect(out.map((e) => e.key)).toEqual(["known", "missing"]);
+  });
+
+  it("leaves an already-ordered list unchanged and does not mutate the input", () => {
+    const input = list("q", "f");
+    const reasons = { q: "question" as const, f: "finished" as const };
+    const out = sortByAttentionPriority(input, reasons);
+    expect(out.map((e) => e.key)).toEqual(["q", "f"]);
+    expect(input.map((e) => e.key)).toEqual(["q", "f"]);
+    expect(out).not.toBe(input);
+  });
+
+  it("handles empty and single-entry lists", () => {
+    expect(sortByAttentionPriority(list(), {})).toEqual([]);
+    expect(sortByAttentionPriority(list("only"), { only: "finished" })).toEqual([
+      { key: "only" },
     ]);
   });
 });

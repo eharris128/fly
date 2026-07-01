@@ -5,6 +5,7 @@
 // holds the live `$state` and the id counters and stays a thin orchestrator.
 
 import { leaves, type Node } from "./layout";
+import type { AttentionReason } from "../ipc";
 
 export interface Tab {
   id: string; // in-memory only (e.g. "tab-3"); never persisted
@@ -143,6 +144,42 @@ export function flattenRaised(
         if (attentionByLeaf[l.key] === "raised")
           out.push({ wsId: ws.id, tabId: tab.id, key: l.key });
   return out;
+}
+
+/**
+ * Triage payoff tier of an attention reason (reason-typed triage, R7). A
+ * question or a permission prompt is a fast unlock, so both sit at tier 0; a
+ * finished agent is a longer turnaround at tier 1; error/unknown trails at tier
+ * 2 (Error is unfed in v1, so it only reaches here via an absent reason). Lower
+ * is higher priority.
+ */
+export function attentionPriority(reason: AttentionReason | null | undefined): number {
+  switch (reason) {
+    case "question":
+    case "permission":
+      return 0;
+    case "finished":
+      return 1;
+    default:
+      return 2;
+  }
+}
+
+/**
+ * Reorder an already-positional list of raised entries by triage payoff:
+ * question/permission first, then finished, then error/unknown (R7). Within a
+ * tier the input (positional) order is preserved — `Array.prototype.sort` is
+ * stable — which is the R7 tie-break, for free. Returns a new array; the input
+ * is untouched. Callers pass `flattenRaised` output (whose entries carry `key`).
+ */
+export function sortByAttentionPriority<T extends { key: string }>(
+  list: T[],
+  reasonByLeaf: Record<string, AttentionReason | null>,
+): T[] {
+  return [...list].sort(
+    (a, b) =>
+      attentionPriority(reasonByLeaf[a.key]) - attentionPriority(reasonByLeaf[b.key]),
+  );
 }
 
 /**
