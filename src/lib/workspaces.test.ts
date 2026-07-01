@@ -1,11 +1,13 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { newLeaf, splitLeaf, resetKeys, type Node } from "./layout";
+import { newLeaf, splitLeaf, leaves, resetKeys, type Node } from "./layout";
 import {
   basename,
   tabDisplayTitle,
   findTab,
   closeTabIn,
   deleteWorkspaceFrom,
+  persistedTabs,
+  scrollbackLeafKeys,
   flattenRaised,
   attentionPriority,
   sortByAttentionPriority,
@@ -129,6 +131,59 @@ describe("closeTabIn", () => {
     const wsB = makeWorkspace("b", [t2]);
     const out = closeTabIn([wsA, wsB], t2.id, () => makeTab());
     expect(out[0]).toBe(wsA); // untouched reference
+  });
+  it("closes an ephemeral tab exactly like any other tab (U11)", () => {
+    const t1 = makeTab();
+    const eph: Tab = { ...makeTab(), ephemeral: true };
+    const t3 = makeTab();
+    const ws = { ...makeWorkspace("w", [t1, eph, t3]), activeTabId: eph.id };
+    const [out] = closeTabIn([ws], eph.id, () => makeTab());
+    expect(out.tabs.map((t) => t.id)).toEqual([t1.id, t3.id]);
+    expect(out.activeTabId).toBe(t1.id); // left neighbour, same as a normal close
+  });
+  it("replaces a closing last ephemeral tab with a fresh one, like any last-tab close (U11)", () => {
+    const eph: Tab = { ...makeTab(), ephemeral: true };
+    const ws = makeWorkspace("w", [eph]);
+    const fresh = makeTab();
+    const [out] = closeTabIn([ws], eph.id, () => fresh);
+    expect(out.tabs).toEqual([fresh]);
+    expect(out.activeTabId).toBe(fresh.id);
+  });
+});
+
+describe("persistedTabs", () => {
+  it("filters ephemeral tabs out while keeping siblings in order (R12)", () => {
+    const t1 = makeTab();
+    const eph: Tab = { ...makeTab(), ephemeral: true };
+    const t3 = makeTab();
+    expect(persistedTabs([t1, eph, t3])).toEqual([t1, t3]);
+  });
+  it("keeps every tab when no ephemeral flag is present anywhere (KTD-G default)", () => {
+    const tabs = [makeTab(), makeTab()];
+    expect(persistedTabs(tabs)).toEqual(tabs);
+  });
+});
+
+describe("scrollbackLeafKeys", () => {
+  it("excludes an ephemeral tab's leaves from the scrollback-save candidate list (R12)", () => {
+    const split = splitLeaf(newLeaf(), "leaf-1", "horizontal")!; // two-leaf tab
+    const normal = makeTab(null, split.tree);
+    const eph: Tab = { ...makeTab(), ephemeral: true };
+    const other = makeTab();
+    const wsA = makeWorkspace("a", [normal, eph]);
+    const wsB = makeWorkspace("b", [other]);
+    const keys = scrollbackLeafKeys([wsA, wsB]);
+    const expected = [...leaves(normal.tree), ...leaves(other.tree)]
+      .map((l) => l.key)
+      .sort();
+    expect([...keys].sort()).toEqual(expected);
+    expect(keys.has(eph.focusedLeafKey)).toBe(false);
+  });
+  it("includes every leaf when no tab is ephemeral", () => {
+    const a = makeTab(); // leaf-1
+    const b = makeTab(); // leaf-2
+    const keys = scrollbackLeafKeys([makeWorkspace("w", [a, b])]);
+    expect([...keys].sort()).toEqual(["leaf-1", "leaf-2"]);
   });
 });
 

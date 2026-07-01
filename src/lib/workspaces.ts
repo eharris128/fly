@@ -14,6 +14,15 @@ export interface Tab {
   // null = auto-name from the pane cwd; a string is a manual override that
   // sticks and stops tracking the cwd (see `tabDisplayTitle`).
   title: string | null;
+  // Ephemeral tabs (U-ID U11, R12/KTD-G) are excluded from session persistence
+  // and scrollback save: `SavedPane` has no command field, so they would
+  // restore as dead bare shells. Absent (the default) = a normal, persisted
+  // tab. The flag itself never serializes — old sessions are untouched and no
+  // schema version bump is needed. Purely mechanical here; producers are the
+  // alerts sink pane (U6) and automation agent tabs (U8). Every other tab
+  // behavior (close, focus, attention, display) treats ephemeral tabs like
+  // any other tab.
+  ephemeral?: boolean;
 }
 
 export interface Workspace {
@@ -91,6 +100,30 @@ export function closeTabIn(
         : ws.activeTabId;
     return { ...ws, tabs: remaining, activeTabId };
   });
+}
+
+/**
+ * The tabs of `tabs` that belong in the saved session (U-ID U11, R12): every
+ * tab whose `ephemeral` flag is absent/false. Ephemeral tabs never enter the
+ * saved document (KTD-G), so serialization iterates this instead of `tabs`.
+ */
+export function persistedTabs(tabs: Tab[]): Tab[] {
+  return tabs.filter((t) => t.ephemeral !== true);
+}
+
+/**
+ * Leaf keys eligible for scrollback persistence: the leaves of persisted
+ * (non-ephemeral) tabs across all workspaces (U-ID U11, R12). Leaf keys name
+ * the scrollback files and the saved session is the only record that could
+ * identify them for pruning, so a leaf excluded from the session must also
+ * skip scrollback save or its file is orphaned forever.
+ */
+export function scrollbackLeafKeys(workspaces: Workspace[]): Set<string> {
+  const keys = new Set<string>();
+  for (const ws of workspaces)
+    for (const tab of persistedTabs(ws.tabs))
+      for (const l of leaves(tab.tree)) keys.add(l.key);
+  return keys;
 }
 
 /**

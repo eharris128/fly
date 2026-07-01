@@ -2,8 +2,9 @@
 // frontend owns the layout tree and the workspace grouping, so rehydration
 // happens here.
 import { invoke } from "@tauri-apps/api/core";
-import type { Node } from "./layout";
+import { leaves, type Node } from "./layout";
 import { coerceNotifications, type Notification } from "./notifications";
+import { persistedTabs, type Workspace } from "./workspaces";
 
 export interface SavedPane {
   cwd: string | null;
@@ -27,6 +28,62 @@ export interface SavedSession {
   // Notification history (U20). Keyed by leafKey, so it resolves to a pane after
   // restart; bodies persist only when saveScrollback is on (gated in App).
   notifications: Notification[];
+}
+
+/**
+ * Saved `activeTabIndex` for a workspace: the active tab's index within its
+ * *persisted* tabs. When the active tab is ephemeral (never saved, U-ID U11)
+ * the index falls back to the nearest persisted tab before it — the same
+ * left-neighbour rule `closeTabIn` applies when an active tab goes away —
+ * clamped into range. All-ephemeral workspaces yield 0 (the restore path
+ * refills them with a fresh tab; see `toSavedWorkspaces`).
+ */
+function persistedActiveTabIndex(ws: Workspace): number {
+  const kept = persistedTabs(ws.tabs);
+  const idx = kept.findIndex((t) => t.id === ws.activeTabId);
+  if (idx !== -1) return idx;
+  const liveIdx = ws.tabs.findIndex((t) => t.id === ws.activeTabId);
+  let keptBefore = 0;
+  for (let i = 0; i < liveIdx; i++) if (ws.tabs[i].ephemeral !== true) keptBefore++;
+  return Math.max(0, Math.min(keptBefore - 1, kept.length - 1));
+}
+
+/**
+ * Project live workspaces into the saved-session shape (U-ID U11, R12, KTD-G).
+ * Ephemeral tabs are skipped entirely: `SavedPane` has no command field, so
+ * they would restore as dead bare shells. The flag itself never serializes —
+ * `SavedTab` has no field for it — so the schema is unchanged (no version
+ * bump) and pre-U11 sessions round-trip untouched.
+ *
+ * `panesByLeaf` carries the per-leaf snapshot; the caller resolves live cwds
+ * (async) up front so this projection stays pure and unit-testable. A leaf
+ * missing from the snapshot degrades to `{ cwd: null, title: null }`.
+ *
+ * A workspace whose only tabs are ephemeral serializes with `tabs: []` — a
+ * deliberately valid document rather than dropping the workspace: the restore
+ * path already enforces "never an empty workspace" by inserting a fresh
+ * default tab (the same rule `closeTabIn` applies to a last-tab close), so
+ * the workspace survives by name with a fresh shell. Workspaces are never
+ * dropped, so the saved `activeWorkspaceIndex` stays valid as-is.
+ */
+export function toSavedWorkspaces(
+  workspaces: Workspace[],
+  panesByLeaf: Record<string, SavedPane>,
+): SavedWorkspace[] {
+  return workspaces.map((ws) => ({
+    name: ws.name,
+    tabs: persistedTabs(ws.tabs).map((t) => ({
+      tree: t.tree,
+      panes: Object.fromEntries(
+        leaves(t.tree).map((l) => [
+          l.key,
+          panesByLeaf[l.key] ?? { cwd: null, title: null },
+        ]),
+      ),
+      title: t.title,
+    })),
+    activeTabIndex: persistedActiveTabIndex(ws),
+  }));
 }
 
 export function saveSession(session: SavedSession): Promise<void> {

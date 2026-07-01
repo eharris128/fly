@@ -34,6 +34,8 @@
     unreadCountForLeaves,
     sourceLeafForNewTab,
     reorderWorkspaces,
+    persistedTabs,
+    scrollbackLeafKeys,
     type Tab,
     type Workspace,
   } from "./lib/workspaces";
@@ -102,9 +104,8 @@
   import {
     saveSession,
     loadSession,
-    type SavedTab,
+    toSavedWorkspaces,
     type SavedPane,
-    type SavedWorkspace,
     type SavedSession,
   } from "./lib/serialize";
 
@@ -242,11 +243,25 @@
   // Every pane across every workspace renders once and stays mounted (hidden
   // when not the active tab). Switching workspaces or tabs must never unmount a
   // pane, or its agent would respawn — same invariant as inactive tabs (U5/KTD5).
-  const allPanes = $derived(
-    workspaces.flatMap((w) =>
-      w.tabs.flatMap((t) => leaves(t.tree).map((l) => ({ tabId: t.id, key: l.key }))),
-    ),
-  );
+  // Each entry also carries whether its leaf is a scrollback-save candidate
+  // (U-ID U11): leaves of ephemeral tabs must never write a scrollback file —
+  // the tab has no session record, so nothing could ever prune the file. The
+  // eligibility is snapshotted onto the entry rather than looked up live
+  // because Terminal persists scrollback in onDestroy, *after* a closing tab
+  // has already left `workspaces` — a live lookup there would misclassify
+  // every closing pane as ineligible.
+  const allPanes = $derived.by(() => {
+    const eligible = scrollbackLeafKeys(workspaces);
+    return workspaces.flatMap((w) =>
+      w.tabs.flatMap((t) =>
+        leaves(t.tree).map((l) => ({
+          tabId: t.id,
+          key: l.key,
+          scrollback: eligible.has(l.key),
+        })),
+      ),
+    );
+  });
   // The visible panes = the active tab's leaves in the active workspace, pushed
   // to the backend so a raise on any visible pane acknowledges in-app — the
   // attention-suppression "looking" input, generalized from keyboard focus to
@@ -1128,26 +1143,23 @@
 
   // ---- persistence (U12) ---------------------------------------------------
   async function persist() {
-    const savedWorkspaces: SavedWorkspace[] = [];
+    // Per-leaf snapshots for every persisted tab's leaves, resolved up front
+    // (paneCwd is async) so the saved-shape projection itself stays pure.
+    // Ephemeral tabs are skipped here too — their leaves need no cwd probe
+    // since toSavedWorkspaces drops them from the document (U-ID U11, R12).
+    const panesByLeaf: Record<string, SavedPane> = {};
     for (const w of workspaces) {
-      const savedTabs: SavedTab[] = [];
-      for (const t of w.tabs) {
-        const panes: Record<string, SavedPane> = {};
+      for (const t of persistedTabs(w.tabs)) {
         for (const l of leaves(t.tree)) {
           const pid = paneIdByLeaf[l.key];
           const cwd = pid != null ? await paneCwd(pid) : (cwdByLeaf[l.key] ?? null);
-          panes[l.key] = { cwd, title: null };
+          panesByLeaf[l.key] = { cwd, title: null };
         }
-        savedTabs.push({ tree: t.tree, panes, title: t.title });
       }
-      savedWorkspaces.push({
-        name: w.name,
-        tabs: savedTabs,
-        activeTabIndex: Math.max(0, w.tabs.findIndex((t) => t.id === w.activeTabId)),
-      });
     }
     await saveSession({
-      workspaces: savedWorkspaces,
+      // Ephemeral tabs never enter the saved document (U-ID U11, R12/KTD-G).
+      workspaces: toSavedWorkspaces(workspaces, panesByLeaf),
       activeWorkspaceIndex: Math.max(
         0,
         workspaces.findIndex((w) => w.id === activeWorkspaceId),
@@ -1569,7 +1581,7 @@
             cwd={cwdByLeaf[p.key] ?? null}
             command={resumeCommandByLeaf[p.key] ?? null}
             resumeTier={resumeTierByLeaf[p.key] ?? null}
-            saveScrollback={saveScrollbackEnabled}
+            saveScrollback={saveScrollbackEnabled && p.scrollback}
             {keymap}
             onFocusRequest={setActiveFocus}
             {onSpawned}
