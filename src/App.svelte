@@ -383,49 +383,52 @@
     updateActiveTab((t) => ({ ...t, focusedLeafKey: key }));
   }
 
-  async function split(orientation: Orientation) {
-    if (!activeTab) return;
+  // Shared source capture for the split-alongside operations (split/handoff):
+  // clamp on min-size (R7), capture the focused leaf synchronously before any
+  // await (paneIdByLeaf is non-$state, read directly), then resolve its live
+  // cwd — query fresh so a just-issued `cd` is honored, falling back to the
+  // polled cache then $HOME (null), exactly like newTab (U4). Callers must
+  // re-check `splitSourceStale` after ALL their awaits, then do seeding + tree
+  // mutation in one synchronous block (Terminal reads cwd/command once at mount).
+  async function captureSplitSource(orientation: Orientation) {
+    if (!activeTab) return null;
     const rect = rects.get(activeTab.focusedLeafKey);
-    if (rect && !canSplit(rect, orientation)) return; // min-size clamp (R7)
-    // Inherit the focused pane's cwd (U4), exactly like newTab: query fresh so a
-    // just-issued `cd` is honored, falling back to the polled cache then $HOME
-    // (null). Capture the source synchronously before the await (paneIdByLeaf is
-    // non-$state, read directly).
-    const srcTabId = activeTab.id;
-    const srcKey = activeTab.focusedLeafKey;
-    const srcPid = paneIdByLeaf[srcKey];
-    const cwd =
-      (srcPid != null ? await paneCwd(srcPid) : null) ?? (cwdByLeaf[srcKey] ?? null);
-    // The active tab/focus may have changed during the await — bail unless the
-    // source is still the focused leaf of the active tab, so we never split a
-    // stale tree (the user can simply re-issue the split).
-    if (activeTab?.id !== srcTabId || activeTab.focusedLeafKey !== srcKey) return;
-    const res = splitLeaf(activeTab.tree, srcKey, orientation);
-    if (!res) return;
-    // Seed the new leaf's cwd in the same synchronous block that updates the tree,
-    // so it's present before the Terminal mounts (Terminal reads cwd once at mount).
-    cwdByLeaf = { ...cwdByLeaf, [res.added.key]: cwd };
-    setActiveTree(res.tree, res.added.key);
-  }
-  // Session handoff (U2, docs/plans/2026-07-02-001-feat-session-handoff-plan.md):
-  // hand the focused pane's previous session to a fresh agent in a split to the
-  // right (R3). Follows the split() idiom exactly: capture the source
-  // synchronously, await resolution (chord-time, from the durable resume record
-  // — R4 via U1), staleness-bail, then do ALL seeding + tree mutation in one
-  // synchronous block (Terminal reads cwd/command once at mount). The old pane
-  // is untouched — not closed, killed, or warned (R3).
-  async function handoff(mode: HandoffMode) {
-    if (!activeTab) return;
-    const rect = rects.get(activeTab.focusedLeafKey);
-    if (rect && !canSplit(rect, "horizontal")) return; // min-size clamp, as split()
+    if (rect && !canSplit(rect, orientation)) return null;
     const srcTabId = activeTab.id;
     const srcKey = activeTab.focusedLeafKey;
     const srcPid = paneIdByLeaf[srcKey];
     const liveCwd =
       (srcPid != null ? await paneCwd(srcPid) : null) ?? (cwdByLeaf[srcKey] ?? null);
+    return { srcTabId, srcKey, liveCwd };
+  }
+  // The active tab/focus may have changed across the awaits — a stale source
+  // must bail rather than mutate a stale tree (the user simply re-issues it).
+  function splitSourceStale(src: { srcTabId: string; srcKey: string }): boolean {
+    return activeTab?.id !== src.srcTabId || activeTab.focusedLeafKey !== src.srcKey;
+  }
+  async function split(orientation: Orientation) {
+    const src = await captureSplitSource(orientation);
+    if (!src) return;
+    if (!activeTab || splitSourceStale(src)) return;
+    const res = splitLeaf(activeTab.tree, src.srcKey, orientation);
+    if (!res) return;
+    // Seed the new leaf's cwd in the same synchronous block that updates the tree,
+    // so it's present before the Terminal mounts (Terminal reads cwd once at mount).
+    cwdByLeaf = { ...cwdByLeaf, [res.added.key]: src.liveCwd };
+    setActiveTree(res.tree, res.added.key);
+  }
+  // Session handoff (U2, docs/plans/2026-07-02-001-feat-session-handoff-plan.md):
+  // hand the focused pane's previous session to a fresh agent in a split to the
+  // right (R3). Same shape as split(): capture the source, await resolution
+  // (chord-time, from the durable resume record — R4 via U1), staleness-bail,
+  // then seed + mutate synchronously. The old pane is untouched — not closed,
+  // killed, or warned (R3).
+  async function handoff(mode: HandoffMode) {
+    const src = await captureSplitSource("horizontal");
+    if (!src) return;
     let target: HandoffTarget | null = null;
     try {
-      target = await resolveHandoffTarget(srcKey, liveCwd);
+      target = await resolveHandoffTarget(src.srcKey, src.liveCwd);
     } catch (e) {
       // A rejecting IPC degrades to "nothing qualifies" — notice, never a spawn.
       void frontendLog(`handoff resolution failed: ${String(e)}`);
@@ -439,17 +442,15 @@
       );
       return;
     }
-    // The active tab/focus may have changed during the awaits — bail unless the
-    // source is still the focused leaf of the active tab (split() staleness bail).
-    if (activeTab?.id !== srcTabId || activeTab.focusedLeafKey !== srcKey) return;
-    const res = splitLeaf(activeTab.tree, srcKey, "horizontal");
+    if (!activeTab || splitSourceStale(src)) return;
+    const res = splitLeaf(activeTab.tree, src.srcKey, "horizontal");
     if (!res) return;
     // Seed cwd + command in the same synchronous block that mutates the tree.
     // R12: spawn in the session's recorded cwd, falling back to the live cwd —
     // the transcript and the worktree the new agent sees stay coherent. R11:
     // no automationRunId seed → the Terminal passes null at spawn, so the pane
     // never links to a run, enters the recursion gate, or gets a deadline.
-    cwdByLeaf = { ...cwdByLeaf, [res.added.key]: target.sessionCwd ?? liveCwd };
+    cwdByLeaf = { ...cwdByLeaf, [res.added.key]: target.sessionCwd ?? src.liveCwd };
     handoffCommandByLeaf = {
       ...handoffCommandByLeaf,
       [res.added.key]: buildHandoffCommand(target, mode),

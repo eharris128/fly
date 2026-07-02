@@ -80,7 +80,7 @@ pub fn resolve_handoff_target(
     leaf_key: String,
     live_cwd: Option<String>,
 ) -> Option<HandoffTarget> {
-    let records = super::resume::read_records(&super::resume::resume_path());
+    let records = super::resume::load_resume_records();
     let root = transcript::claude_projects_root()?;
     resolve_in_root(&records, &leaf_key, live_cwd.as_deref(), &root)
 }

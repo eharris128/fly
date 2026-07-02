@@ -144,7 +144,7 @@
       clearInterval(injTicker);
       injTicker = null;
     }
-    if (injState !== null || injPayload !== null) {
+    if (injState !== null) {
       injState = null;
       injPayload = null;
       onInjectionDone?.(leafKey);
