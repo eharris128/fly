@@ -90,10 +90,15 @@ The per-pane hook socket is also PID-keyed, so it never collides regardless.
 ## Architecture
 
 ### One binary, two roles
-`main.rs` → `lib.rs::run()`. If argv[1] is a CLI subcommand (`notify`, `hooks`),
-the process runs as the **`fly` CLI** and exits; otherwise it launches the
-Tauri desktop app. The CLI and the app share the same `fly_lib` crate, so a `fly
-notify` invocation inside a pane talks to the running app.
+`main.rs` → `lib.rs::run()`. If argv[1] is a CLI subcommand (`notify`, `hooks`,
+`automation`), the process runs as the **`fly` CLI** and exits; otherwise it
+launches the Tauri desktop app. The CLI and the app share the same `fly_lib`
+crate, so a `fly notify` invocation inside a pane talks to the running app.
+
+`fly automation <create|list|show|runs|pause|resume|run|delete>` (U9) manages
+cron-scheduled runs: read ops work anywhere (they read the store file directly),
+mutating ops must run inside a pane (they post over the token-authenticated hook
+socket). See the Automations module map below.
 
 ### The attention pipeline (the core feature, spans many files)
 This is the data flow that makes an agent's "I need you" reach the UI:
@@ -108,16 +113,20 @@ This is the data flow that makes an agent's "I need you" reach the UI:
    to the **authenticated Unix socket** (`hooks/`): constant-time token compare
    + `SO_PEERCRED` + lockout. This is the security boundary — treat it as such.
 4. `HookServer`'s dispatch feeds a `Signal` into `AttentionManager::signal`,
-   which runs the pure attention state machine and the **suppression matrix**
-   (`state/suppress.rs`) against the focus/foreground tuple replicated from the
+   which runs the pure attention state machine and the **suppression policy**
+   (`state/policy.rs`) against the focus/foreground tuple replicated from the
    frontend.
 5. On a raise it emits `pane://attention` to the frontend (ring on the pane/tab)
    and, if not suppressed, surfaces an OS notification through the
    `NotificationGate` (coalesce when many panes are raised; rate-limit bursts).
 
-Attention has a **tiered confidence model** (`Tier`: Hook/Cli/Bel/Osc — only
-`Hook` is produced in v1; the rest are forward design). Each pane is modeled by
-**two orthogonal pure state machines**: `state/lifecycle.rs` (process status)
+Attention has a **tiered confidence model** (`Tier`: Hook/Cli/Bel/Osc). `Hook`
+is Claude Code's own hook (the v1 default); `Cli` is a raise from any `fly
+notify` caller — the automations alert path (KTD-H) surfaces a non-silent
+script run as `Signal { reason: Reason::Alert, tier: Tier::Cli }`, the first
+non-agent attention producer. `Reason::Alert` flows end-to-end (raise → ring →
+triage badge, U12/R18); `Bel`/`Osc` remain forward design. Each pane is modeled
+by **two orthogonal pure state machines**: `state/lifecycle.rs` (process status)
 and `state/attention.rs` (Idle→Raised→Acknowledged). Both take time/inputs as
 arguments so they're tested without a running app.
 
@@ -126,14 +135,52 @@ arguments so they're tested without a running app.
   pane, backpressure pause/resume (watermarks), ordered reap-on-exit.
 - `stream/` — `spawn_pane`, raw-byte PTY output over a Tauri `Channel` (no
   transcoding), and the pane↔attention/focus wiring + Tauri commands.
-- `state/` — the two state machines + suppression matrix + per-pane `manager`.
-- `hooks/` — the authenticated socket: `token`, `protocol`, `server`.
-- `cli/` — `fly notify`, `fly hooks setup|teardown`.
+- `state/` — the two state machines + suppression policy (`policy.rs`) +
+  per-pane `manager`.
+- `hooks/` — the authenticated socket: `token`, `protocol` (the notify path +
+  the `automation/*` request envelope, U9), `server`.
+- `cli/` — `fly notify`, `fly hooks setup|teardown`, `fly automation …` (U9).
+- `automations/` — cron-scheduled agent/script runs (see the module map below).
 - `notify/`, `config/`, `session/`, `cwd/` (via `/proc`), `lifecycle.rs`
   (ordered shutdown — reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the
   frontend's typed wrappers for them live in `src/ipc.ts`. Add a command in both
   places.
+
+### Automations (`src-tauri/src/automations/`, cross-referenced U1–U10)
+Cron-scheduled runs that either spawn a `claude "<prompt>"` agent pane (Agent
+mode) or run a stored script with no model spend (Script mode). Data flow: a
+named `fly-automation-sweep` thread ticks every 10s; a due automation is
+**claimed + persisted before it runs** (R2), then dispatched off the store lock
+(KTD-B). Modules:
+- `model.rs` (U1) — pure domain vocabulary: `Automation`, its bounded run
+  history (`RunRow`, R8), and the run-row state machine (claim/skip/close). Serde
+  **camelCase** — this shape crosses the store file, the socket, and the
+  dashboard, so it is the single wire contract.
+- `schedule.rs` (U2) — cron/timezone math (croner), the 5-min min-gap clamp (R1).
+- `store.rs` (U3) — the write-through **mutex-authority** store (KTD-B): the
+  in-memory map is authoritative, flushed atomically per mutation; `StoreHealth`
+  tracks corruption (`.bad.bak` rename, R6) and flush failures for the dashboard.
+- `mod.rs` (U4) — `AutomationManager` (create/pause/resume/delete/manual-run),
+  the sweep, startup recovery, ordered shutdown; the `list_automations` command
+  (U10) and `AutomationsDashboard` DTO. `AUTOMATION_CHANGED_EVENT`
+  (`automation://changed`, payload = the automation id) fires after every
+  mutation so the dashboard refetches.
+- `script.rs` (U5) — the script runner (interpreter enum, timeout, output
+  classification → alert vs silent).
+- Agent dispatch (U7/U7.5/U8) links run↔pane atomically in `stream::spawn_pane`
+  (threading `automation_run_id`), spawns a background ephemeral tab
+  (`App.svelte` `handleAgentRun` + `lib/automation-panes.ts`), and closes the run
+  on the agent's Stop / pane-exit / 30-min deadline. The **R22 recursion gate**
+  blocks an automation-spawned pane from creating or running automations.
+- CLI (`cli/automation.rs`, U9): read ops (`list`/`show`/`runs`) read the store
+  file directly (work outside a pane); mutating ops (`create`/`pause`/`resume`/
+  `run`/`delete`) post over the hook socket (token-validated, origin-stamped,
+  R22-gated).
+- Dashboard panel (U10): `lib/automations.ts` is the pure view-model
+  (`automationsToRows` — sort next-run asc / paused last, mirroring the CLI —
+  plus `humanSchedule`/`relativeTime`); `HomeView.svelte` renders it read-only
+  below the agent list, with the R6 store-health warning row.
 
 ### Frontend (`src/`)
 - `App.svelte` — orchestrates workspaces, tabs, and the split tree; owns

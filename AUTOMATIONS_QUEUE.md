@@ -1,8 +1,8 @@
 # Automations Work Queue (U6-U10)
 
-**Status:** U1-U5 committed, U11-U12 committed, U7 complete (backend + Stop-event closure done), **U7.5 complete** (spawn_pane atomicity + agent lifecycle — see below)  
+**Status:** U1-U5 committed, U11-U12 committed, U7/U7.5 complete, **U8/U9/U10 complete** (see their sections)  
 **Last Updated:** 2026-07-02  
-**Remaining:** U6, U8, U9, U10 (U8 now unblocked — U7.5 landed)
+**Remaining:** U6 only (alert surfacing — alerts log + sink pane; independent, no blockers)
 
 ---
 
@@ -307,15 +307,48 @@ Test the full round-trip: create → list → run → show (output).
 
 ---
 
-## U10: Dashboard Panel and Docs
+## U10: Dashboard Panel and Docs — DONE (2026-07-02)
 
 **Goal:** Read-only visibility of automations.
 
 **Requirements:** R25 (panel), R6 (store health warning)
 
-**Status:** U4 (manager ready), all prior units ready
+**Status:** ✅ **Complete.** Landed:
+- `automations/mod.rs`: `list_automations` command + `AutomationsDashboard` DTO
+  (`{ automations, degraded, corruptBak, flushError }`, serde camelCase) — flattens
+  `StoreHealth` (which already derives `Serialize`) for the R6 warning. Registered in
+  `lib.rs`'s `invoke_handler!`.
+- `ipc.ts`: TS mirrors of the model (`Automation`/`RunRow`/`AutomationSpec`/`AutomationOrigin`
+  + `RunStatus`/`AutomationMode`/`RunTrigger`), the `AutomationsDashboard` DTO, `listAutomations()`,
+  and the `onAutomationChanged()` listener (payload = automation id).
+- `lib/automations.ts` (new, pure + tested): `automationsToRows(automations, nowMs)` — sort
+  next-run asc / paused last / ties by name (mirrors the CLI's `load_store_at`), last-status/-run/-error
+  derived from the last run row, `linkedPaneId` derived for a future jump affordance. Helpers
+  `humanSchedule(cron, tz)` (every N min / hourly / daily / weekly / monthly / raw fallback) and
+  `relativeTime(ms, nowMs)` (full-word, pluralized, past/future-branched — underflow-safe).
+- `lib/automations.test.ts` (new): 13 tests — sorting, paused-last, tie-by-name, last-run derivation,
+  never-run, running-fallback-to-startedAt, empty, `humanSchedule` shapes + raw fallback, `relativeTime`
+  just-now/past/future.
+- `HomeView.svelte`: read-only automations panel stacked **below the agent list in the left column**
+  (static text — no selection/jump), empty state (`No automations · Run \`fly automation create --help\``),
+  and the R6 degraded warning row (`⚠ Store corrupted · see <corruptBak or ~/.local/share/fly/automations.json>`).
+- `App.svelte`: fetches `listAutomations` on dashboard open (re-run on `homeViewOpen`), refetches on
+  `automation://changed` (only while open), tears the listener down on unmount; passes rows + degraded +
+  corruptBak to `HomeView`.
+- `CLAUDE.md`: automations module map (U1–U10), `fly automation …` in the two-roles section, `Reason::Alert` +
+  `Tier::Cli` (KTD-H) in the attention pipeline, and the stale `state/suppress.rs` → `state/policy.rs` fix.
+- `pnpm check` 0 errors; 244 frontend tests pass (13 new); Rust 222 lib + integration tests pass; clippy clean
+  (only the 2 pre-existing warnings — `cli/hooks.rs:202` `Error::other`, `mod.rs:538` `manual_run` let-else).
 
-### Implementation Checklist
+**Deferred (as the checklist allowed):** the **jump affordance** (item 6). The pane_id→leaf/tab jump
+mapping lives in `App.svelte` (`leafByPaneId`), not `HomeView`, and wiring it through is more work than the
+rest of U10 combined. The view-model already derives `linkedPaneId` per row, so the panel can gain a jump
+later without touching `automations.ts`. **Live verification** (a fresh `pnpm tauri build`/`flavor:dev` build)
+was not run — the pure view-model is vitest-covered and `pnpm check` is green; a live build is nice-to-have.
+Also note the panel's relative times are static between refetches (fetch-on-open + refetch-on-changed,
+mirroring the usage panel) — they don't tick on a timer.
+
+### Implementation Checklist (landed — see status above)
 
 #### 1. Create `src/lib/automations.ts`
 
