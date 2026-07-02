@@ -402,9 +402,13 @@ pub fn run() {
             // for the pane-alive probe.
             let pty_mgr = app.state::<Arc<PtyManager>>().inner().clone();
             automations_mgr.set_agent_pane_alive(Arc::new(move |row: &automations::model::RunRow| {
+                // Only a *live* pane counts: `lifecycle(id)` is still `Some`
+                // for an exited-but-not-yet-closed pane, which would strand the
+                // automation (R7 alive-probe would read a dead pane as alive
+                // and skip forever). Gate on `is_live()`.
                 row.pane_id
                     .and_then(|id| pty_mgr.lifecycle(pty::PaneId(id)))
-                    .is_some()
+                    .is_some_and(|s| s.is_live())
             }));
             app.manage(script_runner);
             app.manage(Arc::clone(&automations_mgr));

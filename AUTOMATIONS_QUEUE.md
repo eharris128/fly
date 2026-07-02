@@ -1,8 +1,8 @@
 # Automations Work Queue (U6-U10)
 
-**Status:** U1-U5 committed, U11-U12 committed, U7 complete (backend + Stop-event closure done)  
-**Last Updated:** 2026-07-01  
-**Remaining:** U6, U8, U9, U10 (U7's spawn_pane atomicity blocked by U8)
+**Status:** U1-U5 committed, U11-U12 committed, U7 complete (backend + Stop-event closure done), **U7.5 complete** (spawn_pane atomicity + agent lifecycle — see below)  
+**Last Updated:** 2026-07-02  
+**Remaining:** U6, U8, U9, U10 (U8 now unblocked — U7.5 landed)
 
 ---
 
@@ -72,9 +72,19 @@
 
 ---
 
-## U7.5: spawn_pane Atomicity (BLOCKING U8)
+## U7.5: spawn_pane Atomicity (DONE — 2026-07-02)
 
-**Note:** U7 backend is complete, but this spawn_pane change is needed for U8 to work.
+**Note:** U7 backend is complete, and this spawn_pane change is now done, so U8 is unblocked.
+
+> **✅ RESOLVED (2026-07-02).** All six audit sub-items below landed together:
+> 1. **Link-at-spawn** — `spawn_pane` now calls `AutomationManager::set_run_pane(run_id, pane_id)` (sets `RunRow.pane_id`, flushes, emits `automation://changed`) + `register_automation_pane` before the child spawns; a **late spawn** (run already terminal/unknown) returns `Err` and aborts the spawn (with token/attention cleanup) — no fan-out.
+> 2. **R11 30-min deadline** — `sweep_once` phase-1 closes agent `Running` rows past `RUN_DEADLINE_MS` as `failed(ERR_TIMED_OUT)` **keeping `pane_id`**, so R7's alive-probe holds a stuck-but-alive agent in flight (verified: same-tick next occurrence records Skipped, one dispatch, no second pane).
+> 3. **Pane-exit close** — `stream::spawn_pane`'s `on_exit` tap calls `AutomationManager::on_pane_exit` → closes the linked run `failed(ERR_PANE_EXIT)` and unregisters the recursion entry.
+> 4. **Latent bugs fixed** — alive-probe now gates on `is_live()`; `push_row` evicts the oldest *terminal* row (never a `Running` one); persisted `pane_id`s are cleared on load (launch-stability) — ids are unique within a launch so no per-close clearing is needed.
+> 5. **Lock order** — `on_pane_exit`/`set_run_pane` take the store lock while holding **no** PTY lock (`on_exit` runs on the read thread free of the registry lock), preserving store→PTY (KTD-B). Documented at both call sites.
+> 6. **Tests** — added link-at-spawn, late-spawn-fails, linked-survives-ack, Stop-close (idempotent), pane-exit close, deadline+no-fanout, recursion registry, and launch-stability; plus a model test that a `Running` row survives history eviction. (89 automations tests pass.)
+
+<details><summary>Original audit findings (2026-07-01) — retained for reference</summary>
 
 > **⚠️ Audit findings (2026-07-01) — the agent-run lifecycle is a stub; do NOT land U8 until this whole section is done.**
 > The `automation_run_id` param on `spawn_pane` is currently `_`-prefixed and discarded, so `RunRow.pane_id` is **never set**. Consequences, all latent only because `automations_frontend_ready` is never called yet (agent runs defer forever):
@@ -88,7 +98,9 @@
 > 5. **Lock-order invariant to document + honor:** the sweep consults the pane-alive probe (which takes the PTY registry lock) while holding the store lock, so the order is **store → PTY**. The pane-exit tap must call `close_run*` **outside** `panes.lock()` or it's an AB-BA deadlock that wedges every sweep tick.
 > 6. **Add the agent-lifecycle tests that don't exist:** link-at-spawn, Stop-close (pane linked), deadline fire, pane-exit close, late-spawn-fails-the-spawn. The only agent-path test today asserts the ack fires when *no* pane links — i.e. it green-lights the broken behavior.
 
-### Implementation Checklist
+</details>
+
+### Implementation Checklist (landed — see the resolved note above)
 
 #### Update `spawn_pane` in `src-tauri/src/stream/mod.rs`
 

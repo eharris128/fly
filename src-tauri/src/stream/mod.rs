@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::hooks::{HookServer, TokenRegistry};
 use crate::pty::{PaneId, PtyManager, SpawnConfig};
@@ -113,12 +113,33 @@ pub fn spawn_pane(
     cwd: Option<String>,
     leaf_key: String,
     command: Option<Vec<String>>,
-    _automation_run_id: Option<String>,
+    automation_run_id: Option<String>,
 ) -> Result<PaneId, String> {
     let id = pty.reserve_id();
     // Register the token before the child starts so no callback can race it.
     let token = tokens.issue(id);
     attention.register(id);
+
+    // U7 (R10): link this pane to its automation run atomically BEFORE the
+    // child spawns, so the ack-timeout / alive-probe / Stop close all see the
+    // pane immediately (no window where a live pane reads pane_id = None). A
+    // late spawn — the run already force-failed (ack timeout) or was deleted —
+    // fails here, aborting the spawn rather than orphaning a live pane that the
+    // next occurrence would double up on. Clean up the token/attention
+    // registration on that abort so nothing leaks for an id that never spawned.
+    if let Some(run_id) = automation_run_id.as_deref() {
+        let Some(mgr) = app.try_state::<Arc<crate::automations::AutomationManager>>() else {
+            tokens.revoke(id);
+            attention.remove(id);
+            return Err("automations manager unavailable".into());
+        };
+        if let Err(e) = mgr.set_run_pane(run_id, id.0) {
+            tokens.revoke(id);
+            attention.remove(id);
+            return Err(e);
+        }
+        mgr.register_automation_pane(id.0);
+    }
 
     let socket_path = server.socket_path().to_string_lossy().into_owned();
 
@@ -138,6 +159,14 @@ pub fn spawn_pane(
             }
             attention.remove(id);
             tokens.revoke(id);
+            // U7 pane-exit tap: if this pane was an automation agent run, close
+            // its still-running row failed (a pane that died before Stop) and
+            // clear the recursion-registry entry. This runs on the PTY read
+            // thread holding no PTY registry lock, so the store lock it takes
+            // respects the store→PTY order (KTD-B). A no-op for ordinary panes.
+            if let Some(mgr) = app.try_state::<Arc<crate::automations::AutomationManager>>() {
+                mgr.on_pane_exit(id.0);
+            }
             let _ = app.emit(
                 PANE_EXIT_EVENT,
                 PaneExitEvent {

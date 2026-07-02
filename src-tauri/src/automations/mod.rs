@@ -35,6 +35,7 @@ pub mod schedule;
 pub mod script;
 pub mod store;
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -44,7 +45,7 @@ use tauri::Emitter;
 
 use model::{
     Automation, Mode, Origin, RunMode, RunOutcome, RunRow, RunStatus, Trigger, ERR_DELETED,
-    ERR_INTERRUPTED,
+    ERR_INTERRUPTED, ERR_TIMED_OUT,
 };
 use store::{Store, StoreHealth};
 
@@ -62,6 +63,20 @@ pub const AGENT_ACK_TIMEOUT_MS: u64 = 30_000;
 
 /// Error string for agent runs closed by the R10 ack timeout.
 pub const ERR_SPAWN_ACK: &str = "spawn ack timeout";
+
+/// R11 run deadline: an **agent** run still `Running` this long after it
+/// started is closed failed([`ERR_TIMED_OUT`]) by the sweep. Unlike the ack
+/// timeout (which fires only on a *never-linked* run), the deadline close
+/// **keeps** the linked `pane_id`, so R7's alive-probe treats a genuinely
+/// stuck-but-alive agent as still in flight (no fan-out); a dead pane's row
+/// simply stays terminal.
+pub const RUN_DEADLINE_MS: u64 = 30 * 60 * 1000;
+
+/// Error string for the run linked to a pane that exited before any Stop
+/// closed it (U7 pane-exit tap). A run already closed (Stop→succeeded or the
+/// deadline→timed-out) is left untouched — this only catches a pane that died
+/// mid-run.
+pub const ERR_PANE_EXIT: &str = "pane exited";
 
 /// Skip reason recorded for the R7 overlap skip.
 pub const SKIP_IN_FLIGHT: &str = "run in flight";
@@ -253,6 +268,12 @@ pub struct AutomationManager {
     /// R5 gate: while false, due **agent** automations are deferred —
     /// neither claimed nor skipped (see [`AutomationManager::sweep_once`]).
     frontend_ready: AtomicBool,
+    /// R22 recursion registry: pane ids of automation-spawned agent panes.
+    /// Populated at spawn ([`AutomationManager::register_automation_pane`]),
+    /// cleared on pane exit ([`AutomationManager::on_pane_exit`]). U9's CLI
+    /// recursion gate rejects create/run from a pane in this set. In-memory
+    /// only (pane ids are per-launch); not persisted.
+    automation_panes: Mutex<HashSet<u64>>,
     /// Sweep stop flag + wake, so shutdown interrupts the 10s wait instantly.
     sweep_stop: Mutex<bool>,
     sweep_wake: Condvar,
@@ -278,6 +299,7 @@ impl AutomationManager {
             agent_pane_alive: Mutex::new(Arc::new(|_row: &RunRow| false)),
             script_capacity: Mutex::new(Arc::new(|| true)),
             frontend_ready: AtomicBool::new(false),
+            automation_panes: Mutex::new(HashSet::new()),
             sweep_stop: Mutex::new(false),
             sweep_wake: Condvar::new(),
         };
@@ -289,10 +311,22 @@ impl AutomationManager {
     /// failed([`ERR_INTERRUPTED`]) under one lock hold / one flush. No
     /// `automation://changed` is emitted — this runs before any listener
     /// exists, and the dashboard fetches on open anyway.
+    ///
+    /// Also **clears every persisted `pane_id`** (U7 launch-stability): pane
+    /// ids reset each launch (they start at 1 and are never reused within a
+    /// run), so a `pane_id` loaded from disk can never refer to a live pane
+    /// now. Left in place, a stale terminal row's id could resolve to an
+    /// unrelated new pane and wedge R7's alive-probe (the automation would
+    /// look permanently in-flight and never fire). One clear on load is the
+    /// whole fix — within a launch, ids are unique, so no live row ever needs
+    /// its id cleared.
     fn recover_interrupted(&self) {
         let now = (self.clock)();
         let _ = self.store.mutate(|map| {
             for a in map.values_mut() {
+                for r in a.runs.iter_mut() {
+                    r.pane_id = None;
+                }
                 for run_id in running_run_ids(a) {
                     a.close(&run_id, failed(ERR_INTERRUPTED), now);
                 }
@@ -609,11 +643,39 @@ impl AutomationManager {
         }
     }
 
-    /// U7 Stop-event closure (KTD-F): find any automation run linked to a pane
-    /// and close it as succeeded. Called by the hook dispatch on the first Stop.
-    /// Idempotent: no-op if the pane is not linked to any automation run.
+    /// U7 Stop-event closure (KTD-F): find the automation run linked to a pane
+    /// and close it as **succeeded**. Called by the hook dispatch on the first
+    /// Stop. Idempotent: a no-op if the pane is not linked to any *running*
+    /// automation run (a second Stop, or a run already closed by the deadline
+    /// / pane exit). The agent interaction lives in the pane's scrollback, so
+    /// the row carries no output/exit code.
     pub fn close_run_by_pane(&self, pane_id: u64) -> Result<(), String> {
-        let (automation_id, run_id) = {
+        self.close_run_by_pane_with(pane_id, RunOutcome::Succeeded { output: None })
+    }
+
+    /// U7 pane-exit closure: close the run linked to a pane as
+    /// **failed([`ERR_PANE_EXIT`])** — the pane died before any Stop closed
+    /// it. Idempotent like [`AutomationManager::close_run_by_pane`]: a run
+    /// already closed (Stop→succeeded, or the deadline→timed-out, which keeps
+    /// its `pane_id`) is left untouched. Called from the `stream::spawn_pane`
+    /// on-exit tap (outside any PTY lock — the store→PTY lock order, KTD-B).
+    pub fn close_run_by_pane_failed(&self, pane_id: u64) -> Result<(), String> {
+        self.close_run_by_pane_with(
+            pane_id,
+            RunOutcome::Failed {
+                error: ERR_PANE_EXIT.into(),
+                exit_code: None,
+                output: None,
+            },
+        )
+    }
+
+    /// Shared body of the pane-keyed closes: find the *running* run linked to
+    /// `pane_id` and close it with `outcome`. Idempotent — returns `Ok(())`
+    /// whether it closed a row, found no running run, or hit an already-closed
+    /// one (all benign for the Stop / pane-exit callers).
+    fn close_run_by_pane_with(&self, pane_id: u64, outcome: RunOutcome) -> Result<(), String> {
+        let found = {
             let map = self.store.snapshot();
             let mut found: Option<(String, String)> = None;
             for (auto_id, a) in map.iter() {
@@ -627,19 +689,99 @@ impl AutomationManager {
                     break;
                 }
             }
-            found.ok_or_else(|| String::from("no running automation for pane"))?
+            found
         };
-        // Close as succeeded with no output/exit code (the agent interaction
-        // is in the pane's scrollback, not here).
-        let outcome = RunOutcome::Succeeded { output: None };
-        let result = self.close_run(&automation_id, &run_id, outcome);
-        match result {
-            model::CloseResult::Closed => Ok(()),
-            model::CloseResult::NotFound | model::CloseResult::AlreadyClosed => {
-                // Idempotent: a second Stop is a no-op.
+        let Some((automation_id, run_id)) = found else {
+            // No running run for this pane: idempotent no-op (second Stop, or a
+            // run the deadline/other path already closed).
+            return Ok(());
+        };
+        self.close_run(&automation_id, &run_id, outcome);
+        Ok(())
+    }
+
+    /// U7 pane-exit tap: the pane linked to an agent run has exited. Close its
+    /// still-running row failed (a pane that died before Stop), and clear the
+    /// R22 recursion-registry entry (load-bearing: it deliberately outlives a
+    /// delete so create→delete can't un-gate a still-live pane — only the
+    /// pane's actual exit clears it). Both touch locks other than the PTY
+    /// registry's, and this runs from the read thread holding no PTY lock, so
+    /// the store→PTY lock order (KTD-B) is preserved.
+    pub fn on_pane_exit(&self, pane_id: u64) {
+        self.unregister_automation_pane(pane_id);
+        let _ = self.close_run_by_pane_failed(pane_id);
+    }
+
+    /// U7 link-at-spawn (R10): atomically set the linked `pane_id` on a
+    /// `Running` run row and flush, so the ack-timeout, the R7 alive-probe,
+    /// and the Stop/pane-exit closes can all find the pane immediately (no
+    /// window where a live pane has `pane_id = None`). Emits
+    /// `automation://changed` after the lock (KTD-B) so the dashboard picks up
+    /// the jump target (U10).
+    ///
+    /// **Fails a late spawn** (R10 fan-out guard): if the run id is unknown
+    /// (evicted / deleted) or already terminal (the ack timeout or a delete
+    /// beat the spawn), it returns `Err` and the caller aborts the spawn
+    /// rather than leaving a live pane orphaned from any run — which would let
+    /// the next occurrence start a second concurrent pane.
+    pub fn set_run_pane(&self, run_id: &str, pane_id: u64) -> Result<(), String> {
+        // Ok(auto_id) = linked; Err(()) = found but terminal (late); the outer
+        // Option is None when no row has that id.
+        let outcome: Option<Result<String, ()>> = flush_tolerant(
+            self.store.mutate(|map| {
+                for a in map.values_mut() {
+                    if let Some(row) = a.runs.iter_mut().find(|r| r.id == run_id) {
+                        if row.status != RunStatus::Running {
+                            return Some(Err(()));
+                        }
+                        row.pane_id = Some(pane_id);
+                        return Some(Ok(a.id.clone()));
+                    }
+                }
+                None
+            }),
+            // Flush failed but the mutation applied (KTD-B): re-derive from the
+            // authoritative map — a row now carrying this pane_id linked.
+            || {
+                for a in self.store.snapshot().into_values() {
+                    if let Some(row) = a.runs.iter().find(|r| r.id == run_id) {
+                        return Some(if row.pane_id == Some(pane_id) {
+                            Ok(a.id.clone())
+                        } else {
+                            Err(())
+                        });
+                    }
+                }
+                None
+            },
+        );
+        match outcome {
+            Some(Ok(automation_id)) => {
+                (self.emit_changed)(&automation_id); // after the lock (KTD-B)
                 Ok(())
             }
+            Some(Err(())) => Err(format!(
+                "automation run {run_id} is already closed; refusing to link pane {pane_id}"
+            )),
+            None => Err(format!("no automation run {run_id} to link pane {pane_id}")),
         }
+    }
+
+    /// R22: mark a pane as automation-spawned (recursion registry). Called by
+    /// `stream::spawn_pane` right after [`AutomationManager::set_run_pane`].
+    pub fn register_automation_pane(&self, pane_id: u64) {
+        self.automation_panes.lock().unwrap().insert(pane_id);
+    }
+
+    /// R22: clear a pane's automation-spawned mark (on pane exit).
+    pub fn unregister_automation_pane(&self, pane_id: u64) {
+        self.automation_panes.lock().unwrap().remove(&pane_id);
+    }
+
+    /// R22 recursion gate (consumed by U9's CLI): whether a pane was spawned
+    /// by an automation — such panes may not create or run automations.
+    pub fn is_automation_pane(&self, pane_id: u64) -> bool {
+        self.automation_panes.lock().unwrap().contains(&pane_id)
     }
 
     /// Snapshot of every automation (dashboard/CLI list reads).
@@ -697,10 +839,22 @@ impl AutomationManager {
             for a in map.values_mut() {
                 let mut touched = false;
 
-                // R10 ack-timeout scaffolding: agent rows never linked to a
-                // pane within the window close failed.
+                // R10 ack-timeout: agent rows never linked to a pane within
+                // the window close failed (a dropped agent-run event).
                 for run_id in ack_timed_out_agent_runs(a, now_ms) {
                     a.close(&run_id, failed(ERR_SPAWN_ACK), now_ms);
+                    touched = true;
+                }
+
+                // R11 run deadline: an agent run linked to a pane but still
+                // Running past the 30-min deadline closes failed(timed out).
+                // `close` leaves `pane_id` in place, so if the pane is still
+                // alive the R7 alive-probe keeps this occurrence in flight —
+                // a genuinely stuck agent skips the next occurrence instead of
+                // fanning out a second pane; once the pane exits, the probe
+                // reads dead and the schedule resumes.
+                for run_id in deadline_expired_agent_runs(a, now_ms) {
+                    a.close(&run_id, failed(ERR_TIMED_OUT), now_ms);
                     touched = true;
                 }
 
@@ -891,6 +1045,23 @@ fn ack_timed_out_agent_runs(a: &Automation, now_ms: u64) -> Vec<String> {
                 && r.pane_id.is_none()
                 && r.started_at
                     .is_some_and(|t| t.saturating_add(AGENT_ACK_TIMEOUT_MS) <= now_ms)
+        })
+        .map(|r| r.id.clone())
+        .collect()
+}
+
+/// Agent rows still `Running` past the R11 [`RUN_DEADLINE_MS`] deadline. These
+/// have a linked pane (an unlinked run hits the ack timeout first); the
+/// deadline close keeps that `pane_id` so the alive-probe can still see a
+/// stuck-but-alive agent (R7 widening).
+fn deadline_expired_agent_runs(a: &Automation, now_ms: u64) -> Vec<String> {
+    a.runs
+        .iter()
+        .filter(|r| {
+            r.status == RunStatus::Running
+                && r.mode == RunMode::Agent
+                && r.started_at
+                    .is_some_and(|t| t.saturating_add(RUN_DEADLINE_MS) <= now_ms)
         })
         .map(|r| r.id.clone())
         .collect()
@@ -1660,6 +1831,203 @@ mod tests {
         assert_eq!(h.runs(&id).len(), 1, "the real thread swept");
         handle.stop_and_join();
         handle.stop_and_join(); // idempotent
+    }
+
+    // ---- U7 agent lifecycle: link-at-spawn, Stop/pane-exit/deadline close --
+
+    /// Claim one agent run and return its (automation id, run id), ready to
+    /// link a pane to. Sets frontend-ready so the agent claim proceeds (R5).
+    fn claim_agent_run(h: &Harness, name: &str) -> (String, String) {
+        h.mgr.set_frontend_ready();
+        let id = create_due(h, agent_spec(name));
+        h.sweep();
+        let run_id = h.runs(&id)[0].id.clone();
+        assert_eq!(h.runs(&id)[0].status, RunStatus::Running);
+        assert_eq!(h.runs(&id)[0].pane_id, None, "not linked until spawn acks");
+        (id, run_id)
+    }
+
+    // R10 link-at-spawn: set_run_pane stamps pane_id on the Running row,
+    // flushes (a raw reload agrees), and emits automation://changed so the
+    // dashboard picks up the jump target (U10).
+    #[test]
+    fn set_run_pane_links_pane_flushes_and_emits_r10() {
+        let h = harness();
+        let (id, run_id) = claim_agent_run(&h, "linker");
+        h.events.lock().unwrap().clear();
+
+        h.mgr.set_run_pane(&run_id, 42).expect("links a running run");
+
+        assert_eq!(h.runs(&id)[0].pane_id, Some(42));
+        assert_eq!(*h.events.lock().unwrap(), vec![id.clone()], "emitted once");
+        assert_eq!(
+            store_in(&h.dir).get(&id).unwrap().runs[0].pane_id,
+            Some(42),
+            "flushed to disk"
+        );
+    }
+
+    // R10 fan-out guard: a late spawn fails set_run_pane so the caller aborts
+    // (never leaves a live pane orphaned from a run). Late = the run already
+    // closed (ack timeout / delete beat the spawn) or the id is unknown.
+    #[test]
+    fn set_run_pane_rejects_a_late_or_unknown_spawn_r10() {
+        let h = harness();
+        let (id, run_id) = claim_agent_run(&h, "late");
+        // The ack timeout closes it before the spawn acks.
+        h.mgr
+            .close_run(&id, &run_id, failed(ERR_SPAWN_ACK));
+
+        let err = h.mgr.set_run_pane(&run_id, 7).unwrap_err();
+        assert!(err.contains("already closed"), "{err}");
+        assert_eq!(h.runs(&id)[0].pane_id, None, "no link onto a terminal row");
+
+        let err = h.mgr.set_run_pane("ghost", 7).unwrap_err();
+        assert!(err.contains("no automation run"), "{err}");
+    }
+
+    // A linked agent run is NOT ack-timed-out — only a never-linked one is
+    // (the ack window guards a dropped agent-run event, not a live pane). Past
+    // the ack window a linked run stays Running until the deadline governs it.
+    #[test]
+    fn linked_agent_run_survives_the_ack_window_r10() {
+        let h = harness();
+        let (id, run_id) = claim_agent_run(&h, "linked");
+        h.mgr.set_run_pane(&run_id, 9).unwrap();
+
+        h.set_now(T0 + FIVE_MIN + AGENT_ACK_TIMEOUT_MS + 1);
+        h.sweep();
+        assert_eq!(
+            h.runs(&id)[0].status,
+            RunStatus::Running,
+            "linked run is not ack-timed-out"
+        );
+    }
+
+    // KTD-F Stop close on a linked pane: the first Stop closes the run
+    // succeeded; a second Stop (or any later pane-keyed close) is a no-op.
+    #[test]
+    fn close_run_by_pane_closes_succeeded_then_is_idempotent_ktd_f() {
+        let h = harness();
+        let (id, run_id) = claim_agent_run(&h, "stopper");
+        h.mgr.set_run_pane(&run_id, 11).unwrap();
+
+        h.mgr.close_run_by_pane(11).expect("first Stop closes");
+        assert_eq!(h.runs(&id)[0].status, RunStatus::Succeeded);
+
+        // Second Stop: no running run for the pane → idempotent no-op.
+        h.mgr.close_run_by_pane(11).expect("second Stop is a no-op");
+        assert_eq!(h.runs(&id)[0].status, RunStatus::Succeeded, "still succeeded");
+        // A pane exit after a clean Stop leaves the succeeded row untouched.
+        h.mgr.on_pane_exit(11);
+        assert_eq!(h.runs(&id)[0].status, RunStatus::Succeeded);
+    }
+
+    // R11 pane-exit close: a pane that dies before any Stop closes its run
+    // failed(pane exited), and the recursion-registry entry clears on exit.
+    #[test]
+    fn on_pane_exit_closes_running_run_failed_and_clears_registry_r11() {
+        let h = harness();
+        let (id, run_id) = claim_agent_run(&h, "crasher");
+        h.mgr.set_run_pane(&run_id, 13).unwrap();
+        h.mgr.register_automation_pane(13);
+        assert!(h.mgr.is_automation_pane(13));
+
+        h.mgr.on_pane_exit(13);
+
+        assert_eq!(h.runs(&id)[0].status, RunStatus::Failed);
+        assert_eq!(h.runs(&id)[0].error.as_deref(), Some(ERR_PANE_EXIT));
+        assert!(!h.mgr.is_automation_pane(13), "registry entry cleared on exit");
+    }
+
+    // R11 deadline: an agent run still Running past the 30-min deadline closes
+    // failed(timed out) with pane_id RETAINED. While the pane stays alive the
+    // R7 alive-probe keeps the occurrence in flight (the next one skips — no
+    // fan-out); once the pane dies the schedule resumes claiming.
+    #[test]
+    fn agent_run_past_deadline_times_out_keeps_pane_and_blocks_fanout_r11() {
+        let h = harness();
+        let (id, run_id) = claim_agent_run(&h, "stuck");
+        h.mgr.set_run_pane(&run_id, 42).unwrap();
+        // The pane is (and stays) alive for now.
+        h.mgr
+            .set_agent_pane_alive(Arc::new(|row: &RunRow| row.pane_id == Some(42)));
+
+        // 30 min later the deadline fires; the same tick finds the next
+        // occurrence due but the stuck-alive pane keeps it in flight → Skipped,
+        // never a second dispatch.
+        h.set_now(T0 + FIVE_MIN + RUN_DEADLINE_MS);
+        h.sweep();
+
+        let runs = h.runs(&id);
+        assert_eq!(runs[0].status, RunStatus::Failed);
+        assert_eq!(runs[0].error.as_deref(), Some(ERR_TIMED_OUT));
+        assert_eq!(runs[0].pane_id, Some(42), "pane_id retained past the deadline");
+        assert_eq!(runs[1].status, RunStatus::Skipped, "no fan-out while alive");
+        assert_eq!(runs[1].error.as_deref(), Some(SKIP_IN_FLIGHT));
+        assert_eq!(h.dispatcher.count(), 1, "exactly one dispatch — no second pane");
+
+        // The pane finally dies: the alive-probe reads dead, so the next
+        // occurrence claims again.
+        h.mgr.set_agent_pane_alive(Arc::new(|_row: &RunRow| false));
+        let next = h.next_run_at(&id).expect("re-armed after the skip");
+        h.set_now(next);
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 2, "schedule resumes once the pane is gone");
+    }
+
+    // R22 recursion registry: register / query / unregister round-trips.
+    #[test]
+    fn recursion_registry_tracks_automation_panes_r22() {
+        let h = harness();
+        assert!(!h.mgr.is_automation_pane(5));
+        h.mgr.register_automation_pane(5);
+        assert!(h.mgr.is_automation_pane(5));
+        h.mgr.unregister_automation_pane(5);
+        assert!(!h.mgr.is_automation_pane(5));
+    }
+
+    // U7 launch-stability: a persisted pane_id can never refer to a live pane
+    // after a restart (ids reset each launch), so startup recovery clears
+    // every row's pane_id — otherwise a stale terminal row could resolve to an
+    // unrelated new pane and wedge R7's alive-probe.
+    #[test]
+    fn startup_recovery_clears_persisted_pane_ids_for_launch_stability() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = store_in(&dir);
+            store
+                .mutate(|map| {
+                    let mut a = raw_automation("a1");
+                    a.mode = Mode::Agent {
+                        prompt: "x".into(),
+                    };
+                    // A terminal row carrying a pane_id from a prior launch.
+                    a.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, Trigger::Schedule, "r1")
+                        .unwrap();
+                    a.runs[0].pane_id = Some(3);
+                    a.close(
+                        "r1",
+                        RunOutcome::Failed {
+                            error: ERR_TIMED_OUT.into(),
+                            exit_code: None,
+                            output: None,
+                        },
+                        T0 + 2 * FIVE_MIN,
+                    );
+                    map.insert(a.id.clone(), a);
+                })
+                .unwrap();
+        }
+        let h = harness_in(dir); // construction runs recovery
+
+        assert_eq!(
+            h.runs("a1")[0].pane_id,
+            None,
+            "persisted pane_id cleared on load"
+        );
+        // And the clear was flushed.
+        assert_eq!(store_in(&h.dir).get("a1").unwrap().runs[0].pane_id, None);
     }
 
     /// A hand-built record for tests that seed the store directly (the

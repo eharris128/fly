@@ -361,12 +361,24 @@ impl Automation {
         self.runs.last()
     }
 
-    /// Append a row, evicting oldest-first beyond [`RUN_HISTORY_CAP`] (R8).
+    /// Append a row, evicting beyond [`RUN_HISTORY_CAP`] (R8) — the oldest
+    /// **terminal** row first, never a `Running` one. A long-lived agent run
+    /// (up to the 30-min deadline, U7) can outlive 20 later occurrences'
+    /// rows; evicting it blind (oldest-first) would drop the only `Running`
+    /// row, silently breaking [`Automation::in_flight`] and the pane-linked
+    /// close path (U7's `close_run_by_pane`). So preserve every `Running` row
+    /// and evict the oldest terminal one instead. If every row is `Running`
+    /// (impossible under the R7 overlap gate — at most one runs at a time —
+    /// but handled defensively), the history simply exceeds the cap rather
+    /// than dropping a live run.
     fn push_row(&mut self, row: RunRow) {
         self.runs.push(row);
-        if self.runs.len() > RUN_HISTORY_CAP {
-            let excess = self.runs.len().saturating_sub(RUN_HISTORY_CAP);
-            self.runs.drain(..excess);
+        while self.runs.len() > RUN_HISTORY_CAP {
+            let Some(oldest_terminal) = self.runs.iter().position(|r| r.status.is_terminal())
+            else {
+                break; // nothing terminal to evict — never drop a Running row
+            };
+            self.runs.remove(oldest_terminal);
         }
     }
 }
@@ -610,6 +622,31 @@ mod tests {
         assert_eq!(a.runs.len(), RUN_HISTORY_CAP);
         assert_eq!(a.runs[0].id, "r5", "r0..r4 evicted oldest-first");
         assert_eq!(a.runs.last().unwrap().id, "r24");
+    }
+
+    // R8/U7: a long-lived Running row (an agent run pending up to the 30-min
+    // deadline) is NEVER evicted by the history cap — only terminal rows are,
+    // oldest-first. Evicting the Running row would silently break in_flight()
+    // and the pane-linked close path.
+    #[test]
+    fn history_eviction_preserves_a_running_row_and_drops_oldest_terminal() {
+        let mut a = automation(Mode::Agent {
+            prompt: "long agent".into(),
+        });
+        // A claim mid-history: an agent run that stays Running while later
+        // occurrences skip past it.
+        a.claim(Some(60_000), 10, Trigger::Schedule, "live").unwrap();
+        for i in 0..RUN_HISTORY_CAP as u64 + 5 {
+            a.skip(100 + i, Trigger::Schedule, "overlap", &format!("r{i}"));
+        }
+
+        assert_eq!(a.runs.len(), RUN_HISTORY_CAP);
+        assert!(
+            a.runs.iter().any(|r| r.id == "live" && r.status == RunStatus::Running),
+            "the Running row survives even though older than evicted terminal rows"
+        );
+        assert!(a.in_flight(), "in_flight stays true — the live run wasn't dropped");
+        assert_eq!(a.runs[0].id, "live", "it is now the oldest surviving row");
     }
 
     // R8: stored output keeps the last 8 KiB — the TAIL, because a script's
