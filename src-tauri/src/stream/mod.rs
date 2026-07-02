@@ -95,6 +95,10 @@ pub fn emit_notification_added(
 
 /// Spawn a pane: reserve its id, issue + inject its auth token, register it for
 /// attention, stream raw output over `channel`, and clean everything up on exit.
+///
+/// U7: `automation_run_id` threads the run id for atomically linking run↔pane
+/// (R10) — if supplied, the backend links the pane to the run before the child
+/// spawns, marking the pane in the recursion registry (R22).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // a Tauri command surface — each arg is a wire field
 pub fn spawn_pane(
@@ -109,6 +113,7 @@ pub fn spawn_pane(
     cwd: Option<String>,
     leaf_key: String,
     command: Option<Vec<String>>,
+    _automation_run_id: Option<String>,
 ) -> Result<PaneId, String> {
     let id = pty.reserve_id();
     // Register the token before the child starts so no callback can race it.

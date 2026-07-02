@@ -18,6 +18,8 @@ use crate::state::attention::Reason;
 /// from the Claude payload and feed the resume store. Both are optional — a
 /// manual `fly notify` (no `--claude`) sends neither, and an older installed
 /// binary that predates these fields still deserializes server-side.
+/// `hook_event` is also optional (U7, KTD-F) and threads the event name for
+/// agent-run closure; older servers ignore it via `#[serde(default)]`.
 #[allow(clippy::too_many_arguments)]
 pub fn send(
     socket_path: &Path,
@@ -27,6 +29,7 @@ pub fn send(
     body: Option<&str>,
     session_id: Option<&str>,
     cwd: Option<&str>,
+    hook_event: Option<&str>,
 ) -> std::io::Result<()> {
     let payload = serde_json::json!({
         "token": token,
@@ -35,6 +38,7 @@ pub fn send(
         "body": body,
         "session_id": session_id,
         "cwd": cwd,
+        "hook_event": hook_event,
     });
     let bytes = serde_json::to_vec(&payload)?;
     let mut stream = UnixStream::connect(socket_path)?;
@@ -70,7 +74,8 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
 
-    // Refine reason/body and capture session_id/cwd from the Claude hook payload.
+    // Refine reason/body and capture session_id/cwd/hook_event from the Claude hook payload.
+    let mut hook_event: Option<String> = None;
     if from_claude {
         if let Some(payload) = read_stdin_payload() {
             let parsed = parse_claude_payload(&payload);
@@ -82,6 +87,7 @@ pub fn run(args: &[String]) -> i32 {
             }
             session_id = parsed.session_id;
             cwd = parsed.cwd;
+            hook_event = parsed.hook_event;
         }
     }
 
@@ -110,6 +116,7 @@ pub fn run(args: &[String]) -> i32 {
         body.as_deref(),
         session_id.as_deref(),
         cwd.as_deref(),
+        hook_event.as_deref(),
     ) {
         Ok(()) => 0,
         Err(e) => {
@@ -149,6 +156,7 @@ fn read_stdin_payload() -> Option<String> {
 /// The fields fly extracts from a Claude Code Notification/Stop payload: the
 /// refined attention reason + message (as before), plus the `session_id` and
 /// `cwd` that ride the same payload and drive resume capture (U1, R2/R4/R6).
+/// U7 adds `hook_event` (the raw event name) for agent-run closure (KTD-F).
 /// fly used to parse the payload for the reason and discard the rest.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ClaudePayload {
@@ -156,6 +164,7 @@ pub struct ClaudePayload {
     pub message: Option<String>,
     pub session_id: Option<String>,
     pub cwd: Option<String>,
+    pub hook_event: Option<String>,
 }
 
 /// Map a Claude Code Notification/Stop payload to the fields fly cares about.
@@ -175,7 +184,8 @@ pub fn parse_claude_payload(json: &str) -> ClaudePayload {
 
     // `Stop` events resolve to "finished"; Notification types refine question
     // vs permission when present.
-    let reason = match v.get("hook_event_name").and_then(|e| e.as_str()) {
+    let hook_event_name = str_field("hook_event_name");
+    let reason = match hook_event_name.as_deref() {
         Some("Stop") | Some("SubagentStop") => Some(Reason::Finished),
         _ => match v.get("notification_type").and_then(|t| t.as_str()) {
             Some(t) if t.contains("permission") => Some(Reason::Permission),
@@ -188,6 +198,7 @@ pub fn parse_claude_payload(json: &str) -> ClaudePayload {
         message: str_field("message"),
         session_id: str_field("session_id"),
         cwd: str_field("cwd"),
+        hook_event: hook_event_name,
     }
 }
 
@@ -205,6 +216,7 @@ mod tests {
         assert_eq!(p.message.as_deref(), Some("all done"));
         assert_eq!(p.session_id.as_deref(), Some("sess-abc"));
         assert_eq!(p.cwd.as_deref(), Some("/home/u/proj"));
+        assert_eq!(p.hook_event.as_deref(), Some("Stop"));
     }
 
     #[test]

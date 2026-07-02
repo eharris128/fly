@@ -40,6 +40,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use tauri::Emitter;
+
 use model::{
     Automation, Mode, Origin, RunMode, RunOutcome, RunRow, RunStatus, Trigger, ERR_DELETED,
     ERR_INTERRUPTED,
@@ -130,6 +132,57 @@ impl Dispatcher for UnwiredDispatcher {
     }
     fn dispatch_script(&self, _a: &Automation, _run_id: &str) -> Result<(), String> {
         Err("dispatch not wired yet (U5/U7)".into())
+    }
+}
+
+/// U7 agent dispatcher: emits the `automation://agent-run` event to the
+/// frontend (R9, KTD-E). The frontend creates a background tab with the
+/// prompt-threaded command, calls `spawn_pane` with the run id, and the
+/// backend links run↔pane atomically on spawn (R10).
+pub struct AgentDispatcher {
+    app: tauri::AppHandle,
+}
+
+impl AgentDispatcher {
+    pub fn new(app: tauri::AppHandle) -> Arc<Self> {
+        Arc::new(AgentDispatcher { app })
+    }
+}
+
+/// U7 event payload: agent run creation. Emitted after the run is persisted
+/// (claim flushed) so the frontend can safely call `spawn_pane` with the id.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRunEvent {
+    run_id: String,
+    name: String,
+    prompt: String,
+    cwd: String,
+    /// R9: workspace identity (not pane id) so origin resolves after restart.
+    origin_workspace_hint: String,
+}
+
+impl Dispatcher for AgentDispatcher {
+    fn dispatch_agent(&self, a: &Automation, run_id: &str) -> Result<(), String> {
+        let prompt = match &a.mode {
+            Mode::Agent { prompt } => prompt.clone(),
+            _ => return Err("BUG: dispatch_agent on non-agent automation".into()),
+        };
+        let event = AgentRunEvent {
+            run_id: run_id.to_string(),
+            name: a.name.clone(),
+            prompt,
+            cwd: a.cwd.clone(),
+            origin_workspace_hint: a.origin.workspace_id.clone(),
+        };
+        self.app
+            .emit("automation://agent-run", &event)
+            .map_err(|e| format!("could not emit automation://agent-run: {e}"))?;
+        Ok(())
+    }
+
+    fn dispatch_script(&self, _a: &Automation, _run_id: &str) -> Result<(), String> {
+        Err("AgentDispatcher: script runs dispatched elsewhere (U5)".into())
     }
 }
 
