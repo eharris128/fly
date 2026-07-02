@@ -6,6 +6,7 @@ import {
   injectionStep,
   injectionDone,
   injectionPayload,
+  isUserInputChunk,
   INJECT_QUIET_GAP_MS,
   INJECT_TIMEOUT_MS,
   type InjectionEvent,
@@ -125,6 +126,32 @@ describe("injectionPayload", () => {
     const p = injectionPayload(handoffPrompt(target.transcriptPath));
     expect(p).toBe(BP_START + handoffPrompt(target.transcriptPath) + BP_END);
     expect(p).not.toContain("\r");
+  });
+});
+
+describe("isUserInputChunk", () => {
+  it("counts ESC-free chunks as user input (typed text, Enter)", () => {
+    expect(isUserInputChunk("hello")).toBe(true);
+    expect(isUserInputChunk("\r")).toBe(true);
+  });
+
+  it("excludes xterm's ESC-bearing terminal-query auto-replies", () => {
+    // CPR (cursor position report) and DA (device attributes) replies flow
+    // through the same onData event but are not user intent.
+    expect(isUserInputChunk("\x1b[24;80R")).toBe(false);
+    expect(isUserInputChunk("\x1b[?1;2c")).toBe(false);
+  });
+
+  it("counts a bracketed paste as user input despite the ESC bytes (R9)", () => {
+    // Pastes arrive only via onData, wrapped in \x1b[200~…\x1b[201~ — the ESC
+    // exclusion alone would drop them (review finding #1).
+    expect(isUserInputChunk(`${BP_START}hello\nworld${BP_END}`)).toBe(true);
+  });
+
+  it("counts the paste-open marker mid-chunk", () => {
+    expect(isUserInputChunk(`\x1b[24;80R${BP_START}pasted${BP_END}`)).toBe(
+      true,
+    );
   });
 });
 

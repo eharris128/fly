@@ -120,6 +120,18 @@ describe("buildResumeCommand (U5)", () => {
     expect(out).toEqual(["claude", "--add-dir", "/home/u/.claude/projects/-p", "--resume", "x"]);
   });
 
+  it("keeps every value of a variadic --add-dir, still dropping a trailing prompt", () => {
+    // `--add-dir <directories...>` is variadic in the claude CLI: a user-launched
+    // pane with two added dirs must resume with BOTH, not `--add-dir /a` with
+    // `/b` dropped as a bare positional. The multi-word trailing prompt is still
+    // stripped (the VARIADIC_FLAGS whitespace stop rule), never re-fired.
+    const out = buildResumeCommand(
+      rec({ argv: ["claude", "--add-dir", "/a", "/b", "fix the bug"], sessionId: "x" }),
+      DEFAULT,
+    );
+    expect(out).toEqual(["claude", "--add-dir", "/a", "/b", "--resume", "x"]);
+  });
+
   it("preserves a node-wrapper argv[0..2] and appends --resume <id>", () => {
     const out = buildResumeCommand(
       rec({

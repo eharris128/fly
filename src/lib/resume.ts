@@ -25,7 +25,6 @@ const VALUE_FLAGS = new Set([
   "--model",
   "-m",
   "--fallback-model",
-  "--add-dir",
   "--permission-mode",
   "--permission-prompt-tool",
   "--mcp-config",
@@ -37,6 +36,19 @@ const VALUE_FLAGS = new Set([
   "--output-format",
   "--input-format",
 ]);
+
+/**
+ * Claude flags declared `<value...>` in the CLI — they consume every following
+ * non-dash token as a value, not just one (`--add-dir <directories...>`
+ * verified against `claude --help`). Checked before VALUE_FLAGS so a multi-dir
+ * `--add-dir /a /b` resumes with every dir instead of keeping only the first
+ * and dropping the rest as bare positionals. Consumption stops at a token
+ * containing whitespace: a directory argv token is effectively never
+ * multi-word, but a trailing positional prompt almost always is, and re-firing
+ * a prompt is the failure this module exists to prevent — the same
+ * recoverable-drop tradeoff VALUE_FLAGS accepts.
+ */
+const VARIADIC_FLAGS = new Set(["--add-dir"]);
 
 /** The basename of a `/`-separated path. */
 function basename(s: string): string {
@@ -65,9 +77,11 @@ function binaryPrefix(argv: string[]): string[] {
  * sit, not just trailing: a handoff pane's argv is `claude <prompt> --add-dir
  * <dir>` — prompt BEFORE the flag, because variadic `--add-dir` would swallow a
  * trailing one (session-handoff U2/U4, KTD3) — and a resumed handoff must not
- * re-fire the pickup prompt. The cost is that an unknown value-flag's value
- * (absent from VALUE_FLAGS) is dropped too — the recoverable outcome VALUE_FLAGS
- * already accepts.
+ * re-fire the pickup prompt. A VARIADIC_FLAGS flag keeps ALL consecutive
+ * following non-dash values (`--add-dir /a /b` resumes with both dirs), not
+ * just the first; a VALUE_FLAGS flag keeps exactly one. The cost is that an
+ * unknown value-flag's value (absent from both sets) is dropped too — the
+ * recoverable outcome VALUE_FLAGS already accepts.
  */
 function sanitizeFlags(rest: string[]): string[] {
   const kept: string[] = [];
@@ -91,6 +105,20 @@ function sanitizeFlags(rest: string[]): string[] {
     }
     if (tok.startsWith("-")) {
       kept.push(tok);
+      // A variadic flag keeps every consecutive following value token (see
+      // VARIADIC_FLAGS for the whitespace stop rule that spares a trailing
+      // prompt from being consumed as a value).
+      if (VARIADIC_FLAGS.has(tok)) {
+        while (
+          i + 1 < rest.length &&
+          !rest[i + 1].startsWith("-") &&
+          !/\s/.test(rest[i + 1])
+        ) {
+          kept.push(rest[i + 1]);
+          i++;
+        }
+        continue;
+      }
       // Keep a known value-flag's value so it isn't later read as the prompt.
       const next = rest[i + 1];
       if (VALUE_FLAGS.has(tok) && next !== undefined && !next.startsWith("-")) {

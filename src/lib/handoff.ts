@@ -199,3 +199,24 @@ export function injectionPayload(text: string): string {
     .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, "");
   return `\x1b[200~${inner}\x1b[201~`;
 }
+
+/**
+ * Classify an xterm `onData` chunk as user-originated input (U3/R9: the user's
+ * intent wins; never interleave). The rule is two-sided:
+ *
+ * - An ESC-free chunk is user input (typed text, Enter, Ctrl-C): xterm answers
+ *   terminal queries — cursor position (CPR), device attributes (DA) — through
+ *   the same `onData` event, and every such auto-reply starts with ESC, so
+ *   chunks containing ESC are excluded by default.
+ * - EXCEPT a user paste: xterm delivers pastes only via `onData` (never
+ *   `onKey`), wrapped in bracketed-paste markers `\x1b[200~…\x1b[201~` — so the
+ *   ESC exclusion alone would let a pre-injection paste be ignored and the
+ *   stock prompt still inject after it (review finding #1). Auto-replies never
+ *   contain the paste-open marker, so its presence marks the chunk user input.
+ *
+ * ESC-prefixed *keyboard* keys (arrows, Esc itself) are out of scope here —
+ * the wiring covers those via `onKey`.
+ */
+export function isUserInputChunk(data: string): boolean {
+  return !data.includes("\x1b") || data.includes("\x1b[200~");
+}

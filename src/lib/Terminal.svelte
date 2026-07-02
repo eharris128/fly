@@ -14,6 +14,7 @@
     injectionStep,
     injectionDone,
     injectionPayload,
+    isUserInputChunk,
     type InjectionEvent,
     type InjectionState,
   } from "./handoff";
@@ -295,13 +296,14 @@
       return;
     }
     term.onData((data) => {
-      // Guided-handoff U3: an ESC-free chunk is user-originated (typed text,
-      // Enter, Ctrl-C, a plain paste) → the user's intent wins; skip injection.
-      // Chunks containing ESC don't count: xterm answers terminal queries
-      // (cursor position, device attributes) through this same event, and
-      // those auto-replies are not user intent. The ESC-prefixed *keyboard*
-      // keys (arrows, Esc itself) are covered by onKey below.
-      if (injState !== null && !data.includes("\x1b"))
+      // Guided-handoff U3: a user-originated chunk → the user's intent wins;
+      // skip injection. `isUserInputChunk` (handoff.ts) holds the rule: ESC-free
+      // chunks count (typed text, Enter, Ctrl-C), ESC-bearing ones don't (xterm
+      // answers terminal queries through this same event) — EXCEPT a bracketed
+      // paste, which arrives here ESC-wrapped and is user intent. The
+      // ESC-prefixed *keyboard* keys (arrows, Esc itself) are covered by onKey
+      // below.
+      if (injState !== null && isUserInputChunk(data))
         injEvent({ kind: "userInput" });
       if (paneId !== null) void ptyWrite(paneId, data);
     });
