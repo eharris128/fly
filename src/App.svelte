@@ -76,6 +76,7 @@
     saveResumeSession,
     loadResumeRecords,
     continueTarget,
+    resolveHandoffTarget,
     pruneResumeRecords,
     getLaunchMode,
     frontendLog,
@@ -92,7 +93,13 @@
     type AttentionReason,
     type AgentRunEvent,
     type AlertPendingEvent,
+    type HandoffTarget,
   } from "./ipc";
+  import {
+    buildHandoffCommand,
+    type HandoffMode,
+    type GuidedHandoffByLeaf,
+  } from "./lib/handoff";
   import {
     addNotification,
     markAllRead,
@@ -188,6 +195,18 @@
   // The leaf key of the current alerts sink tab, or null when none is open
   // (U6 single-flight guard). Non-reactive: read only in event handlers.
   let alertSinkLeafKey: string | null = null;
+  // leaf key → command for a session-handoff pane (session-handoff U2,
+  // docs/plans/2026-07-02-001-feat-session-handoff-plan.md). Like
+  // sinkCommandByLeaf, a plain command map with NO run id — a handoff pane is
+  // an ordinary pane: never linked to an automation run, never in the recursion
+  // registry, no deadline (R11 by construction). Quick mode carries the stock
+  // pickup prompt as trailing argv (R7); guided omits it (U3 pre-types it).
+  // Read once at mount.
+  let handoffCommandByLeaf = $state<Record<string, string[]>>({});
+  // leaf key → resolved target for a GUIDED handoff pane (session-handoff U2,
+  // the seam for U3): the injection controller reads which leaf awaits the
+  // pre-typed prompt and what to type from here. Quick panes never appear.
+  let guidedHandoffByLeaf = $state<GuidedHandoffByLeaf>({});
   // leaf key → how it re-attached (fix-003 U3/U4): "precise" (--resume <id>) or
   // "imprecise" (--continue, most-recent-in-folder). Only resumed leaves appear;
   // drives the tier transparency so a degraded resume is never passed off as exact.
@@ -384,6 +403,60 @@
     // so it's present before the Terminal mounts (Terminal reads cwd once at mount).
     cwdByLeaf = { ...cwdByLeaf, [res.added.key]: cwd };
     setActiveTree(res.tree, res.added.key);
+  }
+  // Session handoff (U2, docs/plans/2026-07-02-001-feat-session-handoff-plan.md):
+  // hand the focused pane's previous session to a fresh agent in a split to the
+  // right (R3). Follows the split() idiom exactly: capture the source
+  // synchronously, await resolution (chord-time, from the durable resume record
+  // — R4 via U1), staleness-bail, then do ALL seeding + tree mutation in one
+  // synchronous block (Terminal reads cwd/command once at mount). The old pane
+  // is untouched — not closed, killed, or warned (R3).
+  async function handoff(mode: HandoffMode) {
+    if (!activeTab) return;
+    const rect = rects.get(activeTab.focusedLeafKey);
+    if (rect && !canSplit(rect, "horizontal")) return; // min-size clamp, as split()
+    const srcTabId = activeTab.id;
+    const srcKey = activeTab.focusedLeafKey;
+    const srcPid = paneIdByLeaf[srcKey];
+    const liveCwd =
+      (srcPid != null ? await paneCwd(srcPid) : null) ?? (cwdByLeaf[srcKey] ?? null);
+    let target: HandoffTarget | null = null;
+    try {
+      target = await resolveHandoffTarget(srcKey, liveCwd);
+    } catch (e) {
+      // A rejecting IPC degrades to "nothing qualifies" — notice, never a spawn.
+      void frontendLog(`handoff resolution failed: ${String(e)}`);
+    }
+    // R6: no qualifying session → spawn nothing, say why (all three disqualifiers
+    // come back as one null from the backend, so the notice names them together).
+    if (!target) {
+      showNotice(
+        "No session to hand off: this pane has no previous Claude session " +
+          "(no captured session, transcript missing, or no conversation turns).",
+      );
+      return;
+    }
+    // The active tab/focus may have changed during the awaits — bail unless the
+    // source is still the focused leaf of the active tab (split() staleness bail).
+    if (activeTab?.id !== srcTabId || activeTab.focusedLeafKey !== srcKey) return;
+    const res = splitLeaf(activeTab.tree, srcKey, "horizontal");
+    if (!res) return;
+    // Seed cwd + command in the same synchronous block that mutates the tree.
+    // R12: spawn in the session's recorded cwd, falling back to the live cwd —
+    // the transcript and the worktree the new agent sees stay coherent. R11:
+    // no automationRunId seed → the Terminal passes null at spawn, so the pane
+    // never links to a run, enters the recursion gate, or gets a deadline.
+    cwdByLeaf = { ...cwdByLeaf, [res.added.key]: target.sessionCwd ?? liveCwd };
+    handoffCommandByLeaf = {
+      ...handoffCommandByLeaf,
+      [res.added.key]: buildHandoffCommand(target, mode),
+    };
+    // Track guided panes for U3's injection controller (which pre-types the
+    // stock prompt unsent once the fresh instance's composer is ready).
+    if (mode === "guided") {
+      guidedHandoffByLeaf = { ...guidedHandoffByLeaf, [res.added.key]: target };
+    }
+    setActiveTree(res.tree, res.added.key); // focus moves to the new pane (R3)
   }
   function closePane() {
     if (!activeTab) return;
@@ -632,17 +705,20 @@
     staleDropped: number;
   } | null>(null);
   let resolveResumeOffer: ((accept: boolean) => void) | null = null;
-  // Transient post-resume notice for the explicit `fly resume` path, which shows
-  // no offer dialog (fix-003 U4, R5/AE3): names imprecise (`--continue`) and
-  // stale-dropped panes so neither tier is hidden. Auto-dismisses; click to clear.
-  // The offer path uses the in-dialog breakdown instead.
-  let resumeNotice = $state<string | null>(null);
-  let resumeNoticeTimer: ReturnType<typeof setTimeout> | null = null;
-  function showResumeNotice(text: string | null) {
-    if (text == null) return; // everything resumed exactly → nothing to disclose
-    resumeNotice = text;
-    if (resumeNoticeTimer) clearTimeout(resumeNoticeTimer);
-    resumeNoticeTimer = setTimeout(() => (resumeNotice = null), 8000);
+  // Reusable transient notice toast (one surface, latest message wins). Started
+  // life as the explicit-`fly resume` tier disclosure (fix-003 U4, R5/AE3 —
+  // names imprecise/stale-dropped panes so neither tier is hidden; the offer
+  // path uses the in-dialog breakdown instead) and was generalized for the
+  // session-handoff R6 "no qualifying session" notice (U2). Auto-dismisses;
+  // click to clear. A null text is a no-op (callers pass null for "nothing to
+  // disclose").
+  let notice = $state<string | null>(null);
+  let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+  function showNotice(text: string | null) {
+    if (text == null) return;
+    notice = text;
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => (notice = null), 8000);
   }
   function answerResumeOffer(accept: boolean) {
     resumeOffer = null;
@@ -1401,6 +1477,8 @@
     prevWorkspace: () => shiftWorkspace(-1),
     nextWorkspace: () => shiftWorkspace(1),
     renameTab: startRenameActiveTab,
+    handoffQuick: () => void handoff("quick"),
+    handoffGuided: () => void handoff("guided"),
   };
   // Palette commands: every leader action (from BINDINGS) plus live "jump to
   // workspace/tab" navigation, built from the same resolved view model the
@@ -1495,7 +1573,7 @@
 
     // Explicit `fly resume` shows no dialog, so surface the imprecise/stale tiers
     // as a transient notice (R5/AE3); the offer path discloses them in-dialog.
-    if (mode === "resume") showResumeNotice(resumeNoticeText(summary, staleDropped));
+    if (mode === "resume") showNotice(resumeNoticeText(summary, staleDropped));
 
     // KTD-H: resume each agent in its captured session cwd when we have one.
     for (const key of Object.keys(commands)) {
@@ -1736,6 +1814,7 @@
             command={resumeCommandByLeaf[p.key] ??
               automationCommandByLeaf[p.key] ??
               sinkCommandByLeaf[p.key] ??
+              handoffCommandByLeaf[p.key] ??
               null}
             automationRunId={automationRunIdByLeaf[p.key] ?? null}
             resumeTier={resumeTierByLeaf[p.key] ?? null}
@@ -1837,11 +1916,12 @@
     </div>
   {/if}
 
-  {#if resumeNotice !== null}
-    <!-- Explicit `fly resume` (no offer dialog) tier disclosure (fix-003 U4, R5).
-         Passive + auto-dismissing; click to clear early. -->
-    <button class="resume-notice" onclick={() => (resumeNotice = null)}>
-      {resumeNotice}
+  {#if notice !== null}
+    <!-- Shared transient notice: explicit-resume tier disclosure (fix-003 U4,
+         R5) and the handoff no-qualifying-session notice (session-handoff U2,
+         R6). Passive + auto-dismissing; click to clear early. -->
+    <button class="notice" onclick={() => (notice = null)}>
+      {notice}
     </button>
   {/if}
 
@@ -1974,9 +2054,10 @@
     opacity: 0.5;
     font-size: 11px;
   }
-  /* Transient explicit-resume tier notice (fix-003 U4): a quiet, dismissible toast
-     pinned bottom-centre, styled like the passive cheat-sheet rather than a modal. */
-  .resume-notice {
+  /* Shared transient notice (fix-003 U4; session-handoff U2/R6): a quiet,
+     dismissible toast pinned bottom-centre, styled like the passive cheat-sheet
+     rather than a modal. */
+  .notice {
     position: fixed;
     bottom: 16px;
     left: 50%;
@@ -1994,7 +2075,7 @@
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
     opacity: 0.92;
   }
-  .resume-notice:hover {
+  .notice:hover {
     opacity: 1;
     background: #1a2740;
   }

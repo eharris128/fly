@@ -25,6 +25,8 @@ export interface KeymapActions {
   prevWorkspace: () => void;
   nextWorkspace: () => void;
   renameTab: () => void;
+  handoffQuick: () => void;
+  handoffGuided: () => void;
 }
 
 /**
@@ -61,6 +63,14 @@ export const BINDINGS: Binding[] = [
   { keys: ["n"], label: "Notifications", action: "openNotifications" },
   { keys: ["m"], label: "Toggle mute", action: "toggleMute" },
   { keys: ["r"], label: "Rename tab", action: "renameTab" },
+  // Session handoff (U2, R1/R2, docs/plans/2026-07-02-001-feat-session-handoff-
+  // plan.md): f and F are distinct via `upper`, exactly like x / X. Lowercase f
+  // is the quick handoff (fresh agent in a split, stock pickup prompt sent
+  // immediately); uppercase F is the guided handoff (bare agent, U3 pre-types
+  // the prompt unsent so direction can be appended). Cheat-sheet + palette pick
+  // both up automatically from this array (R2).
+  { keys: ["f"], label: "Handoff (quick)", action: "handoffQuick" },
+  { keys: ["f"], upper: true, label: "Handoff (guided)", action: "handoffGuided" },
   { keys: ["w"], label: "New workspace", action: "newWorkspace" },
   // Uppercase W is distinct from lowercase w (new workspace) via `upper`,
   // exactly like x / X (pane vs tab): it deletes the active workspace.

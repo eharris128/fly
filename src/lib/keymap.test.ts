@@ -49,6 +49,8 @@ function spyActions(): KeymapActions & { calls: string[] } {
     prevWorkspace: mk("prevWorkspace"),
     nextWorkspace: mk("nextWorkspace"),
     renameTab: mk("renameTab"),
+    handoffQuick: mk("handoffQuick"),
+    handoffGuided: mk("handoffGuided"),
   };
 }
 
@@ -96,6 +98,33 @@ describe("BINDINGS", () => {
     ]);
     expect(BINDINGS.find((b) => b.action === "jumpNewestUnread")?.upper).toBe(true);
     expect(BINDINGS.find((b) => b.action === "cycleAttention")?.upper).toBeUndefined();
+  });
+
+  it("carries the session-handoff chords with f/F disambiguated (U2/R1)", () => {
+    // f and F are distinct entries — quick vs guided handoff, like x / X.
+    const fEntries = BINDINGS.filter((b) => b.keys.includes("f"));
+    expect(fEntries.map((b) => b.action).sort()).toEqual([
+      "handoffGuided",
+      "handoffQuick",
+    ]);
+    expect(BINDINGS.find((b) => b.action === "handoffGuided")?.upper).toBe(true);
+    expect(
+      BINDINGS.find((b) => b.action === "handoffQuick")?.upper,
+    ).toBeUndefined();
+  });
+
+  it("no two bindings collide on the same key + case", () => {
+    // A duplicate (key, upper) pair would make dispatch() order-dependent —
+    // one of the two actions silently unreachable. Global guard, so any new
+    // chord (the handoff f/F rows included, U2/R1) is proven unique.
+    const seen = new Set<string>();
+    for (const b of BINDINGS) {
+      for (const k of b.keys) {
+        const id = `${b.upper ? "upper" : "lower"}:${k}`;
+        expect(seen.has(id), `duplicate chord ${id}`).toBe(false);
+        seen.add(id);
+      }
+    }
   });
 
   it("carries the dashboard toggle on leader d", () => {
@@ -253,6 +282,16 @@ describe("Keymap", () => {
       "cycle",
       "jumpUnread",
     ]);
+  });
+
+  it("distinguishes leader f (quick handoff) from leader F (guided)", () => {
+    const a = spyActions();
+    const km = new Keymap("ctrl+a", a);
+    km.handle(ev("a", { ctrl: true }));
+    expect(km.handle(ev("f"))).toBe(true); // literal lowercase → quick
+    km.handle(ev("a", { ctrl: true }));
+    expect(km.handle(ev("F", { shift: true }))).toBe(true); // uppercase → guided
+    expect(a.calls).toEqual(["handoffQuick", "handoffGuided"]);
   });
 
   it("a bare modifier keydown does not consume the pending leader", () => {

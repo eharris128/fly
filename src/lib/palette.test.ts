@@ -33,6 +33,8 @@ function spyActions(calls: string[]): KeymapActions {
     prevWorkspace: mk("prev"),
     nextWorkspace: mk("next"),
     renameTab: mk("rename"),
+    handoffQuick: mk("handoffQuick"),
+    handoffGuided: mk("handoffGuided"),
   };
 }
 
@@ -57,6 +59,17 @@ describe("actionCommands", () => {
     // leader U (jump) renders its upper key, distinct from leader u (cycle).
     expect(cmds.find((c) => c.id === "action:jumpNewestUnread")?.hint).toBe(
       "Ctrl-A U",
+    );
+  });
+
+  it("lists the session-handoff actions with f/F hints (U2/R2)", () => {
+    // Automatic pickup from BINDINGS — no palette wiring for the new chords.
+    const cmds = actionCommands(spyActions([]), "ctrl+a");
+    expect(cmds.find((c) => c.id === "action:handoffQuick")?.hint).toBe(
+      "Ctrl-A f",
+    );
+    expect(cmds.find((c) => c.id === "action:handoffGuided")?.hint).toBe(
+      "Ctrl-A F",
     );
   });
 
