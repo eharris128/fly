@@ -310,13 +310,16 @@ describe("flattenRaised", () => {
 });
 
 describe("attentionPriority", () => {
-  it("ranks question and permission co-equal, ahead of finished, ahead of error/unknown", () => {
+  it("ranks question/permission co-equal, then alert, then finished, then error/unknown", () => {
+    // Tiers extended by automations U12/R18: alert sits between the fast
+    // unlocks (question/permission) and the parked long turnaround (finished).
     expect(attentionPriority("question")).toBe(0);
     expect(attentionPriority("permission")).toBe(0);
-    expect(attentionPriority("finished")).toBe(1);
-    expect(attentionPriority("error")).toBe(2);
-    expect(attentionPriority(null)).toBe(2);
-    expect(attentionPriority(undefined)).toBe(2);
+    expect(attentionPriority("alert")).toBe(1);
+    expect(attentionPriority("finished")).toBe(2);
+    expect(attentionPriority("error")).toBe(3);
+    expect(attentionPriority(null)).toBe(3);
+    expect(attentionPriority(undefined)).toBe(3);
   });
 });
 
@@ -331,6 +334,16 @@ describe("sortByAttentionPriority", () => {
       d: "permission",
     });
     expect(out.map((e) => e.key)).toEqual(["b", "d", "a", "c"]);
+  });
+
+  it("orders an automation alert between the fast unlocks and finished (U12/R18)", () => {
+    const out = sortByAttentionPriority(list("a", "b", "c", "d"), {
+      a: "finished",
+      b: "alert",
+      c: "question",
+      d: "error",
+    });
+    expect(out.map((e) => e.key)).toEqual(["c", "b", "a", "d"]);
   });
 
   it("preserves positional order within a tier (AE2 tie-break)", () => {

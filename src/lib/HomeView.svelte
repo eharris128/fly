@@ -519,12 +519,17 @@
      the agent needs you instead of the generic "waiting", so the row never reads
      a contradictory "waiting … finished". Distinct hue per reason; the label word
      itself carries the meaning, so the distinction is not color-only. (`error` is
-     unfed in v1 but styled for completeness.) */
+     unfed in v1 but styled for completeness; `alert` is the automations watchdog
+     reason (U12/R18) — only reachable on an agent row if a pane sends it via
+     `fly notify`, since the alerts sink pane is not an agent-list row.) */
   .status.reason-question {
     color: #fbbf24;
   }
   .status.reason-permission {
     color: #fb923c;
+  }
+  .status.reason-alert {
+    color: #2dd4bf;
   }
   .status.reason-finished {
     color: #818cf8;

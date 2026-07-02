@@ -46,9 +46,9 @@ export interface AgentRow {
   needsAttention: boolean;
   /**
    * Why the agent needs you, for the triage badge (R4/R6): `question` /
-   * `permission` / `finished`. Non-null only on a raised row — a non-raised or
-   * stale-downgraded row carries `null` so it shows no badge. `error` is unfed
-   * in v1. */
+   * `permission` / `finished` / `alert` (the automations watchdog reason,
+   * U12/R18). Non-null only on a raised row — a non-raised or stale-downgraded
+   * row carries `null` so it shows no badge. `error` is unfed in v1. */
   reason: AttentionReason | null;
   status: AgentStatus;
   /** Stable jump number by flat workspace→tab→pane position (R4/R8): `1`–`9` then

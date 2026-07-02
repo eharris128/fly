@@ -85,6 +85,7 @@
   const REASON_LABEL: Record<AttentionReason, string> = {
     question: "waiting for you",
     permission: "needs permission",
+    alert: "automation alert",
     finished: "finished",
     error: "error",
   };
