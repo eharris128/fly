@@ -9,6 +9,14 @@
   import { getConfig } from "./config";
   import type { Keymap } from "./keymap";
   import type { ResumeTier } from "./resume";
+  import {
+    injectionSpawned,
+    injectionStep,
+    injectionDone,
+    injectionPayload,
+    type InjectionEvent,
+    type InjectionState,
+  } from "./handoff";
   import "@xterm/xterm/css/xterm.css";
   import {
     spawnPane,
@@ -43,6 +51,14 @@
      * most-recent-in-folder) surfaces a brief disclosure banner so it is never
      * mistaken for an exact re-attach (R5/AE4); "precise"/null shows none. */
     resumeTier?: ResumeTier | null;
+    /** Guided session-handoff (session-handoff U3, R9): the stock prompt to
+     * pre-type unsent once this pane's composer looks ready. Null for every
+     * other pane. Read once at mount (arm time), like `command`. */
+    injectText?: string | null;
+    /** Fired once when the injection controller reaches a terminal state — or
+     * the pane unmounts/fails to spawn first — so App releases the leaf's
+     * `guidedHandoffByLeaf` entry (session-handoff U3). */
+    onInjectionDone?: (leafKey: string) => void;
     saveScrollback?: boolean;
     onFocusRequest: (leafKey: string) => void;
     onSpawned?: (leafKey: string, paneId: PaneId) => void;
@@ -61,11 +77,13 @@
     command = null,
     automationRunId = null,
     resumeTier = null,
+    injectText = null,
     saveScrollback = false,
     onFocusRequest,
     onSpawned,
     onExit,
     onAttention,
+    onInjectionDone,
   }: Props = $props();
 
   // Imprecise-resume disclosure (fix-003 U4, R5/AE4): a pane re-attached via
@@ -95,6 +113,44 @@
     error: "error",
   };
 
+  // ---- Guided-handoff injection (session-handoff U3, R9) --------------------
+  // Thin wiring around the pure reducer in handoff.ts: real timestamps plus a
+  // ticker feed injectionStep, and the single `inject` effect writes the
+  // bracketed-paste payload straight to the PTY (never through xterm, so it
+  // cannot echo back as user input). Focus is NOT touched here — it moved to
+  // this pane at spawn (R3); the injection lands whenever readiness does.
+  // Ticker resolution only — the reducer's own timings (quiet gap, timeout)
+  // are named constants in handoff.ts, where U4 tunes them.
+  const INJECT_TICK_MS = 100;
+  let injState: InjectionState | null = null; // null = not a guided pane, or done
+  let injPayload: string | null = null; // built once at arm time
+  let injTicker: ReturnType<typeof setInterval> | null = null;
+
+  function injEvent(ev: InjectionEvent) {
+    if (injState === null) return;
+    const res = injectionStep(injState, ev);
+    injState = res.state;
+    if (res.inject && paneId !== null && injPayload !== null)
+      void ptyWrite(paneId, injPayload);
+    if (injectionDone(res.state)) endInjection();
+  }
+
+  // Tear down the ticker and release the App-side registry entry. Runs on any
+  // reducer terminal state, on spawn failure, and on unmount (a guided pane
+  // closed pre-injection); the null-out makes it idempotent, so the App
+  // callback fires at most once.
+  function endInjection() {
+    if (injTicker !== null) {
+      clearInterval(injTicker);
+      injTicker = null;
+    }
+    if (injState !== null || injPayload !== null) {
+      injState = null;
+      injPayload = null;
+      onInjectionDone?.(leafKey);
+    }
+  }
+
   // Flow control (KTD4).
   const HIGH_WATERMARK = 2 * 1024 * 1024;
   const LOW_WATERMARK = 512 * 1024;
@@ -103,6 +159,8 @@
 
   function onOutput(bytes: Uint8Array) {
     if (!term) return;
+    // Guided-handoff readiness (U3): every chunk re-arms the quiet gap.
+    if (injState !== null) injEvent({ kind: "output", t: Date.now() });
     const n = bytes.length;
     unacked += n;
     term.write(bytes, () => {
@@ -199,6 +257,22 @@
       }
     }
 
+    // Arm the guided-injection controller before the spawn await so the very
+    // first output chunks count toward readiness (session-handoff U3). Stays
+    // disarmed (null) for every non-guided pane.
+    if (injectText != null) {
+      injPayload = injectionPayload(injectText);
+      injState = injectionSpawned(Date.now());
+      injTicker = setInterval(() => {
+        // Ticks gate on the spawn having resolved: only a tick can decide to
+        // inject, and the inject writes to the PTY, which needs paneId. The
+        // other events flow regardless, and the timeout anchor is spawnedAt,
+        // so a deferred first tick still times out on schedule.
+        if (paneId === null) return;
+        injEvent({ kind: "tick", t: Date.now() });
+      }, INJECT_TICK_MS);
+    }
+
     const channel = makeOutputChannel(onOutput);
     // A missing/stale cwd falls back to $HOME (portable-pty filters non-dirs).
     // `command` (resume only) runs a known `claude` invocation instead of the
@@ -216,12 +290,25 @@
       // A spawn can be rejected — notably an automation late-link (U8/R10): the
       // run already closed, so the backend refuses to link this pane rather
       // than orphan it. Surface it in the pane instead of leaving a blank one.
+      endInjection(); // nothing will ever inject — release the registry entry
       term.write(`\r\n\x1b[31m[failed to start: ${String(e)}]\x1b[0m\r\n`);
       return;
     }
     term.onData((data) => {
+      // Guided-handoff U3: an ESC-free chunk is user-originated (typed text,
+      // Enter, Ctrl-C, a plain paste) → the user's intent wins; skip injection.
+      // Chunks containing ESC don't count: xterm answers terminal queries
+      // (cursor position, device attributes) through this same event, and
+      // those auto-replies are not user intent. The ESC-prefixed *keyboard*
+      // keys (arrows, Esc itself) are covered by onKey below.
+      if (injState !== null && !data.includes("\x1b"))
+        injEvent({ kind: "userInput" });
       if (paneId !== null) void ptyWrite(paneId, data);
     });
+    // Guided-handoff U3: any real keystroke is user input — including the
+    // ESC-prefixed keys the onData filter above ignores. A leader chord
+    // consumed by attachCustomKeyEventHandler never reaches here.
+    if (injState !== null) term.onKey(() => injEvent({ kind: "userInput" }));
 
     resizeObs = new ResizeObserver(() => {
       if (!fit || !term) return;
@@ -241,6 +328,7 @@
             ? `process exited (code ${s.code}${s.signal ? `, ${s.signal}` : ""})`
             : `process ${s.kind}`;
         term.write(`\r\n\x1b[2m[${note}]\x1b[0m\r\n`);
+        injEvent({ kind: "paneExit" }); // guided-handoff U3 → Cancelled
         onExit?.(leafKey);
       }),
     );
@@ -271,6 +359,7 @@
   });
 
   onDestroy(() => {
+    endInjection(); // guided-handoff U3: stop the ticker, release the entry
     if (resumeBannerTimer) clearTimeout(resumeBannerTimer);
     resizeObs?.disconnect();
     unlisteners.forEach((u) => u());

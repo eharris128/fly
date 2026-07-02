@@ -97,6 +97,7 @@
   } from "./ipc";
   import {
     buildHandoffCommand,
+    handoffPrompt,
     type HandoffMode,
     type GuidedHandoffByLeaf,
   } from "./lib/handoff";
@@ -206,6 +207,8 @@
   // leaf key → resolved target for a GUIDED handoff pane (session-handoff U2,
   // the seam for U3): the injection controller reads which leaf awaits the
   // pre-typed prompt and what to type from here. Quick panes never appear.
+  // Entries are released via clearGuidedHandoff when a pane's controller
+  // reaches a terminal state (injected/skipped/cancelled) or the pane unmounts.
   let guidedHandoffByLeaf = $state<GuidedHandoffByLeaf>({});
   // leaf key → how it re-attached (fix-003 U3/U4): "precise" (--resume <id>) or
   // "imprecise" (--continue, most-recent-in-folder). Only resumed leaves appear;
@@ -457,6 +460,15 @@
       guidedHandoffByLeaf = { ...guidedHandoffByLeaf, [res.added.key]: target };
     }
     setActiveTree(res.tree, res.added.key); // focus moves to the new pane (R3)
+  }
+  // Session handoff U3: a guided pane's injection controller reached a terminal
+  // state (injected / skipped / cancelled), or the pane unmounted first —
+  // release its registry entry so the map only ever holds panes still awaiting
+  // injection. Terminal fires this at most once per pane.
+  function clearGuidedHandoff(key: string) {
+    if (!(key in guidedHandoffByLeaf)) return;
+    const { [key]: _dropped, ...rest } = guidedHandoffByLeaf;
+    guidedHandoffByLeaf = rest;
   }
   function closePane() {
     if (!activeTab) return;
@@ -1818,11 +1830,15 @@
               null}
             automationRunId={automationRunIdByLeaf[p.key] ?? null}
             resumeTier={resumeTierByLeaf[p.key] ?? null}
+            injectText={guidedHandoffByLeaf[p.key]
+              ? handoffPrompt(guidedHandoffByLeaf[p.key].transcriptPath)
+              : null}
             saveScrollback={saveScrollbackEnabled && p.scrollback}
             {keymap}
             onFocusRequest={setActiveFocus}
             {onSpawned}
             {onAttention}
+            onInjectionDone={clearGuidedHandoff}
           />
         </div>
       {/each}
