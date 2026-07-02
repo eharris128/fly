@@ -148,7 +148,8 @@ arguments so they're tested without a running app.
   places.
 
 ### Automations (`src-tauri/src/automations/`, cross-referenced U1–U12)
-Cron-scheduled runs that either spawn a `claude "<prompt>"` agent pane (Agent
+Cron-scheduled runs that either spawn a `claude --dangerously-skip-permissions
+"<prompt>"` agent pane (Agent
 mode) or run a stored script with no model spend (Script mode). Data flow: a
 named `fly-automation-sweep` thread ticks every 10s; a due automation is
 **claimed + persisted before it runs** (R2), then dispatched off the store lock

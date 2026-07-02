@@ -174,8 +174,10 @@
   // leaf key → automation agent command / run id (U8). An agent-run event
   // creates a background ephemeral tab; these are seeded before the tab is
   // appended so the Terminal reads them once at mount (like resumeCommandByLeaf).
-  // The command is `["claude", prompt]`; automationRunId links the pane to the
-  // run so the backend closes the run on Stop/exit and blocks recursion (R10).
+  // The command is `["claude", "--dangerously-skip-permissions", prompt]` —
+  // automation runs are unattended, so a permission prompt would just stall the
+  // run until the 30-min deadline; automationRunId links the pane to the run so
+  // the backend closes the run on Stop/exit and blocks recursion (R10).
   let automationCommandByLeaf = $state<Record<string, string[]>>({});
   let automationRunIdByLeaf = $state<Record<string, string>>({});
   // leaf key → command for the automations alert sink pane (U6). Like
@@ -479,7 +481,8 @@
     pruneNotifications(); // drop history for the closed tab's leaves
   }
   // Automations U8/R9: an agent run arrives → create a BACKGROUND ephemeral tab
-  // (title = automation name) running `claude <prompt>` in the run's cwd, placed
+  // (title = automation name) running `claude --dangerously-skip-permissions
+  // <prompt>` in the run's cwd (unattended, so permissions are bypassed), placed
   // in the origin workspace (or the first, R9 fallback). It never steals focus —
   // activeWorkspaceId / the workspace's activeTabId are untouched, and allPanes
   // mounts every tab's Terminal regardless of active state, so the agent pane
@@ -509,7 +512,7 @@
     cwdByLeaf = { ...cwdByLeaf, [l.key]: ev.cwd };
     automationCommandByLeaf = {
       ...automationCommandByLeaf,
-      [l.key]: ["claude", ev.prompt],
+      [l.key]: ["claude", "--dangerously-skip-permissions", ev.prompt],
     };
     automationRunIdByLeaf = { ...automationRunIdByLeaf, [l.key]: ev.runId };
     // Append without touching activeWorkspaceId or the workspace's activeTabId —
