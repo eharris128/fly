@@ -180,30 +180,36 @@ export function flattenRaised(
 }
 
 /**
- * Triage payoff tier of an attention reason (reason-typed triage, R7). A
- * question or a permission prompt is a fast unlock, so both sit at tier 0; a
- * finished agent is a longer turnaround at tier 1; error/unknown trails at tier
- * 2 (Error is unfed in v1, so it only reaches here via an absent reason). Lower
- * is higher priority.
+ * Triage payoff tier of an attention reason (reason-typed triage, R7; extended
+ * by automations R18). A question or a permission prompt is a fast unlock, so
+ * both sit at tier 0; an automation alert is a watchdog telling you something
+ * is wrong *now* — a glance-and-triage whose payoff decays, so it ranks below
+ * the co-equal fast unlocks and above the parked long turnaround, tier 1
+ * (automations U-ID U12, R18); a finished agent is that longer turnaround at
+ * tier 2; error/unknown trails at tier 3 (Error is unfed in v1, so it only
+ * reaches here via an absent reason). Lower is higher priority.
  */
 export function attentionPriority(reason: AttentionReason | null | undefined): number {
   switch (reason) {
     case "question":
     case "permission":
       return 0;
-    case "finished":
+    case "alert":
       return 1;
-    default:
+    case "finished":
       return 2;
+    default:
+      return 3;
   }
 }
 
 /**
  * Reorder an already-positional list of raised entries by triage payoff:
- * question/permission first, then finished, then error/unknown (R7). Within a
- * tier the input (positional) order is preserved — `Array.prototype.sort` is
- * stable — which is the R7 tie-break, for free. Returns a new array; the input
- * is untouched. Callers pass `flattenRaised` output (whose entries carry `key`).
+ * question/permission first, then alert (automations R18), then finished, then
+ * error/unknown (R7). Within a tier the input (positional) order is preserved —
+ * `Array.prototype.sort` is stable — which is the R7 tie-break, for free.
+ * Returns a new array; the input is untouched. Callers pass `flattenRaised`
+ * output (whose entries carry `key`).
  */
 export function sortByAttentionPriority<T extends { key: string }>(
   list: T[],

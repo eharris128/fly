@@ -41,7 +41,17 @@ export interface PaneExitEvent {
 }
 
 export type AttentionState = "idle" | "raised" | "acknowledged";
-export type AttentionReason = "question" | "permission" | "finished" | "error";
+/**
+ * Why a pane is raised (mirrors Rust `Reason`). "alert" is the automations
+ * alert reason (automations U-ID U12, R18/KTD-H) — the first non-agent
+ * producer; any pane may also send it via `fly notify` and it is valid.
+ */
+export type AttentionReason =
+  | "question"
+  | "permission"
+  | "finished"
+  | "error"
+  | "alert";
 export type AttentionTier = "hook" | "cli" | "bel" | "osc";
 
 export interface AttentionEvent {

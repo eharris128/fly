@@ -279,7 +279,9 @@ pub fn run() {
                     match &gate_verdict {
                         Surfaced::Individual { title, body } => notify::banner(&handle, title, body),
                         Surfaced::Coalesced { count } => {
-                            notify::banner(&handle, "fly", &format!("{count} agents need attention"))
+                            // "Panes", not "agents": alert raises count too
+                            // (automations U-ID U12, KTD-H).
+                            notify::banner(&handle, "fly", &notify::coalesced_body(*count))
                         }
                         Surfaced::Suppressed => {}
                     }

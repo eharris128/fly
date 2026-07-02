@@ -10,7 +10,7 @@
 //!
 //! Schema:
 //! ```json
-//! { "token": "<hex>", "reason": "question|permission|finished|error",
+//! { "token": "<hex>", "reason": "question|permission|finished|error|alert",
 //!   "title": "<optional>", "body": "<optional>",
 //!   "session_id": "<optional>", "cwd": "<optional>" }
 //! ```
@@ -71,5 +71,16 @@ mod tests {
         .unwrap();
         assert_eq!(msg.session_id.as_deref(), Some("s1"));
         assert_eq!(msg.cwd.as_deref(), Some("/p"));
+    }
+
+    #[test]
+    fn deserializes_a_hook_borne_alert_reason() {
+        // `Reason` rides this wire format, so any pane may send
+        // `reason: "alert"` via `fly notify` — accepted as valid (automations
+        // KTD-H: the socket is per-pane authenticated and panes already
+        // control title/body).
+        let msg: HookMessage =
+            serde_json::from_str(r#"{"token":"abc","reason":"alert"}"#).unwrap();
+        assert_eq!(msg.reason, Reason::Alert);
     }
 }

@@ -11,7 +11,15 @@ use serde::{Deserialize, Serialize};
 
 use super::policy::is_user_viewing;
 
-/// What the agent needs from the user.
+/// Why this pane is raised for the user.
+///
+/// Historically "what the agent needs from the user"; [`Reason::Alert`] widens
+/// the contract (automations R18/KTD-H) — automations are the first non-agent
+/// producer, raising script-watchdog alerts on the alerts sink pane at
+/// [`Tier::Cli`]. And because `Reason` rides the hook wire format
+/// (`hooks/protocol.rs`), any pane may now send `reason: "alert"` via
+/// `fly notify` — that is **accepted as valid**: the socket is per-pane
+/// authenticated and panes already control their notification title/body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
@@ -19,6 +27,9 @@ pub enum Reason {
     Permission,
     Finished,
     Error,
+    /// A non-agent alert (automations U-ID U12, R18): produced by the script
+    /// wake gate (R16) and accepted from any pane over the wire (KTD-H).
+    Alert,
 }
 
 impl Reason {
@@ -28,6 +39,7 @@ impl Reason {
             Reason::Permission => "permission",
             Reason::Finished => "finished",
             Reason::Error => "error",
+            Reason::Alert => "alert",
         }
     }
 
@@ -37,19 +49,23 @@ impl Reason {
             "permission" => Some(Reason::Permission),
             "finished" => Some(Reason::Finished),
             "error" => Some(Reason::Error),
+            "alert" => Some(Reason::Alert),
             _ => None,
         }
     }
 }
 
-/// Where a signal came from — its detection tier (KTD9). v1 only produces
-/// `Hook` (authenticated, Tier 1); the rest are the forward design.
+/// Where a signal came from — its detection tier (KTD9). Agent hooks produce
+/// `Hook`; automations wire `Cli` (its first producer — automations KTD-H);
+/// `Bel`/`Osc` remain the forward design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
     /// Authenticated typed hook (Tier 1) — high confidence.
     Hook,
-    /// `fly notify` command hook (Tier 2).
+    /// Trusted local non-hook signal (Tier 2) — a backend-internal raise, e.g.
+    /// the automation alert path (its first wiring — automations R16/KTD-H).
+    /// Same-process, no untrusted stream parsing, so already High confidence.
     Cli,
     /// Terminal BEL (Tier 3).
     Bel,
@@ -250,5 +266,23 @@ impl AttentionMachine {
         self.reason = None;
         self.tier = None;
         self.outcome(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Reason;
+
+    /// `Reason::Alert` rides the wire as `"alert"` in both directions
+    /// (automations U-ID U12, R18/KTD-H): the serde round-trip the hook
+    /// protocol and events use, plus the manual `as_str`/`parse` pair
+    /// `fly notify` uses.
+    #[test]
+    fn alert_serde_round_trips_as_alert() {
+        assert_eq!(serde_json::to_string(&Reason::Alert).unwrap(), r#""alert""#);
+        let back: Reason = serde_json::from_str(r#""alert""#).unwrap();
+        assert_eq!(back, Reason::Alert);
+        assert_eq!(Reason::Alert.as_str(), "alert");
+        assert_eq!(Reason::parse("alert"), Some(Reason::Alert));
     }
 }

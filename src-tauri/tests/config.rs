@@ -78,6 +78,9 @@ fn old_config_without_notification_keys_loads_new_defaults() {
         Reason::Permission,
         Reason::Finished,
         Reason::Error,
+        // A config predating automations has no `alert` key either — it must
+        // load unchanged with the all-on default (automations U-ID U12, R18).
+        Reason::Alert,
     ] {
         let e = config.reason_effects.for_reason(reason);
         assert!(
@@ -108,6 +111,15 @@ fn partial_reason_effects_fill_omitted_reasons_and_effects() {
     assert!(
         p.desktop && p.sound && p.record,
         "an omitted reason fills all-on"
+    );
+
+    // A partial reasonEffects object written before the `alert` key existed
+    // also fills it all-on (automations U-ID U12, R18 — same struct-level
+    // serde(default) convention).
+    let a = config.reason_effects.alert;
+    assert!(
+        a.desktop && a.sound && a.record,
+        "the omitted alert reason fills all-on"
     );
 }
 

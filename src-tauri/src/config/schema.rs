@@ -32,9 +32,10 @@ pub enum Renderer {
 ///
 /// `#[serde(default)]` here (struct-level) makes a *partial* object such as
 /// `{"question": {...}}` fill the omitted reasons (`permission`/`finished`/
-/// `error`) from `Default`; combined with the same on [`ReasonEffects`], a
-/// partial effect object inside a reason also fills. Without both, `serde`'s
-/// `default` on the parent `Config` would only cover the whole-key-absent case.
+/// `error`/`alert`) from `Default`; combined with the same on
+/// [`ReasonEffects`], a partial effect object inside a reason also fills.
+/// Without both, `serde`'s `default` on the parent `Config` would only cover
+/// the whole-key-absent case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReasonEffectsConfig {
@@ -42,6 +43,10 @@ pub struct ReasonEffectsConfig {
     pub permission: ReasonEffects,
     pub finished: ReasonEffects,
     pub error: ReasonEffects,
+    /// Automation-alert raises (automations U-ID U12, R18) — the first
+    /// non-agent reason. The struct-level `#[serde(default)]` above means a
+    /// config predating it loads unchanged with the all-on default.
+    pub alert: ReasonEffects,
 }
 
 impl Default for ReasonEffectsConfig {
@@ -52,6 +57,7 @@ impl Default for ReasonEffectsConfig {
             permission: ReasonEffects::default(),
             finished: ReasonEffects::default(),
             error: ReasonEffects::default(),
+            alert: ReasonEffects::default(),
         }
     }
 }
@@ -64,6 +70,7 @@ impl ReasonEffectsConfig {
             Reason::Permission => self.permission,
             Reason::Finished => self.finished,
             Reason::Error => self.error,
+            Reason::Alert => self.alert,
         }
     }
 }

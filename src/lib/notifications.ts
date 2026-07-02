@@ -195,7 +195,15 @@ export function toPersisted(
   return list.map((n) => ({ ...n, body: includeBodies ? n.body : null }));
 }
 
-const REASONS: AttentionReason[] = ["question", "permission", "finished", "error"];
+// Every member of the ipc `AttentionReason` union — the coercion allowlist.
+// "alert" restores like any other reason (automations U-ID U12, R18).
+const REASONS: AttentionReason[] = [
+  "question",
+  "permission",
+  "finished",
+  "error",
+  "alert",
+];
 
 function coerceOne(raw: unknown): Notification | null {
   if (!raw || typeof raw !== "object") return null;

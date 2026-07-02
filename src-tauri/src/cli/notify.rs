@@ -125,6 +125,9 @@ fn default_title(reason: Reason) -> &'static str {
         Reason::Permission => "Claude needs permission",
         Reason::Finished => "Claude finished",
         Reason::Error => "Claude hit an error",
+        // Any pane may send `fly notify alert` — a valid, pane-authored alert
+        // (automations KTD-H); no "Claude" phrasing, it need not be an agent.
+        Reason::Alert => "Alert",
     }
 }
 

@@ -82,7 +82,17 @@ pub fn reason_subtitle(reason: Reason) -> &'static str {
         Reason::Permission => "An agent needs permission",
         Reason::Finished => "An agent finished",
         Reason::Error => "An agent hit an error",
+        // The first non-agent reason (automations U-ID U12, R18/KTD-H).
+        Reason::Alert => "An automation raised an alert",
     }
+}
+
+/// Body text for a coalesced banner: `"N panes need attention"`. "Panes", not
+/// "agents" — alert raises count toward the coalesce tally too, and their
+/// producer is an automation, not an agent (automations U-ID U12, KTD-H: the
+/// reason contract widened to "why this pane is raised for the user").
+pub fn coalesced_body(count: usize) -> String {
+    format!("{count} panes need attention")
 }
 
 /// Play an XDG theme sound by name, independent of any banner (the desktop and
@@ -260,7 +270,10 @@ impl NotificationGate {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize, surface_actions, NotificationGate, Surfaced};
+    use super::{
+        coalesced_body, reason_subtitle, sanitize, surface_actions, NotificationGate, Surfaced,
+    };
+    use crate::state::attention::Reason;
     use crate::state::policy::Effects;
 
     const ALL_ON: Effects = Effects {
@@ -273,6 +286,20 @@ mod tests {
     fn strips_control_chars_and_caps_length() {
         assert_eq!(sanitize("hi\x1b[31m\x07there\n", 100), "hi[31mthere");
         assert_eq!(sanitize(&"x".repeat(50), 10).len(), 10);
+    }
+
+    /// The alert reason has its own subtitle naming the automation producer
+    /// (automations U-ID U12, R18) — never a misleading "agent" phrase.
+    #[test]
+    fn alert_subtitle_names_the_automation_producer() {
+        assert_eq!(reason_subtitle(Reason::Alert), "An automation raised an alert");
+    }
+
+    /// The coalesced banner counts *panes*, not "agents" — alert raises (from
+    /// automations, not agents) are in the tally too (automations U12/KTD-H).
+    #[test]
+    fn coalesced_body_counts_panes_not_agents() {
+        assert_eq!(coalesced_body(4), "4 panes need attention");
     }
 
     #[test]
