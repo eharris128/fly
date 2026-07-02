@@ -237,6 +237,20 @@ pub fn run() {
                     return;
                 };
                 stream::emit_attention(&handle, pane, &outcome);
+
+                // U7 agent-run closure (KTD-F): a Stop hook on a pane linked to
+                // an agent run closes it as succeeded on first occurrence. Only
+                // "Stop" closes (not "SubagentStop"); a bare Finished with no
+                // hook_event falls to the 30-min deadline (skew rule).
+                if hook.hook_event.as_deref() == Some("Stop") {
+                    if let Some(mgr) = handle.try_state::<Arc<automations::AutomationManager>>() {
+                        // Find and close any automation run linked to this pane.
+                        // The manager's close_run is idempotent (no-op if run not
+                        // found or already closed), so a second Stop is safe.
+                        let _ = mgr.close_run_by_pane(pane.0);
+                    }
+                }
+
                 // Only a fresh (non-debounced) raise surfaces; duplicates drop.
                 if !outcome.recordable {
                     return;

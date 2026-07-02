@@ -30,6 +30,9 @@ pub struct ValidatedHook {
     /// `fly notify`.
     pub session_id: Option<String>,
     pub cwd: Option<String>,
+    /// U7: the hook event name (e.g. "Stop", "SubagentStop"), used to close
+    /// agent runs on first Stop occurrence (KTD-F). `None` on older hooks.
+    pub hook_event: Option<String>,
 }
 
 /// Sink for authenticated callbacks. The app wires this to the attention
@@ -151,6 +154,7 @@ fn handle_conn(stream: UnixStream, tokens: &TokenRegistry, dispatch: &Dispatch) 
                 body: msg.body,
                 session_id: msg.session_id,
                 cwd: msg.cwd,
+                hook_event: msg.hook_event,
             },
         );
     }

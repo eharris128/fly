@@ -600,6 +600,39 @@ impl AutomationManager {
         }
     }
 
+    /// U7 Stop-event closure (KTD-F): find any automation run linked to a pane
+    /// and close it as succeeded. Called by the hook dispatch on the first Stop.
+    /// Idempotent: no-op if the pane is not linked to any automation run.
+    pub fn close_run_by_pane(&self, pane_id: u64) -> Result<(), String> {
+        let (automation_id, run_id) = {
+            let map = self.store.snapshot();
+            let mut found: Option<(String, String)> = None;
+            for (auto_id, a) in map.iter() {
+                for run in &a.runs {
+                    if run.pane_id == Some(pane_id) && run.status == RunStatus::Running {
+                        found = Some((auto_id.clone(), run.id.clone()));
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            found.ok_or_else(|| String::from("no running automation for pane"))?
+        };
+        // Close as succeeded with no output/exit code (the agent interaction
+        // is in the pane's scrollback, not here).
+        let outcome = RunOutcome::Succeeded { output: None };
+        let result = self.close_run(&automation_id, &run_id, outcome);
+        match result {
+            model::CloseResult::Closed => Ok(()),
+            model::CloseResult::NotFound | model::CloseResult::AlreadyClosed => {
+                // Idempotent: a second Stop is a no-op.
+                Ok(())
+            }
+        }
+    }
+
     /// Snapshot of every automation (dashboard/CLI list reads).
     pub fn list(&self) -> Vec<Automation> {
         self.store.snapshot().into_values().collect()
