@@ -486,6 +486,39 @@ export function continueTarget(cwd: string): Promise<ContinueTarget | null> {
 }
 
 /**
+ * A qualified previous session for handoff (mirrors Rust `HandoffTarget`,
+ * session-handoff U1). `transcriptPath` is the backend-derived transcript file
+ * the stock prompt names; `sessionCwd` is the resume record's cwd — spawn there
+ * when present, falling back to the pane's live cwd (R12). `lastTurnMs` is the
+ * last real turn's Unix ms — always present, since a session only qualifies
+ * with at least one real conversation turn (R5).
+ */
+export interface HandoffTarget {
+  sessionId: string;
+  transcriptPath: string;
+  sessionCwd: string | null;
+  lastTurnMs: number;
+}
+
+/**
+ * Resolve a leaf's previous session into a spawnable handoff target, or null
+ * when nothing qualifies — no resume record, no transcript file, or no real
+ * conversation turn (feeds the R6 notice). Resolved at chord time from the
+ * durable resume record, so it works whether the old instance is still running
+ * or exited hours ago (R4). `liveCwd` is the pane's current cwd, used only as
+ * the transcript-derivation fallback when the record carries no cwd.
+ */
+export function resolveHandoffTarget(
+  leafKey: string,
+  liveCwd: string | null,
+): Promise<HandoffTarget | null> {
+  return invoke<HandoffTarget | null>("resolve_handoff_target", {
+    leafKey,
+    liveCwd,
+  });
+}
+
+/**
  * How the app was launched (mirrors Rust `LaunchMode`, U7):
  *  - `normal` — fresh shells (clean prior exit);
  *  - `resume` — explicit `fly resume`, re-attach agents directly;

@@ -9,7 +9,10 @@
 //!
 //! Resume state (the crash-durable agent mapping) lives in a sibling
 //! write-through store, [`resume`], decoupled from this debounced layout blob.
+//! [`handoff`] resolves a leaf's previous session out of that store into a
+//! spawnable handoff target (session-handoff U1).
 
+pub mod handoff;
 pub mod resume;
 pub mod transcript;
 

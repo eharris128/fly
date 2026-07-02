@@ -33,7 +33,9 @@ const ACTIVE_SESSION_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 /// `~/.claude/projects` — the root of Claude's per-project transcript store.
 /// Honors `CLAUDE_CONFIG_DIR` (Claude's own config-dir override) when set, else
 /// `$HOME`. `None` when neither resolves — the caller degrades to "no id".
-fn claude_projects_root() -> Option<PathBuf> {
+/// Crate-visible so [`super::handoff`]'s command wrapper roots its path-taking
+/// core here (session-handoff U1).
+pub(crate) fn claude_projects_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         return Some(PathBuf::from(dir).join("projects"));
     }
@@ -42,8 +44,9 @@ fn claude_projects_root() -> Option<PathBuf> {
 
 /// Encode an absolute cwd to Claude's project-dir name: replace every `/` **and**
 /// `.` with `-` (KTD-E). A trailing slash is normalized away first, so `…/play/`
-/// and `…/play` map to the same dir.
-fn encode_cwd(cwd: &str) -> String {
+/// and `…/play` map to the same dir. Crate-visible so [`super::handoff`] derives
+/// transcript paths under an injected root (session-handoff U1).
+pub(crate) fn encode_cwd(cwd: &str) -> String {
     // Trim a trailing slash except on the bare root, so "/" still encodes to "-".
     let trimmed = if cwd.len() > 1 {
         cwd.trim_end_matches('/')

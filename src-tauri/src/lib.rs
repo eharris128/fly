@@ -548,6 +548,7 @@ pub fn run() {
             session::resume::save_resume_session,
             session::resume::prune_resume_records,
             session::transcript::continue_target,
+            session::handoff::resolve_handoff_target,
             usage::usage_snapshot,
             automations::automations_frontend_ready,
             automations::list_automations,
