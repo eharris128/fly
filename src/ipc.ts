@@ -122,6 +122,40 @@ export function onAgentRun(
   );
 }
 
+/**
+ * An automation alert with no sink pane yet (automations U6/R17). Emitted by the
+ * backend when an alert-classified script run concludes and the "Automations"
+ * sink pane isn't registered. The frontend single-flights a background ephemeral
+ * tab that `tail -f`s {@link AlertPendingEvent.logPath}, then calls
+ * {@link registerAlertSink} with the new pane id so the backend drains the queued
+ * alerts and rings the pane (R18).
+ */
+export interface AlertPendingEvent {
+  /** Absolute path to the alerts log the sink pane should tail. */
+  logPath: string;
+}
+
+/**
+ * Subscribe to alert-pending events (`automation://alert-pending`). Returns an
+ * unlisten fn — the caller (App.svelte) tears it down on unmount.
+ */
+export function onAlertPending(
+  handler: (ev: AlertPendingEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<AlertPendingEvent>("automation://alert-pending", (e) =>
+    handler(e.payload),
+  );
+}
+
+/**
+ * Register the "Automations" sink pane (automations U6/R17): the backend records
+ * the pane id, drains any alerts queued before it existed, and rings it once per
+ * drained alert (R18). Called from App.svelte once the sink pane mounts.
+ */
+export function registerAlertSink(paneId: PaneId): Promise<void> {
+  return invoke("register_alert_sink", { paneId });
+}
+
 // ---- automations dashboard (U10, R25/R6) ------------------------------------
 // TS mirrors of the Rust `automations::model` types (serde camelCase, the shape
 // that already crosses the store file, the socket, and now the dashboard). The

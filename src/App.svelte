@@ -83,12 +83,15 @@
     automationsFrontendReady,
     listAutomations,
     onAutomationChanged,
+    onAlertPending,
+    registerAlertSink,
     type PaneId,
     type PaneActivity,
     type UsageSnapshot,
     type AttentionState,
     type AttentionReason,
     type AgentRunEvent,
+    type AlertPendingEvent,
   } from "./ipc";
   import {
     addNotification,
@@ -175,6 +178,14 @@
   // run so the backend closes the run on Stop/exit and blocks recursion (R10).
   let automationCommandByLeaf = $state<Record<string, string[]>>({});
   let automationRunIdByLeaf = $state<Record<string, string>>({});
+  // leaf key → command for the automations alert sink pane (U6). Like
+  // automationCommandByLeaf but with NO run id — the sink pane is a plain
+  // background `tail -f` of the alerts log, not an agent run (so it never links
+  // to a run or enters the recursion registry). Read once at mount.
+  let sinkCommandByLeaf = $state<Record<string, string[]>>({});
+  // The leaf key of the current alerts sink tab, or null when none is open
+  // (U6 single-flight guard). Non-reactive: read only in event handlers.
+  let alertSinkLeafKey: string | null = null;
   // leaf key → how it re-attached (fix-003 U3/U4): "precise" (--resume <id>) or
   // "imprecise" (--continue, most-recent-in-folder). Only resumed leaves appear;
   // drives the tier transparency so a degraded resume is never passed off as exact.
@@ -503,6 +514,40 @@
     automationRunIdByLeaf = { ...automationRunIdByLeaf, [l.key]: ev.runId };
     // Append without touching activeWorkspaceId or the workspace's activeTabId —
     // background only, no focus steal.
+    workspaces = workspaces.map((w) =>
+      w.id === wsId ? { ...w, tabs: [...w.tabs, tab] } : w,
+    );
+  }
+  // Automations U6/R17: an alert arrived with no sink pane → single-flight a
+  // BACKGROUND ephemeral tab titled "Automations" tailing the alerts log. Like
+  // handleAgentRun it never steals focus. Once the pane mounts, onSpawned calls
+  // registerAlertSink → the backend drains the queued alerts and rings this pane
+  // (R18). Self-healing single-flight: if the prior sink tab was closed, its
+  // leaf no longer resolves, so a fresh alert opens a new one.
+  function handleAlertPending(ev: AlertPendingEvent) {
+    if (alertSinkLeafKey && locateLeaf(alertSinkLeafKey)) return; // already open
+    const wsId = resolveTargetWorkspace(workspaces, "");
+    if (!wsId) {
+      void frontendLog("automation alert-pending: no workspace to place into; dropped");
+      return;
+    }
+    const l = newLeaf();
+    const tab: Tab = {
+      id: `tab-${nextTabId++}`,
+      tree: l,
+      focusedLeafKey: l.key,
+      title: "Automations",
+      ephemeral: true,
+    };
+    // Seed cwd (the log's dir) + the tail command BEFORE appending, so the
+    // Terminal reads them once at mount. No run id — this is a plain pane.
+    const dir = ev.logPath.replace(/\/[^/]*$/, "") || "/";
+    cwdByLeaf = { ...cwdByLeaf, [l.key]: dir };
+    sinkCommandByLeaf = {
+      ...sinkCommandByLeaf,
+      [l.key]: ["tail", "-n", "50", "-f", ev.logPath],
+    };
+    alertSinkLeafKey = l.key;
     workspaces = workspaces.map((w) =>
       w.id === wsId ? { ...w, tabs: [...w.tabs, tab] } : w,
     );
@@ -918,6 +963,9 @@
     // Register the pane's workspace so a per-workspace mute can scope to it.
     const wsId = workspaceIdForLeaf(key);
     if (wsId) void setPaneWorkspace(paneId, wsId);
+    // U6: the alerts sink pane just mounted → register it so queued/future
+    // alerts ring it (the backend drains the pending backlog on registration).
+    if (key === alertSinkLeafKey) void registerAlertSink(paneId);
   }
   // All leaf keys that still resolve to a live tab/workspace — used to prune
   // notifications whose pane was deleted (else orphaned unread counts leak).
@@ -1606,6 +1654,12 @@
     void onAutomationChanged(() => {
       if (homeViewOpen) void refreshAutomations();
     }).then((un) => (unlistenAutomationChanged = un));
+    // Automations U6/R17: an alert with no sink pane → open the "Automations"
+    // sink tab (single-flighted in the handler).
+    let unlistenAlertPending: (() => void) | undefined;
+    void onAlertPending(handleAlertPending).then(
+      (un) => (unlistenAlertPending = un),
+    );
     const cwdTimer = setInterval(() => void refreshCwds(), 1500);
     return () => {
       window.removeEventListener("focus", reportForeground);
@@ -1615,6 +1669,7 @@
       unlistenNotify?.();
       unlistenAgentRun?.();
       unlistenAutomationChanged?.();
+      unlistenAlertPending?.();
     };
   });
 </script>
@@ -1675,7 +1730,10 @@
             leafKey={p.key}
             focused={p.tabId === activeTab?.id && activeTab?.focusedLeafKey === p.key}
             cwd={cwdByLeaf[p.key] ?? null}
-            command={resumeCommandByLeaf[p.key] ?? automationCommandByLeaf[p.key] ?? null}
+            command={resumeCommandByLeaf[p.key] ??
+              automationCommandByLeaf[p.key] ??
+              sinkCommandByLeaf[p.key] ??
+              null}
             automationRunId={automationRunIdByLeaf[p.key] ?? null}
             resumeTier={resumeTierByLeaf[p.key] ?? null}
             saveScrollback={saveScrollbackEnabled && p.scrollback}

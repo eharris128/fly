@@ -219,8 +219,6 @@
       term.write(`\r\n\x1b[31m[failed to start: ${String(e)}]\x1b[0m\r\n`);
       return;
     }
-    onSpawned?.(leafKey, paneId);
-
     term.onData((data) => {
       if (paneId !== null) void ptyWrite(paneId, data);
     });
@@ -254,6 +252,13 @@
         onAttention?.(leafKey, ev.payload.state, ev.payload.reason);
       }),
     );
+
+    // Announce the pane only after its own pane://exit + pane://attention
+    // listeners are live, so an attention event emitted synchronously in
+    // response to onSpawned — e.g. the U6 alert-sink registration draining its
+    // queued rings — is never missed (the listeners filter on the now-known
+    // paneId).
+    onSpawned?.(leafKey, paneId);
 
     if (focused) {
       term.focus();
