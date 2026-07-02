@@ -136,17 +136,24 @@
 
 ---
 
-## U8: Agent-run Pane Creation and Retention (Frontend)
+## U8: Agent-run Pane Creation and Retention (Frontend) — DONE (2026-07-02)
 
 **Goal:** Agent runs land as background tabs that don't steal focus.
 
 **Requirements:** R9 (backend half + frontend placement), R12 (ephemeral flag, tab retention)
 
-**Status:** U7 emits `automation://agent-run`, U11 ephemeral flag ready, U7.5 spawn_pane atomicity ready
+**Status:** ✅ **Complete.** Landed:
+- `ipc.ts`: `automationRunId` on `SpawnOpts`/`spawnPane`; `AgentRunEvent` + `onAgentRun` listener; `automationsFrontendReady` command wrapper.
+- `Terminal.svelte`: `automationRunId` prop threaded into `spawnPane` (+ a try/catch so a rejected late-link shows an error line, not a blank pane).
+- `automation-panes.ts` (new, pure + tested): `resolveTargetWorkspace` → origin ws if it exists, else first (R9 fallback).
+- `App.svelte`: `handleAgentRun` creates a **background ephemeral tab** (`title = name`, `["claude", prompt]`, `cwd`) in the resolved workspace without touching `activeWorkspaceId`/`activeTabId`; `onAgentRun` registered in `onMount`, then `automationsFrontendReady()` called once the listener is live; listener torn down on unmount.
+- `pnpm check` 0 errors; 231 frontend tests pass; backend builds.
 
-**Blocked by:** U7.5 (spawn_pane linking)
+**Deferred (blocked product decision — see plan open questions):** R12's auto-close on the agent's first `Stop`. Tabs are kept until the user closes them (succeeded and failed alike). The `automation://run-closed` event + `shouldCloseOnSuccess` are intentionally NOT built until that decision lands.
 
-### Implementation Checklist
+**Live end-to-end verification** (agent automation → background tab spawns) is pending **U9** — no UI/CLI path exists yet to create or manually-run an agent automation, so the dispatch can't be triggered until the CLI lands.
+
+### Implementation Checklist (landed — see status above)
 
 #### 1. Update `src/ipc.ts` event types
 

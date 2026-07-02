@@ -40,6 +40,7 @@
     type Workspace,
   } from "./lib/workspaces";
   import { buildHomeModel, effectiveAttention, effectiveTaskCount } from "./lib/home";
+  import { resolveTargetWorkspace } from "./lib/automation-panes";
   import {
     shouldShowNudge,
     deriveBusyIdle,
@@ -77,11 +78,14 @@
     pruneResumeRecords,
     getLaunchMode,
     frontendLog,
+    onAgentRun,
+    automationsFrontendReady,
     type PaneId,
     type PaneActivity,
     type UsageSnapshot,
     type AttentionState,
     type AttentionReason,
+    type AgentRunEvent,
   } from "./ipc";
   import {
     addNotification,
@@ -161,6 +165,13 @@
   // missing entry means a bare shell (the normal case). Read once per Terminal
   // at mount, so it must be set before workspaces are assigned.
   let resumeCommandByLeaf = $state<Record<string, string[]>>({});
+  // leaf key → automation agent command / run id (U8). An agent-run event
+  // creates a background ephemeral tab; these are seeded before the tab is
+  // appended so the Terminal reads them once at mount (like resumeCommandByLeaf).
+  // The command is `["claude", prompt]`; automationRunId links the pane to the
+  // run so the backend closes the run on Stop/exit and blocks recursion (R10).
+  let automationCommandByLeaf = $state<Record<string, string[]>>({});
+  let automationRunIdByLeaf = $state<Record<string, string>>({});
   // leaf key → how it re-attached (fix-003 U3/U4): "precise" (--resume <id>) or
   // "imprecise" (--continue, most-recent-in-folder). Only resumed leaves appear;
   // drives the tier transparency so a degraded resume is never passed off as exact.
@@ -445,6 +456,46 @@
   function closeTab(tabId: string) {
     workspaces = closeTabIn(workspaces, tabId, makeTab);
     pruneNotifications(); // drop history for the closed tab's leaves
+  }
+  // Automations U8/R9: an agent run arrives → create a BACKGROUND ephemeral tab
+  // (title = automation name) running `claude <prompt>` in the run's cwd, placed
+  // in the origin workspace (or the first, R9 fallback). It never steals focus —
+  // activeWorkspaceId / the workspace's activeTabId are untouched, and allPanes
+  // mounts every tab's Terminal regardless of active state, so the agent pane
+  // spawns immediately in the background. The Terminal calls spawn_pane with the
+  // run id, so the backend links run↔pane atomically (R10). Ephemeral so it is
+  // excluded from session/scrollback persistence (U11). R12 auto-close on the
+  // agent's first Stop is a deliberately deferred product decision (see the
+  // plan's open questions) — the tab is kept until the user closes it.
+  function handleAgentRun(ev: AgentRunEvent) {
+    const wsId = resolveTargetWorkspace(workspaces, ev.originWorkspaceHint);
+    if (!wsId) {
+      void frontendLog(
+        `automation agent-run ${ev.runId}: no workspace to place into; dropped`,
+      );
+      return;
+    }
+    const l = newLeaf();
+    const tab: Tab = {
+      id: `tab-${nextTabId++}`,
+      tree: l,
+      focusedLeafKey: l.key,
+      title: ev.name,
+      ephemeral: true,
+    };
+    // Seed the leaf's cwd/command/run id BEFORE appending the tab, so they are
+    // present when the Terminal mounts (all read once at mount).
+    cwdByLeaf = { ...cwdByLeaf, [l.key]: ev.cwd };
+    automationCommandByLeaf = {
+      ...automationCommandByLeaf,
+      [l.key]: ["claude", ev.prompt],
+    };
+    automationRunIdByLeaf = { ...automationRunIdByLeaf, [l.key]: ev.runId };
+    // Append without touching activeWorkspaceId or the workspace's activeTabId —
+    // background only, no focus steal.
+    workspaces = workspaces.map((w) =>
+      w.id === wsId ? { ...w, tabs: [...w.tabs, tab] } : w,
+    );
   }
   function newWorkspace() {
     const ws = makeWorkspace(`workspace ${workspaces.length + 1}`);
@@ -1512,6 +1563,15 @@
         read: ev.read,
       });
     }).then((un) => (unlistenNotify = un));
+    // Automations U8/R5: register the agent-run listener, then tell the backend
+    // the frontend is ready — only after the listener is live, so the first
+    // dispatched run can't fire into a listener-less void. Until this call the
+    // sweep defers due agent automations (script automations run regardless).
+    let unlistenAgentRun: (() => void) | undefined;
+    void onAgentRun(handleAgentRun).then((un) => {
+      unlistenAgentRun = un;
+      void automationsFrontendReady();
+    });
     const cwdTimer = setInterval(() => void refreshCwds(), 1500);
     return () => {
       window.removeEventListener("focus", reportForeground);
@@ -1519,6 +1579,7 @@
       window.removeEventListener("keydown", onWindowKeydown, true);
       clearInterval(cwdTimer);
       unlistenNotify?.();
+      unlistenAgentRun?.();
     };
   });
 </script>
@@ -1579,7 +1640,8 @@
             leafKey={p.key}
             focused={p.tabId === activeTab?.id && activeTab?.focusedLeafKey === p.key}
             cwd={cwdByLeaf[p.key] ?? null}
-            command={resumeCommandByLeaf[p.key] ?? null}
+            command={resumeCommandByLeaf[p.key] ?? automationCommandByLeaf[p.key] ?? null}
+            automationRunId={automationRunIdByLeaf[p.key] ?? null}
             resumeTier={resumeTierByLeaf[p.key] ?? null}
             saveScrollback={saveScrollbackEnabled && p.scrollback}
             {keymap}

@@ -35,6 +35,10 @@
     /** Program to run instead of the shell — set only when resuming a Claude
      * agent (U6/U8, KTD-E). Read once at mount; null → a bare shell. */
     command?: string[] | null;
+    /** Automations U8/R10: the automation run id this pane serves, threaded to
+     * the backend so it links run↔pane atomically at spawn. Read once at mount;
+     * null → an ordinary pane. */
+    automationRunId?: string | null;
     /** How this pane re-attached (fix-003 U4): "imprecise" (`--continue`,
      * most-recent-in-folder) surfaces a brief disclosure banner so it is never
      * mistaken for an exact re-attach (R5/AE4); "precise"/null shows none. */
@@ -55,6 +59,7 @@
     keymap,
     cwd = null,
     command = null,
+    automationRunId = null,
     resumeTier = null,
     saveScrollback = false,
     onFocusRequest,
@@ -198,7 +203,22 @@
     // A missing/stale cwd falls back to $HOME (portable-pty filters non-dirs).
     // `command` (resume only) runs a known `claude` invocation instead of the
     // shell — the scoped KTD10 auto-run exception (KTD-E).
-    paneId = await spawnPane(channel, { rows, cols, cwd, leafKey, command });
+    try {
+      paneId = await spawnPane(channel, {
+        rows,
+        cols,
+        cwd,
+        leafKey,
+        command,
+        automationRunId,
+      });
+    } catch (e) {
+      // A spawn can be rejected — notably an automation late-link (U8/R10): the
+      // run already closed, so the backend refuses to link this pane rather
+      // than orphan it. Surface it in the pane instead of leaving a blank one.
+      term.write(`\r\n\x1b[31m[failed to start: ${String(e)}]\x1b[0m\r\n`);
+      return;
+    }
     onSpawned?.(leafKey, paneId);
 
     term.onData((data) => {

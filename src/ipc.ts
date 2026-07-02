@@ -24,6 +24,13 @@ export interface SpawnOpts {
    * only when resuming a Claude agent (KTD-E); null/undefined → a bare shell.
    */
   command?: string[] | null;
+  /**
+   * Automations U8/R10: the automation run id this pane serves. When set, the
+   * backend links run↔pane atomically before the child spawns (sets
+   * `RunRow.pane_id`, marks the recursion registry). A late link — the run
+   * already closed — rejects the spawn. Null/undefined for an ordinary pane.
+   */
+  automationRunId?: string | null;
 }
 
 /** Lifecycle state as serialized by the Rust `LifecycleState` enum. */
@@ -84,6 +91,45 @@ export function onNotificationAdded(
   return listen<NotificationAddedEvent>("notification://added", (e) =>
     handler(e.payload),
   );
+}
+
+/**
+ * An automation agent run to launch (automations U7/U8, R9/R10). Emitted by the
+ * backend `AgentDispatcher` after the run is claimed + persisted; the frontend
+ * creates a background tab running `claude <prompt>` in `cwd`, placed in the
+ * origin workspace (or the first, R9 fallback), and calls {@link spawnPane}
+ * with `automationRunId = runId` so the backend links run↔pane atomically.
+ */
+export interface AgentRunEvent {
+  runId: string;
+  name: string;
+  prompt: string;
+  cwd: string;
+  /** Workspace identity resolved at create time (not a pane id), so origin
+   * resolves after a restart — falls back to the first workspace if gone. */
+  originWorkspaceHint: string;
+}
+
+/**
+ * Subscribe to automation agent-run dispatches (`automation://agent-run`).
+ * Returns an unlisten fn — the caller (App.svelte) tears it down on unmount.
+ */
+export function onAgentRun(
+  handler: (ev: AgentRunEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<AgentRunEvent>("automation://agent-run", (e) =>
+    handler(e.payload),
+  );
+}
+
+/**
+ * Tell the backend the frontend has finished restore and is listening for
+ * agent-run events (automations R5). Until this fires, the sweep defers due
+ * *agent* automations (script automations run regardless) so a dispatch never
+ * fires into a listener-less void and burns the occurrence.
+ */
+export function automationsFrontendReady(): Promise<void> {
+  return invoke("automations_frontend_ready");
 }
 
 /**
@@ -152,6 +198,7 @@ export function spawnPane(
     cwd: opts.cwd ?? null,
     leafKey: opts.leafKey,
     command: opts.command ?? null,
+    automationRunId: opts.automationRunId ?? null,
   });
 }
 
