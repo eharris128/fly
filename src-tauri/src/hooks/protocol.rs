@@ -27,6 +27,34 @@ use serde::Deserialize;
 
 use crate::state::attention::Reason;
 
+/// The op a socket message selects (automations U9). Absent → `"notify"`, so
+/// every pre-U9 `fly notify` message (which carries no `op`) still routes to
+/// the attention path. `"automation/…"` ops route to the request handler
+/// (which writes a response); anything else is treated as `notify`.
+pub fn default_op() -> String {
+    "notify".to_string()
+}
+
+/// The two-stage discriminator read before the full parse: the token (for the
+/// same constant-time validation + lockout every message faces) and the `op`.
+/// Kept minimal so both a [`HookMessage`] and an automation request deserialize
+/// from the same bytes afterwards.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Envelope {
+    pub token: String,
+    #[serde(default = "default_op")]
+    pub op: String,
+}
+
+impl Envelope {
+    /// Whether this op routes to the automations request handler (vs the
+    /// fire-and-forget notify path). Only the `automation/` prefix qualifies;
+    /// an unknown op degrades to notify (backward-compat).
+    pub fn is_automation(&self) -> bool {
+        self.op.starts_with("automation/")
+    }
+}
+
 /// A callback payload sent by an agent (via `fly notify`).
 ///
 /// `session_id`/`cwd`/`hook_event` are `#[serde(default)]` so an older `fly notify`
@@ -100,6 +128,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(msg.hook_event.as_deref(), Some("Stop"));
+    }
+
+    #[test]
+    fn envelope_defaults_op_to_notify_for_pre_u9_messages() {
+        // A pre-U9 `fly notify` message carries no `op` — it must route to the
+        // attention path, not the automations handler.
+        let e: Envelope =
+            serde_json::from_str(r#"{"token":"abc","reason":"finished"}"#).unwrap();
+        assert_eq!(e.op, "notify");
+        assert!(!e.is_automation());
+    }
+
+    #[test]
+    fn envelope_routes_automation_ops_and_degrades_unknown_to_notify() {
+        let create: Envelope =
+            serde_json::from_str(r#"{"token":"t","op":"automation/create"}"#).unwrap();
+        assert!(create.is_automation());
+        // An op the server doesn't recognize is treated as notify (never a
+        // response-writing path), so a future op can't wedge an old server.
+        let unknown: Envelope =
+            serde_json::from_str(r#"{"token":"t","op":"something/else"}"#).unwrap();
+        assert!(!unknown.is_automation());
     }
 
     #[test]

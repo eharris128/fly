@@ -198,15 +198,26 @@ On status `"failed"`:
 
 ---
 
-## U9: CLI Subcommand and Socket Protocol Extension
+## U9: CLI Subcommand and Socket Protocol Extension — DONE (2026-07-02)
 
 **Goal:** `fly automation …` end-to-end, with auth, origin stamping, recursion gate.
 
 **Requirements:** R19-R24 (all CLI operations)
 
-**Status:** U4 (manager ready), U2 (validation ready), hook socket ready
+**Status:** ✅ **Complete.** Landed:
+- `hooks/protocol.rs`: backward-compatible `Envelope { token, op=default "notify" }`; `op` absent/`"notify"`/unknown → the unchanged notify path, `"automation/*"` → the request handler.
+- `hooks/server.rs`: `RequestHandler` type + `start_with_handler`; `handle_conn` now validates the token **first** (the security boundary, for every message), then branches — notify dispatches as before (no response), automation ops call the handler and write the `{ok,…}` response with a write timeout (bounds a non-reading peer).
+- `state/manager.rs`: `pane_workspace(pane)` getter for origin stamping.
+- `cli/automation.rs` (new): the client. Mutating ops (`create`/`pause`/`resume`/`run`/`delete`) post over the socket with the pane token, `send_request` with a ~5s bounded wait → "may have committed" (R20). Read ops (`list`/`show`/`runs`) read `store_path()` directly (R19, work outside a pane / with no app). `--json` everywhere; captured output sanitized for the terminal (R16/R20) but newline-preserving. `--script-file` read client-side (R21).
+- `lib.rs`: thin `handle_automation_request` (AppHandle → resolves manager, recursion flag, workspace) delegating to a pure, testable `dispatch_automation_op` (R22 gate first, then origin-stamped routing).
+- Tests: protocol envelope; `automation_cli.rs` integration (socket create→persisted + origin stamped, R22 recursion reject, invalid-token→no-response security boundary, dispatch core create/pause/resume/delete/unknown); `load_store_at` direct read; rel-time + sanitize helpers. 222 lib + 4 integration tests pass; clippy clean (only 2 pre-existing warnings).
+- Verified via the real binary: `list`/`list --json`, outside-pane rejection (exit 1), flag validation (exit 2), unknown subcommand usage.
 
-**Dependencies:** U7.5 (pane-id recursion registry, for R22 gate)
+**Requirements:** R19-R24 (all CLI operations)
+
+**Dependencies:** U7.5 (pane-id recursion registry, for R22 gate) — satisfied.
+
+### Original notes
 
 ### Implementation Checklist
 

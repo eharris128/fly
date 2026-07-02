@@ -1,6 +1,6 @@
 //! The `fly` CLI (KTD12): subcommands share the app binary so agents and
-//! scripts invoke one tool and onboarding can run setup. v1 ships `notify`
-//! and `hooks setup` / `hooks teardown`.
+//! scripts invoke one tool and onboarding can run setup. v1 ships `notify`,
+//! `hooks setup` / `hooks teardown`, and `automation …` (U9).
 //!
 //! `fly resume` is deliberately **not** a CLI subcommand: it launches the
 //! desktop window (in resume mode) rather than running and exiting, so it falls
@@ -10,6 +10,7 @@
 //!   - `fly notify …`  — report attention (used by the Claude hook)
 //!   - `fly hooks …`   — install/remove the Claude hook
 
+pub mod automation;
 pub mod hooks;
 pub mod notify;
 
@@ -17,7 +18,7 @@ pub mod notify;
 /// the `fly` CLI rather than launching the desktop app). `resume` is excluded on
 /// purpose — it is a launch mode (KTD-B), handled in `lib.rs::run`.
 pub fn is_cli_subcommand(arg: &str) -> bool {
-    matches!(arg, "notify" | "hooks")
+    matches!(arg, "notify" | "hooks" | "automation")
 }
 
 /// Dispatch a CLI invocation. `args` is the full process argv. Returns the
@@ -25,6 +26,7 @@ pub fn is_cli_subcommand(arg: &str) -> bool {
 pub fn run(args: &[String]) -> i32 {
     match args.get(1).map(String::as_str) {
         Some("notify") => notify::run(&args[2..]),
+        Some("automation") => automation::run(&args[2..]),
         Some("hooks") => match args.get(2).map(String::as_str) {
             Some("setup") => hooks::run_setup(&args[3..]),
             Some("teardown") => hooks::run_teardown(&args[3..]),

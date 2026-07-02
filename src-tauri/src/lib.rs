@@ -323,8 +323,23 @@ pub fn run() {
                     }
                 }
             });
-            let server = HookServer::start(hook_socket_path(), tokens_for_hooks, dispatch)
-                .map_err(|e| format!("failed to start hook server: {e}"))?;
+            // U9 automation request handler: `automation/*` socket ops (create,
+            // pause, resume, run, delete) are validated + answered here. It
+            // resolves the AutomationManager lazily via `try_state` (like the
+            // pane-exit tap), so it needs no construction-order coupling with the
+            // manager built below — by the time any socket request arrives the
+            // manager is managed. The notify path is unchanged.
+            let automation_handle = app.handle().clone();
+            let automation_handler: hooks::RequestHandler = Arc::new(move |pane, buf: &[u8]| {
+                handle_automation_request(&automation_handle, pane, buf).to_bytes()
+            });
+            let server = HookServer::start_with_handler(
+                hook_socket_path(),
+                tokens_for_hooks,
+                dispatch,
+                Some(automation_handler),
+            )
+            .map_err(|e| format!("failed to start hook server: {e}"))?;
             app.manage(server);
 
             // Automations (U4): manager over the write-through store, with the
@@ -463,6 +478,133 @@ pub fn run() {
         });
 }
 
+/// Handle one authenticated `automation/*` socket request (U9). The thin
+/// `AppHandle` wrapper: runs on a hook connection thread after token validation
+/// (the pane is the validated caller), resolves the manager + the pane's
+/// workspace + the recursion flag from app state, and delegates the actual
+/// routing to [`dispatch_automation_op`] (which is AppHandle-free, so it is
+/// integration-tested directly). Returns the response the server writes back.
+fn handle_automation_request(
+    app: &tauri::AppHandle,
+    pane: pty::PaneId,
+    buf: &[u8],
+) -> cli::automation::AutomationResponse {
+    use cli::automation::{AutomationRequest, AutomationResponse};
+
+    let Some(mgr) = app.try_state::<Arc<automations::AutomationManager>>() else {
+        return AutomationResponse::err("automations are unavailable");
+    };
+    let req: AutomationRequest = match serde_json::from_slice(buf) {
+        Ok(r) => r,
+        Err(e) => return AutomationResponse::err(format!("malformed request: {e}")),
+    };
+    let is_recursion = mgr.is_automation_pane(pane.0);
+    // The pane's workspace stamps origin (R9) so an agent run's tab lands back
+    // in it; falls back to empty (→ first workspace) if not yet replicated.
+    let workspace_id = app
+        .try_state::<Arc<AttentionManager>>()
+        .and_then(|a| a.pane_workspace(pane))
+        .unwrap_or_default();
+    dispatch_automation_op(&mgr, pane.0, &workspace_id, is_recursion, req)
+}
+
+/// Route a parsed `automation/*` request to the manager (U9). AppHandle-free so
+/// it is directly testable: the caller supplies the validated `pane_id`, the
+/// pane's `workspace_id` (for origin stamping, R9), and whether the pane is
+/// itself automation-spawned (`is_recursion`, the R22 gate). Enforces the gate
+/// first, then routes create/pause/resume/run/delete to the manager.
+pub fn dispatch_automation_op(
+    mgr: &automations::AutomationManager,
+    pane_id: u64,
+    workspace_id: &str,
+    is_recursion: bool,
+    req: cli::automation::AutomationRequest,
+) -> cli::automation::AutomationResponse {
+    use automations::{CreateMode, CreateSpec, ManualRun};
+    use cli::automation::AutomationResponse;
+
+    // R22 recursion gate: a pane spawned by an automation may not create or
+    // manage automations (the registry entry outlives a delete, cleared only on
+    // the pane's exit, so create→delete can't un-gate a still-live pane).
+    if is_recursion {
+        return AutomationResponse::err(
+            "automations cannot be managed from an automation-spawned pane",
+        );
+    }
+
+    match req.op.as_str() {
+        "automation/create" => {
+            let (Some(name), Some(cron), Some(timezone), Some(cwd)) =
+                (req.name, req.cron, req.timezone, req.cwd)
+            else {
+                return AutomationResponse::err("create requires name, cron, timezone, and cwd");
+            };
+            let mode = if let Some(prompt) = req.prompt {
+                CreateMode::Agent { prompt }
+            } else if let Some(content) = req.script {
+                CreateMode::Script {
+                    content,
+                    interpreter: req.interpreter.unwrap_or_else(|| "bash".to_string()),
+                    timeout_ms: req.timeout_ms.unwrap_or(120_000),
+                }
+            } else {
+                return AutomationResponse::err("create requires a prompt or a script");
+            };
+            let origin = automations::model::Origin {
+                pane_id,
+                workspace_id: workspace_id.to_string(),
+                label: "cli".to_string(),
+            };
+            match mgr.create(CreateSpec {
+                name,
+                cron,
+                timezone,
+                cwd,
+                mode,
+                origin,
+            }) {
+                Ok(created) => AutomationResponse::ok(Some(created.automation.id), created.warning),
+                Err(e) => AutomationResponse::err(e),
+            }
+        }
+        "automation/pause" => match req.id {
+            Some(id) => match mgr.pause(&id) {
+                Ok(a) => AutomationResponse::ok(Some(a.id), None),
+                Err(e) => AutomationResponse::err(e),
+            },
+            None => AutomationResponse::err("pause requires an automation id"),
+        },
+        "automation/resume" => match req.id {
+            Some(id) => match mgr.resume(&id) {
+                Ok(a) => AutomationResponse::ok(Some(a.id), None),
+                Err(e) => AutomationResponse::err(e),
+            },
+            None => AutomationResponse::err("resume requires an automation id"),
+        },
+        "automation/delete" => match req.id {
+            Some(id) => match mgr.delete(&id) {
+                Ok(a) => AutomationResponse::ok(Some(a.id), None),
+                Err(e) => AutomationResponse::err(e),
+            },
+            None => AutomationResponse::err("delete requires an automation id"),
+        },
+        "automation/run" => match req.id {
+            Some(id) => match mgr.manual_run(&id) {
+                Ok(ManualRun::Started { run_id }) => AutomationResponse::ok(Some(run_id), None),
+                Ok(ManualRun::Skipped { run_id }) => AutomationResponse {
+                    ok: true,
+                    id: Some(run_id),
+                    warning: Some("a run was already in flight; this occurrence was skipped".into()),
+                    error: None,
+                },
+                Err(e) => AutomationResponse::err(e),
+            },
+            None => AutomationResponse::err("run requires an automation id"),
+        },
+        other => AutomationResponse::err(format!("unknown automation op {other:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,5 +634,6 @@ mod tests {
         assert!(!cli::is_cli_subcommand("resume"));
         assert!(cli::is_cli_subcommand("notify"));
         assert!(cli::is_cli_subcommand("hooks"));
+        assert!(cli::is_cli_subcommand("automation"));
     }
 }

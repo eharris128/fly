@@ -1,6 +1,7 @@
 //! Unix-domain socket server for the hook channel (U8, R10).
 
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use super::protocol::HookMessage;
+use super::protocol::{Envelope, HookMessage};
 use super::token::TokenRegistry;
 use crate::pty::PaneId;
 use crate::state::attention::Reason;
@@ -18,6 +19,9 @@ use crate::state::attention::Reason;
 /// Cap on a single callback payload — defends against a peer streaming forever.
 const MAX_MESSAGE: u64 = 64 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bound the response write so a peer that connects but never reads can't wedge
+/// an automation handler thread indefinitely (U9).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// An authenticated callback, resolved to its pane.
 #[derive(Debug, Clone)]
@@ -39,6 +43,14 @@ pub struct ValidatedHook {
 /// machine + frontend; tests record into a buffer.
 pub type Dispatch = Arc<dyn Fn(PaneId, ValidatedHook) + Send + Sync>;
 
+/// Handler for an authenticated `automation/…` request (U9). Given the
+/// validated pane and the raw request bytes, it returns the response bytes to
+/// write back (a JSON `{ok,…}` object). `lib.rs` injects one that closes over
+/// the `AutomationManager`; the notify path never uses it, so it stays `None`
+/// in tests that only exercise attention. Runs on the per-connection thread,
+/// after token validation, outside every app lock the caller must avoid.
+pub type RequestHandler = Arc<dyn Fn(PaneId, &[u8]) -> Vec<u8> + Send + Sync>;
+
 /// A running hook socket server. Dropping it shuts the server down and removes
 /// the socket file.
 pub struct HookServer {
@@ -48,11 +60,24 @@ pub struct HookServer {
 }
 
 impl HookServer {
-    /// Bind the socket and start accepting callbacks.
+    /// Bind the socket and start accepting callbacks (attention only — no
+    /// automation request handler). Used by tests that exercise the notify path.
     pub fn start(
         socket_path: PathBuf,
         tokens: Arc<TokenRegistry>,
         dispatch: Dispatch,
+    ) -> std::io::Result<HookServer> {
+        Self::start_with_handler(socket_path, tokens, dispatch, None)
+    }
+
+    /// Bind the socket and start accepting callbacks, with an optional
+    /// automation request handler (U9). The app wires the handler; the notify
+    /// path is unchanged whether or not it is present.
+    pub fn start_with_handler(
+        socket_path: PathBuf,
+        tokens: Arc<TokenRegistry>,
+        dispatch: Dispatch,
+        request_handler: Option<RequestHandler>,
     ) -> std::io::Result<HookServer> {
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -68,7 +93,9 @@ impl HookServer {
         let accept_stopping = Arc::clone(&stopping);
         let accept_handle = std::thread::Builder::new()
             .name("fly-hook-accept".into())
-            .spawn(move || accept_loop(listener, tokens, dispatch, accept_stopping))?;
+            .spawn(move || {
+                accept_loop(listener, tokens, dispatch, request_handler, accept_stopping)
+            })?;
 
         Ok(HookServer {
             socket_path,
@@ -106,6 +133,7 @@ fn accept_loop(
     listener: UnixListener,
     tokens: Arc<TokenRegistry>,
     dispatch: Dispatch,
+    request_handler: Option<RequestHandler>,
     stopping: Arc<AtomicBool>,
 ) {
     for incoming in listener.incoming() {
@@ -116,10 +144,13 @@ fn accept_loop(
             Ok(stream) => {
                 let tokens = Arc::clone(&tokens);
                 let dispatch = Arc::clone(&dispatch);
+                let request_handler = request_handler.clone();
                 // Handle each callback concurrently.
                 let _ = std::thread::Builder::new()
                     .name("fly-hook-conn".into())
-                    .spawn(move || handle_conn(stream, &tokens, &dispatch));
+                    .spawn(move || {
+                        handle_conn(stream, &tokens, &dispatch, request_handler.as_ref())
+                    });
             }
             Err(_) => {
                 if stopping.load(Ordering::Acquire) {
@@ -130,7 +161,12 @@ fn accept_loop(
     }
 }
 
-fn handle_conn(stream: UnixStream, tokens: &TokenRegistry, dispatch: &Dispatch) {
+fn handle_conn(
+    mut stream: UnixStream,
+    tokens: &TokenRegistry,
+    dispatch: &Dispatch,
+    request_handler: Option<&RequestHandler>,
+) {
     // The PTY is a trust boundary; only same-UID local peers may signal.
     if !peer_uid_matches(&stream) {
         return;
@@ -138,26 +174,49 @@ fn handle_conn(stream: UnixStream, tokens: &TokenRegistry, dispatch: &Dispatch) 
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
 
     let mut buf = Vec::new();
-    if stream.take(MAX_MESSAGE).read_to_end(&mut buf).is_err() {
+    if (&stream).take(MAX_MESSAGE).read_to_end(&mut buf).is_err() {
         return;
     }
+    // Two-stage parse (U9): read the envelope first so token validation (the
+    // constant-time compare + lockout, the security boundary) happens once for
+    // every message — notify and automation alike — before any op-specific work.
+    let envelope: Envelope = match serde_json::from_slice(&buf) {
+        Ok(e) => e,
+        Err(_) => return, // malformed → reject silently
+    };
+    let Some(pane) = tokens.validate(&envelope.token) else {
+        return; // unknown/invalid token → reject silently (lockout applies)
+    };
+
+    // Automation ops route to the request handler and get a response written
+    // back; everything else (including an unknown op) is the fire-and-forget
+    // notify path, unchanged.
+    if envelope.is_automation() {
+        if let Some(handler) = request_handler {
+            let response = handler(pane, &buf);
+            let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+            let _ = stream.write_all(&response);
+            let _ = stream.flush();
+            let _ = stream.shutdown(Shutdown::Write);
+        }
+        return;
+    }
+
     let msg: HookMessage = match serde_json::from_slice(&buf) {
         Ok(m) => m,
         Err(_) => return, // malformed → reject silently
     };
-    if let Some(pane) = tokens.validate(&msg.token) {
-        dispatch(
-            pane,
-            ValidatedHook {
-                reason: msg.reason,
-                title: msg.title,
-                body: msg.body,
-                session_id: msg.session_id,
-                cwd: msg.cwd,
-                hook_event: msg.hook_event,
-            },
-        );
-    }
+    dispatch(
+        pane,
+        ValidatedHook {
+            reason: msg.reason,
+            title: msg.title,
+            body: msg.body,
+            session_id: msg.session_id,
+            cwd: msg.cwd,
+            hook_event: msg.hook_event,
+        },
+    );
 }
 
 /// Verify the connecting peer's UID equals ours via `SO_PEERCRED`.

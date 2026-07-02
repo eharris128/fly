@@ -9,5 +9,5 @@ pub mod server;
 pub mod token;
 
 pub use protocol::HookMessage;
-pub use server::{Dispatch, HookServer, ValidatedHook};
+pub use server::{Dispatch, HookServer, RequestHandler, ValidatedHook};
 pub use token::TokenRegistry;

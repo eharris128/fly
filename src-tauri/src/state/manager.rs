@@ -131,6 +131,14 @@ impl AttentionManager {
         self.pane_workspace.lock().unwrap().insert(pane, workspace);
     }
 
+    /// The workspace a pane belongs to, if the frontend has replicated it
+    /// (automations U9: origin stamping resolves the creating pane's workspace
+    /// so an agent run's tab can land back in it, R9/R22). `None` before the
+    /// frontend pushes the mapping, or for a gone pane.
+    pub fn pane_workspace(&self, pane: PaneId) -> Option<String> {
+        self.pane_workspace.lock().unwrap().get(&pane).cloned()
+    }
+
     /// The per-effect policy decision for a pane's raise (KTD14): combines the
     /// reason's configured effect mask with the pane's replicated runtime state.
     /// `None` if the pane is gone.
