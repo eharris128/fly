@@ -467,6 +467,7 @@ pub fn run() {
             session::transcript::continue_target,
             usage::usage_snapshot,
             automations::automations_frontend_ready,
+            automations::list_automations,
         ])
         .build(tauri::generate_context!())
         .expect("error while building fly")

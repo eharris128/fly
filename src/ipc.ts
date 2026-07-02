@@ -122,6 +122,93 @@ export function onAgentRun(
   );
 }
 
+// ---- automations dashboard (U10, R25/R6) ------------------------------------
+// TS mirrors of the Rust `automations::model` types (serde camelCase, the shape
+// that already crosses the store file, the socket, and now the dashboard). The
+// pure view-model in `lib/automations.ts` turns these into rendered rows.
+
+/** Run-row mode discriminant (`RunMode` in model.rs) — also an automation's mode. */
+export type AutomationMode = "agent" | "script";
+/** Run-row status (`RunStatus` in model.rs). `running` is the only non-terminal. */
+export type RunStatus = "running" | "succeeded" | "failed" | "skipped";
+/** What started a run (`Trigger` in model.rs). */
+export type RunTrigger = "schedule" | "manual";
+
+/** One bounded run-history row (mirrors Rust `RunRow`, R8). */
+export interface RunRow {
+  id: string;
+  mode: AutomationMode;
+  trigger: RunTrigger;
+  status: RunStatus;
+  /** Linked pane for agent runs (R10); null for scripts / unlinked rows. */
+  paneId: number | null;
+  output: string | null;
+  exitCode: number | null;
+  /** Failure detail for `failed` rows; the skip reason for `skipped` rows. */
+  error: string | null;
+  scheduledFor: number | null;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
+/** What a due automation executes (serde-tagged `Mode` in model.rs). */
+export type AutomationSpec =
+  | { kind: "agent"; prompt: string }
+  | { kind: "script"; scriptFile: string; interpreter: string; timeoutMs: number };
+
+/** Where an automation came from (mirrors Rust `Origin`, R22/R9). */
+export interface AutomationOrigin {
+  paneId: number;
+  workspaceId: string;
+  label: string;
+}
+
+/** A scheduled automation with its embedded run history (mirrors Rust `Automation`). */
+export interface Automation {
+  id: string;
+  name: string;
+  cron: string;
+  timezone: string;
+  enabled: boolean;
+  cwd: string;
+  mode: AutomationSpec;
+  origin: AutomationOrigin;
+  createdAt: number;
+  updatedAt: number;
+  /** Next occurrence in epoch ms; null = paused (R23). */
+  nextRunAt: number | null;
+  runs: RunRow[];
+}
+
+/**
+ * The dashboard payload (mirrors Rust `AutomationsDashboard`): the raw list
+ * plus flattened store health for the R6 warning row. `degraded` is the
+ * at-a-glance bit; `corruptBak` names where corrupt store bytes were preserved;
+ * `flushError` carries a failing-flush detail. Both null when healthy.
+ */
+export interface AutomationsDashboard {
+  automations: Automation[];
+  degraded: boolean;
+  corruptBak: string | null;
+  flushError: string | null;
+}
+
+/** Fetch the automations + store health for the dashboard panel (U10). */
+export function listAutomations(): Promise<AutomationsDashboard> {
+  return invoke<AutomationsDashboard>("list_automations");
+}
+
+/**
+ * Subscribe to automation mutations (`automation://changed`; payload is the
+ * changed automation's id). The dashboard refetches on each; returns an unlisten
+ * fn the caller tears down on unmount.
+ */
+export function onAutomationChanged(
+  handler: (id: string) => void,
+): Promise<UnlistenFn> {
+  return listen<string>("automation://changed", (e) => handler(e.payload));
+}
+
 /**
  * Tell the backend the frontend has finished restore and is listening for
  * agent-run events (automations R5). Until this fires, the sweep defers due

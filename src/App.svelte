@@ -41,6 +41,7 @@
   } from "./lib/workspaces";
   import { buildHomeModel, effectiveAttention, effectiveTaskCount } from "./lib/home";
   import { resolveTargetWorkspace } from "./lib/automation-panes";
+  import { automationsToRows, type AutomationRow } from "./lib/automations";
   import {
     shouldShowNudge,
     deriveBusyIdle,
@@ -80,6 +81,8 @@
     frontendLog,
     onAgentRun,
     automationsFrontendReady,
+    listAutomations,
+    onAutomationChanged,
     type PaneId,
     type PaneActivity,
     type UsageSnapshot,
@@ -193,6 +196,13 @@
   let usage = $state<UsageSnapshot | null>(null);
   let usageError = $state<string | null>(null);
   let usageLoading = $state(false);
+  // Automations dashboard rows (U10, R25): fetched on dashboard open and
+  // refetched on `automation://changed`. Rows are already sorted + humanized by
+  // the pure `automationsToRows`; `automationsDegraded`/`automationsCorruptBak`
+  // drive the R6 store-health warning.
+  let automationRows = $state<AutomationRow[]>([]);
+  let automationsDegraded = $state(false);
+  let automationsCorruptBak = $state<string | null>(null);
   let paletteOpen = $state(false);
   let notificationPanelOpen = $state(false);
   // Global do-not-disturb. Seeded from the config default on restore; the
@@ -1115,6 +1125,23 @@
     if (!homeViewOpen) return;
     void refreshUsage();
   });
+  // Fetch the automations list + store health for the dashboard panel (U10).
+  // Called on dashboard open and on every `automation://changed`; `nowMs` is
+  // captured per fetch so the relative times ("in 5 minutes") are current.
+  async function refreshAutomations() {
+    try {
+      const dash = await listAutomations();
+      automationRows = automationsToRows(dash.automations, Date.now());
+      automationsDegraded = dash.degraded;
+      automationsCorruptBak = dash.corruptBak;
+    } catch (e) {
+      void frontendLog(`[fly-webview] listAutomations failed: ${String(e)}`);
+    }
+  }
+  $effect(() => {
+    if (!homeViewOpen) return;
+    void refreshAutomations();
+  });
 
   // ---- attention-triage nudge trigger (U5) ---------------------------------
   // Watch the focused pane while the dashboard is closed and decide whether the
@@ -1572,6 +1599,13 @@
       unlistenAgentRun = un;
       void automationsFrontendReady();
     });
+    // Automations U10/R25: refetch the dashboard panel on every mutation, but
+    // only while the dashboard is open (a closed dashboard re-fetches fresh on
+    // its next open, so there is nothing to keep current).
+    let unlistenAutomationChanged: (() => void) | undefined;
+    void onAutomationChanged(() => {
+      if (homeViewOpen) void refreshAutomations();
+    }).then((un) => (unlistenAutomationChanged = un));
     const cwdTimer = setInterval(() => void refreshCwds(), 1500);
     return () => {
       window.removeEventListener("focus", reportForeground);
@@ -1580,6 +1614,7 @@
       clearInterval(cwdTimer);
       unlistenNotify?.();
       unlistenAgentRun?.();
+      unlistenAutomationChanged?.();
     };
   });
 </script>
@@ -1674,6 +1709,9 @@
         usage={usage}
         usageError={usageError}
         usageLoading={usageLoading}
+        automations={automationRows}
+        automationsDegraded={automationsDegraded}
+        automationsCorruptBak={automationsCorruptBak}
         onRefresh={() => void refreshUsage()}
         onJump={jumpFromHome}
         onClose={toggleHome}

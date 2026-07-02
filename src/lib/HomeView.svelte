@@ -12,6 +12,7 @@
     firstRaised,
     type HomeWorkspaceGroup,
   } from "./home";
+  import type { AutomationRow, LastStatus } from "./automations";
   import type { UsageSnapshot } from "../ipc";
 
   let {
@@ -20,6 +21,9 @@
     usage,
     usageError,
     usageLoading,
+    automations,
+    automationsDegraded,
+    automationsCorruptBak,
     onRefresh,
     onJump,
     onClose,
@@ -34,11 +38,26 @@
     /** One-line reason the usage fetch failed (not signed in, offline, …). */
     usageError: string | null;
     usageLoading: boolean;
+    /** Sorted, humanized automation rows (U10, R25). Read-only — no selection or
+     *  jump, unlike the agent rows. */
+    automations: AutomationRow[];
+    /** Store health degraded (corrupt file or failing flush) — shows the R6
+     *  warning row. */
+    automationsDegraded: boolean;
+    /** Where corrupt store bytes were preserved, for the R6 warning hint; null
+     *  when degraded only by a failing flush. */
+    automationsCorruptBak: string | null;
     /** Re-fetch the usage gauges on demand (the panel's refresh button). */
     onRefresh: () => void;
     onJump: (wsId: string, tabId: string, leafKey: string) => void;
     onClose: () => void;
   } = $props();
+
+  // The last-run status word for a row: `"never run"` collapses to `"never"`;
+  // every other value is already a single token that doubles as its CSS class.
+  function statusWord(s: LastStatus): string {
+    return s === "never run" ? "never" : s;
+  }
 
   // Selection is tracked by leaf key (stable across live updates), never index.
   let selectedKey = $state<string | null>(null);
@@ -185,6 +204,42 @@
       {/each}
     </div>
   {/if}
+
+  <!-- Automations panel (U10, R25): read-only, stacked below the agent list in
+       the same left column. Static rows — no keyboard selection or jump. -->
+  <section class="automations" aria-label="Automations">
+    <header class="auto-head">
+      <h2>Automations</h2>
+      <span class="hint">read-only · manage with <code>fly automation</code></span>
+    </header>
+
+    {#if automationsDegraded}
+      <p class="auto-warn">
+        ⚠ Store corrupted · see
+        <code>{automationsCorruptBak ?? "~/.local/share/fly/automations.json"}</code>
+      </p>
+    {/if}
+
+    {#if automations.length === 0}
+      <p class="auto-empty">
+        No automations · Run <code>fly automation create --help</code> to get started
+      </p>
+    {:else}
+      <ul class="auto-list">
+        {#each automations as a (a.id)}
+          <li class="auto-row" class:paused={a.paused} title={a.lastError ?? ""}>
+            <span class="a-status s-{statusWord(a.lastStatus)}">{statusWord(a.lastStatus)}</span>
+            <span class="a-name">{a.name}<span class="a-mode">{a.mode}</span></span>
+            <span class="a-meta">
+              <span class="a-sched">{a.schedule}</span>
+              <span class="a-next">{a.paused ? "paused" : `next ${a.nextRun}`}</span>
+              {#if a.lastRun}<span class="a-last">· last {a.lastRun}</span>{/if}
+            </span>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  </section>
   </div>
 
   <aside class="usage-panel" aria-label="Plan usage">
@@ -548,5 +603,127 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* Automations panel — stacked below the agent list in the same left column,
+     with a divider so the two regions read as distinct. Static text only. */
+  .automations {
+    max-width: 720px;
+    margin-top: 28px;
+    padding-top: 18px;
+    border-top: 1px solid #262d44;
+  }
+  .auto-head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .auto-head h2 {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 0;
+  }
+  .auto-head .hint {
+    font-size: 12px;
+    color: #7b84a3;
+  }
+  .auto-head code,
+  .auto-empty code,
+  .auto-warn code {
+    font-size: 11px;
+    color: #8b93b2;
+  }
+  .auto-warn {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px;
+    font-size: 12px;
+    color: #f0a8a8;
+    background: #2a1a1e;
+    border: 1px solid #5a2a30;
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin: 0 0 12px;
+  }
+  .auto-warn code {
+    color: #f0c0c0;
+  }
+  .auto-empty {
+    font-size: 13px;
+    color: #7b84a3;
+    margin: 0;
+  }
+  .auto-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .auto-row {
+    display: grid;
+    grid-template-columns: 72px 1fr auto;
+    align-items: baseline;
+    gap: 12px;
+    background: #1d2336;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 8px 12px;
+  }
+  /* Paused rows recede — they have no upcoming occurrence. */
+  .auto-row.paused {
+    opacity: 0.72;
+  }
+  .a-status {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .a-status.s-succeeded {
+    color: #4ade80;
+  }
+  .a-status.s-failed {
+    color: #f87171;
+  }
+  .a-status.s-running {
+    color: #38bdf8;
+  }
+  .a-status.s-skipped {
+    color: #fbbf24;
+  }
+  .a-status.s-never {
+    color: #7b84a3;
+  }
+  .a-name {
+    font-size: 13px;
+    color: #e6e9f2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .a-mode {
+    margin-left: 8px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #8b93b2;
+    background: #2a3350;
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  .a-meta {
+    display: flex;
+    gap: 8px;
+    font-size: 12px;
+    color: #7b84a3;
+    white-space: nowrap;
+  }
+  .a-next {
+    color: #aeb6d4;
+    font-variant-numeric: tabular-nums;
   }
 </style>

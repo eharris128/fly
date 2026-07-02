@@ -1185,6 +1185,42 @@ pub fn automations_frontend_ready(manager: tauri::State<'_, Arc<AutomationManage
     manager.set_frontend_ready();
 }
 
+/// The read-only automations dashboard payload (U10, R25/R6). `automations` is
+/// the raw list in the model's serde-camelCase shape — the same shape that
+/// already crosses the store file and the socket (see [`model`]); the frontend
+/// view-model (`src/lib/automations.ts`) does the sort + humanization, matching
+/// the CLI's `load_store_at` ordering. The three health fields flatten
+/// [`store::StoreHealth`] for the R6 warning row: `degraded` is the at-a-glance
+/// bit, `corrupt_bak` names where corrupt bytes were preserved (so the warning
+/// can point the user at them), and `flush_error` carries a failing-flush
+/// detail. Sticky across successful flushes for the app session (see
+/// [`store::StoreHealth`]).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationsDashboard {
+    pub automations: Vec<Automation>,
+    pub degraded: bool,
+    pub corrupt_bak: Option<String>,
+    pub flush_error: Option<String>,
+}
+
+/// List every automation plus store health for the dashboard panel (U10). A
+/// pure read over the manager (no mutation, no lock held past the snapshot), so
+/// it is cheap enough to call on dashboard open and refetch on every
+/// `automation://changed`.
+#[tauri::command]
+pub fn list_automations(
+    manager: tauri::State<'_, Arc<AutomationManager>>,
+) -> AutomationsDashboard {
+    let health = manager.store_health();
+    AutomationsDashboard {
+        automations: manager.list(),
+        degraded: !health.is_ok(),
+        corrupt_bak: health.corrupt_bak.map(|p| p.display().to_string()),
+        flush_error: health.flush_error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU64;
