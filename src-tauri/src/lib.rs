@@ -328,9 +328,13 @@ pub fn run() {
                     let _ = changed_handle.emit(automations::AUTOMATION_CHANGED_EVENT, id);
                 }),
             ));
-            // Script runner (U5): the real dispatcher for script-mode runs
-            // (agent dispatch stays the unwired error until U7). Its reaper
-            // threads close rows via `close_run` — the Weak breaks the
+            // Agent dispatcher (U7): emits automation://agent-run to the frontend.
+            // The frontend creates a background tab with the prompt-threaded
+            // command, calls spawn_pane with the run id, and the backend links
+            // run↔pane atomically on spawn.
+            let agent_dispatcher = automations::AgentDispatcher::new(app.handle().clone());
+            // Script runner (U5): the real dispatcher for script-mode runs.
+            // Its reaper threads close rows via `close_run` — the Weak breaks the
             // manager↔runner Arc cycle (both live for the app's lifetime; a
             // post-shutdown reaper close simply drops). The killer/capacity
             // seams route delete/shutdown group kills and the sweep's KTD-D
@@ -345,13 +349,49 @@ pub fn run() {
                     }
                 },
             )));
-            automations_mgr
-                .set_dispatcher(Arc::clone(&script_runner) as Arc<dyn automations::Dispatcher>);
+            // Composite dispatcher (U7+U5): agent dispatch routes to
+            // AgentDispatcher, script dispatch routes to ScriptRunner.
+            struct CompositeDispatcher {
+                agent: std::sync::Arc<automations::AgentDispatcher>,
+                script: std::sync::Arc<automations::script::ScriptRunner>,
+            }
+            impl automations::Dispatcher for CompositeDispatcher {
+                fn dispatch_agent(
+                    &self,
+                    a: &automations::model::Automation,
+                    run_id: &str,
+                ) -> Result<(), String> {
+                    self.agent.dispatch_agent(a, run_id)
+                }
+                fn dispatch_script(
+                    &self,
+                    a: &automations::model::Automation,
+                    run_id: &str,
+                ) -> Result<(), String> {
+                    self.script.dispatch_script(a, run_id)
+                }
+            }
+            automations_mgr.set_dispatcher(Arc::new(CompositeDispatcher {
+                agent: Arc::clone(&agent_dispatcher),
+                script: Arc::clone(&script_runner),
+            }));
             let killer_runner = Arc::clone(&script_runner);
             automations_mgr
                 .set_script_killer(Arc::new(move |run_id: &str| killer_runner.kill_run(run_id)));
             let capacity_runner = Arc::clone(&script_runner);
             automations_mgr.set_script_capacity(Arc::new(move || capacity_runner.has_capacity()));
+            // U7 pane-alive probe (KTD-D): R7 overlap check widens to include
+            // deadline-failed agent runs whose linked pane is still alive
+            // (stuck agent must skip, not fan out). Consulted inside the sweep's
+            // mutate closure (cheap read, never re-entrant).
+            // The pty_for_hooks above is moved into dispatch; get a fresh clone
+            // for the pane-alive probe.
+            let pty_mgr = app.state::<Arc<PtyManager>>().inner().clone();
+            automations_mgr.set_agent_pane_alive(Arc::new(move |row: &automations::model::RunRow| {
+                row.pane_id
+                    .and_then(|id| pty_mgr.lifecycle(pty::PaneId(id)))
+                    .is_some()
+            }));
             app.manage(script_runner);
             app.manage(Arc::clone(&automations_mgr));
             // The sweep starts unconditionally (R5): script automations run
