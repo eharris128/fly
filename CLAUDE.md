@@ -147,7 +147,7 @@ arguments so they're tested without a running app.
   frontend's typed wrappers for them live in `src/ipc.ts`. Add a command in both
   places.
 
-### Automations (`src-tauri/src/automations/`, cross-referenced U1–U10)
+### Automations (`src-tauri/src/automations/`, cross-referenced U1–U12)
 Cron-scheduled runs that either spawn a `claude "<prompt>"` agent pane (Agent
 mode) or run a stored script with no model spend (Script mode). Data flow: a
 named `fly-automation-sweep` thread ticks every 10s; a due automation is
@@ -167,7 +167,19 @@ named `fly-automation-sweep` thread ticks every 10s; a due automation is
   (`automation://changed`, payload = the automation id) fires after every
   mutation so the dashboard refetches.
 - `script.rs` (U5) — the script runner (interpreter enum, timeout, output
-  classification → alert vs silent).
+  classification → alert vs silent). An alert-classified run hands off through
+  the injected `AlertSink` seam (U6 wires the real one).
+- `alerts.rs` (U6) — alert surfacing. `AlertsLog` owns the sanitized
+  append-only `automation-alerts.log` (R16: `notify::sanitize_*` strips control
+  chars incl. newlines at write time, so a script can't forge a log line;
+  64 KiB tail-truncated on startup), a bounded **pending queue** for alerts
+  arriving before the sink pane exists (R17), and the **sink registry**
+  (`register_sink`/`clear_sink_if`). `lib.rs`'s `set_alert_sink` closure (on the
+  reaper thread; only this lock + the log file, never the store lock — KTD-B)
+  appends then rings the sink pane via `raise_alert` (`Signal { Alert, Cli }` →
+  `emit_attention`, R18) or queues + emits `automation://alert-pending`. The
+  frontend single-flights a background "Automations" tab that `tail -f`s the log
+  and calls the `register_alert_sink` command, which drains the backlog.
 - Agent dispatch (U7/U7.5/U8) links run↔pane atomically in `stream::spawn_pane`
   (threading `automation_run_id`), spawns a background ephemeral tab
   (`App.svelte` `handleAgentRun` + `lib/automation-panes.ts`), and closes the run

@@ -1,74 +1,72 @@
 # Automations Work Queue (U6-U10)
 
-**Status:** U1-U5 committed, U11-U12 committed, U7/U7.5 complete, **U8/U9/U10 complete** (see their sections)  
+**Status:** ✅ **Feature complete.** All of U1–U12 have landed — U1-U5 + U11-U12
+committed, U7/U7.5/U8/U9/U10 complete, and **U6 complete** (see their sections).  
 **Last Updated:** 2026-07-02  
-**Remaining:** U6 only (alert surfacing — alerts log + sink pane; independent, no blockers)
+**Remaining:** none — the automations feature is done.
 
 ---
 
-## U6: Alert Surfacing — Alerts Module and Sink Pane
+## U6: Alert Surfacing — Alerts Module and Sink Pane — DONE (2026-07-02)
 
 **Goal:** Non-silent script output reaches the user through the attention pipeline.
 
-**Requirements:** R16 (sanitized log append), R17 (sink pane creation/registration), R18 (Reason::Alert flows end-to-end)
+**Requirements:** R16 (sanitized log append), R17 (sink pane creation/registration + pending queue), R18 (Reason::Alert flows end-to-end)
 
-**Status:** U5 (script runner) and U12 (Reason::Alert) ready; U7 stop-event ready
+**Status:** ✅ **Complete.** The seam U5 exposed (`ScriptRunner`'s no-op
+`AlertSink`) is now the real alerts-log append + attention raise. Landed:
 
-### Implementation Checklist
-
-#### 1. Create `src-tauri/src/automations/alerts.rs`
-
-- **AlertsLog struct:**
-  - Path: `$XDG_DATA_HOME/<app>/automation-alerts.log` (mode 0600 in 0700 dir)
-  - Append method: takes `[automation-name] first-line` + body, sanitizes via `notify::sanitize_title/body` **at write time**
-  - Startup truncate to 64 KiB tail on app start
-  - Control-char stripping removes newlines (prevents forged log entries, R16)
-
-- **Pending queue:**
-  - Holds alerts arriving before sink registers (R17)
-  - `fn queue_alert(&mut self, line: String)`
-  - `fn drain_pending(&mut self) -> Vec<String>`
-
-- **Sink registry:**
-  - Track pane_id of current alerts-pane (created on demand)
-  - `fn register_sink(&mut self, pane_id: u64)`
-  - `fn clear_sink(&mut self)` on pane exit
-  - `fn has_sink(&self) -> bool`
-
-- **Tests:** log write sanitizes ANSI/OSC escapes, pending drains once on registration, sink clears on pane exit
-
-#### 2. Wire AlertsLog into `src-tauri/src/lib.rs` setup
-
-- Create on app startup (after automations_mgr but before sweep start)
-- Store as managed state: `app.manage(alerts_log)`
-- Export a `raise_alert` closure or wrapper for U5's dispatch to call after claim
-
-#### 3. Update U5 ScriptRunner dispatch to emit alerts (in `src-tauri/src/automations/script.rs`)
-
-- When `dispatch_script` completes a run classified as "alert" (U5 already does this classification)
-- Instead of returning an error, emit to the alerts sink (U6 integration point)
-- Call a `raise_alert(automation_name, line)` that:
-  - Appends to log
-  - Raises `Signal { reason: Alert, tier: Cli }` on the sink pane (if registered)
-  - If no sink, queues for later (R17)
-
-**Note:** The plan says U6 depends on U5, but the script classification is done in U5. U6 just wires the alerting surface. Verify U5's output classification logic is complete before starting U6.
-
-#### 4. Frontend event listener in `src/App.svelte`
-
-- Listen for `automation://alert-pending` event
-- Single-flight create a background ephemeral tab:
-  - Title: "Automations" (fixed)
-  - Command: `["tail", "-n", "50", "-f", "<log-path>"]`
-  - Cwd: app data dir
-  - Ephemeral flag (U11)
-- Call `emit("automationSinkRegistered", { paneId })`
-
-#### 5. Implement `register_sink` Tauri command
-
-- Frontend calls after creating sink tab and getting pane id
-- Backend registers the pane in AlertsLog
-- Drains pending queue and emits raises for each
+- `automations/alerts.rs` (new, pure + tested): **`AlertsLog`** —
+  `automation-alerts.log` under `session::data_dir()` (`0600` in the `0700`
+  dir, private-file helpers recreated locally from `store.rs`).
+  - **Append (R16):** `append(name, first_line)` writes `[name] first-line\n`
+    **sanitized at write time** via `notify::sanitize_title`/`sanitize_body`,
+    which strip control chars *including newlines* — so a script's stdout can
+    never forge a second log line (the trailing `\n` is the only newline). Uses
+    `O_APPEND` (atomic per-write for records this small; concurrent reaper
+    appends don't interleave).
+  - **Startup truncate:** `startup_truncate()` keeps the trailing 64 KiB at a
+    line boundary (saturating byte math — release overflow-checks are off).
+  - **Pending queue (R17):** `sink_or_queue` (atomic check-and-queue for the
+    reaper closure), `queue_alert`/`drain_pending`, bounded at `MAX_PENDING`
+    (drops oldest — the ring is per-pane binary).
+  - **Sink registry (R17):** `register_sink(pane_id) -> Vec<QueuedAlert>` (sets
+    the sink + atomically drains the backlog), `clear_sink_if(pane_id)` (clears
+    only the matching pane), `has_sink`.
+  - **Tests (5):** append strips ANSI/OSC/newlines (single-line record, 0600);
+    pending drains once on registration; sink clears on the matching pane's exit
+    only; startup truncate keeps a line-aligned tail (and leaves a small file
+    alone); the pending queue is bounded.
+- `automations/mod.rs`: `pub mod alerts;`.
+- `lib.rs`:
+  - Builds `AlertsLog::open_default()` (truncates on start), replaces the
+    runner's no-op sink via `set_alert_sink`, and `app.manage`s the log. The
+    sink closure runs on the reaper thread and touches **only** the AlertsLog
+    lock + the log file — never the store lock (KTD-B). Per alert: append (R16),
+    then `sink_or_queue` → **raise on the registered sink pane** (R18) or **queue
+    + emit `automation://alert-pending`** (R17).
+  - `raise_alert(app, attention, pane_id)` helper — the same seam the hook
+    dispatch uses (`attention.signal(Signal { reason: Alert, tier: Cli })` →
+    `stream::emit_attention`), so an alert rings a pane exactly like an agent
+    raise (the attention lock is independent of the store lock).
+  - `register_alert_sink` Tauri command (registered in `invoke_handler!`): the
+    frontend registers its sink pane → backend drains the backlog, raising once
+    per drained alert. `AlertPendingEvent { logPath }` payload struct.
+- `stream/mod.rs`: the `spawn_pane` on-exit tap now calls
+  `AlertsLog::clear_sink_if(id)` so the sink registration self-heals when the
+  Automations pane exits (a later alert re-opens a fresh sink).
+- `ipc.ts`: `AlertPendingEvent`, `onAlertPending` listener, `registerAlertSink`.
+- `App.svelte`: `handleAlertPending` **single-flights** (guarded on the sink
+  leaf still resolving — self-healing if the tab was closed) a **background
+  ephemeral tab** titled "Automations" running `["tail","-n","50","-f",logPath]`
+  in the log's dir (modeled on `handleAgentRun`; no focus steal, no run id).
+  `onSpawned` calls `registerAlertSink` once the sink pane mounts;
+  `sinkCommandByLeaf` seeds the command; listener registered + torn down in
+  `onMount`.
+- `lib/Terminal.svelte`: `onSpawned` now fires **after** the pane's
+  `pane://exit`/`pane://attention` listeners are live, so the ring emitted
+  synchronously by the sink registration drain is never missed (a general
+  early-attention-event robustness fix).
 
 ---
 
@@ -447,20 +445,25 @@ Export the types and command wrapper for `listAutomations`.
 
 ## Test Checklist (End-to-End Verification)
 
-After all units land:
+All units have landed. Each behavior below has **automated coverage** (noted
+per item); the checkboxes track *live-app* end-to-end verification, still
+pending because live runs are awkward here (old installed release; Wayland
+screenshots need `GDK_BACKEND=x11` — see CLAUDE.md). Run them against a
+`pnpm flavor:dev` build to tick them off.
 
-- [ ] Script automation runs silently with empty stdout
-- [ ] Script with `{"wakeAgent": false}` in final line runs silently
-- [ ] Script with output shows alert pane, banner, and log line (no ANSI/OSC escapes)
-- [ ] Agent automation emits event, frontend creates background tab
-- [ ] Agent run closes on first Stop hook (second Stop is no-op)
-- [ ] 5-minute automation fires exactly once over a 10-minute window
-- [ ] Paused automation resumes into future (no instant fire)
-- [ ] Automation-spawned pane blocks create/run (recursion gate)
-- [ ] CLI list/show work outside a pane (read store file directly)
-- [ ] CLI create fires banner (even if silent), stores to disk
-- [ ] Dashboard lists automations, shows next-run / last-status, jump to tabs
-- [ ] Store corruption rendered as `.bad.bak` rename + warning in dashboard
+- [ ] Script automation runs silently with empty stdout — *unit: `script.rs` `exit_zero_empty_stdout_closes_succeeded_with_null_output_ae1`*
+- [ ] Script with `{"wakeAgent": false}` in final line runs silently — *unit: `script.rs` `trailing_wake_agent_false_is_silent_despite_earlier_output_ae2`*
+- [ ] Script with output shows alert pane + log line, no ANSI/OSC escapes — *unit: `script.rs` `sentinel_mid_output_alerts_with_first_line_ae3` (classification) + `alerts.rs` `append_sanitizes_control_chars_and_newlines_r16` (sanitized log line)*
+- [ ] Agent automation emits event, frontend creates background tab — *unit: `mod.rs` agent-run tests + `automation-panes.ts` placement*
+- [ ] Agent run closes on first Stop hook (second Stop is no-op) — *unit: `mod.rs` Stop-close (idempotent)*
+- [ ] 5-minute automation fires exactly once over a 10-minute window — *unit: `mod.rs` sweep/`schedule.rs` advance tests*
+- [ ] Paused automation resumes into future (no instant fire) — *unit: `mod.rs` resume-into-future (AE7)*
+- [ ] Automation-spawned pane blocks create/run (recursion gate) — *unit: `mod.rs`/`lib.rs` recursion-gate tests*
+- [ ] CLI list/show work outside a pane (read store file directly) — *unit: `automation_cli.rs`*
+- [ ] CLI create fires banner (even if silent), stores to disk — *unit: `automation_cli.rs`*
+- [ ] Dashboard lists automations, shows next-run / last-status, jump to tabs — *unit: `automations.test.ts`*
+- [ ] Store corruption rendered as `.bad.bak` rename + warning in dashboard — *unit: `store.rs` corrupt-json test*
+- [ ] Alert with no sink pane open queues, then rings + tails the log once the Automations tab spawns — *unit: `alerts.rs` `pending_drains_once_on_sink_registration_r17`*
 
 ---
 
