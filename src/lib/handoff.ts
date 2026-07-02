@@ -5,9 +5,10 @@
 // IPC (U1), then seeds `handoffCommandByLeaf[newLeaf]` from
 // `buildHandoffCommand` so the Terminal reads the argv once at mount.
 //
-// The argv is exec'd directly (no shell), and the prompt rides as the trailing
-// positional argument (R7) — the resume capture's `sanitizeFlags` strips
-// positionals, so a restart never re-fires the pickup prompt (plan KTD3).
+// The argv is exec'd directly (no shell), and the prompt rides as a positional
+// argument BEFORE `--add-dir` (R7; the variadic flag would swallow a trailing
+// one) — the resume capture's `sanitizeFlags` strips positionals wherever they
+// sit, so a restart never re-fires the pickup prompt (plan KTD3).
 
 import type { HandoffTarget } from "../ipc";
 
@@ -55,10 +56,15 @@ export function handoffPrompt(transcriptPath: string): string {
  * Build the handoff pane's argv (U2). Both modes launch `claude` in the user's
  * default permission mode — never `--dangerously-skip-permissions` — with
  * `--add-dir <transcript's project dir>` so the first transcript read (outside
- * the pane's cwd) needs no approval (R10). Quick appends the stock prompt as
- * the trailing positional so the fresh instance starts working with no further
- * input (R7); guided omits it (U3 pre-types instead, R9). The project dir is
- * the dirname of the sanitized transcript path — not a separate target field.
+ * the pane's cwd) needs no approval (R10; verified in U4: without the flag the
+ * read is permission-denied, with it it succeeds unprompted). Quick carries the
+ * stock prompt as the positional so the fresh instance starts working with no
+ * further input (R7); guided omits it (U3 pre-types instead, R9). The prompt
+ * MUST precede `--add-dir`: the flag is variadic (`<directories...>`), so a
+ * trailing positional would be swallowed as another directory (U4's runtime
+ * check — `claude -p --add-dir <dir> "<prompt>"` errors with "input must be
+ * provided"). The project dir is the dirname of the sanitized transcript path —
+ * not a separate target field.
  */
 export function buildHandoffCommand(
   target: HandoffTarget,
@@ -66,8 +72,9 @@ export function buildHandoffCommand(
 ): string[] {
   const path = sanitizeTranscriptPath(target.transcriptPath);
   const projectDir = path.replace(/\/[^/]*$/, "") || "/";
-  const argv = ["claude", "--add-dir", projectDir];
+  const argv = ["claude"];
   if (mode === "quick") argv.push(handoffPrompt(path));
+  argv.push("--add-dir", projectDir);
   return argv;
 }
 

@@ -223,6 +223,17 @@ named `fly-automation-sweep` thread ticks every 10s; a due automation is
   on `leader p`: every `BINDINGS` action (so it can't drift) plus live
   jump-to-workspace/tab navigation. Unlike the cheat-sheet it takes DOM focus,
   so `App.focusActivePane()` hands focus back to the active pane on close.
+- `lib/handoff.ts` — session handoff (`leader f` quick / `leader F` guided,
+  U1–U4 of the session-handoff plan): a stale pane's previous session is
+  resolved from its durable resume record (backend `session/handoff.rs`) and
+  handed to a fresh `claude` in a split alongside. The pure module builds the
+  argv — prompt positional **before** the variadic `--add-dir` (which would
+  swallow a trailing one) — and houses the guided-injection state machine
+  (spawned→ready→injected; user-typed-first/timeout→skipped, exit→cancelled)
+  that pre-types the pickup prompt unsent via bracketed-paste `pty_write`.
+  Handoff panes are ordinary panes: default permission mode, no automation
+  linkage; `resume.ts::sanitizeFlags` strips positionals so a restart never
+  re-fires the prompt.
 
 ## Conventions
 

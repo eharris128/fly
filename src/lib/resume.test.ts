@@ -106,6 +106,20 @@ describe("buildResumeCommand (U5)", () => {
     expect(out).toEqual(["claude", "--model", "opus", "--resume", "x"]);
   });
 
+  it("strips a mid-argv prompt — a resumed handoff pane must not re-fire it", () => {
+    // The quick-handoff argv puts the prompt BEFORE --add-dir (the flag is
+    // variadic and would swallow a trailing positional; session-handoff U2/U4,
+    // KTD3). Positionals are dropped wherever they sit.
+    const out = buildResumeCommand(
+      rec({
+        argv: ["claude", "pick up the previous session", "--add-dir", "/home/u/.claude/projects/-p"],
+        sessionId: "x",
+      }),
+      DEFAULT,
+    );
+    expect(out).toEqual(["claude", "--add-dir", "/home/u/.claude/projects/-p", "--resume", "x"]);
+  });
+
   it("preserves a node-wrapper argv[0..2] and appends --resume <id>", () => {
     const out = buildResumeCommand(
       rec({

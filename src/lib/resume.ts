@@ -59,12 +59,18 @@ function binaryPrefix(argv: string[]): string[] {
 
 /**
  * Strip any pre-existing `--resume`/`-r`/`--continue`/`-c` (and the resume id
- * value) and a single trailing positional prompt from the flag tokens (argv
- * after the binary prefix). Replaying a resume/continue would fight the one we
- * append; replaying a prompt would re-send it.
+ * value) and every positional prompt from the flag tokens (argv after the
+ * binary prefix). Replaying a resume/continue would fight the one we append;
+ * replaying a prompt would re-send it. Positionals are dropped wherever they
+ * sit, not just trailing: a handoff pane's argv is `claude <prompt> --add-dir
+ * <dir>` — prompt BEFORE the flag, because variadic `--add-dir` would swallow a
+ * trailing one (session-handoff U2/U4, KTD3) — and a resumed handoff must not
+ * re-fire the pickup prompt. The cost is that an unknown value-flag's value
+ * (absent from VALUE_FLAGS) is dropped too — the recoverable outcome VALUE_FLAGS
+ * already accepts.
  */
 function sanitizeFlags(rest: string[]): string[] {
-  const kept: { tok: string; positional: boolean }[] = [];
+  const kept: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
     // Resume/continue, separate-value form: drop the flag and its id value.
@@ -84,23 +90,19 @@ function sanitizeFlags(rest: string[]): string[] {
       continue;
     }
     if (tok.startsWith("-")) {
-      kept.push({ tok, positional: false });
+      kept.push(tok);
       // Keep a known value-flag's value so it isn't later read as the prompt.
       const next = rest[i + 1];
       if (VALUE_FLAGS.has(tok) && next !== undefined && !next.startsWith("-")) {
-        kept.push({ tok: next, positional: false });
+        kept.push(next);
         i++;
       }
       continue;
     }
-    // A bare token not consumed as a value → a positional (candidate prompt).
-    kept.push({ tok, positional: true });
+    // A bare token not consumed as a value → a positional prompt: drop it
+    // (re-sending it would re-prompt).
   }
-  // Drop a single trailing positional prompt (re-sending it would re-prompt).
-  if (kept.length > 0 && kept[kept.length - 1].positional) {
-    kept.pop();
-  }
-  return kept.map((k) => k.tok);
+  return kept;
 }
 
 /**

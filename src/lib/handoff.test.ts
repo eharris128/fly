@@ -21,19 +21,21 @@ const target: HandoffTarget = {
 };
 
 describe("buildHandoffCommand", () => {
-  it("quick: --add-dir project dir + trailing prompt, no permissions skip (AE1, R7/R8/R10)", () => {
+  it("quick: prompt positional BEFORE --add-dir, no permissions skip (AE1, R7/R8/R10)", () => {
     const argv = buildHandoffCommand(target, "quick");
+    // The prompt must precede `--add-dir`: the flag is variadic, so a trailing
+    // positional would be swallowed as another directory (U4 runtime check).
     // `--add-dir` scopes read access to the transcript's project dir — the
     // dirname of the transcript path, not a separate field (R10).
-    expect(argv.slice(0, 3)).toEqual([
-      "claude",
+    expect(argv).toHaveLength(4);
+    expect(argv[0]).toBe("claude");
+    expect(argv.slice(2)).toEqual([
       "--add-dir",
       "/home/u/.claude/projects/-home-u-proj",
     ]);
-    // The stock prompt is the trailing positional (R7), so the resume capture's
+    // The stock prompt is a positional (R7), so the resume capture's
     // sanitizeFlags strips it and a restart never re-fires it.
-    expect(argv).toHaveLength(4);
-    const prompt = argv[3];
+    const prompt = argv[1];
     expect(prompt).toBe(handoffPrompt(target.transcriptPath));
     // R8: names the exact transcript path and directs reading its RECENT
     // portion — not the whole file — to find and continue the outstanding work.
@@ -44,7 +46,7 @@ describe("buildHandoffCommand", () => {
     expect(argv).not.toContain("--dangerously-skip-permissions");
   });
 
-  it("guided: same argv without the trailing prompt (R9 seam for U3)", () => {
+  it("guided: same argv without the prompt positional (R9 seam for U3)", () => {
     expect(buildHandoffCommand(target, "guided")).toEqual([
       "claude",
       "--add-dir",
