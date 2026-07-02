@@ -218,6 +218,30 @@ fn handle_create(args: &[String]) -> i32 {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--help" | "-h" => {
+                println!("usage: fly automation create [options]");
+                println!();
+                println!("Options:");
+                println!("  --name <name>           automation name (required)");
+                println!("  --cron <expr>           cron schedule (required)");
+                println!("  --tz, --timezone <tz>   timezone (default: UTC)");
+                println!("  --cwd <path>            working directory (default: current)");
+                println!("  --prompt <text>         agent mode: claude prompt");
+                println!("  --script <code>         script mode: inline script code");
+                println!("  --script-file <path>    script mode: read script from file");
+                println!("  --interpreter <name>    script interpreter: bash, sh, python3 (default: bash)");
+                println!("  --timeout <ms>          script timeout in milliseconds (default: 120000)");
+                println!("  --json                  output response as JSON");
+                println!();
+                println!("Either --prompt (agent mode) or --script/--script-file (script mode) is required.");
+                println!();
+                println!("Examples:");
+                println!("  fly automation create --name 'check tests' --cron '*/5 * * * *' \\");
+                println!("    --prompt 'run the test suite'");
+                println!("  fly automation create --name 'backup db' --cron '0 2 * * *' \\");
+                println!("    --script-file backup.sh");
+                return 0;
+            }
             "--name" => name = it.next().cloned(),
             "--cron" => cron = it.next().cloned(),
             "--tz" | "--timezone" => timezone = it.next().cloned(),
@@ -316,6 +340,25 @@ fn handle_create(args: &[String]) -> i32 {
 
 /// pause / resume / run / delete: all take a single automation id.
 fn handle_target(op: &str, success: &str, args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        let cmd = match op {
+            "automation/pause" => "pause",
+            "automation/resume" => "resume",
+            "automation/run" => "run",
+            "automation/delete" => "delete",
+            _ => "unknown",
+        };
+        println!("usage: fly automation {cmd} <id> [--json]");
+        println!();
+        match cmd {
+            "pause" => println!("Pause a scheduled automation (it won't run until resumed)."),
+            "resume" => println!("Resume a paused automation."),
+            "run" => println!("Manually trigger an automation run immediately."),
+            "delete" => println!("Delete an automation permanently."),
+            _ => {}
+        }
+        return 0;
+    }
     let mut id: Option<String> = None;
     let mut json = false;
     for arg in args {
@@ -376,6 +419,12 @@ fn wants_json(args: &[String]) -> bool {
 }
 
 fn handle_list(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("usage: fly automation list [--json]");
+        println!();
+        println!("List all automations sorted by next run time.");
+        return 0;
+    }
     let json = wants_json(args);
     let list = match load_store() {
         Ok(l) => l,
@@ -409,6 +458,12 @@ fn handle_list(args: &[String]) -> i32 {
 }
 
 fn handle_show(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("usage: fly automation show <id> [--json]");
+        println!();
+        println!("Show details of a single automation.");
+        return 0;
+    }
     let json = wants_json(args);
     let Some(id) = args.iter().find(|a| !a.starts_with('-')).cloned() else {
         eprintln!("fly automation show: an automation id is required");
@@ -443,6 +498,16 @@ fn handle_show(args: &[String]) -> i32 {
 }
 
 fn handle_runs(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("usage: fly automation runs <id> [--output <run-id>] [--json]");
+        println!();
+        println!("List runs for an automation, or show output of a specific run.");
+        println!();
+        println!("Options:");
+        println!("  --output <run-id>  print captured output from a single run");
+        println!("  --json             output as JSON");
+        return 0;
+    }
     let json = wants_json(args);
     let mut id: Option<String> = None;
     let mut output_run: Option<String> = None;
