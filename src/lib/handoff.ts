@@ -12,8 +12,9 @@
 
 import type { HandoffTarget } from "../ipc";
 
-/** Quick sends the stock prompt as trailing argv (R7); guided spawns bare
- *  `claude` and U3's injection controller pre-types the prompt unsent (R9). */
+/** Quick launches bypass-permissions with the stock prompt as trailing argv
+ *  (R7); guided spawns bare `claude` in the default permission mode and U3's
+ *  injection controller pre-types the prompt unsent (R9). */
 export type HandoffMode = "quick" | "guided";
 
 /**
@@ -53,18 +54,23 @@ export function handoffPrompt(transcriptPath: string): string {
 }
 
 /**
- * Build the handoff pane's argv (U2). Both modes launch `claude` in the user's
- * default permission mode — never `--dangerously-skip-permissions` — with
+ * Build the handoff pane's argv (U2). Both modes launch `claude` with
  * `--add-dir <transcript's project dir>` so the first transcript read (outside
  * the pane's cwd) needs no approval (R10; verified in U4: without the flag the
- * read is permission-denied, with it it succeeds unprompted). Quick carries the
- * stock prompt as the positional so the fresh instance starts working with no
- * further input (R7); guided omits it (U3 pre-types instead, R9). The prompt
- * MUST precede `--add-dir`: the flag is variadic (`<directories...>`), so a
- * trailing positional would be swallowed as another directory (U4's runtime
- * check — `claude -p --add-dir <dir> "<prompt>"` errors with "input must be
- * provided"). The project dir is the dirname of the sanitized transcript path —
- * not a separate target field.
+ * read is permission-denied, with it it succeeds unprompted). The project dir
+ * is the dirname of the sanitized transcript path — not a separate target field.
+ *
+ * Quick launches in **bypass-permissions mode** (`--dangerously-skip-permissions`)
+ * and carries the stock prompt as the positional so the fresh instance starts
+ * working with no further input (R7): a quick resume runs the prompt
+ * immediately and unattended, so a mid-work permission prompt would just stall
+ * it. Guided omits both — it stays in the user's default permission mode
+ * because the user is in the loop (U3 pre-types the prompt unsent for them to
+ * review and send, R9). The prompt MUST precede `--add-dir`: the flag is
+ * variadic (`<directories...>`), so a trailing positional would be swallowed as
+ * another directory (U4's runtime check — `claude -p --add-dir <dir> "<prompt>"`
+ * errors with "input must be provided"); the boolean skip-permissions flag can
+ * sit anywhere, so it leads.
  */
 export function buildHandoffCommand(
   target: HandoffTarget,
@@ -73,7 +79,7 @@ export function buildHandoffCommand(
   const path = sanitizeTranscriptPath(target.transcriptPath);
   const projectDir = path.replace(/\/[^/]*$/, "") || "/";
   const argv = ["claude"];
-  if (mode === "quick") argv.push(handoffPrompt(path));
+  if (mode === "quick") argv.push("--dangerously-skip-permissions", handoffPrompt(path));
   argv.push("--add-dir", projectDir);
   return argv;
 }

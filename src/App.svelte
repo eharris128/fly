@@ -200,9 +200,10 @@
   // docs/plans/2026-07-02-001-feat-session-handoff-plan.md). Like
   // sinkCommandByLeaf, a plain command map with NO run id — a handoff pane is
   // an ordinary pane: never linked to an automation run, never in the recursion
-  // registry, no deadline (R11 by construction). Quick mode carries the stock
-  // pickup prompt as trailing argv (R7); guided omits it (U3 pre-types it).
-  // Read once at mount.
+  // registry, no deadline (R11 by construction). Quick mode launches
+  // bypass-permissions (it runs the prompt unattended) and carries the stock
+  // pickup prompt as trailing argv (R7); guided stays default-permission and
+  // omits the prompt (U3 pre-types it). Read once at mount.
   let handoffCommandByLeaf = $state<Record<string, string[]>>({});
   // leaf key → resolved target for a GUIDED handoff pane (session-handoff U2,
   // the seam for U3): the injection controller reads which leaf awaits the

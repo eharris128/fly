@@ -22,29 +22,30 @@ const target: HandoffTarget = {
 };
 
 describe("buildHandoffCommand", () => {
-  it("quick: prompt positional BEFORE --add-dir, no permissions skip (AE1, R7/R8/R10)", () => {
+  it("quick: bypass-permissions, then prompt positional BEFORE --add-dir (AE1, R7/R8/R10)", () => {
     const argv = buildHandoffCommand(target, "quick");
+    // Quick runs the stock prompt unattended, so it launches in
+    // bypass-permissions mode; the boolean flag leads.
+    expect(argv[0]).toBe("claude");
+    expect(argv[1]).toBe("--dangerously-skip-permissions");
     // The prompt must precede `--add-dir`: the flag is variadic, so a trailing
     // positional would be swallowed as another directory (U4 runtime check).
     // `--add-dir` scopes read access to the transcript's project dir — the
     // dirname of the transcript path, not a separate field (R10).
-    expect(argv).toHaveLength(4);
-    expect(argv[0]).toBe("claude");
-    expect(argv.slice(2)).toEqual([
+    expect(argv).toHaveLength(5);
+    expect(argv.slice(3)).toEqual([
       "--add-dir",
       "/home/u/.claude/projects/-home-u-proj",
     ]);
     // The stock prompt is a positional (R7), so the resume capture's
     // sanitizeFlags strips it and a restart never re-fires it.
-    const prompt = argv[1];
+    const prompt = argv[2];
     expect(prompt).toBe(handoffPrompt(target.transcriptPath));
     // R8: names the exact transcript path and directs reading its RECENT
     // portion — not the whole file — to find and continue the outstanding work.
     expect(prompt).toContain(target.transcriptPath);
     expect(prompt).toMatch(/recent/i);
     expect(prompt).toMatch(/not\s.*the whole file/i);
-    // R10: the user's default permission mode stays untouched.
-    expect(argv).not.toContain("--dangerously-skip-permissions");
   });
 
   it("guided: same argv without the prompt positional (R9 seam for U3)", () => {

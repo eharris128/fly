@@ -231,9 +231,11 @@ named `fly-automation-sweep` thread ticks every 10s; a due automation is
   swallow a trailing one) — and houses the guided-injection state machine
   (spawned→ready→injected; user-typed-first/timeout→skipped, exit→cancelled)
   that pre-types the pickup prompt unsent via bracketed-paste `pty_write`.
-  Handoff panes are ordinary panes: default permission mode, no automation
-  linkage; `resume.ts::sanitizeFlags` strips positionals so a restart never
-  re-fires the prompt.
+  Handoff panes are ordinary panes: no automation linkage;
+  `resume.ts::sanitizeFlags` strips positionals so a restart never re-fires the
+  prompt. Quick launches bypass-permissions (`--dangerously-skip-permissions`,
+  since it runs the pickup prompt unattended); guided stays default permission
+  mode (the user reviews the pre-typed prompt before sending).
 
 ## Conventions
 
