@@ -76,6 +76,18 @@
 
 **Note:** U7 backend is complete, but this spawn_pane change is needed for U8 to work.
 
+> **⚠️ Audit findings (2026-07-01) — the agent-run lifecycle is a stub; do NOT land U8 until this whole section is done.**
+> The `automation_run_id` param on `spawn_pane` is currently `_`-prefixed and discarded, so `RunRow.pane_id` is **never set**. Consequences, all latent only because `automations_frontend_ready` is never called yet (agent runs defer forever):
+> 1. **Sequencing landmine (must fix atomically):** the 30 s ack timeout keys on `pane_id.is_none()`. The moment U8 flips frontend-ready *without* the linking below, **every agent run force-fails at 30 s even though its pane is alive**, then the next occurrence spawns a second concurrent pane → fan-out. The link (below) and the U8 frontend-ready caller **must land in the same change**.
+> 2. **R11 30-min run deadline is entirely unimplemented** (only the `ERR_TIMED_OUT` string exists). Add a deadline check to `sweep_once`'s phase-1 closure: close agent `Running` rows whose `started_at + 30min ≤ now` as `failed(ERR_TIMED_OUT)` **without clearing `pane_id`** (so R7's alive-probe keeps a genuinely-stuck agent in-flight). This item is NOT in the checklist below — add it.
+> 3. **R11 pane-exit → failed is unimplemented:** `stream::spawn_pane`'s `on_exit` closure closes no run. Add a "close the linked run failed on pane exit before Stop" tap (and unregister the recursion-registry entry there).
+> 4. **Latent bugs to fix as part of the linking work, not before:**
+>    - Pane-alive probe (`lib.rs`) uses `pty_mgr.lifecycle(id).is_some()`, which is `true` for an *exited-but-not-closed* pane → strands the automation. Use `.is_some_and(|s| s.is_live())`.
+>    - `pane_id` is not launch-stable (resets to 1); a persisted `Failed` row keeps its old id and a restart can resolve it to an unrelated live pane. Clear `pane_id` on every close **except** the deadline-alive case, or tag rows with a boot id.
+>    - `model::push_row` evicts oldest-first regardless of status, so a long-lived `Running` row can be evicted after 20 pushes → `in_flight()`/`close_run` silently break. Evict the oldest *terminal* row, retaining any `Running` row.
+> 5. **Lock-order invariant to document + honor:** the sweep consults the pane-alive probe (which takes the PTY registry lock) while holding the store lock, so the order is **store → PTY**. The pane-exit tap must call `close_run*` **outside** `panes.lock()` or it's an AB-BA deadlock that wedges every sweep tick.
+> 6. **Add the agent-lifecycle tests that don't exist:** link-at-spawn, Stop-close (pane linked), deadline fire, pane-exit close, late-spawn-fails-the-spawn. The only agent-path test today asserts the ack fires when *no* pane links — i.e. it green-lights the broken behavior.
+
 ### Implementation Checklist
 
 #### Update `spawn_pane` in `src-tauri/src/stream/mod.rs`

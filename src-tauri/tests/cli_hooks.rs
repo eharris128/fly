@@ -123,6 +123,7 @@ fn notify_send_reaches_the_socket() {
         Some("body"),
         None,
         None,
+        None, // hook_event (U7): not exercised here
     )
     .unwrap();
 

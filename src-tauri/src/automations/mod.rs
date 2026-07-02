@@ -348,11 +348,20 @@ impl AutomationManager {
         // Mint a unique id (bounded retry; a collision in a 36^10 space at
         // desktop scale is astronomically unlikely).
         let mut id = mint_id();
+        let mut minted = false;
         for _ in 0..8 {
             if self.store.get(&id).is_none() {
+                minted = true;
                 break;
             }
             id = mint_id();
+        }
+        if !minted {
+            // 8 collisions in a 36^10 space is astronomically improbable, but
+            // proceeding would `put_script` onto (and only later reject) a
+            // colliding id — clobbering the victim's stored script. Bail
+            // before any script write.
+            return Err("could not mint a unique automation id; retry".into());
         }
 
         let mode = match spec.mode {
@@ -456,11 +465,11 @@ impl AutomationManager {
     /// Returns the removed record with its rows closed — the store no longer
     /// holds it, so this return value is the only witness of the closure.
     pub fn delete(&self, id: &str) -> Result<Automation, String> {
-        let removed = self
-            .store
-            .delete(id) // mutate(remove) + flush under the lock; script dir cleanup after
-            .map_err(|e| format!("could not persist delete: {e}"))?;
-        let Some(mut automation) = removed else {
+        // store::delete is flush-tolerant (KTD-B: the in-memory removal stays
+        // authoritative on a flush failure, recorded in health), so the R23
+        // teardown below always runs when the automation existed — a flush
+        // failure never orphans the in-flight script group it kills.
+        let Some(mut automation) = self.store.delete(id) else {
             return Err(format!("no such automation: {id}"));
         };
         // Lock released. Kill in-flight script groups (no-op seam until U5),
@@ -684,7 +693,7 @@ impl AutomationManager {
         // Phase 1: decide + mutate + flush under ONE lock hold.
         let mut changed: Vec<String> = Vec::new();
         let mut to_dispatch: Vec<(Automation, String)> = Vec::new();
-        let _ = self.store.mutate(|map| {
+        let flush_result = self.store.mutate(|map| {
             for a in map.values_mut() {
                 let mut touched = false;
 
@@ -733,6 +742,26 @@ impl AutomationManager {
             }
         });
 
+        // R2 persist-before-dispatch: if the phase-1 claim flush FAILED (e.g.
+        // ENOSPC), the Running rows live only in memory (KTD-B keeps them
+        // authoritative), not on disk. Dispatching them now would break R2 —
+        // a crash before the next successful flush loses the claim on disk
+        // while the side effect already ran, re-firing the occurrence on
+        // restart. So defer dispatch this tick: the in-memory Running rows
+        // block re-claims (skip-if-running) until a later flush persists them
+        // or startup recovery closes them interrupted on the next launch.
+        // Health already records the flush error for the dashboard (R6).
+        if flush_result.is_err() {
+            if !to_dispatch.is_empty() {
+                eprintln!(
+                    "[fly-automations] sweep claim flush failed; deferring dispatch of {} \
+                     run(s) to preserve persist-before-dispatch (R2)",
+                    to_dispatch.len()
+                );
+            }
+            to_dispatch.clear();
+        }
+
         // Phase 2: the store lock is RELEASED — dispatch (KTD-B: the
         // load-bearing discipline; a Dispatcher may safely call back into
         // list()/get() from here).
@@ -747,7 +776,13 @@ impl AutomationManager {
                 let _ = self.store.mutate(|map| {
                     if let Some(a) = map.get_mut(&automation.id) {
                         a.close(&run_id, failed(&e), now_ms);
-                        a.rollback_recompute(recomputed);
+                        // R3 refinement: only recompute if a concurrent pause
+                        // or disable hasn't nulled next_run_at during the
+                        // dispatch window — the recompute must never resurrect
+                        // a schedule the user just paused (R23).
+                        if a.enabled && a.next_run_at.is_some() {
+                            a.rollback_recompute(recomputed);
+                        }
                     }
                 });
             }

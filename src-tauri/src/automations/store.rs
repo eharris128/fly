@@ -122,11 +122,35 @@ impl Store {
     /// attention pipeline and PTYs do not depend on this store).
     pub fn load_at(path: PathBuf, scripts_dir: PathBuf) -> Store {
         let (map, health) = match std::fs::read(&path) {
-            Err(_) => (BTreeMap::new(), StoreHealth::default()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Fresh install: no store file yet.
+                (BTreeMap::new(), StoreHealth::default())
+            }
+            Err(e) => {
+                // The file exists but is unreadable (EACCES / EIO / EISDIR):
+                // do NOT treat it as a fresh install and silently start empty
+                // — surface the degradation so the dashboard warns and the
+                // user knows their automations are present-but-unread rather
+                // than gone. (A read-blocked 0600 file owned by this UID is a
+                // narrow case; the next successful flush would still overwrite
+                // it, but the corrupt_bak flag makes that visible first, R6.)
+                eprintln!(
+                    "[fly-automations] store file {} exists but could not be read ({e}); \
+                     starting empty and degraded (R6)",
+                    path.display()
+                );
+                (
+                    BTreeMap::new(),
+                    StoreHealth {
+                        corrupt_bak: Some(path.clone()),
+                        flush_error: None,
+                    },
+                )
+            }
             Ok(bytes) => match serde_json::from_slice::<BTreeMap<String, Automation>>(&bytes) {
                 Ok(map) => (map, StoreHealth::default()),
                 Err(e) => {
-                    let bak = PathBuf::from(format!("{}.bad.bak", path.display()));
+                    let bak = unique_bak_path(&path);
                     let preserved_at = match std::fs::rename(&path, &bak) {
                         Ok(()) => {
                             eprintln!(
@@ -211,20 +235,44 @@ impl Store {
     /// by the store). Returns the removed record, or `None` if the id was
     /// unknown.
     ///
-    /// The map + flush is the authority; script-dir removal is best-effort
-    /// cleanup attempted even when the entry was absent (it clears a
-    /// half-created orphan — script written, entry never flushed) and its
-    /// failure is logged, not surfaced: returning `Err` after the entry is
-    /// already gone would misreport the delete as failed.
-    pub fn delete(&self, id: &str) -> io::Result<Option<Automation>> {
-        let removed = self.mutate(|map| map.remove(id))?;
+    /// **Flush-tolerant** like every other mutation, but a removal cannot use
+    /// the `mutate` + `flush_tolerant` refetch dance (the entry is gone, so a
+    /// refetch yields `None`). So the removal + flush run inline here and the
+    /// removed record is returned **even when the flush fails** (KTD-B: the
+    /// in-memory removal stays authoritative; `flush_error` records the
+    /// degradation for the dashboard). Never resurrecting the entry on a flush
+    /// failure is load-bearing: the caller's R23 teardown (kill the in-flight
+    /// script group, close open rows) runs off this return value, so dropping
+    /// it would orphan a live process group and misreport the delete.
+    ///
+    /// Script-dir removal is best-effort cleanup attempted regardless of the
+    /// flush outcome (it also clears a half-created orphan — script written,
+    /// entry never flushed); its failure is logged, not surfaced.
+    pub fn delete(&self, id: &str) -> Option<Automation> {
+        let removed = {
+            let mut inner = self.inner.lock().unwrap();
+            let removed = inner.map.remove(id);
+            match write_map(&self.path, &inner.map) {
+                Ok(()) => inner.health.flush_error = None,
+                Err(e) => {
+                    eprintln!(
+                        "[fly-automations] flush after delete of {id:?} to {} failed ({e}); \
+                         in-memory removal remains authoritative (KTD-B)",
+                        self.path.display()
+                    );
+                    inner.health.flush_error = Some(e.to_string());
+                }
+            }
+            removed
+        };
+        // Lock released. Best-effort script cleanup regardless of flush outcome.
         if let Err(e) = self.remove_script(id) {
             eprintln!(
                 "[fly-automations] could not remove script dir for {id:?} ({e}); \
                  automation entry already deleted"
             );
         }
-        Ok(removed)
+        removed
     }
 
     // ---- reads --------------------------------------------------------------
@@ -303,6 +351,26 @@ impl Store {
 }
 
 // ---- atomic write helpers (mirror session::write_session, R6) ---------------
+
+/// A non-clobbering `.bad.bak` path for a corrupt store file (R6: prior
+/// forensic bytes are never overwritten). Prefers `<file>.bad.bak`, then
+/// `.bad.bak.2`, `.3`, … if earlier corruption already preserved copies.
+/// Bounded (release builds have overflow checks off); after 999 preserved
+/// corruptions it falls back to the base name (astronomically unreachable).
+fn unique_bak_path(path: &Path) -> PathBuf {
+    let base = format!("{}.bad.bak", path.display());
+    let first = PathBuf::from(&base);
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..1000u32 {
+        let cand = PathBuf::from(format!("{base}.{n}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    first
+}
 
 /// Serialize and atomically replace the store file. Mirrors
 /// `session::write_session` / `session::resume::write_records` (the repo's
@@ -504,7 +572,7 @@ mod tests {
             })
             .unwrap();
 
-        let removed = store.delete("a1").unwrap();
+        let removed = store.delete("a1");
         assert_eq!(removed.map(|a| a.id), Some("a1".to_string()));
         assert!(!script.exists(), "script file removed");
         assert!(!id_dir.exists(), "<id>/ dir removed too");
@@ -513,7 +581,45 @@ mod tests {
 
         // Deleting an unknown id (or an agent automation with no script) is
         // a calm no-op, not an error.
-        assert_eq!(store.delete("ghost").unwrap(), None);
+        assert_eq!(store.delete("ghost"), None);
+    }
+
+    // A flush failure during delete must STILL return the removed record
+    // (KTD-B: the in-memory removal is authoritative) — otherwise the
+    // manager's R23 teardown (kill the in-flight script group, close rows)
+    // never runs and an in-flight process is orphaned. Regression for the
+    // "delete drops teardown on flush failure" bug (delete previously
+    // `?`-propagated the flush error, discarding the removed record).
+    #[test]
+    fn delete_on_flush_failure_still_returns_the_removed_record_and_degrades_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let store = store_in(&dir);
+        store
+            .mutate(|map| {
+                map.insert("a1".into(), automation("a1"));
+            })
+            .unwrap();
+
+        // Fail the post-remove flush the same way the mutate flush-failure
+        // test does: remove the data dir and make the tempdir root read-only,
+        // so `create_private_dir` cannot recreate it (a plain chmod of `data`
+        // would be undone by that recreate).
+        std::fs::remove_dir_all(&data).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let removed = store.delete("a1");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            removed.map(|a| a.id),
+            Some("a1".to_string()),
+            "removed record survives the flush failure (the R23 teardown depends on it)"
+        );
+        assert!(store.get("a1").is_none(), "in-memory removal is authoritative");
+        assert!(
+            store.health().flush_error.is_some(),
+            "flush failure surfaced in health for the dashboard"
+        );
     }
 
     // KTD-B: flush failure surfaces the io error, keeps the in-memory

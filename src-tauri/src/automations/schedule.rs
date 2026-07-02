@@ -82,9 +82,23 @@ pub struct Validation {
 /// fixed reference instant, gaps measured in local wall-clock time — bb
 /// parity).
 pub fn validate(cron: &str, tz: &str) -> Result<Validation, String> {
-    let (cron, zone) = parse(cron, tz)?;
+    let (parsed, zone) = parse(cron, tz)?;
+    // Reject a syntactically-valid but never-matching expression (e.g.
+    // `0 0 30 2 *` — February 30): it would otherwise validate clean, store
+    // `next_run_at = None`, and sit permanently dormant with no feedback —
+    // the worst outcome for a watchdog the user believes is armed (R1; the U2
+    // "croner accepts but has no future occurrence" scenario). croner bounds
+    // its own search (YEAR_UPPER_LIMIT), so a rare-but-real expression like
+    // `0 0 29 2 *` (Feb 29) still yields `Some` here and is NOT rejected.
+    let reference = zoned(&zone, GAP_SAMPLE_REFERENCE_MS)?;
+    if parsed.iter_after(reference).next().is_none() {
+        return Err(format!(
+            "cron expression {cron:?} has no future occurrences — it never matches a real \
+             date (e.g. February 30), so it would never run"
+        ));
+    }
     Ok(Validation {
-        min_gap_warning: min_gap_warning(&cron, &zone),
+        min_gap_warning: min_gap_warning(&parsed, &zone),
     })
 }
 
@@ -259,6 +273,21 @@ mod tests {
     fn five_field_cron_with_valid_tz_validates_clean_with_no_advisory_warning_r1() {
         let v = validate("*/5 * * * *", NY).expect("validates");
         assert_eq!(v.min_gap_warning, None);
+    }
+
+    // R1 (U2 "accepts but has no future occurrence"): a syntactically-valid
+    // expression that never matches a real date is rejected at validate time,
+    // so create never mints a permanently-dormant automation. A rare-but-real
+    // expression (Feb 29) is not — it has future occurrences.
+    #[test]
+    fn validate_rejects_a_never_matching_expression_but_allows_a_rare_one_r1() {
+        let err = validate("0 0 30 2 *", UTC).unwrap_err(); // February 30: never
+        assert!(err.contains("no future occurrences"), "{err}");
+        assert!(err.contains("0 0 30 2 *"), "names the offending expression: {err}");
+        assert!(
+            validate("0 0 29 2 *", UTC).is_ok(),
+            "Feb 29 is rare but real — must not be rejected"
+        );
     }
 
     // R1/KTD-A: a `*/5` cron steps in 5-minute increments — successive

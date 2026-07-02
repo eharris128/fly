@@ -21,8 +21,8 @@
 //! — an un-`wait()`ed child is at worst a zombie, the kernel keeps its pid
 //! reserved, and no new process (hence no new process *group*) can take that
 //! id, so `kill(-pgid, …)` can never hit an unrelated group. The one
-//! post-reap signal ([`kill_lingering_group`], for a script that exited but
-//! left pipe-holding children behind) is guarded by a liveness probe and its
+//! post-reap signal (in `drain_captures`, for a script that exited but left
+//! pipe-holding children behind) is guarded by a liveness probe and its
 //! residual reuse window (every holder exits or `setsid`s between probe and
 //! signal) is documented and accepted.
 //!
@@ -292,6 +292,25 @@ pub fn resolve_interpreter(name: &str) -> Result<&'static str, String> {
     }
 }
 
+/// Reject an option-like script path before it reaches `Command::arg` — the
+/// argv-injection guard's second half (R14/U9). The interpreter enum blocks a
+/// free-form interpreter, but the script path is passed as the interpreter's
+/// first argv, so a path beginning with `-` (e.g. `-cPAYLOAD`, `--eval=…`)
+/// would be interpreted as a *flag* by bash/sh/python3 rather than a file —
+/// arbitrary execution. The manager only ever writes `script_file` as a store
+/// path under `automation-scripts/`, so this fires only on a tampered store
+/// (same-UID trust domain, KTD-K) — fail the run loudly rather than exec an
+/// attacker-chosen flag.
+pub fn checked_script_path(script_file: &str) -> Result<(), String> {
+    if script_file.starts_with('-') {
+        return Err(format!(
+            "refusing to run script with option-like path {script_file:?} \
+             (argv-injection guard)"
+        ));
+    }
+    Ok(())
+}
+
 // ---- capture buffers ------------------------------------------------------------
 
 /// A byte buffer that keeps at most `cap` bytes, discarding from the FRONT on
@@ -499,6 +518,7 @@ impl ScriptRunner {
             ));
         };
         let interpreter = resolve_interpreter(interpreter)?;
+        checked_script_path(script_file)?;
         let timeout_ms = clamp_timeout_ms(*timeout_ms);
 
         let mut cmd = Command::new(interpreter);
@@ -924,6 +944,23 @@ mod tests {
         for bad in ["sh -c evil", "/usr/bin/perl", "", "Bash"] {
             let err = resolve_interpreter(bad).expect_err(bad);
             assert!(err.contains("unknown interpreter"), "{err}");
+        }
+    }
+
+    // R14/U9 argv-injection guard: an option-like script path (from a tampered
+    // store) is rejected before it reaches Command::arg, where bash/sh/python3
+    // would treat it as a flag (`-cPAYLOAD` → arbitrary exec).
+    #[test]
+    fn checked_script_path_rejects_option_like_paths() {
+        for bad in ["-cPAYLOAD", "--eval=x", "-"] {
+            assert!(checked_script_path(bad).is_err(), "{bad:?} must be rejected");
+        }
+        for ok in [
+            "/home/u/.local/share/fly/automation-scripts/abc123/script",
+            "script",
+            "./script",
+        ] {
+            assert!(checked_script_path(ok).is_ok(), "{ok:?} must be allowed");
         }
     }
 
