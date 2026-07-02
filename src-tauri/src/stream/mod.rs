@@ -167,6 +167,12 @@ pub fn spawn_pane(
             if let Some(mgr) = app.try_state::<Arc<crate::automations::AutomationManager>>() {
                 mgr.on_pane_exit(id.0);
             }
+            // U6: if this pane was the automations alert sink, clear the
+            // registration so a later alert re-opens a fresh sink pane
+            // (no-op for any other pane).
+            if let Some(alerts) = app.try_state::<Arc<crate::automations::alerts::AlertsLog>>() {
+                alerts.clear_sink_if(id.0);
+            }
             let _ = app.emit(
                 PANE_EXIT_EVENT,
                 PaneExitEvent {

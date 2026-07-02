@@ -25,7 +25,7 @@ use config::ConfigStore;
 use hooks::{Dispatch, HookServer, TokenRegistry, ValidatedHook};
 use notify::{NotificationGate, Surfaced};
 use pty::PtyManager;
-use state::attention::{Signal, Tier};
+use state::attention::{Reason, Signal, Tier};
 use state::AttentionManager;
 
 /// Apply Linux-specific webview workarounds before the webview initializes.
@@ -87,6 +87,49 @@ fn hook_socket_path() -> PathBuf {
 #[tauri::command]
 fn frontend_log(msg: String) {
     eprintln!("[fly-webview] {msg}");
+}
+
+/// U6 event payload: an alert arrived with no sink pane registered (R17). The
+/// frontend single-flights a background "Automations" tab that `tail -f`s
+/// `log_path`, then calls `register_alert_sink` with the new pane id.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertPendingEvent {
+    log_path: String,
+}
+
+/// U6 (R18): ring a pane through the attention pipeline for an automation alert
+/// — the same seam the hook dispatch uses (`Signal { reason, tier }` →
+/// `emit_attention`), so an alert surfaces exactly like an agent raise. The
+/// attention manager's lock is independent of the automations store lock
+/// (KTD-B), so this is safe to call from the reaper thread's sink closure.
+fn raise_alert(app: &tauri::AppHandle, attention: &AttentionManager, pane_id: u64) {
+    let pane = pty::PaneId(pane_id);
+    if let Some(outcome) = attention.signal(
+        pane,
+        Signal {
+            reason: Reason::Alert,
+            tier: Tier::Cli,
+        },
+    ) {
+        stream::emit_attention(app, pane, &outcome);
+    }
+}
+
+/// U6 command (R17): the frontend registers its "Automations" sink pane so
+/// queued and future alerts ring it. Draining the pending backlog raises one
+/// ring per alert that arrived before the pane existed (the attention debounce
+/// collapses a burst into a single visible ring, which is the intent).
+#[tauri::command]
+fn register_alert_sink(
+    app: tauri::AppHandle,
+    attention: tauri::State<'_, Arc<AttentionManager>>,
+    alerts: tauri::State<'_, Arc<automations::alerts::AlertsLog>>,
+    pane_id: u64,
+) {
+    for _ in alerts.register_sink(pane_id) {
+        raise_alert(&app, &attention, pane_id);
+    }
 }
 
 /// How the app was launched (U7, KTD-B/G), read once by the frontend at restore.
@@ -368,8 +411,6 @@ pub fn run() {
             // post-shutdown reaper close simply drops). The killer/capacity
             // seams route delete/shutdown group kills and the sweep's KTD-D
             // pre-claim capacity skip to the runner's in-flight registry.
-            // TODO(U6): `set_alert_sink` replaces the runner's no-op alert
-            // sink with the alerts-log + Reason::Alert raise.
             let closer_mgr = Arc::downgrade(&automations_mgr);
             let script_runner = Arc::new(automations::script::ScriptRunner::new(Arc::new(
                 move |automation_id: &str, run_id: &str, outcome: automations::model::RunOutcome| {
@@ -378,6 +419,48 @@ pub fn run() {
                     }
                 },
             )));
+
+            // U6 alert surfacing (R16/R17/R18): the alerts log + sink registry,
+            // and the real alert sink replacing the runner's no-op. The sink
+            // closure runs on the reaper thread and takes only the AlertsLog
+            // lock + the log file — never the store lock (KTD-B). For each
+            // alert-classified run it appends the sanitized `[name] first-line`
+            // (R16), then either rings the registered sink pane through the
+            // attention pipeline (R18) or queues the alert and asks the frontend
+            // to open the "Automations" sink pane (R17).
+            let alerts_log = automations::alerts::AlertsLog::open_default();
+            let alerts_for_sink = Arc::clone(&alerts_log);
+            let attention_for_alerts = app.state::<Arc<AttentionManager>>().inner().clone();
+            let alert_handle = app.handle().clone();
+            script_runner.set_alert_sink(Arc::new(
+                move |ev: automations::script::AlertEvent| {
+                    alerts_for_sink.append(&ev.automation_name, &ev.first_line); // R16
+                    let queued = automations::alerts::QueuedAlert {
+                        automation_name: ev.automation_name,
+                        first_line: ev.first_line,
+                    };
+                    match alerts_for_sink.sink_or_queue(queued) {
+                        // R18: a live sink pane rings via the attention pipeline.
+                        Some(pane_id) => {
+                            raise_alert(&alert_handle, &attention_for_alerts, pane_id)
+                        }
+                        // R17: no sink yet — queued; ask the frontend to open
+                        // the sink pane, which registers and drains the backlog.
+                        None => {
+                            let _ = alert_handle.emit(
+                                "automation://alert-pending",
+                                AlertPendingEvent {
+                                    log_path: alerts_for_sink
+                                        .log_path()
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                },
+                            );
+                        }
+                    }
+                },
+            ));
+            app.manage(alerts_log);
             // Composite dispatcher (U7+U5): agent dispatch routes to
             // AgentDispatcher, script dispatch routes to ScriptRunner.
             struct CompositeDispatcher {
@@ -468,6 +551,7 @@ pub fn run() {
             usage::usage_snapshot,
             automations::automations_frontend_ready,
             automations::list_automations,
+            register_alert_sink,
         ])
         .build(tauri::generate_context!())
         .expect("error while building fly")

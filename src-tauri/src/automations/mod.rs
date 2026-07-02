@@ -30,6 +30,7 @@
 //! be cheap, non-blocking reads and must **never** call back into this
 //! manager or its store (the store mutex is not re-entrant).
 
+pub mod alerts;
 pub mod model;
 pub mod schedule;
 pub mod script;
