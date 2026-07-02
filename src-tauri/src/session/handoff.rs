@@ -36,6 +36,24 @@ pub struct HandoffTarget {
     pub last_turn_ms: u64,
 }
 
+/// Is `session_id` a plausible transcript **basename**? The id originates in
+/// hook-reported data written over the token-authenticated socket, so a hostile
+/// token-holding process could store one carrying `/` or `..` and steer the
+/// derived transcript path outside `projects_root` — which then rides the
+/// `--add-dir` grant and the stock prompt. `encode_cwd` neutralizes the cwd
+/// component, but the id is joined raw; accepting only a nonempty
+/// `[A-Za-z0-9._-]` id with no `..` keeps the derived path provably under
+/// `projects_root` (session-handoff U1 hardening, review follow-up). A
+/// rejected id degrades to `None` — the R6 notice — exactly like the other
+/// disqualifiers.
+fn is_plausible_transcript_basename(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        && !session_id.contains("..")
+}
+
 /// Path-taking core of [`resolve_handoff_target`]: resolve `leaf_key`'s record
 /// in `records` against the transcript store rooted at `projects_root`.
 ///
@@ -53,6 +71,10 @@ pub fn resolve_in_root(
 ) -> Option<HandoffTarget> {
     let rec = records.get(leaf_key)?;
     let session_id = rec.session_id.as_deref()?;
+    // Gate the hook-reported id before any path math (see the helper above).
+    if !is_plausible_transcript_basename(session_id) {
+        return None;
+    }
     // R12 precedence: the record's cwd, then the caller's live cwd, else bail.
     let cwd = rec.session_cwd.as_deref().or(live_cwd)?;
     let transcript_path = projects_root
@@ -201,6 +223,28 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let records = records_with(Some("sess-1"), Some("/proj/app"));
         write_transcript(root.path(), "-proj-app", "sess-1", METADATA_ONLY_FIXTURE);
+        assert_eq!(resolve_in_root(&records, "leaf-1", None, root.path()), None);
+    }
+
+    #[test]
+    fn a_session_id_that_is_not_a_plausible_basename_is_none() {
+        // Hardening (review follow-up): the id is hook-reported, so a
+        // separator-bearing one must never reach the path join — even when a
+        // file actually exists at the traversed location.
+        let root = tempfile::tempdir().unwrap();
+        let records = records_with(Some("a/b"), Some("/proj/app"));
+        write_transcript(root.path(), "-proj-app/a", "b", TURNFUL_FIXTURE);
+        assert_eq!(resolve_in_root(&records, "leaf-1", None, root.path()), None);
+
+        // The classic traversal shape is rejected before any derivation.
+        let records = records_with(Some("../../../etc/passwd"), Some("/proj/app"));
+        assert_eq!(resolve_in_root(&records, "leaf-1", None, root.path()), None);
+
+        // An empty id and a dotdot-smuggling (separator-free) id don't
+        // qualify either.
+        let records = records_with(Some(""), Some("/proj/app"));
+        assert_eq!(resolve_in_root(&records, "leaf-1", None, root.path()), None);
+        let records = records_with(Some("..sess"), Some("/proj/app"));
         assert_eq!(resolve_in_root(&records, "leaf-1", None, root.path()), None);
     }
 
