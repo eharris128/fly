@@ -32,6 +32,12 @@ here is mandatory, not a nicety.
   handler thread by connecting and never reading.
 - **Silent rejection** — unknown, missing, or malformed tokens are rejected with
   **no signal**: don't leak whether a pane exists or why a message failed.
+- **Capture-only messages** (`capture_only` / `SessionStart`, the
+  session-pane-attribution plan) ride this **same authenticated socket** — no new
+  route. The flag is read only *after* token validation, and a message can never
+  select its own trust rank: rank is assigned downstream at the dispatch call
+  site (a socket hook is always `Hook`), never from the wire payload. A forged
+  in-pane capture is thus pane-precise but can't outrank or clear a human `Pick`.
 - **Recursion origin** (`R22`) — the `automation/*` envelope carries its origin
   pane (`protocol.rs`, `Envelope::is_automation`); the actual recursion **gate**
   lives downstream in `automations/mod.rs` (the recursion registry —

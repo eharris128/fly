@@ -241,7 +241,12 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   bypass-permissions) handoff only fires zero-prompt against a remembered
   `Pick`; an uncorroborated Hook/Poll target lists once and the pick persists.
   `leader g` resets a leaf's attribution and forces a re-pick (the escape
-  valve for a stale or mis-attributed id).
+  valve for a stale or mis-attributed id). The `SessionStart` contract this
+  rests on is **empirically confirmed** (Claude Code 2.1.200): the hook inherits
+  `FLY_PANE_TOKEN`, carries `session_id`/`transcript_path`/`cwd`/`source`, and
+  `/clear` rotates to a distinct id (hook→hook rotation holds). Caveat: a plain
+  `claude` in an untrusted dir may not flush a transcript, so the **resume store,
+  not the transcript file, is the reliable capture signal** when verifying.
 
 ### Agent dashboard & attention triage (frontend + `state/activity.rs`, `usage/`)
 - **Dashboard / "home"** (`leader d`; agent-dashboard + dashboard-home-base +
