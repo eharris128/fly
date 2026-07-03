@@ -102,6 +102,62 @@ fn teardown_removes_only_fly_hooks() {
     assert_eq!(v["env"]["A"], "b");
 }
 
+// ---- SessionStart capture hook (fix-session-pane-attribution U7) -----------
+
+#[test]
+fn setup_installs_a_session_start_capture_group_idempotently() {
+    // R1: setup adds the capture hook beside Notification/Stop — a --capture
+    // invocation with NO matcher key, so it fires for every source
+    // (startup/resume/clear/compact, KTD5) — and re-running never duplicates.
+    let dir = tempfile::tempdir().unwrap();
+    let settings = dir.path().join("settings.json");
+    apply(&settings, Path::new(BIN)).unwrap();
+    apply(&settings, Path::new(BIN)).unwrap();
+
+    let v = read(&settings);
+    let start = v["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(start.len(), 1, "re-run duplicated the capture group");
+    let cmd = start[0]["hooks"][0]["command"].as_str().unwrap();
+    assert!(cmd.contains(BIN));
+    assert!(cmd.contains("notify --claude --capture"), "cmd: {cmd}");
+    assert!(
+        start[0].get("matcher").is_none(),
+        "an empty/omitted matcher captures all sources"
+    );
+    // The attention hooks are untouched beside it.
+    assert_eq!(v["hooks"]["Notification"].as_array().unwrap().len(), 1);
+    assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn teardown_removes_the_session_start_group_preserving_the_users() {
+    // Symmetric teardown (KTD5): fly's capture group goes; a user's own
+    // SessionStart hook stays; the emptied fly-only arrays drop.
+    let dir = tempfile::tempdir().unwrap();
+    let settings = dir.path().join("settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo user-start"}]}]}}"#,
+    )
+    .unwrap();
+
+    apply(&settings, Path::new(BIN)).unwrap();
+    let v = read(&settings);
+    assert_eq!(
+        v["hooks"]["SessionStart"].as_array().unwrap().len(),
+        2,
+        "fly's capture group installed alongside the user's"
+    );
+
+    teardown(&settings).unwrap();
+    let v = read(&settings);
+    let start = v["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(start.len(), 1, "only fly's group removed");
+    assert_eq!(start[0]["hooks"][0]["command"], "echo user-start");
+    assert!(v["hooks"].get("Notification").is_none());
+    assert!(v["hooks"].get("Stop").is_none());
+}
+
 #[test]
 fn notify_send_reaches_the_socket() {
     let dir = tempfile::tempdir().unwrap();

@@ -12,11 +12,37 @@ use serde_json::{json, Map, Value};
 
 use crate::state::attention::Reason;
 
-/// The Claude Code events fly hooks into, and the reason each maps to. v1's
-/// only agent; additional agents are deferred (Scope Boundaries).
-const CLAUDE_HOOK_EVENTS: &[(&str, Reason)] = &[
-    ("Notification", Reason::Permission),
-    ("Stop", Reason::Finished),
+/// What a fly hook on a Claude Code event does (fix-session-pane-attribution
+/// U7): raise attention with a CLI-arg fallback reason, or capture-only —
+/// `fly notify --claude --capture`, the `SessionStart` path that updates the
+/// pane's resume record and must never ring (KTD1/R2).
+enum HookKind {
+    Attention(Reason),
+    Capture,
+}
+
+impl HookKind {
+    /// The `fly notify` invocation this kind installs (quoted absolute binary
+    /// path; `--claude` reads the event payload from stdin either way).
+    fn command(&self, fly_bin: &Path) -> String {
+        match self {
+            HookKind::Attention(reason) => {
+                format!("\"{}\" notify {} --claude", fly_bin.display(), reason.as_str())
+            }
+            HookKind::Capture => format!("\"{}\" notify --claude --capture", fly_bin.display()),
+        }
+    }
+}
+
+/// The Claude Code events fly hooks into, and what each does. v1's only agent;
+/// additional agents are deferred (Scope Boundaries). `SessionStart` installs
+/// with **no matcher**, so it fires for every source — `startup`, `resume`,
+/// `clear`, `compact` — keeping the captured id current across `/clear`
+/// rotation (fix-attribution KTD5; all three key sources verified live in U1).
+const CLAUDE_HOOK_EVENTS: &[(&str, HookKind)] = &[
+    ("Notification", HookKind::Attention(Reason::Permission)),
+    ("Stop", HookKind::Attention(Reason::Finished)),
+    ("SessionStart", HookKind::Capture),
 ];
 
 /// CLI: `fly hooks setup [--agent claude]`.
@@ -74,15 +100,17 @@ pub fn apply(settings_path: &Path, fly_bin: &Path) -> std::io::Result<()> {
         .as_object_mut()
         .ok_or_else(|| err("`hooks` is not an object"))?;
 
-    for (event, reason) in CLAUDE_HOOK_EVENTS {
-        let command = format!("\"{}\" notify {} --claude", fly_bin.display(), reason.as_str());
+    for (event, kind) in CLAUDE_HOOK_EVENTS {
+        let command = kind.command(fly_bin);
         let groups = hooks
             .entry(*event)
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or_else(|| err("hook event is not an array"))?;
         // Replace any prior fly group in place (idempotent across re-runs and
-        // schema changes); leave the user's own hooks untouched.
+        // schema changes); leave the user's own hooks untouched. The fly-group
+        // marker keys on the first two command tokens (`fly notify`), so the
+        // --capture variant is recognized unchanged (KTD5).
         groups.retain(|group| !group_is_fly(group));
         groups.push(json!({
             "hooks": [ { "type": "command", "command": command } ]
