@@ -76,20 +76,24 @@ fn jsonl_id(name: &str) -> Option<&str> {
     (!id.is_empty()).then_some(id)
 }
 
-/// The session id of the **actively-written** transcript among `entries`
-/// (`(file-name, mtime)` pairs from the project dir): the basename of the newest
-/// `.jsonl` whose mtime is within `max_age` of `now` (KTD-A). The recency floor is
-/// what keeps a fresh agent that has not written its own transcript yet from
-/// adopting an ancient unrelated session in the same dir: an all-stale set yields
-/// `None`, so the poll captures nothing and the restore path's stale-guard (U3)
-/// stays in charge. A future mtime (clock skew) counts as fresh, never stale. Pure
-/// over its arguments.
-pub fn active_session_id(
+/// The session ids of every **actively-written** transcript among `entries`
+/// (`(file-name, mtime)` pairs from the project dir): the basenames of the
+/// `.jsonl` files whose mtime is within `max_age` of `now`, newest first
+/// (KTD-A recency floor; fix-session-pane-attribution U4). The recency floor
+/// keeps a fresh agent that has not written its own transcript yet from
+/// adopting an ancient unrelated session in the same dir. A future mtime
+/// (clock skew) counts as fresh, never stale. Pure over its arguments.
+///
+/// Returning the whole fresh set — not just the newest — is what lets the
+/// caller tell "one live session" from "several sharing this cwd": post-hoc
+/// attribution between same-cwd sessions is impossible, so the poll must
+/// abstain rather than guess (R4, KTD3).
+pub fn fresh_session_ids(
     entries: &[(String, SystemTime)],
     now: SystemTime,
     max_age: Duration,
-) -> Option<String> {
-    entries
+) -> Vec<String> {
+    let mut fresh: Vec<(&str, SystemTime)> = entries
         .iter()
         .filter_map(|(name, mtime)| jsonl_id(name).map(|id| (id, *mtime)))
         .filter(|(_, mtime)| {
@@ -97,8 +101,9 @@ pub fn active_session_id(
                 .map(|age| age <= max_age)
                 .unwrap_or(true)
         })
-        .max_by_key(|(_, mtime)| *mtime)
-        .map(|(id, _)| id.to_string())
+        .collect();
+    fresh.sort_by(|a, b| b.1.cmp(&a.1));
+    fresh.into_iter().map(|(id, _)| id.to_string()).collect()
 }
 
 /// The Unix-ms timestamp of the last real conversational turn in a transcript —
@@ -247,12 +252,24 @@ fn read_project_entries(dir: &Path) -> Vec<(String, SystemTime)> {
 /// Resolve the active session id for a pane's `cwd` by reading Claude's store
 /// (KTD-A): encode the cwd to its project dir, then pick the actively-written
 /// transcript's basename within the recency window. `None` when the dir is
-/// unresolvable/missing/empty or nothing was written recently. The single I/O
-/// entry point the `pane_session_id` command (U1) and the resume poll (U2) share.
+/// unresolvable/missing/empty, nothing was written recently, **or more than
+/// one fresh transcript shares the cwd** — an ambiguous cwd yields abstention,
+/// not a newest-mtime guess (fix-session-pane-attribution U4, R4/KTD3): the
+/// poll can't tell which same-cwd session is this pane's, and a wrong guess
+/// silently redirects resume and handoff. The frontend's change-tracked
+/// capture treats `None` as a no-op, so abstention never clears a stored id;
+/// disambiguation falls to the SessionStart hook or the pick-list. The single
+/// I/O entry point the `pane_session_id` command (U1) and the resume poll (U2)
+/// share.
 pub fn active_session_for_cwd(cwd: &Path) -> Option<String> {
     let dir = claude_project_dir(cwd)?;
     let entries = read_project_entries(&dir);
-    active_session_id(&entries, SystemTime::now(), ACTIVE_SESSION_MAX_AGE)
+    let mut fresh = fresh_session_ids(&entries, SystemTime::now(), ACTIVE_SESSION_MAX_AGE);
+    if fresh.len() == 1 {
+        fresh.pop()
+    } else {
+        None
+    }
 }
 
 /// The basename (sans `.jsonl`) of the most-recently-modified transcript among
@@ -335,43 +352,78 @@ mod tests {
         );
     }
 
-    // ---- active_session_id (KTD-A) -----------------------------------------
+    // ---- fresh_session_ids (KTD-A recency floor; fix-attribution U4) --------
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
     }
 
+    /// The single-fresh pick `active_session_for_cwd` applies over the pure
+    /// helper (U4): exactly one fresh id captures; zero or several yield `None`.
+    fn single_fresh(
+        entries: &[(String, SystemTime)],
+        now: SystemTime,
+        max_age: Duration,
+    ) -> Option<String> {
+        let mut fresh = fresh_session_ids(entries, now, max_age);
+        if fresh.len() == 1 {
+            fresh.pop()
+        } else {
+            None
+        }
+    }
+
     #[test]
-    fn picks_the_max_mtime_jsonl_basename() {
+    fn exactly_one_fresh_transcript_captures_it() {
+        // The unchanged single-session behavior: one in-window transcript is
+        // the pane's active session, however many stale siblings sit beside it.
         let entries = vec![
-            ("old-session.jsonl".to_string(), at(100)),
-            ("new-session.jsonl".to_string(), at(200)),
+            ("stale-session.jsonl".to_string(), at(100)),
+            ("live-session.jsonl".to_string(), at(9_990)),
         ];
         assert_eq!(
-            active_session_id(&entries, at(200), Duration::from_secs(3600)),
-            Some("new-session".to_string())
+            single_fresh(&entries, at(10_000), Duration::from_secs(60)),
+            Some("live-session".to_string())
         );
     }
 
     #[test]
-    fn ignores_non_jsonl_entries() {
-        // A newer non-`.jsonl` file (e.g. a stray note) must not be picked.
+    fn two_fresh_transcripts_abstain() {
+        // R4/KTD3: two same-cwd sessions both in-window are indistinguishable
+        // post-hoc — the poll must capture nothing, not guess newest-mtime
+        // (the guess IS the reported bug).
         let entries = vec![
-            ("notes.txt".to_string(), at(900)),
-            ("the-session.jsonl".to_string(), at(100)),
+            ("pane-a-session.jsonl".to_string(), at(9_980)),
+            ("pane-b-session.jsonl".to_string(), at(9_990)),
         ];
         assert_eq!(
-            active_session_id(&entries, at(901), Duration::from_secs(3600)),
-            Some("the-session".to_string())
+            fresh_session_ids(&entries, at(10_000), Duration::from_secs(60)).len(),
+            2
+        );
+        assert_eq!(
+            single_fresh(&entries, at(10_000), Duration::from_secs(60)),
+            None
+        );
+    }
+
+    #[test]
+    fn fresh_ids_order_newest_first_ignoring_non_jsonl() {
+        // A newer non-`.jsonl` file (e.g. a stray note) never appears.
+        let entries = vec![
+            ("notes.txt".to_string(), at(990)),
+            ("older.jsonl".to_string(), at(900)),
+            ("newer.jsonl".to_string(), at(950)),
+        ];
+        assert_eq!(
+            fresh_session_ids(&entries, at(1_000), Duration::from_secs(3600)),
+            vec!["newer".to_string(), "older".to_string()]
         );
     }
 
     #[test]
     fn empty_list_is_none() {
-        assert_eq!(
-            active_session_id(&[], at(100), Duration::from_secs(3600)),
-            None
-        );
+        assert!(fresh_session_ids(&[], at(100), Duration::from_secs(3600)).is_empty());
+        assert_eq!(single_fresh(&[], at(100), Duration::from_secs(3600)), None);
     }
 
     #[test]
@@ -380,7 +432,7 @@ mod tests {
         // session → None (so the poll captures nothing).
         let entries = vec![("ancient.jsonl".to_string(), at(10))];
         assert_eq!(
-            active_session_id(&entries, at(10_000), Duration::from_secs(100)),
+            single_fresh(&entries, at(10_000), Duration::from_secs(100)),
             None
         );
     }
@@ -390,7 +442,7 @@ mod tests {
         // Clock skew: an mtime after `now` must not be treated as stale.
         let entries = vec![("future.jsonl".to_string(), at(5_000))];
         assert_eq!(
-            active_session_id(&entries, at(1_000), Duration::from_secs(60)),
+            single_fresh(&entries, at(1_000), Duration::from_secs(60)),
             Some("future".to_string())
         );
     }
