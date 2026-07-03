@@ -23,6 +23,12 @@ export interface SessionPickerRow {
  *  none with extractable text (e.g. a tool-use-only session). */
 export const NO_SNIPPET_FALLBACK = "(no readable turn text)";
 
+/** The human-facing short form of a session id — enough to tell same-cwd
+ *  siblings apart in a row or a notice. */
+export function shortSessionId(id: string): string {
+  return id.slice(0, 8);
+}
+
 /**
  * Order candidates most-recent-activity first (R7). The backend already
  * orders by last real turn, but the sort is re-applied at the seam so the
@@ -41,7 +47,7 @@ export function candidatesToRows(
   now: number,
 ): SessionPickerRow[] {
   return candidates.map((c) => ({
-    shortId: c.sessionId.slice(0, 8),
+    shortId: shortSessionId(c.sessionId),
     snippet: c.snippet ?? NO_SNIPPET_FALLBACK,
     when: relativeTime(c.lastTurnMs, now),
   }));

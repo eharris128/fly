@@ -120,9 +120,12 @@ pub fn session_last_turn_ms(path: &Path) -> Option<u64> {
     last_turn_ms_from_str(&body)
 }
 
-/// Pure core of [`session_last_turn_ms`]: the stamp half of the one turn scan.
+/// Pure core of [`session_last_turn_ms`]: the stamp half of the turn scan —
+/// snippet extraction skipped, since the stamp-only callers (`continue_target`,
+/// `qualifying_session_count`) run per-file on the restore path and would pay
+/// O(turns) of discarded text extraction otherwise.
 fn last_turn_ms_from_str(body: &str) -> Option<u64> {
-    turn_summary_from_str(body).map(|s| s.last_turn_ms)
+    scan_turns(body, false).map(|s| s.last_turn_ms)
 }
 
 /// What the pick-list shows for one transcript (fix-session-pane-attribution
@@ -142,16 +145,22 @@ pub fn session_turn_summary(path: &Path) -> Option<TurnSummary> {
     turn_summary_from_str(&body)
 }
 
+/// The snippet-bearing scan (see [`scan_turns`]) — the pick-list's entry point.
+fn turn_summary_from_str(body: &str) -> Option<TurnSummary> {
+    scan_turns(body, true)
+}
+
 /// The one turn scan: walk JSONL `body` keeping the last `user`/`assistant`
 /// line bearing a parseable ISO-8601 `timestamp` (the real-turn stamp, KTD-C)
-/// and, independently, the last such line whose `message.content` yields text
-/// (the snippet — a turn may be tool-use-only, so the snippet can come from an
-/// earlier turn than the stamp). Tolerant of a non-JSON or unterminated
-/// trailing line (skipped), matching the thin-reader contract elsewhere. The
-/// content shapes are undocumented Claude contracts, so extraction is
-/// defensive: a string body, or the first `{"type":"text"}` block of an array
-/// (KTD6). Linear scan; read at picker/restore time, never on a hot path.
-fn turn_summary_from_str(body: &str) -> Option<TurnSummary> {
+/// and — only when `want_snippet` — the last such line whose `message.content`
+/// yields text (the snippet — a turn may be tool-use-only, so the snippet can
+/// come from an earlier turn than the stamp). Tolerant of a non-JSON or
+/// unterminated trailing line (skipped), matching the thin-reader contract
+/// elsewhere. The content shapes are undocumented Claude contracts, so
+/// extraction is defensive: a string body, or the first `{"type":"text"}`
+/// block of an array (KTD6). Linear scan; read at picker/restore time, never
+/// on a hot path.
+fn scan_turns(body: &str, want_snippet: bool) -> Option<TurnSummary> {
     let mut last_ms: Option<u64> = None;
     let mut snippet: Option<String> = None;
     for line in body.lines() {
@@ -174,8 +183,10 @@ fn turn_summary_from_str(body: &str) -> Option<TurnSummary> {
             continue;
         };
         last_ms = Some(ms);
-        if let Some(text) = turn_text(&v) {
-            snippet = Some(text);
+        if want_snippet {
+            if let Some(text) = turn_text(&v) {
+                snippet = Some(text);
+            }
         }
     }
     last_ms.map(|last_turn_ms| TurnSummary {

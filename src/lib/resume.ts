@@ -8,7 +8,7 @@
 //
 // The auto-run this enables is the scoped KTD10 exception — gated to resume +
 // a detected agent + the known `claude` shape (see KTD-E in App/Terminal).
-import type { ResumeRecord } from "../ipc";
+import type { ResumeRecord, SessionSource } from "../ipc";
 
 /** JS runtimes that wrap a JS Claude entrypoint (npm-global installs). */
 const JS_RUNTIMES = new Set(["node", "bun", "deno"]);
@@ -298,9 +298,20 @@ export function isAmbiguousResumeLeaf(
   record: ResumeRecord | null | undefined,
   qualifyingTranscriptCount: number,
 ): boolean {
-  const source = record?.sessionSource ?? "poll";
-  if (source === "hook" || source === "pick") return false;
+  if (isPreciseSource(record?.sessionSource)) return false;
   return qualifyingTranscriptCount > 1;
+}
+
+/**
+ * Whether a capture source is pane-precise — hook or pick, above the poll's
+ * cwd-level guess (fix-attribution KTD2). The one predicate the ambiguity
+ * classifier and its callers' probe short-circuits share, so they can't drift.
+ * An absent source (a pre-fix record) is the poll's rank.
+ */
+export function isPreciseSource(
+  source: SessionSource | null | undefined,
+): boolean {
+  return source === "hook" || source === "pick";
 }
 
 /**

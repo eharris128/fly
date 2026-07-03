@@ -16,7 +16,7 @@
 
 use std::path::Path;
 
-use super::resume::{ResumeRecords, SessionSource};
+use super::resume::{is_plausible_session_id, ResumeRecord, ResumeRecords, SessionSource};
 use super::transcript;
 
 /// A qualified previous session, ready to hand to a fresh agent (U1). The
@@ -42,14 +42,13 @@ pub struct HandoffTarget {
     pub divergence_pending: bool,
 }
 
-/// The basename gate on hook-reported ids: a `/`- or `..`-bearing id could
-/// steer the derived transcript path outside `projects_root` — which then rides
-/// the `--add-dir` grant and the stock prompt. The validator itself now lives
-/// in [`super::resume`] and is applied at every **write** too (fix-session-pane-
-/// attribution KTD8/R15); this read-side check stays as defense in depth for a
-/// store written by an older binary. A rejected id degrades to `None` — the R6
-/// notice — exactly like the other disqualifiers.
-use super::resume::is_plausible_session_id as is_plausible_transcript_basename;
+/// The scan cwd both entry points derive transcript paths under (handoff-plan
+/// R12 precedence), shared so the resolver and the U5 candidate lister can
+/// never drift: the record's captured cwd wins; the caller's live cwd is only
+/// the fallback for a record that never captured one.
+fn scan_cwd<'a>(rec: Option<&'a ResumeRecord>, live_cwd: Option<&'a str>) -> Option<&'a str> {
+    rec.and_then(|r| r.session_cwd.as_deref()).or(live_cwd)
+}
 
 /// Path-taking core of [`resolve_handoff_target`]: resolve `leaf_key`'s record
 /// in `records` against the transcript store rooted at `projects_root`.
@@ -68,12 +67,18 @@ pub fn resolve_in_root(
 ) -> Option<HandoffTarget> {
     let rec = records.get(leaf_key)?;
     let session_id = rec.session_id.as_deref()?;
-    // Gate the hook-reported id before any path math (see the helper above).
-    if !is_plausible_transcript_basename(session_id) {
+    // Gate the hook-reported id before any path math: a `/`- or `..`-bearing
+    // id could steer the derived path outside `projects_root` — which then
+    // rides the `--add-dir` grant and the stock prompt. The validator lives in
+    // [`super::resume`] and is applied at every write too (fix-attribution
+    // KTD8/R15); this read-side check stays as defense in depth for a store
+    // written by an older binary. A rejected id degrades to `None` — the R6
+    // notice — exactly like the other disqualifiers.
+    if !is_plausible_session_id(session_id) {
         return None;
     }
     // R12 precedence: the record's cwd, then the caller's live cwd, else bail.
-    let cwd = rec.session_cwd.as_deref().or(live_cwd)?;
+    let cwd = scan_cwd(Some(rec), live_cwd)?;
     let transcript_path = projects_root
         .join(transcript::encode_cwd(cwd))
         .join(format!("{session_id}.jsonl"));
@@ -141,11 +146,7 @@ pub fn list_candidates_in_root(
     projects_root: &Path,
 ) -> Vec<HandoffCandidate> {
     let rec = records.get(leaf_key);
-    let Some(cwd) = rec
-        .and_then(|r| r.session_cwd.as_deref())
-        .or(live_cwd)
-        .map(str::to_string)
-    else {
+    let Some(cwd) = scan_cwd(rec, live_cwd).map(str::to_string) else {
         return Vec::new();
     };
     let dir = projects_root.join(transcript::encode_cwd(&cwd));
@@ -163,7 +164,7 @@ pub fn list_candidates_in_root(
         let Some(id) = transcript::jsonl_id(name) else {
             continue;
         };
-        if !super::resume::is_plausible_session_id(id) {
+        if !is_plausible_session_id(id) {
             continue; // KTD8: never emit an implausible basename
         }
         let path = dir.join(name);

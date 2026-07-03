@@ -59,6 +59,7 @@
     resumeOfferBreakdown,
     resumeNoticeText,
     isAmbiguousResumeLeaf,
+    isPreciseSource,
     type ResumeTier,
   } from "./lib/resume";
   import {
@@ -113,6 +114,7 @@
     sortCandidates,
     pickerPlan,
     provenanceLabel,
+    shortSessionId,
   } from "./lib/session-picker";
   import {
     addNotification,
@@ -462,12 +464,15 @@
       // guess is never invisible (KTD4).
       provenance = provenanceLabel(target.sessionSource);
     } else {
+      // A divergence or an explicit force re-pick must list even a single
+      // candidate — the whole point is re-examining a suspect binding.
+      const forceList = opts.forcePick === true || target?.divergencePending === true;
       const subtitle = target?.divergencePending
         ? "This pane's live session differs from your remembered pick — choose again"
         : opts.forcePick
           ? "Re-pick: choose the session to bind to this pane"
           : null;
-      target = await pickSession(src, subtitle);
+      target = await pickSession(src, { subtitle, forceList });
       if (!target) return; // cancelled, or the R11 notice already showed
     }
     if (!activeTab || splitSourceStale(src)) return;
@@ -492,7 +497,7 @@
       guidedHandoffByLeaf = { ...guidedHandoffByLeaf, [res.added.key]: target };
     }
     if (provenance) {
-      showNotice(`Handing off ${target.sessionId.slice(0, 8)}… — ${provenance}.`);
+      showNotice(`Handing off ${shortSessionId(target.sessionId)}… — ${provenance}.`);
     }
     setActiveTree(res.tree, res.added.key); // focus moves to the new pane (R3)
   }
@@ -505,7 +510,7 @@
   // deliberately mints NO pick, because no human chose.
   async function pickSession(
     src: { srcKey: string; liveCwd: string | null },
-    subtitle: string | null,
+    opts: { subtitle: string | null; forceList: boolean },
   ): Promise<HandoffTarget | null> {
     let candidates: HandoffCandidate[] = [];
     try {
@@ -513,7 +518,7 @@
     } catch (e) {
       void frontendLog(`handoff candidate listing failed: ${String(e)}`);
     }
-    const plan = pickerPlan(candidates.length, subtitle !== null);
+    const plan = pickerPlan(candidates.length, opts.forceList);
     if (plan === "notice") {
       showNotice(
         "No session to hand off: this pane has no previous Claude session " +
@@ -524,22 +529,18 @@
     if (plan === "auto") return candidates[0];
     // One overlay at a time (the openPalette discipline) — the picker takes
     // DOM focus, and onWindowKeydown bails while it is up.
-    pendingConfirm = null;
-    menuOpen = false;
-    paletteOpen = false;
-    if (notificationPanelOpen) setNotificationPanel(false);
+    closeAllOverlays();
     const picked = await new Promise<HandoffCandidate | null>((res) => {
       resolveSessionPicker = res;
-      sessionPicker = { candidates, subtitle };
+      sessionPicker = { candidates, subtitle: opts.subtitle };
     });
     if (!picked) return null;
-    try {
-      await saveSessionPick(src.srcKey, picked.sessionId, picked.sessionCwd);
-    } catch (e) {
-      // Best-effort: this launch still proceeds; only the memory of the pick
-      // is lost (the next ambiguous launch re-prompts).
-      void frontendLog(`session pick save failed: ${String(e)}`);
-    }
+    // Best-effort, fire-and-forget like the poll's captures: the spawn uses
+    // the picked candidate directly, so only the *memory* of the pick rides
+    // this write (the next ambiguous launch would re-prompt if it fails).
+    void saveSessionPick(src.srcKey, picked.sessionId, picked.sessionCwd).catch(
+      (e) => frontendLog(`session pick save failed: ${String(e)}`),
+    );
     return picked;
   }
   function answerSessionPicker(picked: HandoffCandidate | null) {
@@ -898,21 +899,23 @@
   function cancelPending() {
     pendingConfirm = null;
   }
-  // Opening the menu dismisses any pending confirm, so at most one overlay is
-  // ever up — otherwise both Escape capture listeners would fire.
-  function openMenu() {
+  // At most one overlay is ever up — otherwise their Escape capture listeners
+  // would double-fire. Every opener (menu, palette, notifications, the session
+  // picker) closes the rest through this one helper; the opener then raises
+  // its own flag.
+  function closeAllOverlays() {
     pendingConfirm = null;
+    menuOpen = false;
     paletteOpen = false;
     if (notificationPanelOpen) setNotificationPanel(false);
+  }
+  function openMenu() {
+    closeAllOverlays();
     menuOpen = true;
   }
   // The command palette (a U4 follow-up): a focus-taking, type-to-run overlay.
-  // Mutually exclusive with the cheat-sheet and the confirm so only one overlay
-  // is ever up (their Escape handlers must not both fire).
   function openPalette() {
-    pendingConfirm = null;
-    menuOpen = false;
-    if (notificationPanelOpen) setNotificationPanel(false);
+    closeAllOverlays();
     paletteOpen = true;
   }
   // ---- notification panel + mute (U21) -------------------------------------
@@ -930,9 +933,7 @@
       closeNotifications();
       return;
     }
-    pendingConfirm = null;
-    menuOpen = false;
-    paletteOpen = false;
+    closeAllOverlays();
     setNotificationPanel(true);
   }
   function closeNotifications() {
@@ -1694,17 +1695,26 @@
     // is no better than the poll's guess (source poll / pre-fix unset), sitting
     // in a cwd that holds >1 qualifying transcript AT RESUME TIME, may re-attach
     // a sibling — count them for the offer/notice. Count-keyed, not freshness
-    // (post-crash nothing is fresh). Probes run in parallel; a probe failure
-    // degrades to unflagged rather than blocking restore; precise (hook/pick)
-    // leaves skip the probe entirely.
+    // (post-crash nothing is fresh). Probes run in parallel and are DEDUPED by
+    // cwd (several splits often share one repo — the backend scans each project
+    // dir once, not once per leaf); a probe failure degrades to unflagged
+    // rather than blocking restore; precise (hook/pick) leaves skip the probe.
+    const countByCwd = new Map<string, Promise<number>>();
+    const probeCount = (cwd: string) => {
+      let p = countByCwd.get(cwd);
+      if (!p) {
+        p = qualifyingSessionCount(cwd);
+        countByCwd.set(cwd, p);
+      }
+      return p;
+    };
     const ambiguous = (
       await Promise.all(
         Object.keys(commands).map(async (k) => {
           const rec = records[k];
-          const src = rec?.sessionSource ?? "poll";
-          if (src === "hook" || src === "pick") return false;
+          if (isPreciseSource(rec?.sessionSource)) return false;
           try {
-            const n = await qualifyingSessionCount(rec?.sessionCwd ?? cwds[k] ?? "");
+            const n = await probeCount(rec?.sessionCwd ?? cwds[k] ?? "");
             return isAmbiguousResumeLeaf(rec, n);
           } catch {
             return false;
