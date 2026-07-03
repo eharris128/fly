@@ -555,6 +555,32 @@ export function resolveHandoffTarget(
 }
 
 /**
+ * One pick-list row (mirrors Rust `HandoffCandidate`, fix-session-pane-
+ * attribution U5): a spawnable target plus the display-only snippet of its most
+ * recent text-bearing turn. Selecting a candidate hands it off exactly as if it
+ * had been precisely captured (R8).
+ */
+export interface HandoffCandidate extends HandoffTarget {
+  snippet: string | null;
+}
+
+/**
+ * The cwd's qualifying sessions for the pick-list (U5; R6/R7/R11), last
+ * activity first, aged-out targets included so a reset stays non-lossy (KTD7).
+ * Empty when nothing qualifies — the caller shows the existing "no previous
+ * session" notice, never an empty picker (R11).
+ */
+export function listHandoffCandidates(
+  leafKey: string,
+  liveCwd: string | null,
+): Promise<HandoffCandidate[]> {
+  return invoke<HandoffCandidate[]>("list_handoff_candidates", {
+    leafKey,
+    liveCwd,
+  });
+}
+
+/**
  * How the app was launched (mirrors Rust `LaunchMode`, U7):
  *  - `normal` — fresh shells (clean prior exit);
  *  - `resume` — explicit `fly resume`, re-attach agents directly;

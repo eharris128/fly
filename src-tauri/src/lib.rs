@@ -566,6 +566,7 @@ pub fn run() {
             session::resume::prune_resume_records,
             session::transcript::continue_target,
             session::handoff::resolve_handoff_target,
+            session::handoff::list_handoff_candidates,
             usage::usage_snapshot,
             automations::automations_frontend_ready,
             automations::list_automations,

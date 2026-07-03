@@ -98,6 +98,99 @@ pub fn resolve_handoff_target(
     resolve_in_root(&records, &leaf_key, live_cwd.as_deref(), &root)
 }
 
+// ---- pick-list candidates (fix-session-pane-attribution U5) -----------------
+
+/// One pick-list row (U5; R6/R7): a spawnable [`HandoffTarget`] plus the
+/// display-only snippet of its most recent text-bearing turn. Selecting a
+/// candidate proceeds exactly as if the target had been precisely captured
+/// (R8) — the flattened target IS the spawn contract.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffCandidate {
+    #[serde(flatten)]
+    pub target: HandoffTarget,
+    pub snippet: Option<String>,
+}
+
+/// Cap on candidates for one cwd (the plan's deferred count question, resolved
+/// here): a long-lived project dir can hold hundreds of transcripts, each of
+/// which costs a full-body read to qualify — and a pick-list past ~20 rows is
+/// unusable anyway. Files are visited newest-mtime-first, so the cap sheds the
+/// *oldest* history.
+const CANDIDATE_CAP: usize = 20;
+
+/// Path-taking core of [`list_handoff_candidates`]: every real-turn-qualified
+/// transcript in the leaf's cwd, **not** gated by the poll's freshness window
+/// (KTD4/KTD7 — reset stays non-lossy: an aged-out true target is still
+/// selectable), ordered by last real turn descending. The scan cwd follows
+/// [`resolve_in_root`]'s precedence — the record's `session_cwd`, then
+/// `live_cwd`. Only validated basenames become candidates (KTD8); a
+/// metadata-only transcript never qualifies (R11 counts on the empty vec).
+pub fn list_candidates_in_root(
+    records: &ResumeRecords,
+    leaf_key: &str,
+    live_cwd: Option<&str>,
+    projects_root: &Path,
+) -> Vec<HandoffCandidate> {
+    let rec = records.get(leaf_key);
+    let Some(cwd) = rec
+        .and_then(|r| r.session_cwd.as_deref())
+        .or(live_cwd)
+        .map(str::to_string)
+    else {
+        return Vec::new();
+    };
+    let dir = projects_root.join(transcript::encode_cwd(&cwd));
+    // Newest-mtime-first so the CANDIDATE_CAP sheds the oldest transcripts
+    // without having paid a body read for them (mtime is only the visiting
+    // order; the displayed/sorted stamp is the last real turn).
+    let mut entries = transcript::read_project_entries(&dir);
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut out = Vec::new();
+    for (name, _) in &entries {
+        if out.len() >= CANDIDATE_CAP {
+            break;
+        }
+        let Some(id) = transcript::jsonl_id(name) else {
+            continue;
+        };
+        if !super::resume::is_plausible_session_id(id) {
+            continue; // KTD8: never emit an implausible basename
+        }
+        let path = dir.join(name);
+        let Some(summary) = transcript::session_turn_summary(&path) else {
+            continue; // no real turn → not a candidate (R5/R11)
+        };
+        out.push(HandoffCandidate {
+            target: HandoffTarget {
+                session_id: id.to_string(),
+                transcript_path: path.to_string_lossy().into_owned(),
+                session_cwd: Some(cwd.clone()),
+                last_turn_ms: summary.last_turn_ms,
+            },
+            snippet: summary.snippet,
+        });
+    }
+    out.sort_by(|a, b| b.target.last_turn_ms.cmp(&a.target.last_turn_ms));
+    out
+}
+
+/// Command: the cwd's qualifying sessions for the pick-list (U5; R6/R7/R11),
+/// last-activity first, aged-out targets included. An empty vec drives the
+/// existing "no previous session" notice — never an empty picker (R11).
+#[tauri::command]
+pub fn list_handoff_candidates(
+    leaf_key: String,
+    live_cwd: Option<String>,
+) -> Vec<HandoffCandidate> {
+    let records = super::resume::load_resume_records();
+    let Some(root) = transcript::claude_projects_root() else {
+        return Vec::new();
+    };
+    list_candidates_in_root(&records, &leaf_key, live_cwd.as_deref(), &root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +330,150 @@ mod tests {
         assert_eq!(resolve_in_root(&records, "leaf-1", None, root.path()), None);
         let records = records_with(Some("..sess"), Some("/proj/app"));
         assert_eq!(resolve_in_root(&records, "leaf-1", None, root.path()), None);
+    }
+
+    // ---- list_candidates_in_root (fix-attribution U5) -----------------------
+
+    /// A one-turn transcript body with a chosen stamp + user text, so tests can
+    /// stage several sessions with distinct last-activity times and snippets.
+    fn turnful_body(ts: &str, text: &str) -> String {
+        format!(
+            concat!(
+                r#"{{"type":"mode","sessionId":"s"}}"#,
+                "\n",
+                r#"{{"type":"user","timestamp":"{ts}","message":{{"role":"user","content":"{text}"}}}}"#,
+                "\n",
+            ),
+            ts = ts,
+            text = text,
+        )
+    }
+
+    #[test]
+    fn lists_qualifying_candidates_ordered_by_last_turn_desc() {
+        // R6/R7 + KTD7: every real-turn transcript qualifies — including one
+        // whose activity long predates any freshness window (reset stays
+        // non-lossy) — ordered newest-turn-first with recognizable snippets.
+        // Metadata-only files, implausible basenames, and non-transcripts are
+        // never emitted (R11/KTD8).
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("-proj-app");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mid.jsonl"),
+            turnful_body("2026-06-19T00:00:00Z", "refactor the store"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("aged-out.jsonl"),
+            turnful_body("2026-01-01T00:00:00Z", "ancient work"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("newest.jsonl"),
+            turnful_body("2026-06-25T00:00:00Z", "fix the picker"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("meta-only.jsonl"), METADATA_ONLY_FIXTURE).unwrap();
+        std::fs::write(
+            dir.join("a..b.jsonl"),
+            turnful_body("2026-06-26T00:00:00Z", "smuggled"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("notes.txt"), "not a transcript").unwrap();
+
+        let got = list_candidates_in_root(
+            &ResumeRecords::new(),
+            "leaf-1",
+            Some("/proj/app"),
+            root.path(),
+        );
+        let ids: Vec<&str> = got.iter().map(|c| c.target.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["newest", "mid", "aged-out"], "last-turn desc");
+        assert_eq!(got[0].snippet.as_deref(), Some("fix the picker"));
+        assert_eq!(got[2].snippet.as_deref(), Some("ancient work"));
+        assert!(got[0].target.last_turn_ms > got[1].target.last_turn_ms);
+        assert_eq!(got[0].target.session_cwd.as_deref(), Some("/proj/app"));
+        assert!(got[0].target.transcript_path.ends_with("newest.jsonl"));
+    }
+
+    #[test]
+    fn no_qualifying_transcripts_is_an_empty_vec() {
+        // R11: the empty vec drives the "no previous session" notice — never
+        // an empty picker. Covers: no cwd at all, an absent project dir, and a
+        // dir holding only a metadata-only transcript.
+        let root = tempfile::tempdir().unwrap();
+        let none = list_candidates_in_root(&ResumeRecords::new(), "leaf-1", None, root.path());
+        assert!(none.is_empty(), "no cwd from anywhere");
+        let missing = list_candidates_in_root(
+            &ResumeRecords::new(),
+            "leaf-1",
+            Some("/proj/app"),
+            root.path(),
+        );
+        assert!(missing.is_empty(), "project dir absent");
+        write_transcript(root.path(), "-proj-app", "sess-1", METADATA_ONLY_FIXTURE);
+        let meta_only = list_candidates_in_root(
+            &ResumeRecords::new(),
+            "leaf-1",
+            Some("/proj/app"),
+            root.path(),
+        );
+        assert!(meta_only.is_empty(), "metadata-only never qualifies");
+    }
+
+    #[test]
+    fn candidates_scan_the_records_cwd_before_the_live_cwd() {
+        // The scan cwd mirrors resolve_in_root's R12 precedence, so the picker
+        // and the single-target path always look in the same place.
+        let root = tempfile::tempdir().unwrap();
+        let records = records_with(None, Some("/proj/recorded"));
+        write_transcript(
+            root.path(),
+            "-proj-recorded",
+            "recorded-sess",
+            &turnful_body("2026-06-19T00:00:00Z", "recorded work"),
+        );
+        write_transcript(
+            root.path(),
+            "-proj-live",
+            "live-sess",
+            &turnful_body("2026-06-19T00:00:00Z", "live work"),
+        );
+
+        let got =
+            list_candidates_in_root(&records, "leaf-1", Some("/proj/live"), root.path());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].target.session_id, "recorded-sess");
+        // A leaf with no record scans the live cwd.
+        let got = list_candidates_in_root(
+            &ResumeRecords::new(),
+            "leaf-1",
+            Some("/proj/live"),
+            root.path(),
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].target.session_id, "live-sess");
+    }
+
+    #[test]
+    fn candidate_serialization_flattens_the_target() {
+        // The wire shape the picker consumes: target fields at the top level
+        // (camelCase) beside `snippet` — ipc.ts mirrors this as an interface
+        // extension.
+        let c = HandoffCandidate {
+            target: HandoffTarget {
+                session_id: "s".into(),
+                transcript_path: "/t.jsonl".into(),
+                session_cwd: Some("/p".into()),
+                last_turn_ms: 5,
+            },
+            snippet: Some("hi".into()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["sessionId"], "s");
+        assert_eq!(v["lastTurnMs"], 5);
+        assert_eq!(v["snippet"], "hi");
     }
 
     #[test]

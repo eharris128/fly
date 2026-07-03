@@ -70,8 +70,9 @@ pub fn claude_project_dir(cwd: &Path) -> Option<PathBuf> {
 
 /// The session id of a transcript file name — its basename sans `.jsonl` — or
 /// `None` for a non-transcript or empty name. The filename *is* the session id
-/// (KTD-A), so this is the one place that knowledge lives.
-fn jsonl_id(name: &str) -> Option<&str> {
+/// (KTD-A), so this is the one place that knowledge lives. Crate-visible for
+/// [`super::handoff`]'s candidate lister (fix-attribution U5).
+pub(crate) fn jsonl_id(name: &str) -> Option<&str> {
     let id = name.strip_suffix(".jsonl")?;
     (!id.is_empty()).then_some(id)
 }
@@ -119,14 +120,40 @@ pub fn session_last_turn_ms(path: &Path) -> Option<u64> {
     last_turn_ms_from_str(&body)
 }
 
-/// Pure core of [`session_last_turn_ms`]: scan JSONL `body` for the last
-/// `user`/`assistant` line bearing a parseable ISO-8601 `timestamp`. Tolerant of
-/// a non-JSON or unterminated trailing line (skipped), matching the thin-reader
-/// contract elsewhere. Reads the whole body and keeps the last match — a
-/// linear-scan "tail-parse"; the file is only read at restore, never on a hot
-/// path, so a from-the-end optimization is unwarranted.
+/// Pure core of [`session_last_turn_ms`]: the stamp half of the one turn scan.
 fn last_turn_ms_from_str(body: &str) -> Option<u64> {
-    let mut last: Option<u64> = None;
+    turn_summary_from_str(body).map(|s| s.last_turn_ms)
+}
+
+/// What the pick-list shows for one transcript (fix-session-pane-attribution
+/// U5, R7): when the last real turn happened, and a short recognizable excerpt
+/// of the most recent turn that carried extractable text (`None` when no turn
+/// does — e.g. a tool-use-only tail). `None` overall means no real turn — the
+/// transcript doesn't qualify as a candidate at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnSummary {
+    pub last_turn_ms: u64,
+    pub snippet: Option<String>,
+}
+
+/// Read a transcript and summarize its last real turn for the pick-list (U5).
+pub fn session_turn_summary(path: &Path) -> Option<TurnSummary> {
+    let body = std::fs::read_to_string(path).ok()?;
+    turn_summary_from_str(&body)
+}
+
+/// The one turn scan: walk JSONL `body` keeping the last `user`/`assistant`
+/// line bearing a parseable ISO-8601 `timestamp` (the real-turn stamp, KTD-C)
+/// and, independently, the last such line whose `message.content` yields text
+/// (the snippet — a turn may be tool-use-only, so the snippet can come from an
+/// earlier turn than the stamp). Tolerant of a non-JSON or unterminated
+/// trailing line (skipped), matching the thin-reader contract elsewhere. The
+/// content shapes are undocumented Claude contracts, so extraction is
+/// defensive: a string body, or the first `{"type":"text"}` block of an array
+/// (KTD6). Linear scan; read at picker/restore time, never on a hot path.
+fn turn_summary_from_str(body: &str) -> Option<TurnSummary> {
+    let mut last_ms: Option<u64> = None;
+    let mut snippet: Option<String> = None;
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -139,15 +166,74 @@ fn last_turn_ms_from_str(body: &str) -> Option<u64> {
         if ty != Some("user") && ty != Some("assistant") {
             continue;
         }
-        if let Some(ms) = v
+        let Some(ms) = v
             .get("timestamp")
             .and_then(|t| t.as_str())
             .and_then(iso8601_to_ms)
-        {
-            last = Some(ms);
+        else {
+            continue;
+        };
+        last_ms = Some(ms);
+        if let Some(text) = turn_text(&v) {
+            snippet = Some(text);
         }
     }
-    last
+    last_ms.map(|last_turn_ms| TurnSummary {
+        last_turn_ms,
+        snippet,
+    })
+}
+
+/// Extract displayable text from one turn's `message.content`: a plain string,
+/// or the first `{"type":"text","text":…}` block of an array. Sanitized and
+/// truncated for the picker row; `None` when the turn carries no usable text.
+fn turn_text(v: &serde_json::Value) -> Option<String> {
+    let content = v.get("message")?.get("content")?;
+    let raw = match content {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))?
+            .get("text")?
+            .as_str()?,
+        _ => return None,
+    };
+    sanitize_snippet(raw)
+}
+
+/// Cap on a pick-list snippet, in characters (deferred plan question, resolved
+/// here): long enough to recognize a conversation, short enough for a row.
+const SNIPPET_MAX_CHARS: usize = 100;
+
+/// Collapse whitespace runs (newlines included) to single spaces, drop every
+/// other control character — transcript text is agent-authored, so treat it
+/// like the alerts log (R16 posture) — and truncate to [`SNIPPET_MAX_CHARS`]
+/// on a char boundary with an ellipsis. `None` when nothing displayable is left.
+fn sanitize_snippet(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = 0usize;
+    let mut in_ws = false;
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            in_ws = true;
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        if chars >= SNIPPET_MAX_CHARS {
+            out.push('…');
+            break;
+        }
+        if in_ws && !out.is_empty() {
+            out.push(' ');
+            chars += 1;
+        }
+        in_ws = false;
+        out.push(c);
+        chars += 1;
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Parse an ISO-8601 UTC timestamp (`2026-06-19T19:17:04.506Z`, the form Claude
@@ -227,12 +313,12 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// Read a project dir's `(file-name, mtime)` entries for [`active_session_id`].
-/// Best-effort: a missing dir or an unreadable entry yields an empty/partial list,
-/// never an error (the caller degrades to "no id"). An entry whose mtime is
-/// unreadable is kept with a `UNIX_EPOCH` stamp so it sorts oldest rather than
-/// being dropped.
-fn read_project_entries(dir: &Path) -> Vec<(String, SystemTime)> {
+/// Read a project dir's `(file-name, mtime)` entries for [`fresh_session_ids`]
+/// and the U5 candidate lister ([`super::handoff`]). Best-effort: a missing dir
+/// or an unreadable entry yields an empty/partial list, never an error (the
+/// caller degrades to "no id"). An entry whose mtime is unreadable is kept with
+/// a `UNIX_EPOCH` stamp so it sorts oldest rather than being dropped.
+pub(crate) fn read_project_entries(dir: &Path) -> Vec<(String, SystemTime)> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
         return out;
@@ -537,6 +623,80 @@ mod tests {
         assert_eq!(session_last_turn_ms(&path), Some(1_781_896_636_402));
         // A missing file degrades to None.
         assert_eq!(session_last_turn_ms(&dir.path().join("gone.jsonl")), None);
+    }
+
+    // ---- turn_summary_from_str / sanitize_snippet (fix-attribution U5) ------
+
+    #[test]
+    fn turn_summary_extracts_string_and_block_content() {
+        // The two content shapes Claude writes: a plain string (typed user
+        // prompt) and an array of blocks (assistant turns). The snippet is the
+        // LAST text-bearing turn's text.
+        let body = concat!(
+            r#"{"type":"user","timestamp":"2026-06-19T19:17:04.506Z","message":{"role":"user","content":"fix the bug"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-06-19T19:17:16.402Z","message":{"role":"assistant","content":[{"type":"text","text":"done, tests pass"}]}}"#,
+            "\n",
+        );
+        let s = turn_summary_from_str(body).unwrap();
+        assert_eq!(s.last_turn_ms, 1_781_896_636_402);
+        assert_eq!(s.snippet.as_deref(), Some("done, tests pass"));
+    }
+
+    #[test]
+    fn turn_summary_snippet_falls_back_past_a_tool_only_turn() {
+        // A tool-use-only tail (no text block) must not blank the snippet —
+        // the stamp comes from the last turn, the snippet from the last turn
+        // WITH text.
+        let body = concat!(
+            r#"{"type":"user","timestamp":"2026-06-19T19:17:04.506Z","message":{"role":"user","content":"refactor the store"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-06-19T19:17:16.402Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]}}"#,
+            "\n",
+        );
+        let s = turn_summary_from_str(body).unwrap();
+        assert_eq!(s.last_turn_ms, 1_781_896_636_402, "stamp: the last turn");
+        assert_eq!(
+            s.snippet.as_deref(),
+            Some("refactor the store"),
+            "snippet: the last text-bearing turn"
+        );
+    }
+
+    #[test]
+    fn turn_summary_matches_last_turn_ms_and_none_for_metadata_only() {
+        // The summary is the same scan session_last_turn_ms delegates to; a
+        // metadata-only body summarizes to None (the disqualifier R5/R11 use).
+        assert_eq!(
+            turn_summary_from_str(METADATA_TAIL_FIXTURE).map(|s| s.last_turn_ms),
+            last_turn_ms_from_str(METADATA_TAIL_FIXTURE)
+        );
+        assert_eq!(
+            turn_summary_from_str("{\"type\":\"mode\"}\n{\"type\":\"ai-title\"}\n"),
+            None
+        );
+        // A turnful body whose turns carry no content still summarizes (the
+        // fixture's turns have no `content`) — snippet None, stamp present.
+        let s = turn_summary_from_str(METADATA_TAIL_FIXTURE).unwrap();
+        assert_eq!(s.snippet, None);
+    }
+
+    #[test]
+    fn snippets_are_sanitized_and_truncated() {
+        // Agent-authored text: control chars stripped, whitespace runs (and
+        // newlines) collapsed, over-long text cut at a char boundary with an
+        // ellipsis (R16 posture). The printable residue of an ANSI sequence
+        // ("[2J") is harmless in a DOM-rendered row — only the control byte
+        // itself is the threat.
+        assert_eq!(
+            sanitize_snippet("a\u{1b}[2J  b\n\nc"),
+            Some("a[2J b c".to_string())
+        );
+        assert_eq!(sanitize_snippet("   \n\t "), None);
+        let long: String = std::iter::repeat('é').take(150).collect();
+        let cut = sanitize_snippet(&long).unwrap();
+        assert_eq!(cut.chars().count(), SNIPPET_MAX_CHARS + 1, "100 chars + ellipsis");
+        assert!(cut.ends_with('…'));
     }
 
     // ---- newest_session_basename / continue_target_in_dir (U3, KTD-C) ------
