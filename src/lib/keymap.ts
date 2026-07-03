@@ -27,6 +27,7 @@ export interface KeymapActions {
   renameTab: () => void;
   handoffQuick: () => void;
   handoffGuided: () => void;
+  handoffRepick: () => void;
 }
 
 /**
@@ -71,6 +72,13 @@ export const BINDINGS: Binding[] = [
   // both up automatically from this array (R2).
   { keys: ["f"], label: "Handoff (quick)", action: "handoffQuick" },
   { keys: ["f"], upper: true, label: "Handoff (guided)", action: "handoffGuided" },
+  // Reset + re-pick (fix-session-pane-attribution U8, KTD7/R14): g sits beside
+  // the f/F handoffs. Clears the pane's session attribution — the escape valve
+  // for a stranded hook id, a stale pick, or a flagged divergence, which no
+  // automatic writer may correct — then runs the quick handoff with the
+  // pick-list forced, so a pane that still *resolves* (staleness included) can
+  // be corrected. Cheat-sheet + palette pick it up from this array (no drift).
+  { keys: ["g"], label: "Handoff (re-pick session)", action: "handoffRepick" },
   { keys: ["w"], label: "New workspace", action: "newWorkspace" },
   // Uppercase W is distinct from lowercase w (new workspace) via `upper`,
   // exactly like x / X (pane vs tab): it deletes the active workspace.

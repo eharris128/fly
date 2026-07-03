@@ -563,6 +563,7 @@ pub fn run() {
             session::resume::save_resume_record,
             session::resume::save_resume_session,
             session::resume::save_session_pick,
+            session::resume::reset_pane_attribution,
             session::resume::prune_resume_records,
             session::transcript::continue_target,
             session::handoff::resolve_handoff_target,

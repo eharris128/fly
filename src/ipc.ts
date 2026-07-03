@@ -424,6 +424,18 @@ export function pruneResumeRecords(liveLeafKeys: string[]): Promise<void> {
 }
 
 /**
+ * Clear a leaf's session attribution — id, source, divergence flag — leaving
+ * the poll's argv/isAgent intact (fix-session-pane-attribution U8, KTD7/R14).
+ * The user escape valve for a stranded, stale, or diverged precise id that no
+ * automatic writer may correct: resolution then returns empty and the next
+ * launch re-captures via the pick-list (which includes aged-out targets, so
+ * reset is non-lossy).
+ */
+export function resetPaneAttribution(leafKey: string): Promise<void> {
+  return invoke("reset_pane_attribution", { leafKey });
+}
+
+/**
  * Per-pane agent state for the dashboard (U4; running-state U3): whether the pane
  * runs a Claude Code agent, its current work stretch (ms; null when idle/not an
  * agent), how long since its last above-threshold output (ms), and the count of

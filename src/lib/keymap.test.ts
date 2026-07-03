@@ -51,6 +51,7 @@ function spyActions(): KeymapActions & { calls: string[] } {
     renameTab: mk("renameTab"),
     handoffQuick: mk("handoffQuick"),
     handoffGuided: mk("handoffGuided"),
+    handoffRepick: mk("handoffRepick"),
   };
 }
 
@@ -111,6 +112,14 @@ describe("BINDINGS", () => {
     expect(
       BINDINGS.find((b) => b.action === "handoffQuick")?.upper,
     ).toBeUndefined();
+  });
+
+  it("carries the re-pick chord beside the handoffs (fix-attribution U8/R14)", () => {
+    // leader g = reset attribution + forced pick-list, in the shared table so
+    // dispatch, the cheat-sheet, and the palette can't drift.
+    const g = BINDINGS.find((b) => b.keys.includes("g"));
+    expect(g?.action).toBe("handoffRepick");
+    expect(g?.upper).toBeUndefined();
   });
 
   it("no two bindings collide on the same key + case", () => {

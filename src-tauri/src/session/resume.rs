@@ -407,6 +407,14 @@ pub fn prune_resume_records(live_leaf_keys: Vec<String>) -> Result<(), String> {
     retain_at(&resume_path(), &live).map_err(|e| e.to_string())
 }
 
+/// Command: the user-initiated attribution reset (fix-session-pane-attribution
+/// U8, KTD7/R14) — see [`reset_attribution_at`]. Frontend-only, like the other
+/// explicit-action writers: no socket path can clear an id.
+#[tauri::command]
+pub fn reset_pane_attribution(leaf_key: String) -> Result<(), String> {
+    reset_attribution_at(&resume_path(), &leaf_key).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

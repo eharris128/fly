@@ -35,6 +35,7 @@ function spyActions(calls: string[]): KeymapActions {
     renameTab: mk("rename"),
     handoffQuick: mk("handoffQuick"),
     handoffGuided: mk("handoffGuided"),
+    handoffRepick: mk("handoffRepick"),
   };
 }
 

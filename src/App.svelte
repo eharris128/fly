@@ -80,6 +80,7 @@
     resolveHandoffTarget,
     listHandoffCandidates,
     saveSessionPick,
+    resetPaneAttribution,
     pruneResumeRecords,
     getLaunchMode,
     frontendLog,
@@ -545,6 +546,22 @@
     resolveSessionPicker = null;
     r?.(picked);
     if (picked === null) focusActivePane(); // cancelled → focus back to the pane
+  }
+  // Reset + re-pick (fix-attribution U8, KTD7/R14): the user escape valve.
+  // The reset lands FIRST, so even a cancelled re-pick leaves no stranded,
+  // stale, or diverged id behind — resolution then returns empty and the next
+  // launch re-captures via the pick-list (non-lossy: aged-out targets are
+  // listed too). Then the quick handoff runs with the picker forced.
+  async function handoffRepick() {
+    const key = activeTab?.focusedLeafKey;
+    if (key) {
+      try {
+        await resetPaneAttribution(key);
+      } catch (e) {
+        void frontendLog(`attribution reset failed: ${String(e)}`);
+      }
+    }
+    await handoff("quick", { forcePick: true });
   }
   // Session handoff U3: a guided pane's injection controller reached a terminal
   // state (injected / skipped / cancelled), or the pane unmounted first —
@@ -1588,6 +1605,7 @@
     renameTab: startRenameActiveTab,
     handoffQuick: () => void handoff("quick"),
     handoffGuided: () => void handoff("guided"),
+    handoffRepick: () => void handoffRepick(),
   };
   // Palette commands: every leader action (from BINDINGS) plus live "jump to
   // workspace/tab" navigation, built from the same resolved view model the
