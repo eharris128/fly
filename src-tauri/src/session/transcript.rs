@@ -217,9 +217,10 @@ fn turn_text(v: &serde_json::Value) -> Option<String> {
 const SNIPPET_MAX_CHARS: usize = 100;
 
 /// Collapse whitespace runs (newlines included) to single spaces, drop every
-/// other control character — transcript text is agent-authored, so treat it
-/// like the alerts log (R16 posture) — and truncate to [`SNIPPET_MAX_CHARS`]
-/// on a char boundary with an ellipsis. `None` when nothing displayable is left.
+/// control and format character via the shared [`crate::notify::is_stripped_char`]
+/// policy — transcript text is agent-authored, so treat it like the alerts log
+/// (R16 posture) — and truncate to [`SNIPPET_MAX_CHARS`] on a char boundary with
+/// an ellipsis. `None` when nothing displayable is left.
 fn sanitize_snippet(raw: &str) -> Option<String> {
     let mut out = String::new();
     let mut chars = 0usize;
@@ -229,10 +230,15 @@ fn sanitize_snippet(raw: &str) -> Option<String> {
             in_ws = true;
             continue;
         }
-        if c.is_control() {
+        if crate::notify::is_stripped_char(c) {
             continue;
         }
-        if chars >= SNIPPET_MAX_CHARS {
+        // A pending collapsed-whitespace separator costs a space *before* this
+        // char, so count it toward the cap too — otherwise " x" at chars ==
+        // SNIPPET_MAX_CHARS - 1 pushes the space then the char before the next
+        // iteration's check trips, overshooting the cap by one.
+        let needed = if in_ws && !out.is_empty() { 2 } else { 1 };
+        if chars + needed > SNIPPET_MAX_CHARS {
             out.push('…');
             break;
         }
@@ -738,6 +744,51 @@ mod tests {
         let cut = sanitize_snippet(&long).unwrap();
         assert_eq!(cut.chars().count(), SNIPPET_MAX_CHARS + 1, "100 chars + ellipsis");
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn snippets_strip_bidi_and_zero_width_format_chars() {
+        // Format (Cf) chars pass char::is_control but can visually reorder or
+        // hide a picker row — a transcript spoofing the human-disambiguation
+        // step. The shared notify::is_stripped_char policy drops them (R16):
+        // RLO (U+202E), zero-width space (U+200B), BOM/ZWNBSP (U+FEFF).
+        assert_eq!(
+            sanitize_snippet("a\u{202e}b\u{200b}c\u{feff}d"),
+            Some("abcd".to_string())
+        );
+    }
+
+    #[test]
+    fn snippet_cap_accounts_for_collapsed_whitespace_separator() {
+        // R16 off-by-one guard: the collapsed-whitespace separator counts toward
+        // the cap, so truncation at a word boundary still yields at most
+        // SNIPPET_MAX_CHARS content chars plus the ellipsis — never one over.
+        // 98 chars, the separator (99th), one char (100th), then overflow → the
+        // exact SNIPPET_MAX_CHARS + 1 contract with a real collapsed separator.
+        let at_cap = format!("{} {}", "a".repeat(98), "b".repeat(5));
+        let cut = sanitize_snippet(&at_cap).unwrap();
+        assert_eq!(
+            cut.chars().count(),
+            SNIPPET_MAX_CHARS + 1,
+            "100 content chars + ellipsis"
+        );
+        assert!(cut.ends_with('…'));
+        assert_eq!(
+            cut.chars().take_while(|&c| c != '…').count(),
+            SNIPPET_MAX_CHARS,
+            "content is capped at SNIPPET_MAX_CHARS"
+        );
+
+        // The pre-fix overshoot shape: 99 content chars, then " bb". The separator
+        // used to push content to 101 before the ellipsis check tripped; now the
+        // boundary check breaks first, so content never exceeds the cap.
+        let overshoot = format!("{} {}", "a".repeat(99), "bb");
+        let cut = sanitize_snippet(&overshoot).unwrap();
+        assert!(cut.ends_with('…'));
+        assert!(
+            cut.chars().take_while(|&c| c != '…').count() <= SNIPPET_MAX_CHARS,
+            "collapsed-whitespace boundary must not overshoot the cap"
+        );
     }
 
     // ---- newest_session_basename / continue_target_in_dir (U3, KTD-C) ------

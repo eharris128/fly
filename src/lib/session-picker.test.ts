@@ -4,6 +4,8 @@ import {
   sortCandidates,
   clampIndex,
   pickerPlan,
+  takesPrecisePath,
+  shouldForceSessionPick,
   provenanceLabel,
   NO_SNIPPET_FALLBACK,
 } from "./session-picker";
@@ -81,6 +83,30 @@ describe("pickerPlan (R6/R9/R11)", () => {
     // A divergence re-pick / force re-pick exists to re-examine a suspect
     // binding — auto-proceeding would defeat it (KTD2/KTD7).
     expect(pickerPlan(1, true)).toBe("list");
+  });
+});
+
+describe("handoff routing predicates (AE1/AE6, R14/KTD2)", () => {
+  it("takesPrecisePath: only a present, non-divergent target is precise", () => {
+    expect(takesPrecisePath({ divergencePending: false })).toBe(true);
+    expect(takesPrecisePath({ divergencePending: true })).toBe(false);
+    expect(takesPrecisePath(null)).toBe(false);
+  });
+
+  it("shouldForceSessionPick: divergence forces the list even unforced", () => {
+    // A divergence-pending target must re-examine the binding (AE6) regardless
+    // of the forcePick flag.
+    expect(shouldForceSessionPick({ divergencePending: true }, false)).toBe(true);
+  });
+
+  it("shouldForceSessionPick: forcePick forces the list with a null target", () => {
+    // U8 force re-pick skips resolution (null target) but must still list.
+    expect(shouldForceSessionPick(null, true)).toBe(true);
+  });
+
+  it("shouldForceSessionPick: a non-divergent target, unforced, does not force", () => {
+    expect(shouldForceSessionPick({ divergencePending: false }, false)).toBe(false);
+    expect(shouldForceSessionPick(null, false)).toBe(false);
   });
 });
 

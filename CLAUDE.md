@@ -229,6 +229,16 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   live id — into a spawnable `HandoffTarget`, qualified by at least one real
   transcript turn. `lib/handoff.ts` (see Frontend) drives the chords and the
   guided-injection state machine.
+- **Attribution** (fix-session-pane-attribution plan): a resume record's session
+  id is trust-ranked `Poll < Hook < Pick`. A capture-only `SessionStart` hook
+  (`fly notify --claude --capture`, installed by `fly hooks setup`) stamps
+  pane-precise ids over the socket without raising attention; the poll abstains
+  when >1 fresh session shares a cwd (`transcript.rs::active_session_for_cwd`);
+  an ambiguous handoff routes through the session pick-list
+  (`lib/session-picker.ts` + `SessionPicker.svelte`), and an explicit pick is
+  remembered at the highest rank — a divergent hook never rebinds it, only sets
+  a re-pick prompt flag. `leader g` resets a leaf's attribution and forces a
+  re-pick (the escape valve for a stale or mis-attributed id).
 
 ### Agent dashboard & attention triage (frontend + `state/activity.rs`, `usage/`)
 - **Dashboard / "home"** (`leader d`; agent-dashboard + dashboard-home-base +
@@ -288,7 +298,9 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   `resume.ts::sanitizeFlags` strips positionals so a restart never re-fires the
   prompt. Quick launches bypass-permissions (`--dangerously-skip-permissions`,
   since it runs the pickup prompt unattended); guided stays default permission
-  mode (the user reviews the pre-typed prompt before sending).
+  mode (the user reviews the pre-typed prompt before sending). `leader g`
+  (fix-session-pane-attribution U8) resets the pane's attribution and re-runs
+  quick handoff with the pick-list forced.
 
 ## Conventions
 

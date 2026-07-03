@@ -208,6 +208,7 @@ pub fn list_handoff_candidates(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
 
     use crate::session::resume::ResumeRecord;
 
@@ -432,6 +433,83 @@ mod tests {
         assert!(got[0].target.last_turn_ms > got[1].target.last_turn_ms);
         assert_eq!(got[0].target.session_cwd.as_deref(), Some("/proj/app"));
         assert!(got[0].target.transcript_path.ends_with("newest.jsonl"));
+    }
+
+    #[test]
+    fn the_candidate_cap_sheds_the_oldest_and_non_qualifying_files_take_no_slots() {
+        // Finding #12: CANDIDATE_CAP bounds one cwd's pick-list. Files are
+        // visited newest-mtime-first and the break counts only qualifying
+        // real-turn candidates — so the cap sheds the OLDEST history, and
+        // interleaved non-qualifying files (metadata-only, implausible basename)
+        // consume no slots. Stage more than the cap with mtime order and
+        // last-turn order agreeing, then pin exactly the newest CANDIDATE_CAP.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("-proj-app");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A smaller offset is a newer file (base is the newest mtime).
+        let set_mtime = |path: &Path, offset_secs: u64| {
+            let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000 - offset_secs);
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        };
+
+        // CANDIDATE_CAP + 3 qualifying transcripts, index 0 the newest: both the
+        // last-turn stamp (tick, descending) and the mtime (offset, ascending)
+        // track the index, so the two newest-first orderings agree.
+        let total = CANDIDATE_CAP + 3;
+        for i in 0..total {
+            let path = dir.join(format!("sess-{i:02}.jsonl"));
+            let tick = (total - i) as u64; // index 0 → latest turn
+            let ts = format!("2026-06-20T12:{:02}:{:02}Z", tick / 60, tick % 60);
+            std::fs::write(&path, turnful_body(&ts, &format!("work {i}"))).unwrap();
+            set_mtime(&path, (i as u64) * 10);
+        }
+
+        // Two non-qualifying files interleaved among the newest few (visited well
+        // before the cap fills): a metadata-only transcript (no real turn) and an
+        // implausible `..`-bearing basename (KTD8). Each is disqualified by its
+        // category, not its age, so a slot one wrongly took would show up as the
+        // kept set falling short of the newest CANDIDATE_CAP.
+        let meta = dir.join("meta-only.jsonl");
+        std::fs::write(&meta, METADATA_ONLY_FIXTURE).unwrap();
+        set_mtime(&meta, 25); // between sess-02 and sess-03
+        let smuggled = dir.join("a..b.jsonl");
+        std::fs::write(&smuggled, turnful_body("2026-06-20T12:00:59Z", "smuggled")).unwrap();
+        set_mtime(&smuggled, 55); // between sess-05 and sess-06
+
+        let got = list_candidates_in_root(
+            &ResumeRecords::new(),
+            "leaf-1",
+            Some("/proj/app"),
+            root.path(),
+        );
+
+        // Exactly the cap: not one over (the `>=` boundary), and not short — the
+        // two interleaved non-qualifying files consumed no cap slots.
+        assert_eq!(got.len(), CANDIDATE_CAP);
+        let ids: Vec<String> = got.iter().map(|c| c.target.session_id.clone()).collect();
+        let expected: Vec<String> = (0..CANDIDATE_CAP).map(|i| format!("sess-{i:02}")).collect();
+        assert_eq!(
+            ids, expected,
+            "the newest CANDIDATE_CAP transcripts, last-turn descending"
+        );
+
+        // The oldest 3 qualifying transcripts (indices CANDIDATE_CAP..) were shed.
+        for i in CANDIDATE_CAP..total {
+            let shed = format!("sess-{i:02}");
+            assert!(!ids.contains(&shed), "{shed} is older than the cap keeps");
+        }
+        // The implausible basename is skipped, never capped — it took no slot.
+        assert!(!ids.iter().any(|s| s == "a..b"));
+        // The kept set is strictly last-turn descending.
+        assert!(got
+            .windows(2)
+            .all(|w| w[0].target.last_turn_ms > w[1].target.last_turn_ms));
     }
 
     #[test]

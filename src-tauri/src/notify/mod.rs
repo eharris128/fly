@@ -32,9 +32,37 @@ const BODY_CAP: usize = 400;
 /// banner only; `record` and `sound` are decided independently (U18).
 const MIN_INTERVAL_MS: u64 = 800;
 
-/// Strip control characters and length-cap untrusted notification text (R16).
+/// Characters dropped from untrusted display text (R16 posture), shared by
+/// [`sanitize`] (OS-notification / alert text) and the session pick-list snippet
+/// sanitizer so a hardening can't land in one and be missed in the other:
+///
+/// - **control characters (Cc)** — `char::is_control`; strips the ESC that
+///   begins an ANSI/OSC escape sequence, defanging it in a rendered line;
+/// - **format characters (Cf)** — *not* covered by `char::is_control`: bidi
+///   overrides/isolates (`U+202A`–`U+202E`, `U+2066`–`U+2069`) that visually
+///   reorder a line, and zero-width / joiner chars (`U+200B`–`U+200F`,
+///   `U+2060`–`U+2064`, `U+FEFF`) that hide or disguise content. Left in, a
+///   transcript could spoof its own picker row to defeat the human
+///   disambiguation step (Svelte escaping already blocks XSS, so this is
+///   display-only).
+pub(crate) fn is_stripped_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{200B}'..='\u{200F}'   // zero-width space/non-joiner/joiner, LRM/RLM/ALM
+            | '\u{202A}'..='\u{202E}' // bidi embeddings / overrides
+            | '\u{2060}'..='\u{2064}' // word joiner, invisible math operators
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{FEFF}',             // zero-width no-break space / BOM
+        )
+}
+
+/// Strip control/format characters and length-cap untrusted notification text
+/// (R16); see [`is_stripped_char`] for the shared character policy.
 pub fn sanitize(text: &str, cap: usize) -> String {
-    text.chars().filter(|c| !c.is_control()).take(cap).collect()
+    text.chars()
+        .filter(|&c| !is_stripped_char(c))
+        .take(cap)
+        .collect()
 }
 
 /// Sanitize untrusted text for a notification title (R16).
@@ -286,6 +314,14 @@ mod tests {
     fn strips_control_chars_and_caps_length() {
         assert_eq!(sanitize("hi\x1b[31m\x07there\n", 100), "hi[31mthere");
         assert_eq!(sanitize(&"x".repeat(50), 10).len(), 10);
+    }
+
+    #[test]
+    fn strips_bidi_and_zero_width_format_chars() {
+        // Format (Cf) chars — bidi overrides, zero-width — pass char::is_control
+        // but can spoof how untrusted text renders (R16); the shared
+        // is_stripped_char policy drops them here as well as in the pick-list.
+        assert_eq!(sanitize("a\u{202e}b\u{200b}c\u{2066}d\u{feff}e", 100), "abcde");
     }
 
     /// The alert reason has its own subtitle naming the automation producer

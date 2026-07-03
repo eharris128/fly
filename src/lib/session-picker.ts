@@ -77,6 +77,36 @@ export function pickerPlan(candidateCount: number, forceList: boolean): PickerPl
 }
 
 /**
+ * The two ambiguity-routing predicates the handoff flow branches on, lifted out
+ * of App.svelte so the AE6 guarantee can never drift from inline booleans (R14,
+ * KTD2). Both take the minimal shape a resolved target exposes, so they test
+ * without a full `HandoffTarget`.
+ *
+ * `takesPrecisePath`: the zero-prompt AE1 branch — a target resolved with
+ * confidence (present and NOT divergence-pending) hands off straight away. A
+ * null target (nothing resolved) routes to the pick path instead.
+ */
+export function takesPrecisePath(
+  target: { divergencePending: boolean } | null,
+): boolean {
+  return target !== null && !target.divergencePending;
+}
+
+/**
+ * `shouldForceSessionPick`: when the pick-list must show even a single candidate
+ * (`pickerPlan`'s `forceList`). True for an explicit force re-pick (U8) or a
+ * divergence-pending target (KTD2) — the AE6 guarantee that a divergent `Hook`
+ * can't silently redirect a single-candidate launch. Auto-proceeding there would
+ * defeat the whole point of re-examining a suspect binding.
+ */
+export function shouldForceSessionPick(
+  target: { divergencePending: boolean } | null,
+  forcePick: boolean,
+): boolean {
+  return forcePick || target?.divergencePending === true;
+}
+
+/**
  * Human wording for a resolved target's provenance (KTD4: shown at handoff so
  * a remembered rebind — or a lingering poll guess — is never invisible).
  */

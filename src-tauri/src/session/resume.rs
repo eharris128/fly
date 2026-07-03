@@ -154,6 +154,12 @@ pub fn read_records(path: &Path) -> ResumeRecords {
 /// `write_session`, but with a per-write unique temp name (KTD9): concurrent
 /// flushes sharing one fixed temp path can truncate each other mid-write and
 /// rename a torn file into the corruption (`.bad.bak`) path.
+///
+/// On any error after the temp file may exist, the temp is best-effort removed
+/// before the error propagates: the unique per-write name (unlike the old fixed
+/// name, which the next write overwrote) never self-heals, so a sustained write
+/// failure (ENOSPC, dir perms) would otherwise orphan `resume.json.tmp.*` files
+/// unbounded — nothing else scans or prunes them.
 pub fn write_records(path: &Path, records: &ResumeRecords) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -164,10 +170,21 @@ pub fn write_records(path: &Path, records: &ResumeRecords) -> std::io::Result<()
         std::process::id(),
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, serde_json::to_vec_pretty(records)?)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    // Atomic temp+rename with 0600-before-rename ordering, unchanged; the closure
+    // just gives one Err path to clean the temp up on.
+    let write = || -> std::io::Result<()> {
+        std::fs::write(&tmp, serde_json::to_vec_pretty(records)?)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    };
+    match write() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// Acquire the store lock, recovering from poisoning (see [`STORE_LOCK`]).
@@ -232,22 +249,29 @@ pub fn upsert_at(
     Ok(effective)
 }
 
-/// Clear one leaf's session attribution — id, source, and divergence flag —
+/// Clear one leaf's session attribution — id, cwd, source, and divergence flag —
 /// leaving the poll's `argv`/`is_agent` intact (fix-session-pane-attribution
 /// U8, KTD7/R14). The user-initiated escape valve for a stranded, stale, or
 /// diverged precise id that no automatic writer may correct: resolution then
-/// returns empty and the next launch re-captures via the pick-list. A no-op
-/// (no write) when the leaf has no record or no session id.
+/// returns empty and the next launch re-captures via the pick-list. The
+/// `session_cwd` clears *with* the id: `upsert_at` only ever writes a cwd
+/// alongside a winning id, so a reset id leaves no session the cwd is coherent
+/// with — and `handoff.rs::scan_cwd` prefers a lingering `session_cwd` over the
+/// live cwd even with no id, so keeping it would let a stale (or forged) dir
+/// survive the reset and steer the forced re-pick's scan (R14). A no-op (no
+/// write) when the leaf has no record, or its record already carries no id, no
+/// pending divergence, and no cwd.
 pub fn reset_attribution_at(path: &Path, leaf_key: &str) -> std::io::Result<()> {
     let _guard = store_guard();
     let mut records = read_records(path);
     let Some(rec) = records.get_mut(leaf_key) else {
         return Ok(());
     };
-    if rec.session_id.is_none() && !rec.divergence_pending {
+    if rec.session_id.is_none() && !rec.divergence_pending && rec.session_cwd.is_none() {
         return Ok(());
     }
     rec.session_id = None;
+    rec.session_cwd = None;
     rec.session_source = SessionSource::default();
     rec.divergence_pending = false;
     rec.updated_at = crate::notify::now_unix_ms();
@@ -864,9 +888,12 @@ mod tests {
 
     #[test]
     fn reset_clears_attribution_keeping_the_poll_fields() {
-        // U8/KTD7: reset is the user escape valve — it clears id + source +
+        // U8/KTD7: reset is the user escape valve — it clears id + cwd + source +
         // divergence so resolution returns empty (→ the pick-list), while the
-        // poll's argv/is_agent survive for the resume-command builder.
+        // poll's argv/is_agent survive for the resume-command builder. The cwd
+        // must clear with the id (R14): handoff's scan_cwd prefers a lingering
+        // session_cwd over the live cwd even with no id, so a stale/forged dir
+        // left behind would steer the forced re-pick's scan.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("resume.json");
         upsert_at(
@@ -879,21 +906,63 @@ mod tests {
             },
         )
         .unwrap();
-        upsert_at(&path, "leaf", ranked("sess-stale", SessionSource::Pick)).unwrap();
+        // A pick carries its cwd; the later Hook diverges (sets the flag) but
+        // never rewrites the pick's id or cwd.
+        upsert_at(
+            &path,
+            "leaf",
+            ResumePartial {
+                session_id: Some("sess-stale".into()),
+                session_cwd: Some("/proj/stale".into()),
+                session_source: Some(SessionSource::Pick),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         upsert_at(&path, "leaf", ranked("sess-live", SessionSource::Hook)).unwrap();
         assert!(stored(&path, "leaf").divergence_pending);
+        assert_eq!(stored(&path, "leaf").session_cwd.as_deref(), Some("/proj/stale"));
 
         reset_attribution_at(&path, "leaf").unwrap();
         let rec = stored(&path, "leaf");
         assert_eq!(rec.session_id, None);
+        assert_eq!(rec.session_cwd, None);
         assert_eq!(rec.session_source, SessionSource::Poll);
         assert!(!rec.divergence_pending);
         assert_eq!(rec.argv.as_deref(), Some(["claude".to_string()].as_slice()));
         assert!(rec.is_agent);
 
-        // Reset on an unset leaf (or an absent record) is a no-op, not an error.
+        // Reset on an already-cleared leaf is a byte-for-byte no-op (no write, so
+        // updated_at never moves), and resetting an absent leaf creates no record.
+        let before = stored(&path, "leaf");
         reset_attribution_at(&path, "leaf").unwrap();
         reset_attribution_at(&path, "no-such-leaf").unwrap();
+        assert_eq!(stored(&path, "leaf"), before);
+        assert!(!read_records(&path).contains_key("no-such-leaf"));
+    }
+
+    #[test]
+    fn write_records_cleans_up_temp_on_failure() {
+        // KTD9: the unique per-write temp name never self-heals, so a failing
+        // flush must unlink its temp or a sustained failure orphans them
+        // unbounded. Force the rename to fail by making the destination path a
+        // directory — the temp file is created + chmod'd first, then the rename
+        // errs (EISDIR), so this exercises the post-temp cleanup path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resume.json");
+        std::fs::create_dir(&path).unwrap();
+        let mut records = ResumeRecords::new();
+        records.insert("leaf".into(), ResumeRecord::default());
+
+        assert!(write_records(&path, &records).is_err());
+
+        let leftover: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("resume.json.tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "orphaned temp files: {leftover:?}");
     }
 
     #[test]

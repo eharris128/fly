@@ -38,6 +38,7 @@ a plan header's own `status:` field may lag behind the code.
 | `2026-07-01-001-feat-reason-typed-attention-triage` | `Reason`-typed attention (`Reason::Alert` end-to-end) + triage badge | `state/attention.rs`, `hooks/`, `lib/notifications.ts` |
 | `2026-07-01-002-feat-automations` | Cron-scheduled agent/script runs (`U1`–`U12`) | `automations/`, `cli/automation.rs`, `lib/automations.ts`, `lib/automation-panes.ts` |
 | `2026-07-02-001-feat-session-handoff` | Fresh agent handed a stale pane's previous session (`leader f`/`F`) | `session/handoff.rs`, `lib/handoff.ts` |
+| `2026-07-03-001-fix-session-pane-attribution` | Trust-ranked (`Poll < Hook < Pick`) SessionStart capture, poll abstention on same-cwd ambiguity, session pick-list, reset/re-pick (`leader g`) | `session/{resume,transcript,handoff}.rs`, `cli/{hooks,notify}.rs`, `hooks/protocol.rs`, `lib/session-picker.ts`, `lib/SessionPicker.svelte` |
 
 ## Brainstorms
 
