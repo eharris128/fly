@@ -2,8 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`docs/plans/` holds the full design; the code is cross-referenced to it by ID
-(see "Conventions"). This file is the single agent guide for the repo.
+`docs/plans/` holds the full design (indexed by `docs/plans/README.md`); the
+code is cross-referenced to it by ID (see "Conventions"). This file is the
+primary agent guide; `AGENTS.md` is a thin pointer to it for non-Claude tools,
+and `src-tauri/src/hooks/CLAUDE.md` adds a scoped note at the socket security
+boundary.
 
 ## What this is
 
@@ -126,23 +129,35 @@ notify` caller — the automations alert path (KTD-H) surfaces a non-silent
 script run as `Signal { reason: Reason::Alert, tier: Tier::Cli }`, the first
 non-agent attention producer. `Reason::Alert` flows end-to-end (raise → ring →
 triage badge, U12/R18); `Bel`/`Osc` remain forward design. Each pane is modeled
-by **two orthogonal pure state machines**: `state/lifecycle.rs` (process status)
-and `state/attention.rs` (Idle→Raised→Acknowledged). Both take time/inputs as
-arguments so they're tested without a running app.
+by **two orthogonal pure state machines** — `state/lifecycle.rs` (process status)
+and `state/attention.rs` (Idle→Raised→Acknowledged) — plus a third pure,
+time-injected signal, `state/activity.rs` (the current output "work stretch"
+that drives the dashboard's working/idle read and the triage nudge; note the
+attention machine has **no** output-driven transition, so "resumed working" must
+come from this activity poll, not `pane://attention`). All three take
+time/inputs as arguments so they're tested without a running app.
 
 ### Backend modules (`src-tauri/src/`)
 - `pty/` — `PtyManager` registry + `Pane`: portable-pty, one read thread per
   pane, backpressure pause/resume (watermarks), ordered reap-on-exit.
 - `stream/` — `spawn_pane`, raw-byte PTY output over a Tauri `Channel` (no
   transcoding), and the pane↔attention/focus wiring + Tauri commands.
-- `state/` — the two state machines + suppression policy (`policy.rs`) +
-  per-pane `manager`.
-- `hooks/` — the authenticated socket: `token`, `protocol` (the notify path +
-  the `automation/*` request envelope, U9), `server`.
+- `state/` — the pure state machines (`lifecycle`, `attention`) + the output
+  `activity` tracker + suppression policy (`policy.rs`) + per-pane `manager`.
+- `hooks/` — the authenticated socket **(the security boundary)**: `token`,
+  `protocol` (the notify path + the `automation/*` request envelope, U9),
+  `server`. Has its own scoped `CLAUDE.md` — read it before changing anything here.
 - `cli/` — `fly notify`, `fly hooks setup|teardown`, `fly automation …` (U9).
 - `automations/` — cron-scheduled agent/script runs (see the module map below).
-- `notify/`, `config/`, `session/`, `cwd/` (via `/proc`), `lifecycle.rs`
-  (ordered shutdown — reap every pane, no zombies/orphans).
+- `session/` — layout persistence (`mod.rs`) **plus the resume/handoff
+  subsystem** (`resume.rs`, `transcript.rs`, `handoff.rs`); see "Session, resume
+  & handoff" below.
+- `usage/` — live plan-usage snapshot for the dashboard: reproduces Claude Code's
+  `/usage` gauges via `GET /api/oauth/usage` (read-only OAuth bearer from
+  `~/.claude/.credentials.json`), fetched on dashboard open only (KTD-C), never
+  on a timer.
+- `notify/`, `config/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
+  reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the
   frontend's typed wrappers for them live in `src/ipc.ts`. Add a command in both
   places.
@@ -195,10 +210,48 @@ named `fly-automation-sweep` thread ticks every 10s; a due automation is
   plus `humanSchedule`/`relativeTime`); `HomeView.svelte` renders it read-only
   below the agent list, with the R6 store-health warning row.
 
+### Session, resume & handoff (`session/` + `lib/{resume,handoff}.ts`)
+Durable, backend-owned stores kept **separate** from the debounced layout blob
+(`session/mod.rs`), all under the `FLY_APP_NAME` root so a dev flavor stays
+isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
+- **Resume** (resume-agents + fix-resume-session-selection plans): `resume.rs` is
+  a write-through store mapping each layout leaf → its last `session_id`/`cwd`/
+  `argv`, flushed atomically per upsert so an unclean shutdown still leaves the
+  mapping on disk; a clean-exit marker (absent at startup ⇒ prior run died
+  uncleanly) drives the crash auto-offer. `transcript.rs` derives the session id
+  straight from Claude's transcript filenames
+  (`~/.claude/projects/<encoded-cwd>/<id>.jsonl`), so capture doesn't depend on
+  the installed `fly` binary's wire version. `lib/resume.ts` builds the exact
+  replay argv (stripping stale `--resume`/`--continue` and one-shot positional
+  prompts — the flag hygiene lives in this one tested place).
+- **Handoff** (session-handoff plan): `handoff.rs` resolves a *stale* leaf's
+  previous session — from the durable resume record, **not** the 15-min-recency
+  live id — into a spawnable `HandoffTarget`, qualified by at least one real
+  transcript turn. `lib/handoff.ts` (see Frontend) drives the chords and the
+  guided-injection state machine.
+
+### Agent dashboard & attention triage (frontend + `state/activity.rs`, `usage/`)
+- **Dashboard / "home"** (`leader d`; agent-dashboard + dashboard-home-base +
+  running-state plans): `lib/home.ts` is the pure view-model — it folds App's
+  live `agentByLeaf`/`attentionByLeaf`/activity maps into grouped agent rows with
+  a `waiting`/`working`/`idle`/`running` status precedence (only `isAgent` panes
+  become rows; empty ⇒ the R7 empty state). `HomeView.svelte` renders it, plus
+  the read-only automations panel and the `usage/` gauges. The working/idle
+  signal is `state/activity.rs`; the `running · N tasks` count is the `/proc`
+  task probe (top-level pgids only — see the `dashboard-running-state` memory).
+- **Attention triage** (reason-typed-triage + dashboard-home-base plans):
+  `lib/notifications.ts` + `NotificationPanel.svelte` are the notification
+  history (`leader n`, keyed by **leafKey** so it survives paneId reassignment;
+  clear removes the entry). `lib/nudge.ts` + `NudgeOverlay.svelte` are the
+  "handled — move along" nudge (Tab rotates to the next agent / dashboard). Both
+  are pure & framework-free like `home.ts`; the nudge takes **no** DOM focus
+  (HotkeyMenu archetype) so type-through never drops a keystroke.
+
 ### Frontend (`src/`)
 - `App.svelte` — orchestrates workspaces, tabs, and the split tree; owns
-  attention/cwd state, debounced session persistence (~800ms), and overlay
-  (hotkey menu / destructive-confirm) wiring.
+  attention/cwd/activity state, debounced session persistence (~800ms), and the
+  overlay wiring (hotkey menu, command palette, notification panel, triage nudge,
+  dashboard, destructive-confirm).
 - `lib/layout.ts` — **pure split-tree model**. Leaves render flat and keyed, so
   splitting/resizing never unmounts a pane (which would respawn its agent). Leaf
   keys are stable and also key the scrollback files — preserve this invariant.
@@ -241,8 +294,12 @@ named `fly-automation-sweep` thread ticks every 10s; a due automation is
 
 - Code is cross-referenced to the design by ID — **KTD\<n\>** (key technical
   decision) and **R\<n\>**/**U\<n\>** (requirement/unit) appear in doc comments
-  and tie back to `docs/plans/`. When changing behavior, keep the referenced IDs
-  accurate. Match the surrounding style; modules are heavily doc-commented.
+  and tie back to `docs/plans/`. IDs are **scoped per plan** — each plan restarts
+  its KTD/R/U numbering, so `KTD7`/`R10`/`U8` mean different things in different
+  plans; resolve an ID against the plan the file belongs to
+  (`docs/plans/README.md` maps each plan to its code). When changing behavior, keep the
+  referenced IDs accurate. Match the surrounding style; modules are heavily
+  doc-commented.
 - Behavior-bearing units ship with tests (Rust state machines are test-first and
   pure; frontend has vitest for layout/keymap).
 - Commits: conventional, with a `Co-Authored-By: Claude` trailer.
