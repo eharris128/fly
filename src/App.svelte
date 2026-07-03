@@ -486,24 +486,31 @@
         }
       }
       // Route by the two tested predicates (session-picker.ts) so this glue can't
-      // drift from the AE6 guarantee (R14/KTD2).
+      // drift from the AE6 guarantee (R14/KTD2) or the corroborate-then-remember
+      // gate (the plan's bypass-permissions Open-Question resolution): quick's
+      // zero-prompt path requires an explicit Pick — an uncorroborated Hook/Poll
+      // target lists once, and the remembered pick keeps later launches
+      // zero-prompt. Guided stays in-loop, so any non-divergent target proceeds.
       let provenance: string | null = null;
       let pickerPathTaken = false;
-      if (target && takesPrecisePath(target)) {
+      if (target && takesPrecisePath(target, mode)) {
         // The precise path (AE1): resolved with confidence — zero-prompt, but
         // the provenance is disclosed below so a remembered pick or a poll
         // guess is never invisible (KTD4).
         provenance = provenanceLabel(target.sessionSource);
       } else {
-        // A divergence or an explicit force re-pick must list even a single
-        // candidate — the whole point is re-examining a suspect binding.
+        // A divergence, an explicit force re-pick, or an uncorroborated quick
+        // launch must list even a single candidate — confirming a suspect (or
+        // merely unconfirmed) binding is the whole point.
         pickerPathTaken = true;
-        const forceList = shouldForceSessionPick(target, opts.forcePick === true);
+        const forceList = shouldForceSessionPick(target, opts.forcePick === true, mode);
         const subtitle = target?.divergencePending
           ? "This pane's live session differs from your remembered pick — choose again"
           : opts.forcePick
             ? "Re-pick: choose the session to bind to this pane"
-            : null;
+            : mode === "quick"
+              ? "Confirm the session to hand off — your pick is remembered for future quick launches"
+              : null;
         target = await pickSession(src, { subtitle, forceList });
         if (!target) return; // cancelled, or the R11 notice already showed
       }
@@ -551,9 +558,10 @@
   }
   // Ambiguity interception (fix-attribution U6; R6-R11): fetch the cwd's
   // qualifying sessions and route by pickerPlan — none → the R11 notice (never
-  // an empty picker); exactly one, unforced → zero-prompt (R9); else await the
-  // pick-list (the resumeOffer promise pattern). An explicit selection is
-  // persisted as the leaf's remembered Pick (R10) — the highest trust rank —
+  // an empty picker); exactly one, unforced → zero-prompt (R9, now guided-only:
+  // a quick launch always forces the list per corroborate-then-remember); else
+  // await the pick-list (the resumeOffer promise pattern). An explicit selection
+  // is persisted as the leaf's remembered Pick (R10) — the highest trust rank —
   // so the next launch resolves without prompting (AE2); the R9 auto path
   // deliberately mints NO pick, because no human chose.
   async function pickSession(

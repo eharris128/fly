@@ -86,27 +86,51 @@ describe("pickerPlan (R6/R9/R11)", () => {
   });
 });
 
-describe("handoff routing predicates (AE1/AE6, R14/KTD2)", () => {
-  it("takesPrecisePath: only a present, non-divergent target is precise", () => {
-    expect(takesPrecisePath({ divergencePending: false })).toBe(true);
-    expect(takesPrecisePath({ divergencePending: true })).toBe(false);
-    expect(takesPrecisePath(null)).toBe(false);
+describe("handoff routing predicates (AE1/AE6, R14/KTD2 + corroborate-then-remember)", () => {
+  it("takesPrecisePath, quick: only an explicit Pick authorizes the zero-prompt bypass path", () => {
+    // The corroboration gate (the plan's bypass-permissions Open-Question
+    // resolution): a forgeable Hook capture or a Poll guess never fires the
+    // unattended --dangerously-skip-permissions spawn without a one-time pick.
+    expect(takesPrecisePath({ divergencePending: false, sessionSource: "pick" }, "quick")).toBe(true);
+    expect(takesPrecisePath({ divergencePending: false, sessionSource: "hook" }, "quick")).toBe(false);
+    expect(takesPrecisePath({ divergencePending: false, sessionSource: "poll" }, "quick")).toBe(false);
+    expect(takesPrecisePath(null, "quick")).toBe(false);
   });
 
-  it("shouldForceSessionPick: divergence forces the list even unforced", () => {
+  it("takesPrecisePath, guided: any non-divergent resolved target proceeds (in-loop mode)", () => {
+    expect(takesPrecisePath({ divergencePending: false, sessionSource: "hook" }, "guided")).toBe(true);
+    expect(takesPrecisePath({ divergencePending: false, sessionSource: "poll" }, "guided")).toBe(true);
+    expect(takesPrecisePath({ divergencePending: false, sessionSource: "pick" }, "guided")).toBe(true);
+    expect(takesPrecisePath(null, "guided")).toBe(false);
+  });
+
+  it("takesPrecisePath: divergence blocks the precise path in both modes, even for a Pick", () => {
+    expect(takesPrecisePath({ divergencePending: true, sessionSource: "pick" }, "quick")).toBe(false);
+    expect(takesPrecisePath({ divergencePending: true, sessionSource: "hook" }, "guided")).toBe(false);
+  });
+
+  it("shouldForceSessionPick: divergence forces the list even unforced (guided)", () => {
     // A divergence-pending target must re-examine the binding (AE6) regardless
-    // of the forcePick flag.
-    expect(shouldForceSessionPick({ divergencePending: true }, false)).toBe(true);
+    // of the forcePick flag — pinned on guided, where nothing else forces.
+    expect(shouldForceSessionPick({ divergencePending: true }, false, "guided")).toBe(true);
   });
 
-  it("shouldForceSessionPick: forcePick forces the list with a null target", () => {
+  it("shouldForceSessionPick: forcePick forces the list with a null target (guided)", () => {
     // U8 force re-pick skips resolution (null target) but must still list.
-    expect(shouldForceSessionPick(null, true)).toBe(true);
+    expect(shouldForceSessionPick(null, true, "guided")).toBe(true);
   });
 
-  it("shouldForceSessionPick: a non-divergent target, unforced, does not force", () => {
-    expect(shouldForceSessionPick({ divergencePending: false }, false)).toBe(false);
-    expect(shouldForceSessionPick(null, false)).toBe(false);
+  it("shouldForceSessionPick: quick always forces — no R9 auto for a bypass spawn", () => {
+    // Corroborate-then-remember: a lone (possibly planted) transcript must not
+    // auto-launch an unattended bypass-permissions agent; one explicit pick is
+    // required, then remembered.
+    expect(shouldForceSessionPick(null, false, "quick")).toBe(true);
+    expect(shouldForceSessionPick({ divergencePending: false }, false, "quick")).toBe(true);
+  });
+
+  it("shouldForceSessionPick: guided, non-divergent, unforced keeps R9's auto path", () => {
+    expect(shouldForceSessionPick({ divergencePending: false }, false, "guided")).toBe(false);
+    expect(shouldForceSessionPick(null, false, "guided")).toBe(false);
   });
 });
 

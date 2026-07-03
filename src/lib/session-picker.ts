@@ -6,6 +6,7 @@
 // (`resumeOffer` pattern) and feeds candidates from `listHandoffCandidates`.
 
 import type { HandoffCandidate, SessionSource } from "../ipc";
+import type { HandoffMode } from "./handoff";
 import { relativeTime } from "./notifications";
 
 /** One rendered picker row: recognizable by its recent-turn snippet and
@@ -83,27 +84,41 @@ export function pickerPlan(candidateCount: number, forceList: boolean): PickerPl
  * without a full `HandoffTarget`.
  *
  * `takesPrecisePath`: the zero-prompt AE1 branch — a target resolved with
- * confidence (present and NOT divergence-pending) hands off straight away. A
- * null target (nothing resolved) routes to the pick path instead.
+ * confidence hands off straight away. What counts as confidence is mode-ranked
+ * (the plan's Open-Question resolution, **corroborate-then-remember**): a
+ * quick handoff runs unattended under `--dangerously-skip-permissions`, so
+ * only a corroborated target — an explicit human `Pick` — authorizes its
+ * zero-prompt path; a forgeable `Hook` capture or a `Poll` guess routes
+ * through the pick-list once, and the persisted pick keeps every later quick
+ * launch zero-prompt (a one-time cost, not a standing downgrade). Guided
+ * stays in-loop (default permission mode, prompt reviewed before sending), so
+ * any non-divergent resolved target proceeds. A null target (nothing
+ * resolved) routes to the pick path in both modes.
  */
 export function takesPrecisePath(
-  target: { divergencePending: boolean } | null,
+  target: { divergencePending: boolean; sessionSource: SessionSource } | null,
+  mode: HandoffMode,
 ): boolean {
-  return target !== null && !target.divergencePending;
+  if (target === null || target.divergencePending) return false;
+  return mode === "guided" || target.sessionSource === "pick";
 }
 
 /**
  * `shouldForceSessionPick`: when the pick-list must show even a single candidate
- * (`pickerPlan`'s `forceList`). True for an explicit force re-pick (U8) or a
- * divergence-pending target (KTD2) — the AE6 guarantee that a divergent `Hook`
- * can't silently redirect a single-candidate launch. Auto-proceeding there would
- * defeat the whole point of re-examining a suspect binding.
+ * (`pickerPlan`'s `forceList`). True for an explicit force re-pick (U8), a
+ * divergence-pending target (KTD2 — the AE6 guarantee that a divergent `Hook`
+ * can't silently redirect a single-candidate launch), or ANY quick handoff that
+ * reached the pick path (corroborate-then-remember: the R9 single-candidate
+ * auto path never authorizes an unattended bypass-permissions spawn — a lone
+ * planted transcript must not auto-launch; the explicit pick is required once,
+ * then remembered at `Pick` rank). Guided keeps R9's zero-prompt auto path.
  */
 export function shouldForceSessionPick(
   target: { divergencePending: boolean } | null,
   forcePick: boolean,
+  mode: HandoffMode,
 ): boolean {
-  return forcePick || target?.divergencePending === true;
+  return forcePick || target?.divergencePending === true || mode === "quick";
 }
 
 /**
