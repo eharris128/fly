@@ -19,6 +19,8 @@ const target: HandoffTarget = {
   transcriptPath: "/home/u/.claude/projects/-home-u-proj/abc-123.jsonl",
   sessionCwd: "/home/u/proj",
   lastTurnMs: 1_700_000_000_000,
+  sessionSource: "hook",
+  divergencePending: false,
 };
 
 describe("buildHandoffCommand", () => {

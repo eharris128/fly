@@ -6,6 +6,7 @@
   import HotkeyMenu from "./lib/HotkeyMenu.svelte";
   import CommandPalette from "./lib/CommandPalette.svelte";
   import NotificationPanel from "./lib/NotificationPanel.svelte";
+  import SessionPicker from "./lib/SessionPicker.svelte";
   import HomeView from "./lib/HomeView.svelte";
   import NudgeOverlay from "./lib/NudgeOverlay.svelte";
   import {
@@ -77,6 +78,8 @@
     loadResumeRecords,
     continueTarget,
     resolveHandoffTarget,
+    listHandoffCandidates,
+    saveSessionPick,
     pruneResumeRecords,
     getLaunchMode,
     frontendLog,
@@ -94,6 +97,7 @@
     type AgentRunEvent,
     type AlertPendingEvent,
     type HandoffTarget,
+    type HandoffCandidate,
   } from "./ipc";
   import {
     buildHandoffCommand,
@@ -101,6 +105,12 @@
     type HandoffMode,
     type GuidedHandoffByLeaf,
   } from "./lib/handoff";
+  import {
+    candidatesToRows,
+    sortCandidates,
+    pickerPlan,
+    provenanceLabel,
+  } from "./lib/session-picker";
   import {
     addNotification,
     markAllRead,
@@ -418,40 +428,57 @@
     cwdByLeaf = { ...cwdByLeaf, [res.added.key]: src.liveCwd };
     setActiveTree(res.tree, res.added.key);
   }
-  // Session handoff (U2, docs/plans/2026-07-02-001-feat-session-handoff-plan.md):
-  // hand the focused pane's previous session to a fresh agent in a split to the
-  // right (R3). Same shape as split(): capture the source, await resolution
-  // (chord-time, from the durable resume record — R4 via U1), staleness-bail,
-  // then seed + mutate synchronously. The old pane is untouched — not closed,
-  // killed, or warned (R3).
-  async function handoff(mode: HandoffMode) {
+  // Session handoff (U2, docs/plans/2026-07-02-001-feat-session-handoff-plan.md;
+  // ambiguity interception fix-session-pane-attribution U6): hand the focused
+  // pane's previous session to a fresh agent in a split to the right (R3). Same
+  // shape as split(): capture the source, await resolution (chord-time, from
+  // the durable resume record — R4 via U1), staleness-bail, then seed + mutate
+  // synchronously. The old pane is untouched — not closed, killed, or warned
+  // (R3). When resolution is empty but candidates exist, the pick-list decides
+  // (fix-attribution R6); a divergence-pending pick (a hook reported a
+  // different live session, KTD2) never spawns without an explicit re-pick;
+  // `forcePick` (U8) skips resolution entirely so a stale-but-resolving id can
+  // still be corrected.
+  async function handoff(mode: HandoffMode, opts: { forcePick?: boolean } = {}) {
     const src = await captureSplitSource("horizontal");
     if (!src) return;
     let target: HandoffTarget | null = null;
-    try {
-      target = await resolveHandoffTarget(src.srcKey, src.liveCwd);
-    } catch (e) {
-      // A rejecting IPC degrades to "nothing qualifies" — notice, never a spawn.
-      void frontendLog(`handoff resolution failed: ${String(e)}`);
+    if (!opts.forcePick) {
+      try {
+        target = await resolveHandoffTarget(src.srcKey, src.liveCwd);
+      } catch (e) {
+        // A rejecting IPC degrades to "nothing qualifies" — the pick-list (or
+        // its notice), never a blind spawn.
+        void frontendLog(`handoff resolution failed: ${String(e)}`);
+      }
     }
-    // R6: no qualifying session → spawn nothing, say why (all three disqualifiers
-    // come back as one null from the backend, so the notice names them together).
-    if (!target) {
-      showNotice(
-        "No session to hand off: this pane has no previous Claude session " +
-          "(no captured session, transcript missing, or no conversation turns).",
-      );
-      return;
+    let provenance: string | null = null;
+    if (target && !target.divergencePending) {
+      // The precise path (AE1): resolved with confidence — zero-prompt, but
+      // the provenance is disclosed below so a remembered pick or a poll
+      // guess is never invisible (KTD4).
+      provenance = provenanceLabel(target.sessionSource);
+    } else {
+      const subtitle = target?.divergencePending
+        ? "This pane's live session differs from your remembered pick — choose again"
+        : opts.forcePick
+          ? "Re-pick: choose the session to bind to this pane"
+          : null;
+      target = await pickSession(src, subtitle);
+      if (!target) return; // cancelled, or the R11 notice already showed
     }
     if (!activeTab || splitSourceStale(src)) return;
     const res = splitLeaf(activeTab.tree, src.srcKey, "horizontal");
     if (!res) return;
     // Seed cwd + command in the same synchronous block that mutates the tree.
-    // R12: spawn in the session's recorded cwd, falling back to the live cwd —
-    // the transcript and the worktree the new agent sees stay coherent. R11:
-    // no automationRunId seed → the Terminal passes null at spawn, so the pane
-    // never links to a run, enters the recursion gate, or gets a deadline.
-    cwdByLeaf = { ...cwdByLeaf, [res.added.key]: target.sessionCwd ?? src.liveCwd };
+    // KTD8/R15 (supersedes handoff-plan R12): the spawn dir is PINNED to the
+    // pane's live cwd — a recorded sessionCwd that diverges never steers the
+    // fresh agent, quick or guided (claude auto-loads the spawn dir's project
+    // config before the user reviews anything); the transcript itself still
+    // rides --add-dir. R11: no automationRunId seed → the Terminal passes null
+    // at spawn, so the pane never links to a run, enters the recursion gate,
+    // or gets a deadline.
+    cwdByLeaf = { ...cwdByLeaf, [res.added.key]: src.liveCwd };
     handoffCommandByLeaf = {
       ...handoffCommandByLeaf,
       [res.added.key]: buildHandoffCommand(target, mode),
@@ -461,7 +488,63 @@
     if (mode === "guided") {
       guidedHandoffByLeaf = { ...guidedHandoffByLeaf, [res.added.key]: target };
     }
+    if (provenance) {
+      showNotice(`Handing off ${target.sessionId.slice(0, 8)}… — ${provenance}.`);
+    }
     setActiveTree(res.tree, res.added.key); // focus moves to the new pane (R3)
+  }
+  // Ambiguity interception (fix-attribution U6; R6-R11): fetch the cwd's
+  // qualifying sessions and route by pickerPlan — none → the R11 notice (never
+  // an empty picker); exactly one, unforced → zero-prompt (R9); else await the
+  // pick-list (the resumeOffer promise pattern). An explicit selection is
+  // persisted as the leaf's remembered Pick (R10) — the highest trust rank —
+  // so the next launch resolves without prompting (AE2); the R9 auto path
+  // deliberately mints NO pick, because no human chose.
+  async function pickSession(
+    src: { srcKey: string; liveCwd: string | null },
+    subtitle: string | null,
+  ): Promise<HandoffTarget | null> {
+    let candidates: HandoffCandidate[] = [];
+    try {
+      candidates = sortCandidates(await listHandoffCandidates(src.srcKey, src.liveCwd));
+    } catch (e) {
+      void frontendLog(`handoff candidate listing failed: ${String(e)}`);
+    }
+    const plan = pickerPlan(candidates.length, subtitle !== null);
+    if (plan === "notice") {
+      showNotice(
+        "No session to hand off: this pane has no previous Claude session " +
+          "(no captured session, transcript missing, or no conversation turns).",
+      );
+      return null;
+    }
+    if (plan === "auto") return candidates[0];
+    // One overlay at a time (the openPalette discipline) — the picker takes
+    // DOM focus, and onWindowKeydown bails while it is up.
+    pendingConfirm = null;
+    menuOpen = false;
+    paletteOpen = false;
+    if (notificationPanelOpen) setNotificationPanel(false);
+    const picked = await new Promise<HandoffCandidate | null>((res) => {
+      resolveSessionPicker = res;
+      sessionPicker = { candidates, subtitle };
+    });
+    if (!picked) return null;
+    try {
+      await saveSessionPick(src.srcKey, picked.sessionId, picked.sessionCwd);
+    } catch (e) {
+      // Best-effort: this launch still proceeds; only the memory of the pick
+      // is lost (the next ambiguous launch re-prompts).
+      void frontendLog(`session pick save failed: ${String(e)}`);
+    }
+    return picked;
+  }
+  function answerSessionPicker(picked: HandoffCandidate | null) {
+    sessionPicker = null;
+    const r = resolveSessionPicker;
+    resolveSessionPicker = null;
+    r?.(picked);
+    if (picked === null) focusActivePane(); // cancelled → focus back to the pane
   }
   // Session handoff U3: a guided pane's injection controller reached a terminal
   // state (injected / skipped / cancelled), or the pane unmounted first —
@@ -719,6 +802,17 @@
     staleDropped: number;
   } | null>(null);
   let resolveResumeOffer: ((accept: boolean) => void) | null = null;
+  // Session pick-list (fix-attribution U6): the sorted candidates + context
+  // line the overlay renders, and the promise handoff()/pickSession awaits —
+  // the resumeOffer pattern. Null when closed; answerSessionPicker resolves.
+  let sessionPicker = $state<{
+    candidates: HandoffCandidate[];
+    subtitle: string | null;
+  } | null>(null);
+  let resolveSessionPicker: ((picked: HandoffCandidate | null) => void) | null = null;
+  const sessionPickerRows = $derived(
+    sessionPicker ? candidatesToRows(sessionPicker.candidates, Date.now()) : [],
+  );
   // Reusable transient notice toast (one surface, latest message wins). Started
   // life as the explicit-`fly resume` tier disclosure (fix-003 U4, R5/AE3 —
   // names imprecise/stale-dropped panes so neither tier is hidden; the offer
@@ -994,6 +1088,7 @@
       homeViewOpen ||
       pendingConfirm ||
       resumeOffer ||
+      sessionPicker ||
       paletteOpen ||
       notificationPanelOpen
     )
@@ -1964,6 +2059,14 @@
     onClearAll={onPanelClearAll}
     onMarkAllRead={onPanelMarkAllRead}
     onClose={closeNotifications}
+  />
+
+  <SessionPicker
+    open={sessionPicker !== null}
+    rows={sessionPickerRows}
+    subtitle={sessionPicker?.subtitle ?? null}
+    onPick={(i) => answerSessionPicker(sessionPicker?.candidates[i] ?? null)}
+    onClose={() => answerSessionPicker(null)}
   />
 </div>
 

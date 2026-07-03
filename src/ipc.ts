@@ -524,16 +524,20 @@ export function continueTarget(cwd: string): Promise<ContinueTarget | null> {
 /**
  * A qualified previous session for handoff (mirrors Rust `HandoffTarget`,
  * session-handoff U1). `transcriptPath` is the backend-derived transcript file
- * the stock prompt names; `sessionCwd` is the resume record's cwd — spawn there
- * when present, falling back to the pane's live cwd (R12). `lastTurnMs` is the
- * last real turn's Unix ms — always present, since a session only qualifies
- * with at least one real conversation turn (R5).
+ * the stock prompt names; `sessionCwd` is the resume record's cwd — context
+ * only, since the spawn dir is pinned to the pane's live cwd
+ * (fix-session-pane-attribution KTD8). `lastTurnMs` is the last real turn's
+ * Unix ms — always present, since a session only qualifies with at least one
+ * real conversation turn (R5). `sessionSource`/`divergencePending` carry the
+ * record's trust rank and re-pick signal (fix-attribution U6, KTD2/KTD4).
  */
 export interface HandoffTarget {
   sessionId: string;
   transcriptPath: string;
   sessionCwd: string | null;
   lastTurnMs: number;
+  sessionSource: SessionSource;
+  divergencePending: boolean;
 }
 
 /**

@@ -16,17 +16,21 @@
 
 use std::path::Path;
 
-use super::resume::ResumeRecords;
+use super::resume::{ResumeRecords, SessionSource};
 use super::transcript;
 
 /// A qualified previous session, ready to hand to a fresh agent (U1). The
 /// transcript path is backend-derived (KTD1: path derivation stays
-/// backend-only). `session_cwd` is the **record's** cwd, `None` when the record
-/// never captured one — the frontend spawns there when present, falling back to
-/// the pane's live cwd (R12; precedence decided here, the fallback applied in
-/// U2). `last_turn_ms` is the last real turn's Unix-ms stamp — present by
+/// backend-only). `session_cwd` is the **record's** cwd (`None` when the record
+/// never captured one) — display/derivation context only since
+/// fix-session-pane-attribution KTD8 pinned the spawn dir to the pane's live
+/// cwd. `last_turn_ms` is the last real turn's Unix-ms stamp — present by
 /// construction, since a target only qualifies with at least one real turn
-/// (R5). Serialized camelCase, the repo's wire-contract convention.
+/// (R5). `session_source`/`divergence_pending` carry the record's trust rank
+/// and re-pick signal to the handoff UI (fix-attribution U6, KTD2/KTD4): the
+/// resolve/return path is where the frontend learns a pick has diverged, and
+/// provenance is shown so a remembered rebind is never invisible. Serialized
+/// camelCase, the repo's wire-contract convention.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffTarget {
@@ -34,6 +38,8 @@ pub struct HandoffTarget {
     pub transcript_path: String,
     pub session_cwd: Option<String>,
     pub last_turn_ms: u64,
+    pub session_source: SessionSource,
+    pub divergence_pending: bool,
 }
 
 /// The basename gate on hook-reported ids: a `/`- or `..`-bearing id could
@@ -80,6 +86,8 @@ pub fn resolve_in_root(
         transcript_path: transcript_path.to_string_lossy().into_owned(),
         session_cwd: rec.session_cwd.clone(),
         last_turn_ms,
+        session_source: rec.session_source,
+        divergence_pending: rec.divergence_pending,
     })
 }
 
@@ -168,6 +176,10 @@ pub fn list_candidates_in_root(
                 transcript_path: path.to_string_lossy().into_owned(),
                 session_cwd: Some(cwd.clone()),
                 last_turn_ms: summary.last_turn_ms,
+                // A candidate spawns only through the pick flow (R8), so it
+                // carries the rank the pick write will persist.
+                session_source: SessionSource::Pick,
+                divergence_pending: false,
             },
             snippet: summary.snippet,
         });
@@ -277,6 +289,30 @@ mod tests {
             Some("/home/evan/.obsidian/notes")
         );
         assert_eq!(target.last_turn_ms, LAST_TURN_MS);
+    }
+
+    #[test]
+    fn the_records_trust_rank_and_divergence_ride_the_target() {
+        // fix-attribution U6 (KTD2/KTD4): the resolve/return path is where the
+        // frontend learns the target's provenance and whether a hook reported
+        // a live session diverging from the pick — so the re-pick prompt fires
+        // before any spawn.
+        let root = tempfile::tempdir().unwrap();
+        let mut records = ResumeRecords::new();
+        records.insert(
+            "leaf-1".to_string(),
+            ResumeRecord {
+                session_id: Some("sess-1".into()),
+                session_cwd: Some("/proj/app".into()),
+                session_source: crate::session::resume::SessionSource::Pick,
+                divergence_pending: true,
+                ..Default::default()
+            },
+        );
+        write_transcript(root.path(), "-proj-app", "sess-1", TURNFUL_FIXTURE);
+        let target = resolve_in_root(&records, "leaf-1", None, root.path()).unwrap();
+        assert_eq!(target.session_source, crate::session::resume::SessionSource::Pick);
+        assert!(target.divergence_pending);
     }
 
     #[test]
@@ -467,6 +503,8 @@ mod tests {
                 transcript_path: "/t.jsonl".into(),
                 session_cwd: Some("/p".into()),
                 last_turn_ms: 5,
+                session_source: SessionSource::Pick,
+                divergence_pending: false,
             },
             snippet: Some("hi".into()),
         };
@@ -474,6 +512,8 @@ mod tests {
         assert_eq!(v["sessionId"], "s");
         assert_eq!(v["lastTurnMs"], 5);
         assert_eq!(v["snippet"], "hi");
+        assert_eq!(v["sessionSource"], "pick");
+        assert_eq!(v["divergencePending"], false);
     }
 
     #[test]
