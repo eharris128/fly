@@ -391,8 +391,31 @@ export function saveResumeSession(
   leafKey: string,
   sessionId: string,
   sessionCwd: string | null,
-): Promise<void> {
-  return invoke("save_resume_session", { leafKey, sessionId, sessionCwd });
+): Promise<ResumeRecord> {
+  return invoke<ResumeRecord>("save_resume_session", {
+    leafKey,
+    sessionId,
+    sessionCwd,
+  });
+}
+
+/**
+ * Bind a user-picked session to a leaf at the highest trust rank
+ * (fix-session-pane-attribution U6, R10/KTD2). Superseded only by another
+ * explicit pick or a reset; a hook reporting a divergent live id flags
+ * `divergencePending` but never rebinds. Returns the effective stored record
+ * so the pick flow can confirm the bind.
+ */
+export function saveSessionPick(
+  leafKey: string,
+  sessionId: string,
+  sessionCwd: string | null,
+): Promise<ResumeRecord> {
+  return invoke<ResumeRecord>("save_session_pick", {
+    leafKey,
+    sessionId,
+    sessionCwd,
+  });
 }
 
 /** Prune the resume store to the live layout leaves, dropping orphans (U8). */
@@ -452,14 +475,27 @@ export function usageSnapshot(): Promise<UsageSnapshot> {
 }
 
 /**
+ * How a stored session id was captured, ranked by trust (mirrors Rust
+ * `SessionSource`, fix-session-pane-attribution KTD2): `poll` is a cwd-level
+ * newest-mtime guess, `hook` is pane-precise via the authenticated socket (but
+ * forgeable by in-pane code), `pick` is an explicit human decision.
+ */
+export type SessionSource = "poll" | "hook" | "pick";
+
+/**
  * One agent leaf's resume mapping (mirrors Rust `ResumeRecord`, U2). `argv` is
  * the captured launch command (the flag source); `sessionCwd` is the project dir
- * the resumed agent runs in (KTD-H). All optional — a record may hold only the
- * hook's session fields, or only the poll's argv, before both writers have run.
+ * the resumed agent runs in (KTD-H). `sessionSource` ranks how the id was
+ * captured; `divergencePending` flags a pick whose pane's live session was
+ * hook-reported as different (the re-pick prompt's signal). All optional — a
+ * record may hold only the hook's session fields, or only the poll's argv,
+ * before both writers have run.
  */
 export interface ResumeRecord {
   sessionId: string | null;
   sessionCwd: string | null;
+  sessionSource: SessionSource;
+  divergencePending: boolean;
   argv: string[] | null;
   isAgent: boolean;
   updatedAt: number;

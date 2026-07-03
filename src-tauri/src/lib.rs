@@ -257,6 +257,10 @@ pub fn run() {
                 // renderer crash; write-through, so it survives an unclean kill.
                 // Done before the attention gate so a debounced/suppressed raise
                 // still captures. Best-effort — a write error never blocks the UI.
+                // Stamped `Hook` HERE, at the call site — the socket authenticates
+                // the pane, not the honesty of in-pane code, so no wire field may
+                // select a rank (fix-session-pane-attribution KTD2): pane-precise,
+                // above the poll's guess, below a human pick.
                 if let Some(session_id) = hook.session_id.clone() {
                     if let Some(leaf_key) = pty.leaf_key(pane) {
                         let _ = session::resume::upsert_at(
@@ -265,6 +269,7 @@ pub fn run() {
                             session::resume::ResumePartial {
                                 session_id: Some(session_id),
                                 session_cwd: hook.cwd.clone(),
+                                session_source: Some(session::resume::SessionSource::Hook),
                                 ..Default::default()
                             },
                         );
@@ -546,6 +551,7 @@ pub fn run() {
             session::resume::load_resume_records,
             session::resume::save_resume_record,
             session::resume::save_resume_session,
+            session::resume::save_session_pick,
             session::resume::prune_resume_records,
             session::transcript::continue_target,
             session::handoff::resolve_handoff_target,

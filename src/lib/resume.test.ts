@@ -20,6 +20,8 @@ function rec(over: Partial<ResumeRecord>): ResumeRecord {
   return {
     sessionId: null,
     sessionCwd: null,
+    sessionSource: "poll",
+    divergencePending: false,
     argv: null,
     isAgent: false,
     updatedAt: 0,

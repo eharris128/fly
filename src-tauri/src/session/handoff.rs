@@ -36,23 +36,14 @@ pub struct HandoffTarget {
     pub last_turn_ms: u64,
 }
 
-/// Is `session_id` a plausible transcript **basename**? The id originates in
-/// hook-reported data written over the token-authenticated socket, so a hostile
-/// token-holding process could store one carrying `/` or `..` and steer the
-/// derived transcript path outside `projects_root` — which then rides the
-/// `--add-dir` grant and the stock prompt. `encode_cwd` neutralizes the cwd
-/// component, but the id is joined raw; accepting only a nonempty
-/// `[A-Za-z0-9._-]` id with no `..` keeps the derived path provably under
-/// `projects_root` (session-handoff U1 hardening, review follow-up). A
-/// rejected id degrades to `None` — the R6 notice — exactly like the other
-/// disqualifiers.
-fn is_plausible_transcript_basename(session_id: &str) -> bool {
-    !session_id.is_empty()
-        && session_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-        && !session_id.contains("..")
-}
+/// The basename gate on hook-reported ids: a `/`- or `..`-bearing id could
+/// steer the derived transcript path outside `projects_root` — which then rides
+/// the `--add-dir` grant and the stock prompt. The validator itself now lives
+/// in [`super::resume`] and is applied at every **write** too (fix-session-pane-
+/// attribution KTD8/R15); this read-side check stays as defense in depth for a
+/// store written by an older binary. A rejected id degrades to `None` — the R6
+/// notice — exactly like the other disqualifiers.
+use super::resume::is_plausible_session_id as is_plausible_transcript_basename;
 
 /// Path-taking core of [`resolve_handoff_target`]: resolve `leaf_key`'s record
 /// in `records` against the transcript store rooted at `projects_root`.
@@ -152,7 +143,7 @@ mod tests {
                 session_cwd: session_cwd.map(str::to_string),
                 argv: Some(vec!["claude".into()]),
                 is_agent: true,
-                updated_at: 0,
+                ..Default::default()
             },
         );
         records
