@@ -284,32 +284,64 @@ export function planResumeLeaves(
 }
 
 /**
- * The resume-offer dialog's tier breakdown (fix-003 U4, R5): `null` when every
- * resumable leaf is exact (nothing to disclose), else a terse "M exact ·
- * K most-recent-in-folder · J stale, started fresh" line. Pure.
+ * Whether a restored leaf's resume is ambiguity-risky (fix-session-pane-
+ * attribution U9, R13/AE5): its stored id is no better than the poll's
+ * cwd-level guess (source `poll` — a pre-fix record loads the same) AND its
+ * cwd holds more than one qualifying transcript at resume time, so
+ * `--resume`/`--continue` could re-attach a sibling's session. A hook- or
+ * pick-sourced id is pane-precise and never flagged. Keyed on transcript
+ * count, not live freshness: crash-resume runs at startup when nothing is
+ * fresh, so a freshness signal would be structurally zero and never fire.
+ * Pure — the count is injected (the IPC probe stays in the caller).
+ */
+export function isAmbiguousResumeLeaf(
+  record: ResumeRecord | null | undefined,
+  qualifyingTranscriptCount: number,
+): boolean {
+  const source = record?.sessionSource ?? "poll";
+  if (source === "hook" || source === "pick") return false;
+  return qualifyingTranscriptCount > 1;
+}
+
+/**
+ * The resume-offer dialog's tier breakdown (fix-003 U4, R5; fix-attribution
+ * U9): `null` when every resumable leaf is exact and unambiguous (nothing to
+ * disclose), else a terse "M exact · K most-recent-in-folder · J stale,
+ * started fresh · N in multi-session folders" line. `ambiguous` counts the
+ * higher-risk leaves — several qualifying transcripts share their cwd, so the
+ * resume may re-attach a sibling (R13/AE5). Pure.
  */
 export function resumeOfferBreakdown(
   tiers: { precise: number; imprecise: number },
   staleDropped: number,
+  ambiguous = 0,
 ): string | null {
-  if (tiers.imprecise === 0 && staleDropped === 0) return null;
+  if (tiers.imprecise === 0 && staleDropped === 0 && ambiguous === 0) return null;
   const parts: string[] = [];
   if (tiers.precise > 0) parts.push(`${tiers.precise} exact`);
   if (tiers.imprecise > 0) parts.push(`${tiers.imprecise} most-recent-in-folder`);
   if (staleDropped > 0) parts.push(`${staleDropped} stale, started fresh`);
+  if (ambiguous > 0) {
+    parts.push(
+      `${ambiguous} in multi-session folders — may re-attach a sibling`,
+    );
+  }
   return parts.join(" · ");
 }
 
 /**
  * The transient post-resume disclosure for the explicit `fly resume` path, which
- * shows no offer dialog (fix-003 U4, R5/AE3): names how many panes re-attached
- * imprecisely (`--continue`) and how many were dropped to a fresh shell because
- * their only candidate session was stale. `null` when everything resumed exactly.
- * Pure, so the wording is unit-tested.
+ * shows no offer dialog (fix-003 U4, R5/AE3; fix-attribution U9): names how many
+ * panes re-attached imprecisely (`--continue`), how many were dropped to a fresh
+ * shell because their only candidate session was stale, and how many resumed
+ * from a multi-session folder where a sibling could have been re-attached
+ * (R13/AE5). `null` when everything resumed exactly and unambiguously. Pure, so
+ * the wording is unit-tested.
  */
 export function resumeNoticeText(
   summary: { precise: number; imprecise: number },
   staleDropped: number,
+  ambiguous = 0,
 ): string | null {
   const parts: string[] = [];
   if (summary.imprecise > 0) {
@@ -319,6 +351,12 @@ export function resumeNoticeText(
   if (staleDropped > 0) {
     const s = staleDropped === 1 ? "" : "s";
     parts.push(`${staleDropped} agent${s} started fresh — no recent session to resume`);
+  }
+  if (ambiguous > 0) {
+    const s = ambiguous === 1 ? "" : "s";
+    parts.push(
+      `${ambiguous} agent${s} resumed from a folder with several sessions — verify the right one re-attached`,
+    );
   }
   return parts.length ? parts.join("; ") + "." : null;
 }

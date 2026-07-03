@@ -402,6 +402,36 @@ pub fn continue_target(cwd: String) -> Option<ContinueTarget> {
     continue_target_in_dir(&dir)
 }
 
+/// Path-taking core of [`qualifying_session_count`]: how many transcripts in
+/// `dir` hold at least one real turn — the same qualification the handoff
+/// candidates use (R5), keyed on content, **not** freshness: crash-resume runs
+/// at startup when nothing is live, so a freshness signal would be
+/// structurally zero and never fire (fix-session-pane-attribution U9, R13).
+fn qualifying_count_in_dir(dir: &Path) -> u32 {
+    let mut n = 0u32;
+    for (name, _) in read_project_entries(dir) {
+        if jsonl_id(&name).is_none() {
+            continue;
+        }
+        if session_last_turn_ms(&dir.join(&name)).is_some() {
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
+/// Command: how many real-turn-qualified transcripts `cwd`'s project dir holds
+/// (fix-attribution U9). The resume offer marks a `Poll`/unset-source leaf in a
+/// cwd counting >1 as higher-risk — its `--resume`/`--continue` could re-attach
+/// a sibling's session (R13/AE5). 0 for an unresolvable/missing dir.
+#[tauri::command]
+pub fn qualifying_session_count(cwd: String) -> u32 {
+    match claude_project_dir(Path::new(&cwd)) {
+        Some(dir) => qualifying_count_in_dir(&dir),
+        None => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,5 +763,27 @@ mod tests {
     fn continue_target_is_none_for_an_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(continue_target_in_dir(dir.path()), None);
+    }
+
+    // ---- qualifying_count_in_dir (fix-attribution U9, R13) ------------------
+
+    #[test]
+    fn qualifying_count_ignores_metadata_only_and_non_transcripts() {
+        // The count keys on real turns, not freshness or file count: two
+        // turnful transcripts (one ancient by mtime — irrelevant), one
+        // metadata-only, one stray file → 2.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.jsonl"), METADATA_TAIL_FIXTURE).unwrap();
+        std::fs::write(dir.path().join("b.jsonl"), METADATA_TAIL_FIXTURE).unwrap();
+        std::fs::write(
+            dir.path().join("meta.jsonl"),
+            "{\"type\":\"mode\"}\n{\"type\":\"ai-title\"}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        assert_eq!(qualifying_count_in_dir(dir.path()), 2);
+        // Empty dir → 0 (the benign single/none paths stay unflagged).
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(qualifying_count_in_dir(empty.path()), 0);
     }
 }

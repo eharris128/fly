@@ -58,6 +58,7 @@
     resumeTierSummary,
     resumeOfferBreakdown,
     resumeNoticeText,
+    isAmbiguousResumeLeaf,
     type ResumeTier,
   } from "./lib/resume";
   import {
@@ -77,6 +78,7 @@
     saveResumeSession,
     loadResumeRecords,
     continueTarget,
+    qualifyingSessionCount,
     resolveHandoffTarget,
     listHandoffCandidates,
     saveSessionPick,
@@ -817,6 +819,8 @@
     count: number;
     tiers: { precise: number; imprecise: number };
     staleDropped: number;
+    /** Leaves whose resume may re-attach a sibling (fix-attribution U9, R13). */
+    ambiguous: number;
   } | null>(null);
   let resolveResumeOffer: ((accept: boolean) => void) | null = null;
   // Session pick-list (fix-attribution U6): the sorted candidates + context
@@ -1686,6 +1690,29 @@
     const hasResumable = Object.keys(commands).length > 0;
     if (!hasResumable && staleDropped === 0) return empty; // nothing happened
 
+    // Ambiguity risk (fix-attribution U9, R13/AE5): a kept leaf whose stored id
+    // is no better than the poll's guess (source poll / pre-fix unset), sitting
+    // in a cwd that holds >1 qualifying transcript AT RESUME TIME, may re-attach
+    // a sibling — count them for the offer/notice. Count-keyed, not freshness
+    // (post-crash nothing is fresh). Probes run in parallel; a probe failure
+    // degrades to unflagged rather than blocking restore; precise (hook/pick)
+    // leaves skip the probe entirely.
+    const ambiguous = (
+      await Promise.all(
+        Object.keys(commands).map(async (k) => {
+          const rec = records[k];
+          const src = rec?.sessionSource ?? "poll";
+          if (src === "hook" || src === "pick") return false;
+          try {
+            const n = await qualifyingSessionCount(rec?.sessionCwd ?? cwds[k] ?? "");
+            return isAmbiguousResumeLeaf(rec, n);
+          } catch {
+            return false;
+          }
+        }),
+      )
+    ).filter(Boolean).length;
+
     // Explicit `fly resume` resumes immediately; a detected crash offers first.
     const summary = resumeTierSummary(tierByLeaf);
     let resuming = mode === "resume";
@@ -1693,14 +1720,20 @@
       if (!hasResumable) return empty; // all stale → bare shells, no offer to show
       resuming = await new Promise<boolean>((res) => {
         resolveResumeOffer = res;
-        resumeOffer = { count: Object.keys(commands).length, tiers: summary, staleDropped };
+        resumeOffer = {
+          count: Object.keys(commands).length,
+          tiers: summary,
+          staleDropped,
+          ambiguous,
+        };
       });
     }
     if (!resuming) return empty;
 
-    // Explicit `fly resume` shows no dialog, so surface the imprecise/stale tiers
-    // as a transient notice (R5/AE3); the offer path discloses them in-dialog.
-    if (mode === "resume") showNotice(resumeNoticeText(summary, staleDropped));
+    // Explicit `fly resume` shows no dialog, so surface the imprecise/stale/
+    // ambiguous tiers as a transient notice (R5/AE3; U9); the offer path
+    // discloses them in-dialog.
+    if (mode === "resume") showNotice(resumeNoticeText(summary, staleDropped, ambiguous));
 
     // KTD-H: resume each agent in its captured session cwd when we have one.
     for (const key of Object.keys(commands)) {
@@ -2013,6 +2046,7 @@
     {@const breakdown = resumeOfferBreakdown(
       resumeOffer.tiers,
       resumeOffer.staleDropped,
+      resumeOffer.ambiguous,
     )}
     <div class="backdrop" role="presentation">
       <div

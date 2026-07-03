@@ -10,6 +10,7 @@ import {
   planResumeLeaves,
   resumeOfferBreakdown,
   resumeNoticeText,
+  isAmbiguousResumeLeaf,
 } from "./resume";
 import type { ResumeRecord } from "../ipc";
 
@@ -449,5 +450,50 @@ describe("resumeCommandsForLeaves (U8)", () => {
     };
     const out = resumeCommandsForLeaves(["leaf-1"], records, DEFAULT);
     expect(Object.keys(out)).toEqual(["leaf-1"]);
+  });
+});
+
+describe("isAmbiguousResumeLeaf (fix-attribution U9, R13/AE5)", () => {
+  it("flags a poll-sourced leaf whose cwd holds several qualifying transcripts", () => {
+    expect(isAmbiguousResumeLeaf(rec({ sessionId: "a" }), 2)).toBe(true);
+    expect(isAmbiguousResumeLeaf(rec({ sessionId: "a" }), 5)).toBe(true);
+  });
+
+  it("never flags a single-transcript or empty cwd", () => {
+    expect(isAmbiguousResumeLeaf(rec({ sessionId: "a" }), 1)).toBe(false);
+    expect(isAmbiguousResumeLeaf(rec({ sessionId: "a" }), 0)).toBe(false);
+  });
+
+  it("never flags a precise (hook/pick) leaf however crowded the cwd", () => {
+    expect(
+      isAmbiguousResumeLeaf(rec({ sessionId: "a", sessionSource: "hook" }), 9),
+    ).toBe(false);
+    expect(
+      isAmbiguousResumeLeaf(rec({ sessionId: "a", sessionSource: "pick" }), 9),
+    ).toBe(false);
+  });
+
+  it("treats a record without a source (pre-fix store) as poll", () => {
+    const legacy = rec({ sessionId: "a" });
+    // Simulate a pre-fix record: the field is absent on the loaded object.
+    delete (legacy as Partial<typeof legacy>).sessionSource;
+    expect(isAmbiguousResumeLeaf(legacy, 2)).toBe(true);
+  });
+});
+
+describe("ambiguity disclosure in breakdown + notice (fix-attribution U9)", () => {
+  it("appends the multi-session-folder part to the offer breakdown", () => {
+    expect(resumeOfferBreakdown({ precise: 2, imprecise: 0 }, 0, 1)).toBe(
+      "2 exact · 1 in multi-session folders — may re-attach a sibling",
+    );
+    // Ambiguity alone (all leaves precise-tier but poll-sourced) still discloses.
+    expect(resumeOfferBreakdown({ precise: 1, imprecise: 0 }, 0, 0)).toBeNull();
+  });
+
+  it("names the ambiguous count in the explicit-resume notice", () => {
+    expect(resumeNoticeText({ precise: 1, imprecise: 0 }, 0, 1)).toBe(
+      "1 agent resumed from a folder with several sessions — verify the right one re-attached.",
+    );
+    expect(resumeNoticeText({ precise: 1, imprecise: 0 }, 0, 0)).toBeNull();
   });
 });

@@ -534,6 +534,17 @@ export function continueTarget(cwd: string): Promise<ContinueTarget | null> {
 }
 
 /**
+ * How many real-turn-qualified transcripts `cwd`'s project dir holds
+ * (fix-session-pane-attribution U9). The resume offer marks a poll/unset-source
+ * leaf in a cwd counting >1 as higher-risk — its resume could re-attach a
+ * sibling's session (R13/AE5). Count-based, not freshness-based: at crash
+ * resume nothing is fresh.
+ */
+export function qualifyingSessionCount(cwd: string): Promise<number> {
+  return invoke<number>("qualifying_session_count", { cwd });
+}
+
+/**
  * A qualified previous session for handoff (mirrors Rust `HandoffTarget`,
  * session-handoff U1). `transcriptPath` is the backend-derived transcript file
  * the stock prompt names; `sessionCwd` is the resume record's cwd — context
