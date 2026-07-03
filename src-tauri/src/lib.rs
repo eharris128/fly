@@ -276,6 +276,17 @@ pub fn run() {
                     }
                 }
 
+                // Capture-only short-circuit (fix-attribution U2, KTD1/R2):
+                // a SessionStart capture ends here, after the upsert and before
+                // any Signal — no ring, no history, no banner, and (ordered
+                // before the Stop-close below, an accepted self-scoped
+                // interaction) never a run closure. The reason is ignored: a
+                // message carrying both a raising reason and a capture gate
+                // raises nothing.
+                if hook.is_capture_only() {
+                    return;
+                }
+
                 let reason = hook.reason;
                 let signal = Signal {
                     reason,

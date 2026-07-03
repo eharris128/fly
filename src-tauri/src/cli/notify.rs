@@ -20,6 +20,9 @@ use crate::state::attention::Reason;
 /// binary that predates these fields still deserializes server-side.
 /// `hook_event` is also optional (U7, KTD-F) and threads the event name for
 /// agent-run closure; older servers ignore it via `#[serde(default)]`.
+/// `capture_only` (fix-attribution U2, KTD1) marks a session-capture message
+/// that must never raise; an older server ignores the field (accepted
+/// mixed-version risk — the plan's skew note).
 #[allow(clippy::too_many_arguments)]
 pub fn send(
     socket_path: &Path,
@@ -30,6 +33,7 @@ pub fn send(
     session_id: Option<&str>,
     cwd: Option<&str>,
     hook_event: Option<&str>,
+    capture_only: bool,
 ) -> std::io::Result<()> {
     let payload = serde_json::json!({
         "token": token,
@@ -39,6 +43,7 @@ pub fn send(
         "session_id": session_id,
         "cwd": cwd,
         "hook_event": hook_event,
+        "capture_only": capture_only,
     });
     let bytes = serde_json::to_vec(&payload)?;
     let mut stream = UnixStream::connect(socket_path)?;
@@ -47,10 +52,14 @@ pub fn send(
     Ok(())
 }
 
-/// CLI entry for `fly notify <reason> [--claude] [--title T] [--body B]`.
+/// CLI entry for `fly notify <reason> [--claude] [--capture] [--title T] [--body B]`.
 pub fn run(args: &[String]) -> i32 {
     let mut reason: Option<Reason> = None;
     let mut from_claude = false;
+    // fix-attribution U2 (KTD1): the SessionStart capture path — update the
+    // pane's resume record, raise nothing. The event name is a second gate
+    // server-side, so the flag and the payload reinforce each other.
+    let mut capture_only = false;
     let mut title: Option<String> = None;
     let mut body: Option<String> = None;
     // Captured from the Claude payload and forwarded to the app for resume (U1).
@@ -61,6 +70,7 @@ pub fn run(args: &[String]) -> i32 {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--claude" => from_claude = true,
+            "--capture" => capture_only = true,
             "--title" => title = it.next().cloned(),
             "--body" => body = it.next().cloned(),
             other if !other.starts_with('-') && reason.is_none() => {
@@ -117,6 +127,7 @@ pub fn run(args: &[String]) -> i32 {
         session_id.as_deref(),
         cwd.as_deref(),
         hook_event.as_deref(),
+        capture_only,
     ) {
         Ok(()) => 0,
         Err(e) => {

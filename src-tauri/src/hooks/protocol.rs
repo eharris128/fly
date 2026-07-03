@@ -13,8 +13,15 @@
 //! { "token": "<hex>", "reason": "question|permission|finished|error|alert",
 //!   "title": "<optional>", "body": "<optional>",
 //!   "session_id": "<optional>", "cwd": "<optional>",
-//!   "hook_event": "<optional>" }
+//!   "hook_event": "<optional>", "capture_only": false }
 //! ```
+//!
+//! `capture_only` (fix-session-pane-attribution U2, KTD1) marks a message that
+//! only updates the pane's resume record — the dispatch returns before the
+//! attention machine, so it can never ring, record history, or banner. There is
+//! deliberately **no** wire field selecting a trust rank: the dispatch stamps
+//! every socket write `SessionSource::Hook` at the call site (KTD2), so a
+//! client cannot self-declare `Pick`/`Poll` authority.
 //!
 //! Authentication & rejection rules:
 //! - The connecting peer's UID must equal the app's UID (`SO_PEERCRED`).
@@ -63,6 +70,11 @@ impl Envelope {
 /// (e.g. "Stop", "SubagentStop") for the U7 agent-run closure (KTD-F): a bare
 /// `Finished` with no `hook_event` does not close the run, falling through to
 /// the 30-min deadline (matches "hooks not installed" degradation).
+/// `capture_only` (fix-attribution U2/KTD1, also `#[serde(default)]`) is set by
+/// `fly notify --capture` — the `SessionStart` capture path that must never
+/// raise; the dispatch equally treats a `SessionStart` `hook_event` as capture,
+/// so a stale installed binary that forwards the event without the flag still
+/// can't turn session birth into a ring.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HookMessage {
     pub token: String,
@@ -77,6 +89,8 @@ pub struct HookMessage {
     pub cwd: Option<String>,
     #[serde(default)]
     pub hook_event: Option<String>,
+    #[serde(default)]
+    pub capture_only: bool,
 }
 
 #[cfg(test)]
@@ -150,6 +164,27 @@ mod tests {
         let unknown: Envelope =
             serde_json::from_str(r#"{"token":"t","op":"something/else"}"#).unwrap();
         assert!(!unknown.is_automation());
+    }
+
+    #[test]
+    fn deserializes_without_capture_only_for_backward_compat() {
+        // Every pre-fix message carries no capture_only — it must parse as a
+        // normal (raising) message (fix-attribution U2).
+        let msg: HookMessage =
+            serde_json::from_str(r#"{"token":"abc","reason":"finished"}"#).unwrap();
+        assert!(!msg.capture_only);
+    }
+
+    #[test]
+    fn deserializes_capture_only_when_present() {
+        // `fly notify --capture` sets the flag; the reason still parses (and is
+        // ignored downstream, KTD1).
+        let msg: HookMessage = serde_json::from_str(
+            r#"{"token":"abc","reason":"question","capture_only":true,"session_id":"s1"}"#,
+        )
+        .unwrap();
+        assert!(msg.capture_only);
+        assert_eq!(msg.session_id.as_deref(), Some("s1"));
     }
 
     #[test]

@@ -37,6 +37,21 @@ pub struct ValidatedHook {
     /// U7: the hook event name (e.g. "Stop", "SubagentStop"), used to close
     /// agent runs on first Stop occurrence (KTD-F). `None` on older hooks.
     pub hook_event: Option<String>,
+    /// fix-attribution U2: `fly notify --capture` — see [`Self::is_capture_only`].
+    pub capture_only: bool,
+}
+
+impl ValidatedHook {
+    /// Whether this message only captures a session id and must never raise
+    /// attention (fix-session-pane-attribution U2, KTD1/R2). Two independent
+    /// gates for binary-skew safety: the explicit `--capture` flag, **or** a
+    /// `SessionStart` event name — so a stale installed `fly notify` that
+    /// forwards the event without the flag still can't ring at session birth.
+    /// The message's `reason` is deliberately ignored: a payload carrying both
+    /// a raising reason and either gate raises nothing.
+    pub fn is_capture_only(&self) -> bool {
+        self.capture_only || self.hook_event.as_deref() == Some("SessionStart")
+    }
 }
 
 /// Sink for authenticated callbacks. The app wires this to the attention
@@ -215,6 +230,7 @@ fn handle_conn(
             session_id: msg.session_id,
             cwd: msg.cwd,
             hook_event: msg.hook_event,
+            capture_only: msg.capture_only,
         },
     );
 }
