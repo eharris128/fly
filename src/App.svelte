@@ -1912,7 +1912,21 @@
   }
 
   function reportForeground() {
-    void setWindowForeground(document.hasFocus());
+    const focused = document.hasFocus();
+    void setWindowForeground(focused);
+    // Focus-in status refresh (fix-dashboard-stale-status-on-focus): WebKit
+    // throttles/pauses the 1.5s polls (refreshAgents/refreshCwds) while the window
+    // is backgrounded, so the dashboard freezes and only catches up on the next
+    // resumed tick — the ~700ms "statuses flip after I switch back" lag (avg half
+    // the 1.5s cadence). Pull a poll forward to the moment focus returns so the
+    // dashboard reads current on glance, not one interval later. Cheap: the same
+    // probes the timers already run, just not made to wait for the throttle to
+    // wake. Agents only while the dashboard drives that poll (homeViewOpen); cwds
+    // always, mirroring their unconditional timer.
+    if (focused) {
+      if (homeViewOpen) void refreshAgents();
+      void refreshCwds();
+    }
   }
   onMount(() => {
     window.addEventListener("focus", reportForeground);
