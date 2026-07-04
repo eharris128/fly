@@ -543,6 +543,64 @@ fn sole_transcript_in_dir_since(dir: &Path, dispatched_ms: u64) -> Option<PathBu
     }
 }
 
+/// Retry budget for [`capture_final_assistant_since`]. Claude Code fires the
+/// `Stop` hook that triggers automation output capture ~100ms **before** it
+/// flushes the run's final assistant turn to the transcript `.jsonl`
+/// (empirically observed on Claude Code 2.1.200: the Stop-close reads the file
+/// at T, the transcript's final write lands at ~T+100ms). A single-shot read on
+/// Stop therefore sees a transcript that still lacks the final turn and records
+/// an empty run output. Re-reading for up to ~2s (20 × 100ms) closes the race
+/// while staying well under the agent-run close/deadline paths; both close call
+/// sites run capture off their thread, so these waits never stall dispatch.
+pub const CAPTURE_ATTEMPTS: u32 = 20;
+pub const CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// U4b capture with Stop/flush-race tolerance. Resolves the sole fresh
+/// transcript for `cwd` since `dispatched_ms` ([`sole_transcript_since`]) and
+/// returns its last assistant turn's text, re-reading up to `attempts` times
+/// spaced by `delay` because the final turn flushes shortly **after** the `Stop`
+/// hook that triggers capture (see [`CAPTURE_ATTEMPTS`]). Abstains (`None`) if no
+/// assistant text appears within the budget, if the cwd is ambiguous (>1 fresh
+/// transcript), or if the transcript never materializes — the same
+/// no-cross-session-leak posture as the single-shot [`sole_transcript_since`].
+///
+/// The caller sleeps on its own (spawned) thread, never the hook-dispatch or PTY
+/// read thread — Claude Code blocks on the Stop hook, so a slow/abstaining
+/// capture must not ride that path.
+pub fn capture_final_assistant_since(
+    cwd: &Path,
+    dispatched_ms: u64,
+    attempts: u32,
+    delay: Duration,
+) -> Option<String> {
+    let dir = claude_project_dir(cwd)?;
+    capture_final_assistant_in_dir_since(&dir, dispatched_ms, attempts, delay)
+}
+
+/// Dir-taking core of [`capture_final_assistant_since`] — tested directly on a
+/// temp project dir (no `$HOME`). Loops resolve+read so a transcript that gains
+/// its final assistant turn *between* reads is still captured, bounded by
+/// `attempts` (never an unbounded wait).
+fn capture_final_assistant_in_dir_since(
+    dir: &Path,
+    dispatched_ms: u64,
+    attempts: u32,
+    delay: Duration,
+) -> Option<String> {
+    for attempt in 0..attempts {
+        if let Some(path) = sole_transcript_in_dir_since(dir, dispatched_ms) {
+            if let Some(text) = last_assistant_text(&path) {
+                return Some(text);
+            }
+        }
+        // No sleep after the final attempt (nothing would re-read the result).
+        if attempt + 1 < attempts {
+            std::thread::sleep(delay);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,5 +1073,70 @@ mod tests {
 
         // A dispatch time in the far future excludes every existing transcript.
         assert_eq!(sole_transcript_in_dir_since(dir.path(), u64::MAX), None);
+    }
+
+    // ---- capture_final_assistant flush-race retry (U4b) --------------------
+
+    // A transcript in the state it is in the instant the `Stop` hook fires: the
+    // user turn is written, but the final assistant turn has NOT flushed yet.
+    const USER_ONLY_FIXTURE: &str =
+        concat!(r#"{"type":"user","message":{"role":"user","content":"run it"}}"#, "\n");
+
+    #[test]
+    fn capture_single_shot_misses_a_turn_that_has_not_flushed_yet() {
+        // Reproduces the bug: on Stop the transcript exists (user turn written)
+        // but the final assistant turn has not flushed, so one read finds no
+        // assistant text — the single-shot behaviour that recorded empty output.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.jsonl"), USER_ONLY_FIXTURE).unwrap();
+        assert_eq!(
+            capture_final_assistant_in_dir_since(dir.path(), 0, 1, Duration::ZERO),
+            None
+        );
+        // Once the assistant turn IS flushed, even a single-shot read captures it.
+        std::fs::write(dir.path().join("s.jsonl"), AGENT_RUN_FIXTURE).unwrap();
+        assert!(capture_final_assistant_in_dir_since(dir.path(), 0, 1, Duration::ZERO)
+            .unwrap()
+            .contains("82% full"));
+    }
+
+    #[test]
+    fn capture_retries_until_the_final_turn_is_flushed() {
+        // The fix: the assistant turn lands AFTER capture starts (as it does
+        // ~100ms after Stop). A background flush appends it while the retry loop
+        // polls; the loop must return the turn rather than abstain. The budget
+        // (50 × 20ms = 1s) is a 20× margin over the ~50ms flush delay, so this
+        // is not timing-fragile.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, USER_ONLY_FIXTURE).unwrap();
+        let flush_path = path.clone();
+        let flusher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            std::fs::write(&flush_path, AGENT_RUN_FIXTURE).unwrap();
+        });
+        let got = capture_final_assistant_in_dir_since(
+            dir.path(),
+            0,
+            50,
+            Duration::from_millis(20),
+        );
+        flusher.join().unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some("Disk is 82% full.\n\nClean ~/.cache to recover 4 GB.")
+        );
+    }
+
+    #[test]
+    fn capture_gives_up_within_budget_when_no_turn_ever_flushes() {
+        // Bounded: a transcript that never gains an assistant turn abstains after
+        // `attempts` reads instead of looping forever (ZERO delay ⇒ instant).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.jsonl"), USER_ONLY_FIXTURE).unwrap();
+        assert_eq!(
+            capture_final_assistant_in_dir_since(dir.path(), 0, 4, Duration::ZERO),
+            None
+        );
     }
 }

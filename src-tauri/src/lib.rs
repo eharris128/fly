@@ -298,7 +298,19 @@ pub fn run() {
                 // is safe) and a no-op for any non-automation pane.
                 if hook.hook_event.as_deref() == Some("Stop") {
                     if let Some(mgr) = handle.try_state::<Arc<automations::AutomationManager>>() {
-                        let _ = mgr.close_run_by_pane(pane.0);
+                        // Off the dispatch thread: close_run_by_pane's U4b
+                        // capture retries the transcript read for up to ~2s
+                        // (Claude flushes the final turn ~100ms AFTER this Stop),
+                        // and Claude Code BLOCKS on this hook — so a slow capture
+                        // must not ride the dispatch path. Idempotent; and the
+                        // Finished-suppression below keys only on the pane's
+                        // automation linkage, not on the run still being open, so
+                        // it stays correct without awaiting the close.
+                        let mgr = mgr.inner().clone();
+                        let pane_id = pane.0;
+                        std::thread::spawn(move || {
+                            let _ = mgr.close_run_by_pane(pane_id);
+                        });
                     }
                 }
 
@@ -529,14 +541,20 @@ pub fn run() {
             // (abstains on ambiguity — no cross-session leak), extract the last
             // assistant message, scrub secrets (an agent runs with
             // --dangerously-skip-permissions and may quote one), then strip
-            // control chars. `close_run` tail-caps the result.
+            // control chars. `close_run` tail-caps the result. The read RETRIES
+            // (bounded): Claude Code flushes the final assistant turn to the
+            // transcript ~100ms AFTER firing the Stop hook that triggers this
+            // capture, so a single-shot read loses the race and records empty
+            // output. Both close call sites run the capturer off their thread
+            // (dispatch / PTY read), so the retry sleeps never stall dispatch.
             automations_mgr.set_output_capturer(Arc::new(
                 |cwd: &str, dispatched_ms: u64| {
-                    let path = session::transcript::sole_transcript_since(
+                    let text = session::transcript::capture_final_assistant_since(
                         std::path::Path::new(cwd),
                         dispatched_ms,
+                        session::transcript::CAPTURE_ATTEMPTS,
+                        session::transcript::CAPTURE_RETRY_DELAY,
                     )?;
-                    let text = session::transcript::last_assistant_text(&path)?;
                     let scrubbed = automations::redact::scrub_secrets(&text);
                     let clean = notify::sanitize_multiline(&scrubbed);
                     (!clean.trim().is_empty()).then_some(clean)

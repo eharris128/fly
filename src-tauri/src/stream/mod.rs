@@ -161,11 +161,16 @@ pub fn spawn_pane(
             tokens.revoke(id);
             // U7 pane-exit tap: if this pane was an automation agent run, close
             // its still-running row failed (a pane that died before Stop) and
-            // clear the recursion-registry entry. This runs on the PTY read
-            // thread holding no PTY registry lock, so the store lock it takes
-            // respects the store→PTY order (KTD-B). A no-op for ordinary panes.
+            // clear the recursion-registry entry. Spawned off the PTY read thread
+            // because the U4b output capture inside the close now retries the
+            // transcript read (bounded ~2s), which must not block pane teardown
+            // (alert-sink clear + PANE_EXIT_EVENT below). on_pane_exit takes the
+            // store lock, never the PTY registry lock, so the store→PTY order
+            // (KTD-B) holds. A no-op for ordinary panes.
             if let Some(mgr) = app.try_state::<Arc<crate::automations::AutomationManager>>() {
-                mgr.on_pane_exit(id.0);
+                let mgr = mgr.inner().clone();
+                let pane_id = id.0;
+                std::thread::spawn(move || mgr.on_pane_exit(pane_id));
             }
             // U6: if this pane was the automations alert sink, clear the
             // registration so a later alert re-opens a fresh sink pane
