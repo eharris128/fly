@@ -97,6 +97,12 @@ pub struct Config {
     pub font_size: u16,
     /// Persist scrollback across restart — off by default for privacy (KTD10).
     pub save_scrollback: bool,
+    /// Show the notifications (🔔) icon in the control bar. On by default; the
+    /// settings menu toggles it and persists the choice. Purely a chrome
+    /// affordance — hiding it never disables notifications: the unread badge
+    /// vanishes with the button, but `leader n` still opens the panel and OS
+    /// notifications still surface.
+    pub show_notifications_icon: bool,
     /// Start with global do-not-disturb on (R17). Per-workspace mute is runtime
     /// only in v1; this is the one mute startup default.
     pub notifications_muted_default: bool,
@@ -132,6 +138,7 @@ impl Default for Config {
             scrollback_lines: 10_000,
             font_size: 15,
             save_scrollback: false,
+            show_notifications_icon: true,
             notifications_muted_default: false,
             notification_sound: Some("message-new-instant".into()),
             notification_command: None,
@@ -152,5 +159,21 @@ mod tests {
     #[test]
     fn default_renderer_is_dom() {
         assert_eq!(Config::default().renderer, Renderer::Dom);
+    }
+
+    /// The notifications control-bar icon is shown by default; the settings menu
+    /// toggles it. Guards the no-surprise default so a config predating the field
+    /// (loaded via `#[serde(default)]`) still shows the bell.
+    #[test]
+    fn default_shows_notifications_icon() {
+        assert!(Config::default().show_notifications_icon);
+    }
+
+    /// An older config file that omits `show_notifications_icon` still loads and
+    /// falls back to the shown-by-default, rather than deserializing to `false`.
+    #[test]
+    fn missing_show_notifications_icon_defaults_shown() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.show_notifications_icon);
     }
 }

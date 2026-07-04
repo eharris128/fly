@@ -18,6 +18,7 @@ export interface KeymapActions {
   toggleMute: () => void;
   openMenu: () => void;
   openPalette: () => void;
+  openSettings: () => void;
   toggleSidebar: () => void;
   toggleHome: () => void;
   newWorkspace: () => void;
@@ -88,6 +89,11 @@ export const BINDINGS: Binding[] = [
   { keys: ["b"], label: "Toggle sidebar", action: "toggleSidebar" },
   { keys: ["d"], label: "Dashboard (home)", action: "toggleHome" },
   { keys: ["p"], label: "Command palette", action: "openPalette" },
+  // Settings menu — comma is the conventional "preferences" chord and is unused
+  // elsewhere (the collision guard proves it). Picked up by the cheat-sheet and
+  // command palette from this array, so it stays reachable even after its first
+  // setting hides the control-bar notifications icon (KTD1, no drift).
+  { keys: [","], label: "Settings", action: "openSettings" },
   { keys: ["?"], label: "Hotkey menu", action: "openMenu" },
 ];
 

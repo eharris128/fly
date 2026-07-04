@@ -29,6 +29,8 @@ export interface Config {
   scrollbackLines: number;
   fontSize: number;
   saveScrollback: boolean;
+  /** Show the 🔔 notifications icon in the control bar (settings-menu toggle). */
+  showNotificationsIcon: boolean;
   /** Start with global do-not-disturb on (R17). */
   notificationsMutedDefault: boolean;
   /** Sound-theme name for surfaced notifications, or null for silent (R23). */
@@ -49,5 +51,20 @@ export async function getConfig(): Promise<Config> {
   if (cached === null) {
     cached = await invoke<Config>("get_config");
   }
+  return cached;
+}
+
+/**
+ * Persist a settings change: merge `patch` onto the cached config, write the
+ * full object through the backend (atomic), and refresh the cache with the
+ * canonical stored value so {@link getConfig} stays current for the session.
+ * Merging onto the cached object (the raw parsed config) rather than a
+ * hand-built one preserves any backend field this frontend doesn't yet model,
+ * so a save never silently resets it. Resolves to the new full config.
+ */
+export async function setConfig(patch: Partial<Config>): Promise<Config> {
+  const base = await getConfig();
+  const next = { ...base, ...patch };
+  cached = await invoke<Config>("set_config", { config: next });
   return cached;
 }

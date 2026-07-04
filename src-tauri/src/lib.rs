@@ -539,6 +539,7 @@ pub fn run() {
             frontend_log,
             get_launch_mode,
             config::get_config,
+            config::set_config,
             stream::spawn_pane,
             stream::set_visible_panes,
             stream::set_window_foreground,
