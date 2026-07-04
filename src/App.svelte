@@ -6,6 +6,7 @@
   import HotkeyMenu from "./lib/HotkeyMenu.svelte";
   import CommandPalette from "./lib/CommandPalette.svelte";
   import NotificationPanel from "./lib/NotificationPanel.svelte";
+  import SettingsMenu, { type ToggleSetting } from "./lib/SettingsMenu.svelte";
   import SessionPicker from "./lib/SessionPicker.svelte";
   import HomeView from "./lib/HomeView.svelte";
   import NudgeOverlay from "./lib/NudgeOverlay.svelte";
@@ -140,7 +141,7 @@
   } from "./lib/notifications";
   import { Keymap, type KeymapActions } from "./lib/keymap";
   import { actionCommands, navCommands, type PaletteCommand } from "./lib/palette";
-  import { getConfig } from "./lib/config";
+  import { getConfig, setConfig } from "./lib/config";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import {
     saveSession,
@@ -282,6 +283,13 @@
   let automationsCorruptBak = $state<string | null>(null);
   let paletteOpen = $state(false);
   let notificationPanelOpen = $state(false);
+  // Settings menu (`leader ,`, the ⚙ control-bar button, or the command
+  // palette): a focus-taking overlay, mutually exclusive with the others.
+  let settingsOpen = $state(false);
+  // Config-backed chrome toggle: whether the control-bar 🔔 shows. Seeded from
+  // config in restore(); flipped through the settings menu, which persists it
+  // via setConfig. Hiding it never disables notifications (leader n still works).
+  let showNotificationsIcon = $state(true);
   // Global do-not-disturb. Seeded from the config default on restore; the
   // runtime toggle is the session's source of truth, mirrored to the backend.
   let muted = $state(false);
@@ -1019,6 +1027,7 @@
     pendingConfirm = null;
     menuOpen = false;
     paletteOpen = false;
+    settingsOpen = false;
     if (notificationPanelOpen) setNotificationPanel(false);
     if (sessionPicker !== null) answerSessionPicker(null);
   }
@@ -1031,6 +1040,45 @@
     closeAllOverlays();
     paletteOpen = true;
   }
+  // ---- settings menu -------------------------------------------------------
+  // A focus-taking overlay like the palette; the same three openers (chord,
+  // control-bar ⚙, palette command) route here. closeAllOverlays() first so it
+  // supersedes any other overlay; the menu takes DOM focus, so the window keydown
+  // handler bails on `settingsOpen` (below) and Esc/backdrop hand focus back.
+  function openSettings() {
+    closeAllOverlays();
+    homeViewOpen = false;
+    settingsOpen = true;
+  }
+  function closeSettings() {
+    settingsOpen = false;
+    focusActivePane();
+  }
+  // The settings menu is a dumb view: App owns each setting's live value and its
+  // mapping to a config field. `key` round-trips back through here (opaque to the
+  // menu). Optimistic — flip the runtime value, then persist; on a failed flush
+  // (the backend leaves its config unchanged) revert so the toggle mirrors disk.
+  async function onSettingToggle(key: string, value: boolean) {
+    if (key === "showNotificationsIcon") {
+      showNotificationsIcon = value;
+      try {
+        await setConfig({ showNotificationsIcon: value });
+      } catch (e) {
+        showNotificationsIcon = !value;
+        void frontendLog(`settings: persist ${key} failed: ${String(e)}`);
+      }
+    }
+  }
+  // Rebuilt whenever a backing value changes so the menu's switch tracks it.
+  const settingsToggles = $derived<ToggleSetting[]>([
+    {
+      key: "showNotificationsIcon",
+      label: "Notifications icon",
+      description:
+        "Show the 🔔 in the control bar. Hiding it doesn't disable notifications — leader n still opens the panel.",
+      value: showNotificationsIcon,
+    },
+  ]);
   // ---- notification panel + mute (U21) -------------------------------------
   // Replicate panel-open to the backend so KTD15's panel-open suppressor works.
   function setNotificationPanel(open: boolean) {
@@ -1225,6 +1273,7 @@
       resumeOffer ||
       sessionPicker ||
       paletteOpen ||
+      settingsOpen ||
       notificationPanelOpen
     )
       return;
@@ -1655,6 +1704,7 @@
     pendingConfirm = null;
     menuOpen = false;
     paletteOpen = false;
+    settingsOpen = false;
     if (notificationPanelOpen) setNotificationPanel(false);
     homeViewOpen = true;
   }
@@ -1714,6 +1764,7 @@
     toggleMute,
     openMenu,
     openPalette,
+    openSettings,
     toggleSidebar: () => (sidebarCollapsed = !sidebarCollapsed),
     toggleHome,
     newWorkspace,
@@ -1871,6 +1922,7 @@
     saveScrollbackEnabled = cfg.saveScrollback;
     leaderKey = cfg.leaderKey;
     nudgeIdleMs = cfg.nudgeIdleMs;
+    showNotificationsIcon = cfg.showNotificationsIcon;
     // Seed global mute from the config default; the backend seeds the same value
     // at startup, so they start in sync (the runtime toggle keeps them so).
     muted = cfg.notificationsMutedDefault;
@@ -2072,12 +2124,14 @@
     {sidebarCollapsed}
     {muted}
     unreadTotal={unreadTotal(notifications)}
+    {showNotificationsIcon}
     onToggleSidebar={() => (sidebarCollapsed = !sidebarCollapsed)}
     onSplitH={() => void split("horizontal")}
     onSplitV={() => void split("vertical")}
     onClosePane={closePane}
     onToggleMute={toggleMute}
     onOpenNotifications={openNotifications}
+    onOpenSettings={openSettings}
     onMenu={openMenu}
   />
   <div class="body">
@@ -2261,6 +2315,13 @@
     onClearAll={onPanelClearAll}
     onMarkAllRead={onPanelMarkAllRead}
     onClose={closeNotifications}
+  />
+
+  <SettingsMenu
+    open={settingsOpen}
+    toggles={settingsToggles}
+    onToggle={onSettingToggle}
+    onClose={closeSettings}
   />
 
   <SessionPicker

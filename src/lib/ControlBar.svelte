@@ -8,12 +8,14 @@
     sidebarCollapsed: boolean;
     muted: boolean;
     unreadTotal: number;
+    showNotificationsIcon: boolean;
     onToggleSidebar: () => void;
     onSplitH: () => void;
     onSplitV: () => void;
     onClosePane: () => void;
     onToggleMute: () => void;
     onOpenNotifications: () => void;
+    onOpenSettings: () => void;
     onMenu: () => void;
   }
   let {
@@ -22,12 +24,14 @@
     sidebarCollapsed,
     muted,
     unreadTotal,
+    showNotificationsIcon,
     onToggleSidebar,
     onSplitH,
     onSplitV,
     onClosePane,
     onToggleMute,
     onOpenNotifications,
+    onOpenSettings,
     onMenu,
   }: Props = $props();
 </script>
@@ -46,13 +50,15 @@
     </span>
   </div>
   <div class="controls">
-    <button
-      class="iconbtn notif"
-      title="notifications"
-      onclick={onOpenNotifications}
-    >
-      🔔{#if unreadTotal > 0}<span class="ubadge">{unreadTotal}</span>{/if}
-    </button>
+    {#if showNotificationsIcon}
+      <button
+        class="iconbtn notif"
+        title="notifications"
+        onclick={onOpenNotifications}
+      >
+        🔔{#if unreadTotal > 0}<span class="ubadge">{unreadTotal}</span>{/if}
+      </button>
+    {/if}
     <button
       class="iconbtn"
       class:on={muted}
@@ -63,6 +69,7 @@
     <button class="iconbtn" title="split right" onclick={onSplitH}>▥</button>
     <button class="iconbtn" title="split down" onclick={onSplitV}>▤</button>
     <button class="iconbtn" title="close pane" onclick={onClosePane}>✕</button>
+    <button class="iconbtn" title="settings" onclick={onOpenSettings}>⚙</button>
     <button class="iconbtn" title="hotkeys" onclick={onMenu}>?</button>
   </div>
 </div>
