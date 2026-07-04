@@ -5,7 +5,7 @@
 
 mod schema;
 
-pub use schema::{Config, ReasonEffectsConfig, Renderer};
+pub use schema::{AutomationDefaults, Config, ReasonEffectsConfig, Renderer};
 
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -23,6 +23,16 @@ impl ConfigStore {
         Self {
             config: RwLock::new(config),
             path,
+        }
+    }
+
+    /// In-memory store backed by `config`, touching no file (empty path). The
+    /// [`crate::automations::AutomationManager`]'s pre-injection default and a
+    /// convenient test seam — the real app injects a file-backed store.
+    pub fn ephemeral(config: Config) -> Self {
+        Self {
+            config: RwLock::new(config),
+            path: PathBuf::new(),
         }
     }
 

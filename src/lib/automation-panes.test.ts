@@ -1,25 +1,83 @@
 import { describe, it, expect } from "vitest";
-import { resolveTargetWorkspace } from "./automation-panes";
+import {
+  findAutomationsWorkspace,
+  buildAgentArgv,
+  shouldAutoCloseRun,
+} from "./automation-panes";
 import type { Workspace } from "./workspaces";
 
-function ws(id: string): Workspace {
-  return { id, name: id, tabs: [], activeTabId: "" };
+function ws(id: string, role?: "automations"): Workspace {
+  return { id, name: id, tabs: [], activeTabId: "", ...(role ? { role } : {}) };
 }
 
-describe("resolveTargetWorkspace", () => {
-  it("places into the origin workspace when it still exists (R9)", () => {
-    const workspaces = [ws("ws-1"), ws("ws-2"), ws("ws-3")];
-    expect(resolveTargetWorkspace(workspaces, "ws-2")).toBe("ws-2");
+describe("findAutomationsWorkspace (U6, R2)", () => {
+  it("returns the id of the role-marked workspace", () => {
+    const workspaces = [ws("ws-1"), ws("ws-2", "automations"), ws("ws-3")];
+    expect(findAutomationsWorkspace(workspaces)).toBe("ws-2");
   });
 
-  it("falls back to the first workspace when the origin is gone (R9)", () => {
-    // A hint from a prior launch / closed workspace never matches — land in the
-    // first workspace rather than dropping the run.
-    const workspaces = [ws("ws-5"), ws("ws-6")];
-    expect(resolveTargetWorkspace(workspaces, "ws-stale")).toBe("ws-5");
+  it("returns null when no workspace is marked", () => {
+    expect(findAutomationsWorkspace([ws("ws-1"), ws("ws-2")])).toBeNull();
+    expect(findAutomationsWorkspace([])).toBeNull();
   });
 
-  it("returns null only when there are no workspaces to place into", () => {
-    expect(resolveTargetWorkspace([], "ws-1")).toBeNull();
+  it("returns the FIRST marked workspace when more than one exists (defensive)", () => {
+    const workspaces = [ws("ws-1", "automations"), ws("ws-2", "automations")];
+    expect(findAutomationsWorkspace(workspaces)).toBe("ws-1");
+  });
+});
+
+describe("buildAgentArgv (U7, R11)", () => {
+  it("appends --model / --effort / --fallback-model when set, prompt LAST", () => {
+    expect(
+      buildAgentArgv("summarize CI", {
+        model: "opus",
+        effort: "high",
+        fallbackModel: "sonnet",
+      }),
+    ).toEqual([
+      "claude",
+      "--dangerously-skip-permissions",
+      "--model",
+      "opus",
+      "--effort",
+      "high",
+      "--fallback-model",
+      "sonnet",
+      "summarize CI",
+    ]);
+  });
+
+  it("omits each flag when its value is null", () => {
+    expect(
+      buildAgentArgv("do it", { model: "opus", effort: null, fallbackModel: null }),
+    ).toEqual([
+      "claude",
+      "--dangerously-skip-permissions",
+      "--model",
+      "opus",
+      "do it",
+    ]);
+  });
+
+  it("with all flags null returns exactly today's argv (regression guard)", () => {
+    expect(
+      buildAgentArgv("hi", { model: null, effort: null, fallbackModel: null }),
+    ).toEqual(["claude", "--dangerously-skip-permissions", "hi"]);
+  });
+});
+
+describe("shouldAutoCloseRun (U8, R6/R7)", () => {
+  it("auto-closes a succeeded run with no genuine raise", () => {
+    expect(shouldAutoCloseRun("succeeded", false)).toBe(true);
+  });
+
+  it("keeps a succeeded run that still carries a genuine mid-run raise (R7)", () => {
+    expect(shouldAutoCloseRun("succeeded", true)).toBe(false);
+  });
+
+  it("keeps a failed run regardless of raise (R7)", () => {
+    expect(shouldAutoCloseRun("failed", false)).toBe(false);
+    expect(shouldAutoCloseRun("failed", true)).toBe(false);
   });
 });

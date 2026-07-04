@@ -32,6 +32,7 @@
 
 pub mod alerts;
 pub mod model;
+pub mod redact;
 pub mod schedule;
 pub mod script;
 pub mod store;
@@ -44,11 +45,56 @@ use std::time::Duration;
 
 use tauri::Emitter;
 
+use crate::config::{AutomationDefaults, ConfigStore};
 use model::{
     Automation, Mode, Origin, RunMode, RunOutcome, RunRow, RunStatus, Trigger, ERR_DELETED,
     ERR_INTERRUPTED, ERR_TIMED_OUT,
 };
 use store::{Store, StoreHealth};
+
+/// The model / reasoning effort / fallback an agent run actually launches with
+/// (automations-workspace-and-model plan, U4a — R11/R13). Resolved once per
+/// dispatch by [`resolve_agent_launch`], recorded on the run row (R13), and
+/// carried to the frontend on the `automation://agent-run` event so the pane
+/// launches with the exact flags.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedLaunch {
+    /// `--model` value; `None` ⇒ omit the flag (Claude's own default).
+    pub model: Option<String>,
+    /// `--effort` value; `None` ⇒ omit the flag.
+    pub effort: Option<String>,
+    /// `--fallback-model` value; `None` when it equals the resolved primary
+    /// (a fallback identical to the primary is a no-op — omit it).
+    pub fallback: Option<String>,
+}
+
+/// Deterministic launch resolution (U4a — R11/R12/R15). The primary model and
+/// effort resolve **automation → shared default → Claude's own default**
+/// (`None` at the end means "omit the flag, let Claude decide"). The fallback
+/// is always the shared default's `fallback_model`, except it is omitted when
+/// it already equals the resolved primary. Pure — unit-tested without a manager.
+pub fn resolve_agent_launch(
+    agent_model: Option<&str>,
+    agent_effort: Option<&str>,
+    defaults: &AutomationDefaults,
+) -> ResolvedLaunch {
+    let model = agent_model
+        .or(defaults.model.as_deref())
+        .map(str::to_owned);
+    let effort = agent_effort
+        .or(defaults.effort.as_deref())
+        .map(str::to_owned);
+    // Fallback is meaningful only when it differs from the resolved primary.
+    let fallback = match &model {
+        Some(m) if *m == defaults.fallback_model => None,
+        _ => Some(defaults.fallback_model.clone()),
+    };
+    ResolvedLaunch {
+        model,
+        effort,
+        fallback,
+    }
+}
 
 /// Sweep cadence (KTD-C): the named `fly-automation-sweep` thread wakes this
 /// often. Due-ness is `next_run_at <= now`, so a 10s tick bounds claim
@@ -120,6 +166,35 @@ pub type PaneAliveProbe = Arc<dyn Fn(&RunRow) -> bool + Send + Sync>;
 /// `true`; `lib.rs` wires [`script::ScriptRunner::has_capacity`] (U5).
 pub type CapacityProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// U4b seam: capture an agent run's final assistant turn for its
+/// [`RunRow::output`] (R8). Given the automation's `cwd` and the run's dispatch
+/// time (`started_at`, epoch ms), resolve the run's transcript and return the
+/// **scrubbed + control-sanitized** final message — or `None` when it can't be
+/// resolved unambiguously (never the wrong session's content — a confidentiality
+/// guard, see `transcript::sole_transcript_since`). Invoked from the pane-keyed
+/// close, off the store lock (KTD-B): it reads a transcript from disk, so it must
+/// never run under the lock. Default: always `None` (no capture); `lib.rs` wires
+/// the transcript reader.
+pub type OutputCapturer = Arc<dyn Fn(&str, u64) -> Option<String> + Send + Sync>;
+
+/// U5 event payload (automations-workspace-and-model): an **agent** run reached
+/// a terminal status. Serde camelCase (`runId`/`automationId`/`status`), the
+/// same wire convention as the rest of the automations contract.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunClosedEvent {
+    pub run_id: String,
+    pub automation_id: String,
+    pub status: RunStatus,
+}
+
+/// U5 seam: emit `automation://run-closed` after an **agent** run closes, so the
+/// frontend tab lifecycle (U8) can auto-close a `succeeded` run's tab or keep a
+/// `failed` one. Called only for agent-run closes, always **after** the store
+/// mutation returns (lock released, KTD-B). Default no-op; `lib.rs` wires the
+/// Tauri emit, tests wire a collector.
+pub type RunClosedEmitter = Arc<dyn Fn(&RunClosedEvent) + Send + Sync>;
+
 /// How claimed runs leave the manager (KTD-C/E): the sweep claims + flushes
 /// under the store lock, releases it, then calls exactly one of these.
 /// Implementations must not call back into the manager *synchronously from
@@ -128,8 +203,14 @@ pub type CapacityProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 /// `list()`/`close`-style APIs from other threads (U5's reaper) or even from
 /// the dispatch itself is safe.
 pub trait Dispatcher: Send + Sync {
-    /// Start an agent run (U7: emit `automation://agent-run`).
-    fn dispatch_agent(&self, automation: &Automation, run_id: &str) -> Result<(), String>;
+    /// Start an agent run (U7: emit `automation://agent-run`). `launch` is the
+    /// resolved model/effort/fallback (U4a) the pane should launch with.
+    fn dispatch_agent(
+        &self,
+        automation: &Automation,
+        run_id: &str,
+        launch: &ResolvedLaunch,
+    ) -> Result<(), String>;
     /// Start a script run (U5: spawn the interpreter in its own group).
     fn dispatch_script(&self, automation: &Automation, run_id: &str) -> Result<(), String>;
 }
@@ -143,7 +224,12 @@ pub trait Dispatcher: Send + Sync {
 pub struct UnwiredDispatcher;
 
 impl Dispatcher for UnwiredDispatcher {
-    fn dispatch_agent(&self, _a: &Automation, _run_id: &str) -> Result<(), String> {
+    fn dispatch_agent(
+        &self,
+        _a: &Automation,
+        _run_id: &str,
+        _launch: &ResolvedLaunch,
+    ) -> Result<(), String> {
         Err("dispatch not wired yet (U5/U7)".into())
     }
     fn dispatch_script(&self, _a: &Automation, _run_id: &str) -> Result<(), String> {
@@ -175,13 +261,25 @@ struct AgentRunEvent {
     prompt: String,
     cwd: String,
     /// R9: workspace identity (not pane id) so origin resolves after restart.
+    /// (Superseded by the durable Automations-workspace role marker in the
+    /// frontend, U6/U7; retained on the wire for now.)
     origin_workspace_hint: String,
+    /// Resolved launch flags (U4a — R11): the frontend appends `--model` /
+    /// `--effort` / `--fallback-model` only when the matching field is set.
+    model: Option<String>,
+    effort: Option<String>,
+    fallback_model: Option<String>,
 }
 
 impl Dispatcher for AgentDispatcher {
-    fn dispatch_agent(&self, a: &Automation, run_id: &str) -> Result<(), String> {
+    fn dispatch_agent(
+        &self,
+        a: &Automation,
+        run_id: &str,
+        launch: &ResolvedLaunch,
+    ) -> Result<(), String> {
         let prompt = match &a.mode {
-            Mode::Agent { prompt } => prompt.clone(),
+            Mode::Agent { prompt, .. } => prompt.clone(),
             _ => return Err("BUG: dispatch_agent on non-agent automation".into()),
         };
         let event = AgentRunEvent {
@@ -190,6 +288,9 @@ impl Dispatcher for AgentDispatcher {
             prompt,
             cwd: a.cwd.clone(),
             origin_workspace_hint: a.origin.workspace_id.clone(),
+            model: launch.model.clone(),
+            effort: launch.effort.clone(),
+            fallback_model: launch.fallback.clone(),
         };
         self.app
             .emit("automation://agent-run", &event)
@@ -226,6 +327,11 @@ pub struct CreateSpec {
 pub enum CreateMode {
     Agent {
         prompt: String,
+        /// Optional pinned launch model + reasoning effort (U2/U1 of the
+        /// automations-workspace-and-model plan, R9/R10/R14). `None` ⇒ fall
+        /// through to the shared default / Claude's own default at dispatch.
+        model: Option<String>,
+        effort: Option<String>,
     },
     Script {
         content: String,
@@ -266,6 +372,17 @@ pub struct AutomationManager {
     script_killer: Mutex<ScriptKiller>,
     agent_pane_alive: Mutex<PaneAliveProbe>,
     script_capacity: Mutex<CapacityProbe>,
+    /// U4a: shared config for agent-launch resolution (model/effort/fallback,
+    /// R11/R12/R15). Read off the store lock (KTD8). Defaults to an ephemeral
+    /// store with `Config::default()` so tests need no config wiring; `lib.rs`
+    /// injects the real file-backed `ConfigStore` via [`AutomationManager::set_config`].
+    config: Mutex<Arc<ConfigStore>>,
+    /// U4b: transcript-reading capture of an agent run's final message (see
+    /// [`OutputCapturer`]). Default no-op; `lib.rs` injects the real reader.
+    output_capturer: Mutex<OutputCapturer>,
+    /// U5: emit `automation://run-closed` on agent-run close (see
+    /// [`RunClosedEmitter`]). Default no-op; `lib.rs` injects the Tauri emit.
+    emit_run_closed: Mutex<RunClosedEmitter>,
     /// R5 gate: while false, due **agent** automations are deferred —
     /// neither claimed nor skipped (see [`AutomationManager::sweep_once`]).
     frontend_ready: AtomicBool,
@@ -299,6 +416,11 @@ impl AutomationManager {
             script_killer: Mutex::new(Arc::new(|_run_id: &str| {})),
             agent_pane_alive: Mutex::new(Arc::new(|_row: &RunRow| false)),
             script_capacity: Mutex::new(Arc::new(|| true)),
+            config: Mutex::new(Arc::new(ConfigStore::ephemeral(
+                crate::config::Config::default(),
+            ))),
+            output_capturer: Mutex::new(Arc::new(|_cwd: &str, _since: u64| None)),
+            emit_run_closed: Mutex::new(Arc::new(|_ev: &RunClosedEvent| {})),
             frontend_ready: AtomicBool::new(false),
             automation_panes: Mutex::new(HashSet::new()),
             sweep_stop: Mutex::new(false),
@@ -359,6 +481,33 @@ impl AutomationManager {
         *self.script_capacity.lock().unwrap() = c;
     }
 
+    /// U4a: inject the real file-backed [`ConfigStore`] so agent-launch
+    /// resolution reads the user's shared automation defaults (R12/R15).
+    pub fn set_config(&self, config: Arc<ConfigStore>) {
+        *self.config.lock().unwrap() = config;
+    }
+
+    /// U4b: inject the transcript-reading output capturer (see [`OutputCapturer`]).
+    pub fn set_output_capturer(&self, c: OutputCapturer) {
+        *self.output_capturer.lock().unwrap() = c;
+    }
+
+    /// U5: inject the `automation://run-closed` emitter (see [`RunClosedEmitter`]).
+    pub fn set_run_closed_emitter(&self, e: RunClosedEmitter) {
+        *self.emit_run_closed.lock().unwrap() = e;
+    }
+
+    /// U5: fire `automation://run-closed` for an agent run that reached
+    /// `status`. Always called after the store mutation, outside the lock.
+    fn emit_run_closed(&self, automation_id: &str, run_id: &str, status: RunStatus) {
+        let ev = RunClosedEvent {
+            run_id: run_id.to_string(),
+            automation_id: automation_id.to_string(),
+            status,
+        };
+        (self.emit_run_closed.lock().unwrap())(&ev);
+    }
+
     /// R5: the frontend finished restore and is listening for agent-run
     /// events. Until this flips, the sweep defers due agent automations.
     pub fn set_frontend_ready(&self) {
@@ -400,7 +549,15 @@ impl AutomationManager {
         }
 
         let mode = match spec.mode {
-            CreateMode::Agent { prompt } => Mode::Agent { prompt },
+            CreateMode::Agent {
+                prompt,
+                model,
+                effort,
+            } => Mode::Agent {
+                prompt,
+                model,
+                effort,
+            },
             CreateMode::Script {
                 content,
                 interpreter,
@@ -675,14 +832,17 @@ impl AutomationManager {
     /// `pane_id` and close it with `outcome`. Idempotent — returns `Ok(())`
     /// whether it closed a row, found no running run, or hit an already-closed
     /// one (all benign for the Stop / pane-exit callers).
-    fn close_run_by_pane_with(&self, pane_id: u64, outcome: RunOutcome) -> Result<(), String> {
+    fn close_run_by_pane_with(&self, pane_id: u64, mut outcome: RunOutcome) -> Result<(), String> {
         let found = {
             let map = self.store.snapshot();
-            let mut found: Option<(String, String)> = None;
+            let mut found: Option<(String, String, String, Option<u64>)> = None;
             for (auto_id, a) in map.iter() {
                 for run in &a.runs {
                     if run.pane_id == Some(pane_id) && run.status == RunStatus::Running {
-                        found = Some((auto_id.clone(), run.id.clone()));
+                        // Also capture cwd + dispatch time for the U4b transcript
+                        // read below.
+                        found =
+                            Some((auto_id.clone(), run.id.clone(), a.cwd.clone(), run.started_at));
                         break;
                     }
                 }
@@ -692,12 +852,30 @@ impl AutomationManager {
             }
             found
         };
-        let Some((automation_id, run_id)) = found else {
+        let Some((automation_id, run_id, cwd, started_at)) = found else {
             // No running run for this pane: idempotent no-op (second Stop, or a
             // run the deadline/other path already closed).
             return Ok(());
         };
-        self.close_run(&automation_id, &run_id, outcome);
+        // U4b (R8): capture the agent's final assistant turn into the run's
+        // output, unless the caller already supplied output. The capturer reads
+        // a transcript from disk (off the store lock, KTD-B) and abstains on an
+        // ambiguous cwd — so this never blocks the close and never records the
+        // wrong session's content. `close_run` tail-caps the text (R8).
+        if outcome_output(&outcome).is_none() {
+            if let Some(started) = started_at {
+                let capturer = Arc::clone(&self.output_capturer.lock().unwrap());
+                if let Some(text) = capturer(&cwd, started) {
+                    outcome = with_output(outcome, text);
+                }
+            }
+        }
+        // U5: emit `automation://run-closed` when this close actually closed the
+        // row (idempotent no-op on a second Stop / already-closed run).
+        let status = outcome_status(&outcome);
+        if self.close_run(&automation_id, &run_id, outcome) == model::CloseResult::Closed {
+            self.emit_run_closed(&automation_id, &run_id, status);
+        }
         Ok(())
     }
 
@@ -836,6 +1014,9 @@ impl AutomationManager {
         // Phase 1: decide + mutate + flush under ONE lock hold.
         let mut changed: Vec<String> = Vec::new();
         let mut to_dispatch: Vec<(Automation, String)> = Vec::new();
+        // U5: agent runs the sweep itself closed failed (ack-timeout / deadline),
+        // to emit `automation://run-closed` in phase 3 (outside the lock).
+        let mut closed_agent_runs: Vec<(String, String)> = Vec::new();
         let flush_result = self.store.mutate(|map| {
             for a in map.values_mut() {
                 let mut touched = false;
@@ -844,6 +1025,7 @@ impl AutomationManager {
                 // the window close failed (a dropped agent-run event).
                 for run_id in ack_timed_out_agent_runs(a, now_ms) {
                     a.close(&run_id, failed(ERR_SPAWN_ACK), now_ms);
+                    closed_agent_runs.push((a.id.clone(), run_id));
                     touched = true;
                 }
 
@@ -856,6 +1038,7 @@ impl AutomationManager {
                 // reads dead and the schedule resumes.
                 for run_id in deadline_expired_agent_runs(a, now_ms) {
                     a.close(&run_id, failed(ERR_TIMED_OUT), now_ms);
+                    closed_agent_runs.push((a.id.clone(), run_id));
                     touched = true;
                 }
 
@@ -947,6 +1130,12 @@ impl AutomationManager {
         for id in changed {
             (self.emit_changed)(&id);
         }
+        // U5: agent runs the sweep closed failed (ack-timeout / deadline) emit
+        // run-closed so the frontend tab lifecycle can react (keeps a failed
+        // tab, U8) — also outside the lock.
+        for (automation_id, run_id) in closed_agent_runs {
+            self.emit_run_closed(&automation_id, &run_id, RunStatus::Failed);
+        }
     }
 
     /// R5 shutdown half (called from `lifecycle::shutdown` after the sweep
@@ -982,10 +1171,42 @@ impl AutomationManager {
     /// invoke this after the store mutate returned).
     fn dispatch(&self, automation: &Automation, run_id: &str) -> Result<(), String> {
         let dispatcher = Arc::clone(&self.dispatcher.lock().unwrap());
-        match automation.mode.kind() {
-            RunMode::Agent => dispatcher.dispatch_agent(automation, run_id),
-            RunMode::Script => dispatcher.dispatch_script(automation, run_id),
+        match &automation.mode {
+            Mode::Agent { model, effort, .. } => {
+                // U4a: resolve launch off the store lock (KTD8 — config is a
+                // separate RwLock read), record what we launched with (R13),
+                // then hand the resolved flags to the dispatcher so they ride
+                // the `automation://agent-run` event (R11).
+                let defaults = self.config.lock().unwrap().get().automation_defaults;
+                let launch =
+                    resolve_agent_launch(model.as_deref(), effort.as_deref(), &defaults);
+                if launch.model.is_some() || launch.effort.is_some() {
+                    self.set_run_launch(run_id, &launch);
+                }
+                dispatcher.dispatch_agent(automation, run_id, &launch)
+            }
+            Mode::Script { .. } => dispatcher.dispatch_script(automation, run_id),
         }
+    }
+
+    /// U4a (R13): stamp the resolved launch model/effort onto a still-`Running`
+    /// agent run row, so the dashboard records what the run launched with.
+    /// Quiet — emits no `automation://changed` (every caller is a dispatch path
+    /// that emits afterward: sweep phase 3 / `manual_run`). Best-effort: an
+    /// unknown or already-terminal row (the ack-timeout or a delete beat the
+    /// dispatch) is a no-op.
+    fn set_run_launch(&self, run_id: &str, launch: &ResolvedLaunch) {
+        let _ = self.store.mutate(|map| {
+            for a in map.values_mut() {
+                if let Some(row) = a.runs.iter_mut().find(|r| r.id == run_id) {
+                    if row.status == RunStatus::Running {
+                        row.model = launch.model.clone();
+                        row.effort = launch.effort.clone();
+                    }
+                    return;
+                }
+            }
+        });
     }
 
     /// Mutate one automation under the store lock (flushes on return) and
@@ -1102,6 +1323,39 @@ fn failed(error: &str) -> RunOutcome {
         error: error.to_owned(),
         exit_code: None,
         output: None,
+    }
+}
+
+/// The output slot of a terminal outcome, whichever variant (U4b): so the
+/// pane-keyed close only captures a transcript when the caller left it empty.
+fn outcome_output(o: &RunOutcome) -> Option<&String> {
+    match o {
+        RunOutcome::Succeeded { output } => output.as_ref(),
+        RunOutcome::Failed { output, .. } => output.as_ref(),
+    }
+}
+
+/// The terminal [`RunStatus`] a [`RunOutcome`] closes to (U5 run-closed event).
+fn outcome_status(o: &RunOutcome) -> RunStatus {
+    match o {
+        RunOutcome::Succeeded { .. } => RunStatus::Succeeded,
+        RunOutcome::Failed { .. } => RunStatus::Failed,
+    }
+}
+
+/// Set the output on a terminal outcome, preserving its variant + fields (U4b).
+fn with_output(o: RunOutcome, text: String) -> RunOutcome {
+    match o {
+        RunOutcome::Succeeded { .. } => RunOutcome::Succeeded {
+            output: Some(text),
+        },
+        RunOutcome::Failed {
+            error, exit_code, ..
+        } => RunOutcome::Failed {
+            error,
+            exit_code,
+            output: Some(text),
+        },
     }
 }
 
@@ -1244,6 +1498,8 @@ mod tests {
         calls: Mutex<Vec<(String, String, RunMode)>>,
         fail_with: Mutex<Option<String>>,
         reenter: Mutex<Option<Arc<AutomationManager>>>,
+        /// U4a: the resolved launch handed to each `dispatch_agent`.
+        agent_launches: Mutex<Vec<ResolvedLaunch>>,
     }
 
     impl FakeDispatcher {
@@ -1267,7 +1523,13 @@ mod tests {
     }
 
     impl Dispatcher for FakeDispatcher {
-        fn dispatch_agent(&self, a: &Automation, run_id: &str) -> Result<(), String> {
+        fn dispatch_agent(
+            &self,
+            a: &Automation,
+            run_id: &str,
+            launch: &ResolvedLaunch,
+        ) -> Result<(), String> {
+            self.agent_launches.lock().unwrap().push(launch.clone());
             self.record(a, run_id, RunMode::Agent)
         }
         fn dispatch_script(&self, a: &Automation, run_id: &str) -> Result<(), String> {
@@ -1280,6 +1542,8 @@ mod tests {
         clock: Arc<AtomicU64>,
         events: Arc<Mutex<Vec<String>>>,
         dispatcher: Arc<FakeDispatcher>,
+        /// U5: collected `automation://run-closed` payloads (run id + status).
+        run_closed: Arc<Mutex<Vec<(String, RunStatus)>>>,
         dir: tempfile::TempDir,
     }
 
@@ -1323,11 +1587,17 @@ mod tests {
             Box::new(move || c.load(Ordering::SeqCst)),
             Box::new(move |id: &str| ev.lock().unwrap().push(id.to_owned())),
         ));
+        let run_closed: Arc<Mutex<Vec<(String, RunStatus)>>> = Arc::new(Mutex::new(Vec::new()));
+        let rc = Arc::clone(&run_closed);
+        mgr.set_run_closed_emitter(Arc::new(move |ev: &RunClosedEvent| {
+            rc.lock().unwrap().push((ev.run_id.clone(), ev.status));
+        }));
         Harness {
             mgr,
             clock,
             events,
             dispatcher,
+            run_closed,
             dir,
         }
     }
@@ -1363,6 +1633,8 @@ mod tests {
         CreateSpec {
             mode: CreateMode::Agent {
                 prompt: "summarize overnight CI".into(),
+                model: None,
+                effort: None,
             },
             ..script_spec(name)
         }
@@ -1696,6 +1968,102 @@ mod tests {
         assert_eq!(h.dispatcher.count(), 2);
     }
 
+    // U4a resolver (R11/R12/R15): resolution order (automation → shared default
+    // → Claude default) and the fallback rule (omitted iff it equals the
+    // resolved primary).
+    #[test]
+    fn resolve_agent_launch_resolution_order_and_fallback_u4a() {
+        let defaults = AutomationDefaults {
+            model: Some("sonnet".into()),
+            effort: Some("medium".into()),
+            fallback_model: "sonnet".into(),
+        };
+        // Automation values win over the shared default; primary opus ≠ sonnet.
+        let r = resolve_agent_launch(Some("opus"), Some("high"), &defaults);
+        assert_eq!(r.model.as_deref(), Some("opus"));
+        assert_eq!(r.effort.as_deref(), Some("high"));
+        assert_eq!(r.fallback.as_deref(), Some("sonnet"), "differs ⇒ present");
+
+        // Absent automation values fall through to the shared default; here the
+        // resolved primary equals the fallback model, so the fallback is omitted.
+        let r = resolve_agent_launch(None, None, &defaults);
+        assert_eq!(r.model.as_deref(), Some("sonnet"));
+        assert_eq!(r.effort.as_deref(), Some("medium"));
+        assert_eq!(r.fallback, None, "primary == fallback_model ⇒ omitted");
+
+        // Both absent and no shared default ⇒ None/None (Claude default), with
+        // the fallback still present (a None primary never equals the fallback).
+        let r = resolve_agent_launch(None, None, &AutomationDefaults::default());
+        assert_eq!(r.model, None);
+        assert_eq!(r.effort, None);
+        assert_eq!(r.fallback.as_deref(), Some("sonnet"));
+    }
+
+    // U4a (R13): a dispatched agent run records the resolved model/effort on its
+    // RunRow and hands the resolved launch (with fallback) to the dispatcher.
+    // The automation pins both, so they win over the empty shared default.
+    #[test]
+    fn agent_dispatch_records_resolved_model_effort_and_passes_launch_u4a() {
+        let h = harness();
+        let spec = CreateSpec {
+            mode: CreateMode::Agent {
+                prompt: "audit".into(),
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+            },
+            ..script_spec("pinned")
+        };
+        let id = h.mgr.create(spec).unwrap().automation.id;
+        h.set_now(T0 + FIVE_MIN);
+        h.mgr.set_frontend_ready();
+        h.sweep();
+
+        let runs = h.runs(&id);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Running);
+        assert_eq!(runs[0].model.as_deref(), Some("opus"), "R13: recorded model");
+        assert_eq!(runs[0].effort.as_deref(), Some("high"), "R13: recorded effort");
+
+        let launches = h.dispatcher.agent_launches.lock().unwrap();
+        assert_eq!(launches.len(), 1, "one agent dispatch");
+        assert_eq!(launches[0].model.as_deref(), Some("opus"));
+        assert_eq!(launches[0].effort.as_deref(), Some("high"));
+        assert_eq!(
+            launches[0].fallback.as_deref(),
+            Some("sonnet"),
+            "default fallback, differs from the pinned primary"
+        );
+    }
+
+    // U4b (R8): a pane-keyed agent close captures the run's final message into
+    // RunRow.output via the injected capturer. The default (no capturer) path is
+    // covered by the other close tests, which leave output None.
+    #[test]
+    fn close_run_by_pane_captures_agent_output_via_the_seam_u4b() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("cap")).unwrap().automation.id;
+        h.set_now(T0 + FIVE_MIN);
+        h.mgr.set_frontend_ready();
+        h.sweep();
+        let run_id = h.runs(&id)[0].id.clone();
+        h.mgr.set_run_pane(&run_id, 42).unwrap();
+
+        // Inject a capturer and close via the pane (Stop → succeeded).
+        h.mgr
+            .set_output_capturer(Arc::new(|_cwd: &str, _since: u64| {
+                Some("final summary".to_string())
+            }));
+        h.mgr.close_run_by_pane(42).unwrap();
+
+        let row = &h.runs(&id)[0];
+        assert_eq!(row.status, RunStatus::Succeeded);
+        assert_eq!(
+            row.output.as_deref(),
+            Some("final summary"),
+            "capturer output recorded on the run row"
+        );
+    }
+
     // KTD-D: the U5 capacity pre-claim check — a due script automation with
     // no capacity records skipped("capacity") and the schedule advances; no
     // Running row is ever persisted, nothing dispatches.
@@ -2013,6 +2381,51 @@ mod tests {
         assert_eq!(h.dispatcher.count(), 2, "schedule resumes once the pane is gone");
     }
 
+    // U5 (automations-workspace-and-model): an agent-run close emits
+    // `automation://run-closed` with the terminal status — succeeded on a Stop
+    // (pane close), failed on a deadline timeout — while a script close never
+    // does. All emissions happen in phase 3 / after the close, outside the lock.
+    #[test]
+    fn run_closed_event_fires_for_agent_closes_only_u5() {
+        // Agent Stop → run-closed succeeded.
+        let h = harness();
+        let (_agent, run1) = claim_agent_run(&h, "a");
+        h.mgr.set_run_pane(&run1, 10).unwrap();
+        h.mgr.close_run_by_pane(10).unwrap();
+        assert_eq!(
+            *h.run_closed.lock().unwrap(),
+            vec![(run1, RunStatus::Succeeded)]
+        );
+
+        // Deadline timeout on a linked agent run → run-closed failed (the sweep).
+        let h2 = harness();
+        let (_id2, run2) = claim_agent_run(&h2, "stuck");
+        h2.mgr.set_run_pane(&run2, 20).unwrap();
+        h2.set_now(T0 + FIVE_MIN + RUN_DEADLINE_MS);
+        h2.sweep();
+        assert!(
+            h2.run_closed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(r, s)| *r == run2 && *s == RunStatus::Failed),
+            "deadline close emits run-closed failed"
+        );
+
+        // A script close (via `close_run`) never emits run-closed.
+        let h3 = harness();
+        let script = h3.mgr.create(script_spec("s")).unwrap().automation.id;
+        h3.set_now(T0 + FIVE_MIN);
+        h3.sweep();
+        let srun = h3.runs(&script).last().unwrap().id.clone();
+        h3.mgr
+            .close_run(&script, &srun, RunOutcome::Succeeded { output: None });
+        assert!(
+            h3.run_closed.lock().unwrap().is_empty(),
+            "script close emits no run-closed"
+        );
+    }
+
     // R22 recursion registry: register / query / unregister round-trips.
     #[test]
     fn recursion_registry_tracks_automation_panes_r22() {
@@ -2038,6 +2451,8 @@ mod tests {
                     let mut a = raw_automation("a1");
                     a.mode = Mode::Agent {
                         prompt: "x".into(),
+                        model: None,
+                        effort: None,
                     };
                     // A terminal row carrying a pane_id from a prior launch.
                     a.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, Trigger::Schedule, "r1")

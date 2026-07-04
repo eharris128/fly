@@ -449,6 +449,100 @@ pub fn qualifying_session_count(cwd: String) -> u32 {
     }
 }
 
+// ---- agent-run output capture (automations-workspace-and-model U4b) --------
+
+/// The full text of the **last assistant turn** in a transcript (automations-
+/// workspace-and-model plan, U4b — R8): the concatenation of every
+/// `{"type":"text"}` block of the last `type == "assistant"` JSONL entry that
+/// carries text (or its plain-string content). `None` for a missing / empty /
+/// corrupt transcript, or one whose assistant tail is tool-use only. Uncapped
+/// and unsanitized — the caller scrubs secrets, strips control chars, and
+/// tail-caps before persisting. Linear scan; read once per agent-run close.
+pub fn last_assistant_text(path: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(path).ok()?;
+    last_assistant_text_from_str(&body)
+}
+
+/// Pure core of [`last_assistant_text`] — tolerant of a non-JSON / unterminated
+/// trailing line (skipped), matching the thin-reader contract elsewhere.
+fn last_assistant_text_from_str(body: &str) -> Option<String> {
+    let mut last: Option<String> = None;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(text) = assistant_text_blocks(&v) {
+            last = Some(text);
+        }
+    }
+    last
+}
+
+/// Concatenate every `{"type":"text"}` block of an assistant turn's
+/// `message.content` (joined by blank lines), or its plain-string content.
+/// `None` when the turn carries no text (defensive: the content shapes are
+/// undocumented Claude contracts, same posture as [`turn_text`]).
+fn assistant_text_blocks(v: &serde_json::Value) -> Option<String> {
+    let content = v.get("message")?.get("content")?;
+    match content {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Array(blocks) => {
+            let parts: Vec<&str> = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .filter(|t| !t.is_empty())
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("\n\n"))
+        }
+        _ => None,
+    }
+}
+
+/// Resolve the transcript for an automation agent run by its `cwd`, guarded by
+/// the run's dispatch time (automations-workspace-and-model U4b — the
+/// confidentiality guard): return the **sole** `.jsonl` under the cwd's project
+/// dir whose mtime is at or after `dispatched_ms`, or `None` when zero or more
+/// than one qualify. This never reads another session's content into this run's
+/// record (a cross-automation leak) — an ambiguous cwd abstains, exactly as the
+/// attribution poll ([`active_session_for_cwd`]) does. A pane-precise SessionStart
+/// id would be more accurate, but the automation manager has no backend
+/// pane→session path, so cwd + dispatch-time disambiguation is the resolver.
+pub fn sole_transcript_since(cwd: &Path, dispatched_ms: u64) -> Option<PathBuf> {
+    let dir = claude_project_dir(cwd)?;
+    sole_transcript_in_dir_since(&dir, dispatched_ms)
+}
+
+/// Path-taking core of [`sole_transcript_since`]: the sole transcript in `dir`
+/// modified at/after `dispatched_ms`, else `None` (0 or >1 qualify → abstain).
+fn sole_transcript_in_dir_since(dir: &Path, dispatched_ms: u64) -> Option<PathBuf> {
+    let mut matches: Vec<PathBuf> = Vec::new();
+    for (name, mtime) in read_project_entries(dir) {
+        if jsonl_id(&name).is_none() {
+            continue;
+        }
+        let mtime_ms = mtime
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if mtime_ms >= dispatched_ms {
+            matches.push(dir.join(&name));
+        }
+    }
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,5 +941,79 @@ mod tests {
         // Empty dir → 0 (the benign single/none paths stay unflagged).
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(qualifying_count_in_dir(empty.path()), 0);
+    }
+
+    // ---- last_assistant_text (automations-workspace-and-model U4b) ----------
+
+    // A transcript whose last assistant turn carries a two-block text answer,
+    // preceded by an earlier assistant turn and a trailing tool-use-only turn.
+    const AGENT_RUN_FIXTURE: &str = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"check disk"}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me look."}]}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Disk is 82% full."},{"type":"text","text":"Clean ~/.cache to recover 4 GB."}]}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn last_assistant_text_returns_last_texted_turn_concatenating_blocks() {
+        // The tool-use-only tail does NOT clobber the prior texted turn, and the
+        // two text blocks of that turn are concatenated (blank-line joined).
+        assert_eq!(
+            last_assistant_text_from_str(AGENT_RUN_FIXTURE).as_deref(),
+            Some("Disk is 82% full.\n\nClean ~/.cache to recover 4 GB.")
+        );
+    }
+
+    #[test]
+    fn last_assistant_text_handles_string_content_and_degenerate_inputs() {
+        // Plain-string content is returned as-is.
+        let s = r#"{"type":"assistant","message":{"role":"assistant","content":"done"}}"#;
+        assert_eq!(last_assistant_text_from_str(s).as_deref(), Some("done"));
+        // Empty, metadata-only, and corrupt bodies → None (never a panic).
+        assert_eq!(last_assistant_text_from_str(""), None);
+        assert_eq!(last_assistant_text_from_str("{\"type\":\"user\"}\n"), None);
+        assert_eq!(last_assistant_text_from_str("{ not json\ngarbage"), None);
+        // A tool-use-only transcript (no assistant text at all) → None.
+        let tools = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use"}]}}"#;
+        assert_eq!(last_assistant_text_from_str(tools), None);
+    }
+
+    #[test]
+    fn last_assistant_text_reads_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, AGENT_RUN_FIXTURE).unwrap();
+        assert!(last_assistant_text(&path).unwrap().contains("82% full"));
+        // A missing file degrades to None.
+        assert_eq!(last_assistant_text(&dir.path().join("nope.jsonl")), None);
+    }
+
+    // ---- sole_transcript_since disambiguation (U4b confidentiality guard) ---
+
+    #[test]
+    fn sole_transcript_since_abstains_unless_exactly_one_qualifies() {
+        let dir = tempfile::tempdir().unwrap();
+        // No transcripts yet → None.
+        assert_eq!(sole_transcript_in_dir_since(dir.path(), 0), None);
+
+        // Exactly one .jsonl (mtime ~ now ≥ 0) → that path.
+        std::fs::write(dir.path().join("one.jsonl"), AGENT_RUN_FIXTURE).unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "ignored").unwrap();
+        assert_eq!(
+            sole_transcript_in_dir_since(dir.path(), 0),
+            Some(dir.path().join("one.jsonl"))
+        );
+
+        // A second transcript modified after dispatch ⇒ ambiguous ⇒ None (never
+        // read another session's content into this run's row).
+        std::fs::write(dir.path().join("two.jsonl"), AGENT_RUN_FIXTURE).unwrap();
+        assert_eq!(sole_transcript_in_dir_since(dir.path(), 0), None);
+
+        // A dispatch time in the far future excludes every existing transcript.
+        assert_eq!(sole_transcript_in_dir_since(dir.path(), u64::MAX), None);
     }
 }

@@ -34,6 +34,16 @@ export interface AutomationRow {
   lastError: string | null;
   /** The last run's linked pane (agent runs), for a future jump affordance. */
   linkedPaneId: number | null;
+  /** Configured launch model for an agent automation (automations-workspace-and-
+   * model U9, R13); null = Claude's own default. Always null for scripts — the
+   * `mode` field distinguishes "Claude default" (agent) from "—" (script). */
+  model: string | null;
+  /** Configured reasoning effort for an agent automation; null = Claude default. */
+  effort: string | null;
+  /** The model the *last* run actually launched with (R13), or null. */
+  lastRunModel: string | null;
+  /** The effort the last run actually launched with, or null. */
+  lastRunEffort: string | null;
 }
 
 /**
@@ -62,6 +72,10 @@ function toRow(a: Automation, nowMs: number): AutomationRow {
   // mirror to drift, matching the Rust model's `last_run()`.
   const last = a.runs.length > 0 ? a.runs[a.runs.length - 1] : null;
   const lastRunAt = last ? (last.finishedAt ?? last.startedAt) : null;
+  // Configured model/effort come from the agent mode; scripts carry neither
+  // (U9, R13). The last run's *actual* model/effort come from its RunRow.
+  const model = a.mode.kind === "agent" ? a.mode.model : null;
+  const effort = a.mode.kind === "agent" ? a.mode.effort : null;
   return {
     id: a.id,
     name: a.name,
@@ -73,6 +87,10 @@ function toRow(a: Automation, nowMs: number): AutomationRow {
     lastRun: lastRunAt != null ? relativeTime(lastRunAt, nowMs) : null,
     lastError: last?.error ?? null,
     linkedPaneId: last?.paneId ?? null,
+    model,
+    effort,
+    lastRunModel: last?.model ?? null,
+    lastRunEffort: last?.effort ?? null,
   };
 }
 

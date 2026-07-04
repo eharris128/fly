@@ -105,9 +105,14 @@ export interface AgentRunEvent {
   name: string;
   prompt: string;
   cwd: string;
-  /** Workspace identity resolved at create time (not a pane id), so origin
-   * resolves after a restart — falls back to the first workspace if gone. */
+  /** Workspace identity resolved at create time (not a pane id). Superseded by
+   * the durable Automations-workspace role marker (U6/U7); kept on the wire. */
   originWorkspaceHint: string;
+  /** Resolved launch flags (U4a, R11). The frontend appends `--model` /
+   * `--effort` / `--fallback-model` only when the matching value is non-null. */
+  model: string | null;
+  effort: string | null;
+  fallbackModel: string | null;
 }
 
 /**
@@ -118,6 +123,30 @@ export function onAgentRun(
   handler: (ev: AgentRunEvent) => void,
 ): Promise<UnlistenFn> {
   return listen<AgentRunEvent>("automation://agent-run", (e) =>
+    handler(e.payload),
+  );
+}
+
+/**
+ * An automation **agent** run reached a terminal status (automations-workspace-
+ * and-model U5). Emitted after the run's store mutation, so the frontend tab
+ * lifecycle (U8) can auto-close a `succeeded` run's tab after a linger, or keep
+ * a `failed` one for review.
+ */
+export interface RunClosedEvent {
+  runId: string;
+  automationId: string;
+  status: RunStatus;
+}
+
+/**
+ * Subscribe to agent-run closes (`automation://run-closed`). Returns an unlisten
+ * fn — the caller (App.svelte) tears it down on unmount.
+ */
+export function onRunClosed(
+  handler: (ev: RunClosedEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<RunClosedEvent>("automation://run-closed", (e) =>
     handler(e.payload),
   );
 }
@@ -176,6 +205,11 @@ export interface RunRow {
   status: RunStatus;
   /** Linked pane for agent runs (R10); null for scripts / unlinked rows. */
   paneId: number | null;
+  /** Model / reasoning effort this agent run launched with (automations-
+   * workspace-and-model U1/U4a, R13); null for scripts and for runs that used
+   * Claude's own default. */
+  model: string | null;
+  effort: string | null;
   output: string | null;
   exitCode: number | null;
   /** Failure detail for `failed` rows; the skip reason for `skipped` rows. */
@@ -187,7 +221,14 @@ export interface RunRow {
 
 /** What a due automation executes (serde-tagged `Mode` in model.rs). */
 export type AutomationSpec =
-  | { kind: "agent"; prompt: string }
+  | {
+      kind: "agent";
+      prompt: string;
+      /** Pinned launch model + reasoning effort (U1/U2, R9/R10); null ⇒ shared
+       * default / Claude's own default resolved at dispatch. */
+      model: string | null;
+      effort: string | null;
+    }
   | { kind: "script"; scriptFile: string; interpreter: string; timeoutMs: number };
 
 /** Where an automation came from (mirrors Rust `Origin`, R22/R9). */

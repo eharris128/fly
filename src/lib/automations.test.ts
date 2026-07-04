@@ -14,6 +14,8 @@ function run(status: RunStatus, over: Partial<RunRow> = {}): RunRow {
     trigger: "schedule",
     status,
     paneId: null,
+    model: null,
+    effort: null,
     output: null,
     exitCode: null,
     error: null,
@@ -107,6 +109,44 @@ describe("automationsToRows", () => {
     expect(rows[0].lastRun).toBeNull();
     expect(rows[0].lastError).toBeNull();
     expect(rows[0].linkedPaneId).toBeNull();
+  });
+
+  it("carries the agent automation's configured model/effort; scripts carry none (U9)", () => {
+    const [agentRow] = automationsToRows(
+      [automation({ mode: { kind: "agent", prompt: "x", model: "opus", effort: "high" } })],
+      NOW,
+    );
+    expect(agentRow.mode).toBe("agent");
+    expect(agentRow.model).toBe("opus");
+    expect(agentRow.effort).toBe("high");
+
+    // A default script automation carries neither (HomeView renders "—").
+    const [scriptRow] = automationsToRows([automation()], NOW);
+    expect(scriptRow.mode).toBe("script");
+    expect(scriptRow.model).toBeNull();
+    expect(scriptRow.effort).toBeNull();
+
+    // An agent with no pinned model → null (HomeView renders "Claude default").
+    const [defaultRow] = automationsToRows(
+      [automation({ mode: { kind: "agent", prompt: "x", model: null, effort: null } })],
+      NOW,
+    );
+    expect(defaultRow.mode).toBe("agent");
+    expect(defaultRow.model).toBeNull();
+  });
+
+  it("derives the last run's actual model/effort from the last RunRow (U9, R13)", () => {
+    const [row] = automationsToRows(
+      [
+        automation({
+          mode: { kind: "agent", prompt: "x", model: "opus", effort: "high" },
+          runs: [run("succeeded", { model: "sonnet", effort: "medium" })],
+        }),
+      ],
+      NOW,
+    );
+    expect(row.lastRunModel).toBe("sonnet");
+    expect(row.lastRunEffort).toBe("medium");
   });
 
   it("falls back to startedAt when a run has no finishedAt (still running)", () => {

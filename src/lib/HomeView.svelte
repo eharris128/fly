@@ -59,6 +59,15 @@
     return s === "never run" ? "never" : s;
   }
 
+  // Compact model/effort chip for an automation row (U9, R13). Scripts spend no
+  // model → "—"; an agent with no pinned model → "Claude default"; otherwise the
+  // model, with the effort appended when set ("opus · high").
+  function modelLabel(a: AutomationRow): string {
+    if (a.mode !== "agent") return "—";
+    const model = a.model ?? "Claude default";
+    return a.effort ? `${model} · ${a.effort}` : model;
+  }
+
   // Selection is tracked by leaf key (stable across live updates), never index.
   let selectedKey = $state<string | null>(null);
   let now = $state(Date.now());
@@ -232,6 +241,7 @@
             <span class="a-name">{a.name}<span class="a-mode">{a.mode}</span></span>
             <span class="a-meta">
               <span class="a-sched">{a.schedule}</span>
+              <span class="a-model" title="launch model · effort">{modelLabel(a)}</span>
               <span class="a-next">{a.paused ? "paused" : `next ${a.nextRun}`}</span>
               {#if a.lastRun}<span class="a-last">· last {a.lastRun}</span>{/if}
             </span>
@@ -724,6 +734,12 @@
   }
   .a-next {
     color: #aeb6d4;
+    font-variant-numeric: tabular-nums;
+  }
+  /* Launch model · effort chip (U9). Subtle — it is reference detail, not the
+     row's headline. */
+  .a-model {
+    color: #8b93b2;
     font-variant-numeric: tabular-nums;
   }
 </style>

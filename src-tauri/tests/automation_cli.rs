@@ -120,6 +120,57 @@ fn invalid_token_gets_no_response_the_security_boundary_holds() {
 }
 
 #[test]
+fn create_persists_agent_model_and_effort_and_defaults_to_none_r9_r10() {
+    use fly_lib::automations::model::Mode;
+    let (mgr, _d) = manager();
+
+    // With --model/--effort: they land on the stored Mode::Agent.
+    let with = dispatch_automation_op(
+        &mgr,
+        1,
+        "ws",
+        false,
+        AutomationRequest {
+            op: "automation/create".to_string(),
+            name: Some("pinned".to_string()),
+            cron: Some("*/5 * * * *".to_string()),
+            timezone: Some("UTC".to_string()),
+            cwd: Some("/tmp".to_string()),
+            prompt: Some("audit disk".to_string()),
+            model: Some("opus".to_string()),
+            effort: Some("high".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(with.ok, "create with model/effort: {with:?}");
+    let a = mgr.get(&with.id.unwrap()).unwrap();
+    match a.mode {
+        Mode::Agent {
+            ref prompt,
+            ref model,
+            ref effort,
+        } => {
+            assert_eq!(prompt, "audit disk");
+            assert_eq!(model.as_deref(), Some("opus"));
+            assert_eq!(effort.as_deref(), Some("high"));
+        }
+        other => panic!("expected agent mode, got {other:?}"),
+    }
+
+    // Without them: the stored Mode::Agent carries None for both.
+    let plain = dispatch_automation_op(&mgr, 1, "ws", false, create_req("tok"));
+    assert!(plain.ok);
+    let a = mgr.get(&plain.id.unwrap()).unwrap();
+    match a.mode {
+        Mode::Agent { model, effort, .. } => {
+            assert_eq!(model, None, "no --model ⇒ None");
+            assert_eq!(effort, None, "no --effort ⇒ None");
+        }
+        other => panic!("expected agent mode, got {other:?}"),
+    }
+}
+
+#[test]
 fn dispatch_core_routes_create_pause_resume_delete_and_rejects_unknown() {
     let (mgr, _d) = manager();
 

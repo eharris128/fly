@@ -31,6 +31,12 @@ export interface Workspace {
   tabs: Tab[];
   // Remembered per-workspace so switching back restores the last active tab.
   activeTabId: string;
+  // Durable role marker (automations-workspace-and-model U6, R2/KTD1). The one
+  // workspace that hosts automation agent runs + the alerts-log tab is marked
+  // `"automations"`; all automation placement resolves by scanning for this
+  // role, never the in-memory `id` (which resets every launch). Persisted (see
+  // `serialize.ts`); absent on a normal or pre-feature workspace ⇒ `undefined`.
+  role?: "automations";
 }
 
 /** Last path segment of a cwd, for an auto tab name. "/" → "/". */

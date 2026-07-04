@@ -203,3 +203,52 @@ describe("toSavedWorkspaces", () => {
     expect(toSavedWorkspaces([ws], {})[0].activeTabIndex).toBe(1); // p2 within [p1, p2]
   });
 });
+
+describe("Automations workspace role marker (U6, R2)", () => {
+  it("toSavedWorkspaces persists the role marker", () => {
+    const marked: Workspace = {
+      ...liveWs("Automations", [liveTab("leaf-1")]),
+      role: "automations",
+    };
+    expect(toSavedWorkspaces([marked], {})[0].role).toBe("automations");
+  });
+
+  it("a normal workspace serializes without a role (dropped by JSON)", () => {
+    const out = toSavedWorkspaces([liveWs("web", [liveTab("leaf-1")])], {});
+    expect(out[0].role).toBeUndefined();
+    expect(JSON.stringify(out)).not.toContain("automations");
+  });
+
+  it("migrateSession preserves role on a current-shape session", () => {
+    const saved = {
+      workspaces: [
+        {
+          name: "Automations",
+          tabs: [{ tree: leaf, panes: {}, title: null }],
+          activeTabIndex: 0,
+          role: "automations",
+        },
+      ],
+      activeWorkspaceIndex: 0,
+      sidebarCollapsed: false,
+      notifications: [],
+    };
+    expect(migrateSession(saved)?.workspaces[0].role).toBe("automations");
+  });
+
+  it("a legacy {tabs, activeIndex} session yields an unmarked default workspace", () => {
+    const out = migrateSession({
+      tabs: [{ tree: leaf, panes: {}, title: null }],
+      activeIndex: 0,
+    });
+    expect(out?.workspaces[0].role).toBeUndefined();
+  });
+
+  it("a current-shape session without role restores with role undefined (back-compat)", () => {
+    const out = migrateSession({
+      workspaces: [{ name: "web", tabs: [], activeTabIndex: 0 }],
+      activeWorkspaceIndex: 0,
+    });
+    expect(out?.workspaces[0].role).toBeUndefined();
+  });
+});

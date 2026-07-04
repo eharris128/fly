@@ -41,7 +41,11 @@
     type Workspace,
   } from "./lib/workspaces";
   import { buildHomeModel, effectiveAttention, effectiveTaskCount } from "./lib/home";
-  import { resolveTargetWorkspace } from "./lib/automation-panes";
+  import {
+    findAutomationsWorkspace,
+    buildAgentArgv,
+    shouldAutoCloseRun,
+  } from "./lib/automation-panes";
   import { automationsToRows, type AutomationRow } from "./lib/automations";
   import {
     shouldShowNudge,
@@ -92,6 +96,7 @@
     listAutomations,
     onAutomationChanged,
     onAlertPending,
+    onRunClosed,
     registerAlertSink,
     type PaneId,
     type PaneActivity,
@@ -100,6 +105,7 @@
     type AttentionReason,
     type AgentRunEvent,
     type AlertPendingEvent,
+    type RunClosedEvent,
     type HandoffTarget,
     type HandoffCandidate,
   } from "./ipc";
@@ -153,6 +159,24 @@
   function makeWorkspace(name: string): Workspace {
     const t = makeTab();
     return { id: `ws-${nextWorkspaceId++}`, name, tabs: [t], activeTabId: t.id };
+  }
+
+  // Automations-workspace-and-model U7 (R1/R3/KTD2): resolve — or provision —
+  // the one durable "Automations" workspace that hosts every automation agent
+  // run and the alerts-log tab. Returns its id. Provisions a fresh role-marked
+  // workspace when none exists (so it is silently recreated after a user deletes
+  // it, R3); resolution is by the persisted `role`, never the in-memory id, so a
+  // run always lands in the same workspace across restarts (R2). Appends only —
+  // never switches the active workspace/tab/focus (the background-tab contract).
+  function ensureAutomationsWorkspace(): string {
+    const existing = findAutomationsWorkspace(workspaces);
+    if (existing) return existing;
+    const ws: Workspace = {
+      ...makeWorkspace("Automations"),
+      role: "automations",
+    };
+    workspaces = [...workspaces, ws];
+    return ws.id;
   }
 
   // ---- state ---------------------------------------------------------------
@@ -741,13 +765,9 @@
   // agent's first Stop is a deliberately deferred product decision (see the
   // plan's open questions) — the tab is kept until the user closes it.
   function handleAgentRun(ev: AgentRunEvent) {
-    const wsId = resolveTargetWorkspace(workspaces, ev.originWorkspaceHint);
-    if (!wsId) {
-      void frontendLog(
-        `automation agent-run ${ev.runId}: no workspace to place into; dropped`,
-      );
-      return;
-    }
+    // U7 (R1/R5): every agent run — scheduled and "Run now" — lands in the one
+    // durable Automations workspace, provisioning it if needed.
+    const wsId = ensureAutomationsWorkspace();
     const l = newLeaf();
     const tab: Tab = {
       id: `tab-${nextTabId++}`,
@@ -757,11 +777,17 @@
       ephemeral: true,
     };
     // Seed the leaf's cwd/command/run id BEFORE appending the tab, so they are
-    // present when the Terminal mounts (all read once at mount).
+    // present when the Terminal mounts (all read once at mount). The launch argv
+    // carries the resolved --model/--effort/--fallback-model flags (U4a → U7,
+    // R11), prompt last.
     cwdByLeaf = { ...cwdByLeaf, [l.key]: ev.cwd };
     automationCommandByLeaf = {
       ...automationCommandByLeaf,
-      [l.key]: ["claude", "--dangerously-skip-permissions", ev.prompt],
+      [l.key]: buildAgentArgv(ev.prompt, {
+        model: ev.model,
+        effort: ev.effort,
+        fallbackModel: ev.fallbackModel,
+      }),
     };
     automationRunIdByLeaf = { ...automationRunIdByLeaf, [l.key]: ev.runId };
     // Append without touching activeWorkspaceId or the workspace's activeTabId —
@@ -778,11 +804,8 @@
   // leaf no longer resolves, so a fresh alert opens a new one.
   function handleAlertPending(ev: AlertPendingEvent) {
     if (alertSinkLeafKey && locateLeaf(alertSinkLeafKey)) return; // already open
-    const wsId = resolveTargetWorkspace(workspaces, "");
-    if (!wsId) {
-      void frontendLog("automation alert-pending: no workspace to place into; dropped");
-      return;
-    }
+    // U7 (R4): the alerts-log tab lives in the Automations workspace too.
+    const wsId = ensureAutomationsWorkspace();
     const l = newLeaf();
     const tab: Tab = {
       id: `tab-${nextTabId++}`,
@@ -803,6 +826,29 @@
     workspaces = workspaces.map((w) =>
       w.id === wsId ? { ...w, tabs: [...w.tabs, tab] } : w,
     );
+  }
+  // Auto-close linger for a succeeded automation run's background tab (U8, R6):
+  // short enough to feel immediate, long enough to glance at the result.
+  const AGENT_RUN_CLOSE_LINGER_MS = 6000;
+  // Automations-workspace-and-model U8 (R6/R7): an agent run closed. Map its run
+  // id → leaf → enclosing tab. A succeeded run with no genuine outstanding raise
+  // auto-closes after a brief linger — closeTab removes the leaf, unmounts the
+  // pane, and reaps the child (KTD7). A failed run, or one still carrying a real
+  // mid-run raise, keeps its tab for review (R7). A run-closed for an unknown /
+  // already-gone run (e.g. the spawn never happened) is a no-op.
+  function handleRunClosed(ev: RunClosedEvent) {
+    const leafKey = Object.keys(automationRunIdByLeaf).find(
+      (k) => automationRunIdByLeaf[k] === ev.runId,
+    );
+    if (!leafKey) return;
+    const loc = locateLeaf(leafKey);
+    if (!loc) return;
+    // The backend suppresses an automation pane's normal completion raise
+    // (KTD5), so a "raised" state here is a genuine mid-run signal → keep (R7).
+    const raised = attentionByLeaf[leafKey] === "raised";
+    if (!shouldAutoCloseRun(ev.status, raised)) return;
+    const { tabId } = loc;
+    setTimeout(() => closeTab(tabId), AGENT_RUN_CLOSE_LINGER_MS);
   }
   function newWorkspace() {
     const ws = makeWorkspace(`workspace ${workspaces.length + 1}`);
@@ -1873,7 +1919,15 @@
         const activeTabId =
           tabs[Math.min(Math.max(0, sw.activeTabIndex), tabs.length - 1)]?.id ??
           tabs[0].id;
-        return { id: `ws-${nextWorkspaceId++}`, name: sw.name, tabs, activeTabId };
+        // Carry the durable Automations-workspace role marker across restart
+        // (U6, R2): a fresh in-memory id, but the role is what placement resolves.
+        return {
+          id: `ws-${nextWorkspaceId++}`,
+          name: sw.name,
+          tabs,
+          activeTabId,
+          ...(sw.role ? { role: sw.role } : {}),
+        };
       });
       activeWorkspaceId =
         workspaces[
@@ -1992,6 +2046,10 @@
     void onAlertPending(handleAlertPending).then(
       (un) => (unlistenAlertPending = un),
     );
+    // Automations-workspace-and-model U8: an agent run closed → auto-close a
+    // succeeded run's background tab (or keep a failed / attention one).
+    let unlistenRunClosed: (() => void) | undefined;
+    void onRunClosed(handleRunClosed).then((un) => (unlistenRunClosed = un));
     const cwdTimer = setInterval(() => void refreshCwds(), 1500);
     return () => {
       window.removeEventListener("focus", reportForeground);
@@ -2002,6 +2060,7 @@
       unlistenAgentRun?.();
       unlistenAutomationChanged?.();
       unlistenAlertPending?.();
+      unlistenRunClosed?.();
     };
   });
 </script>

@@ -75,6 +75,39 @@ impl ReasonEffectsConfig {
     }
 }
 
+/// Shared defaults for automation **agent** runs (automations-workspace-and-
+/// model plan, U3 — R12/R15). The dispatch resolution order is
+/// automation → this shared default → Claude's own default (U4a);
+/// `fallback_model` is handed to `--fallback-model` so an unattended run
+/// degrades when the resolved primary is unavailable or over quota (omitted
+/// when it equals the resolved primary).
+///
+/// The nested-serde recipe (see [`ReasonEffectsConfig`]): struct-level
+/// `#[serde(default)]` here **plus** the parent `Config`'s container default
+/// means a partial object like `{"model":"opus"}` still fills the omitted
+/// `effort`/`fallbackModel` from `Default` instead of dropping them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AutomationDefaults {
+    /// Shared default launch model (alias or full id); `None` ⇒ Claude default.
+    pub model: Option<String>,
+    /// Shared default reasoning effort; `None` ⇒ Claude default.
+    pub effort: Option<String>,
+    /// Model handed to `--fallback-model` for unattended over-quota runs (R15).
+    /// Non-optional — there is always a fallback; default `sonnet`.
+    pub fallback_model: String,
+}
+
+impl Default for AutomationDefaults {
+    fn default() -> Self {
+        Self {
+            model: None,
+            effort: None,
+            fallback_model: "sonnet".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Config {
@@ -116,6 +149,9 @@ pub struct Config {
     /// Defaults to `--dangerously-skip-permissions` so the permission posture is
     /// never silently lost on resume (Claude drops it across `--resume`, #21974).
     pub resume_default_args: Vec<String>,
+    /// Shared default model / effort + fallback model for automation agent runs
+    /// (automations-workspace-and-model U3, R12/R15). See [`AutomationDefaults`].
+    pub automation_defaults: AutomationDefaults,
 }
 
 impl Default for Config {
@@ -137,6 +173,7 @@ impl Default for Config {
             notification_command: None,
             reason_effects: ReasonEffectsConfig::default(),
             resume_default_args: vec!["--dangerously-skip-permissions".into()],
+            automation_defaults: AutomationDefaults::default(),
         }
     }
 }
@@ -152,5 +189,45 @@ mod tests {
     #[test]
     fn default_renderer_is_dom() {
         assert_eq!(Config::default().renderer, Renderer::Dom);
+    }
+
+    // U3 (R12/R15): an empty config loads the shared automation defaults —
+    // fallbackModel "sonnet", model/effort None.
+    #[test]
+    fn empty_config_has_automation_defaults() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.automation_defaults.fallback_model, "sonnet");
+        assert_eq!(c.automation_defaults.model, None);
+        assert_eq!(c.automation_defaults.effort, None);
+    }
+
+    // U3 nested-serde gotcha: a *partial* automationDefaults object keeps the
+    // omitted siblings at their defaults (fallbackModel stays "sonnet") rather
+    // than dropping them — the struct-level `#[serde(default)]` at work.
+    #[test]
+    fn partial_automation_defaults_retains_sibling_defaults() {
+        let c: Config =
+            serde_json::from_str(r#"{"automationDefaults":{"model":"opus"}}"#).unwrap();
+        assert_eq!(c.automation_defaults.model.as_deref(), Some("opus"));
+        assert_eq!(
+            c.automation_defaults.fallback_model, "sonnet",
+            "omitted sibling kept its default"
+        );
+        assert_eq!(c.automation_defaults.effort, None);
+    }
+
+    // U3: the shared defaults round-trip under camelCase.
+    #[test]
+    fn automation_defaults_round_trip_camel_case() {
+        let mut c = Config::default();
+        c.automation_defaults.model = Some("opus".into());
+        c.automation_defaults.effort = Some("high".into());
+        c.automation_defaults.fallback_model = "haiku".into();
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["automationDefaults"]["model"], "opus");
+        assert_eq!(v["automationDefaults"]["effort"], "high");
+        assert_eq!(v["automationDefaults"]["fallbackModel"], "haiku");
+        let back: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(back, c);
     }
 }

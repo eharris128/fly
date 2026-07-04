@@ -18,6 +18,18 @@ export interface ReasonEffectsConfig {
   error: ReasonEffects;
 }
 
+/** Shared defaults for automation agent runs (mirrors Rust AutomationDefaults,
+ * automations-workspace-and-model U3, R12/R15). Resolution at dispatch is
+ * automation → this default → Claude's own default. */
+export interface AutomationDefaults {
+  /** Shared default launch model (alias or full id); null ⇒ Claude default. */
+  model: string | null;
+  /** Shared default reasoning effort; null ⇒ Claude default. */
+  effort: string | null;
+  /** Model handed to --fallback-model for unattended over-quota runs (R15). */
+  fallbackModel: string;
+}
+
 export interface Config {
   leaderKey: string;
   attentionDebounceMs: number;
@@ -40,6 +52,8 @@ export interface Config {
   /** Flag floor replayed on resume when an agent's launch argv wasn't captured
    * (R8/KTD-C); default ["--dangerously-skip-permissions"]. */
   resumeDefaultArgs: string[];
+  /** Shared default model/effort + fallback for automation agent runs (U3). */
+  automationDefaults: AutomationDefaults;
 }
 
 let cached: Config | null = null;

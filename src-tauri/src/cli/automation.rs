@@ -28,6 +28,37 @@ use crate::automations::model::{Automation, Mode, RunStatus};
 use crate::automations::store;
 use crate::notify;
 
+/// Closed set of reasoning-effort levels accepted by `--effort`
+/// (automations-workspace-and-model U2, R10). Mirrors Claude Code's own
+/// `--effort` levels; validated CLI-side so a bad value is rejected before it
+/// reaches the socket.
+pub const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Validate the agent-only launch flags at `create` time (U2, R14). `--model`
+/// and `--effort` require agent mode (rejected alongside `--script`), and
+/// `--effort` must name a [`VALID_EFFORTS`] level (the model string itself is
+/// opaque — aliases and full ids both pass through to `claude`). Returns the
+/// message the CLI prints before exiting 2. Pure, so it is unit-tested without
+/// the arg loop or the socket.
+pub fn validate_agent_flags(
+    script_present: bool,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<(), String> {
+    if script_present && (model.is_some() || effort.is_some()) {
+        return Err("--model / --effort are only valid with --prompt (agent mode)".to_string());
+    }
+    if let Some(level) = effort {
+        if !VALID_EFFORTS.contains(&level) {
+            return Err(format!(
+                "--effort must be one of {} (got {level:?})",
+                VALID_EFFORTS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Request posted for an `automation/*` op (U9). The client fills `token`, `op`,
 /// and the fields the op needs; the app-side handler in `lib.rs` deserializes
 /// the same bytes and dispatches. All op-specific fields are optional so one
@@ -56,6 +87,13 @@ pub struct AutomationRequest {
     pub interpreter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Agent-only: pin the launch model (alias or full id) and reasoning effort
+    /// (automations-workspace-and-model U2, R9/R10/R14). Validated CLI-side
+    /// (`effort` ∈ the closed set); the model string passes through opaque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// The app's response to an `automation/*` request.
@@ -213,6 +251,8 @@ fn handle_create(args: &[String]) -> i32 {
     let mut script_file: Option<String> = None;
     let mut interpreter: Option<String> = None;
     let mut timeout_ms: Option<u64> = None;
+    let mut model: Option<String> = None;
+    let mut effort: Option<String> = None;
     let mut json = false;
 
     let mut it = args.iter();
@@ -227,6 +267,8 @@ fn handle_create(args: &[String]) -> i32 {
                 println!("  --tz, --timezone <tz>   timezone (default: UTC)");
                 println!("  --cwd <path>            working directory (default: current)");
                 println!("  --prompt <text>         agent mode: claude prompt");
+                println!("  --model <name>          agent mode: pin the model (alias or full id)");
+                println!("  --effort <level>        agent mode: reasoning effort (low, medium, high, xhigh, max)");
                 println!("  --script <code>         script mode: inline script code");
                 println!("  --script-file <path>    script mode: read script from file");
                 println!("  --interpreter <name>    script interpreter: bash, sh, python3 (default: bash)");
@@ -234,6 +276,7 @@ fn handle_create(args: &[String]) -> i32 {
                 println!("  --json                  output response as JSON");
                 println!();
                 println!("Either --prompt (agent mode) or --script/--script-file (script mode) is required.");
+                println!("--model / --effort are agent-mode only.");
                 println!();
                 println!("Examples:");
                 println!("  fly automation create --name 'check tests' --cron '*/5 * * * *' \\");
@@ -247,6 +290,8 @@ fn handle_create(args: &[String]) -> i32 {
             "--tz" | "--timezone" => timezone = it.next().cloned(),
             "--cwd" => cwd = it.next().cloned(),
             "--prompt" => prompt = it.next().cloned(),
+            "--model" => model = it.next().cloned(),
+            "--effort" => effort = it.next().cloned(),
             "--script" => script = it.next().cloned(),
             "--script-file" => script_file = it.next().cloned(),
             "--interpreter" => interpreter = it.next().cloned(),
@@ -315,6 +360,12 @@ fn handle_create(args: &[String]) -> i32 {
         interpreter = Some(name.to_string());
     }
 
+    // --model / --effort are agent-only and effort is a closed set (U2, R14).
+    if let Err(e) = validate_agent_flags(script.is_some(), model.as_deref(), effort.as_deref()) {
+        eprintln!("fly automation create: {e}");
+        return 2;
+    }
+
     // Default the cwd to where the CLI runs — i.e. the pane's cwd — so an
     // automation created here runs here (R1). Resolved client-side.
     let cwd = cwd.or_else(|| {
@@ -333,6 +384,8 @@ fn handle_create(args: &[String]) -> i32 {
         script,
         interpreter,
         timeout_ms,
+        model,
+        effort,
         ..Default::default()
     };
     send_and_report(req, "created", json)
@@ -751,5 +804,36 @@ mod tests {
         let back: AutomationResponse = serde_json::from_slice(&err.to_bytes()).unwrap();
         assert!(!back.ok);
         assert_eq!(back.error.as_deref(), Some("nope"));
+    }
+
+    // U2/R14: agent-mode model + a valid effort validate; no flags validate.
+    #[test]
+    fn validate_agent_flags_accepts_agent_model_effort_and_none() {
+        assert!(validate_agent_flags(false, Some("opus"), Some("high")).is_ok());
+        assert!(validate_agent_flags(false, None, None).is_ok());
+        // Every closed-set effort level is accepted.
+        for level in VALID_EFFORTS {
+            assert!(
+                validate_agent_flags(false, None, Some(level)).is_ok(),
+                "effort {level:?} should validate"
+            );
+        }
+    }
+
+    // U2/R14: --model / --effort are agent-only — rejected with --script.
+    #[test]
+    fn validate_agent_flags_rejects_model_or_effort_in_script_mode() {
+        let m = validate_agent_flags(true, Some("opus"), None).unwrap_err();
+        assert!(m.contains("agent mode"), "model+script rejected: {m}");
+        let e = validate_agent_flags(true, None, Some("high")).unwrap_err();
+        assert!(e.contains("agent mode"), "effort+script rejected: {e}");
+    }
+
+    // U2/R10: an effort outside the closed set is rejected with the level named.
+    #[test]
+    fn validate_agent_flags_rejects_a_bogus_effort_level() {
+        let m = validate_agent_flags(false, None, Some("bogus")).unwrap_err();
+        assert!(m.contains("bogus"), "the bad level is echoed: {m}");
+        assert!(m.contains("low"), "the valid set is listed: {m}");
     }
 }

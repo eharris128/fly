@@ -75,6 +75,18 @@ pub fn sanitize_body(text: &str) -> String {
     sanitize(text, BODY_CAP)
 }
 
+/// Strip control / format characters from untrusted **multi-line** text while
+/// preserving `\n` / `\t` layout, with no length cap (the caller tail-caps).
+/// For captured agent output persisted at rest and printed by `fly automation
+/// runs --output` (automations-workspace-and-model U4b): same
+/// [`is_stripped_char`] policy as [`sanitize`], minus the newline/tab exception
+/// so a multi-line summary stays readable.
+pub fn sanitize_multiline(text: &str) -> String {
+    text.chars()
+        .filter(|&c| c == '\n' || c == '\t' || !is_stripped_char(c))
+        .collect()
+}
+
 /// Wall-clock milliseconds since the Unix epoch, stamped on a notification so
 /// the frontend can sort and show relative times — and keep them stable across a
 /// restart (the backend epoch-relative clock would not survive one).

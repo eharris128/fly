@@ -287,7 +287,37 @@ pub fn run() {
                     return;
                 }
 
+                // U7 agent-run closure (KTD-F): a Stop hook on a pane linked to
+                // an agent run closes it succeeded on first occurrence. Hoisted
+                // ABOVE the attention raise so it is independent of it — U8 (KTD5)
+                // suppresses the completion raise for an automation pane, and a
+                // suppressed completion must still close its run. Only "Stop"
+                // closes (not "SubagentStop"); a bare Finished with no hook_event
+                // falls to the 30-min deadline (skew rule). close_run_by_pane is
+                // idempotent (no-op if not found / already closed → a second Stop
+                // is safe) and a no-op for any non-automation pane.
+                if hook.hook_event.as_deref() == Some("Stop") {
+                    if let Some(mgr) = handle.try_state::<Arc<automations::AutomationManager>>() {
+                        let _ = mgr.close_run_by_pane(pane.0);
+                    }
+                }
+
                 let reason = hook.reason;
+                // U8 (KTD5): suppress a background automation pane's *normal
+                // completion* raise — a Stop → `Reason::Finished`. Its status
+                // surface is the dashboard and its run auto-closes (U8); without
+                // this the never-focused pane is always left "raised", so the
+                // `succeeded && !isRaised` auto-close guard would never fire. A
+                // genuine mid-run raise (Question/Permission/Notification) is a
+                // DIFFERENT reason, so it still rings and keeps the tab (R7).
+                if reason == Reason::Finished
+                    && handle
+                        .try_state::<Arc<automations::AutomationManager>>()
+                        .is_some_and(|mgr| mgr.is_automation_pane(pane.0))
+                {
+                    return;
+                }
+
                 let signal = Signal {
                     reason,
                     tier: Tier::Hook,
@@ -296,19 +326,6 @@ pub fn run() {
                     return;
                 };
                 stream::emit_attention(&handle, pane, &outcome);
-
-                // U7 agent-run closure (KTD-F): a Stop hook on a pane linked to
-                // an agent run closes it as succeeded on first occurrence. Only
-                // "Stop" closes (not "SubagentStop"); a bare Finished with no
-                // hook_event falls to the 30-min deadline (skew rule).
-                if hook.hook_event.as_deref() == Some("Stop") {
-                    if let Some(mgr) = handle.try_state::<Arc<automations::AutomationManager>>() {
-                        // Find and close any automation run linked to this pane.
-                        // The manager's close_run is idempotent (no-op if run not
-                        // found or already closed), so a second Stop is safe.
-                        let _ = mgr.close_run_by_pane(pane.0);
-                    }
-                }
 
                 // Only a fresh (non-debounced) raise surfaces; duplicates drop.
                 if !outcome.recordable {
@@ -488,8 +505,9 @@ pub fn run() {
                     &self,
                     a: &automations::model::Automation,
                     run_id: &str,
+                    launch: &automations::ResolvedLaunch,
                 ) -> Result<(), String> {
-                    self.agent.dispatch_agent(a, run_id)
+                    self.agent.dispatch_agent(a, run_id, launch)
                 }
                 fn dispatch_script(
                     &self,
@@ -503,6 +521,35 @@ pub fn run() {
                 agent: Arc::clone(&agent_dispatcher),
                 script: Arc::clone(&script_runner),
             }));
+            // U4a: give the manager the real config store so agent-launch
+            // resolution reads the user's shared automation defaults (R12/R15).
+            automations_mgr.set_config(app.state::<Arc<ConfigStore>>().inner().clone());
+            // U4b: capture an agent run's final assistant turn into its run row
+            // on close (R8). Resolve the run's transcript by cwd + dispatch time
+            // (abstains on ambiguity — no cross-session leak), extract the last
+            // assistant message, scrub secrets (an agent runs with
+            // --dangerously-skip-permissions and may quote one), then strip
+            // control chars. `close_run` tail-caps the result.
+            automations_mgr.set_output_capturer(Arc::new(
+                |cwd: &str, dispatched_ms: u64| {
+                    let path = session::transcript::sole_transcript_since(
+                        std::path::Path::new(cwd),
+                        dispatched_ms,
+                    )?;
+                    let text = session::transcript::last_assistant_text(&path)?;
+                    let scrubbed = automations::redact::scrub_secrets(&text);
+                    let clean = notify::sanitize_multiline(&scrubbed);
+                    (!clean.trim().is_empty()).then_some(clean)
+                },
+            ));
+            // U5: forward agent-run closes to the frontend so the tab lifecycle
+            // (U8) can auto-close a succeeded run's tab or keep a failed one.
+            let run_closed_handle = app.handle().clone();
+            automations_mgr.set_run_closed_emitter(Arc::new(
+                move |ev: &automations::RunClosedEvent| {
+                    let _ = run_closed_handle.emit("automation://run-closed", ev);
+                },
+            ));
             let killer_runner = Arc::clone(&script_runner);
             automations_mgr
                 .set_script_killer(Arc::new(move |run_id: &str| killer_runner.kill_run(run_id)));
@@ -646,7 +693,11 @@ pub fn dispatch_automation_op(
                 return AutomationResponse::err("create requires name, cron, timezone, and cwd");
             };
             let mode = if let Some(prompt) = req.prompt {
-                CreateMode::Agent { prompt }
+                CreateMode::Agent {
+                    prompt,
+                    model: req.model,
+                    effort: req.effort,
+                }
             } else if let Some(content) = req.script {
                 CreateMode::Script {
                     content,

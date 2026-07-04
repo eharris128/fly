@@ -210,6 +210,39 @@ named `fly-automation-sweep` thread ticks every 10s; a due automation is
   plus `humanSchedule`/`relativeTime`); `HomeView.svelte` renders it read-only
   below the agent list, with the R6 store-health warning row.
 
+**Dedicated workspace + per-automation model** (`docs/plans/2026-07-03-002-feat-automations-workspace-and-model-plan.md`
+— its own U1–U10/R1–R15, scoped per that plan). Two Agent-mode follow-ons layered on the above:
+- **Dedicated Automations workspace (U6/U7).** Every agent run *and* the
+  alerts-log tab open in one durable workspace marked by a persisted
+  `role: "automations"` on `Workspace`/`SavedWorkspace` (`lib/{workspaces,serialize}.ts`).
+  Placement resolves by **role, never the in-memory `ws-N` id** (which resets each
+  launch): `automation-panes.ts::findAutomationsWorkspace` + `App.ensureAutomationsWorkspace`
+  (provision-if-absent, silently recreated after delete). This **replaces** the old
+  origin-workspace/first-workspace `resolveTargetWorkspace` placement.
+- **Per-automation model + effort (U1–U4a).** `Mode::Agent` and `RunRow` carry
+  optional `model`/`effort` (serde `#[serde(default)]`, back-compat); `fly
+  automation create` takes `--model`/`--effort` (agent-only; effort ∈
+  {low,medium,high,xhigh,max}). `config.automation_defaults` (`AutomationDefaults`:
+  `model`/`effort`/`fallback_model="sonnet"`) is the shared default. The manager
+  resolves **automation → shared default → Claude default** once per dispatch
+  (`resolve_agent_launch`, off the store lock via an injected `Arc<ConfigStore>`),
+  stamps the resolved values on the `RunRow` (R13), and rides them on the
+  `automation://agent-run` event; `App.buildAgentArgv` appends
+  `--model`/`--effort`/`--fallback-model` (prompt last). Dashboard shows them (U9).
+- **Auto-close + output capture (U4b/U5/U8).** On agent-run close the manager
+  captures the run's **final assistant turn** from its transcript
+  (`session/transcript.rs::{last_assistant_text,sole_transcript_since}` — resolves
+  by cwd + dispatch-time, abstains when >1 transcript qualifies, a confidentiality
+  guard) into `RunRow.output`, **secret-scrubbed** (`automations/redact.rs`) +
+  control-sanitized (injected `OutputCapturer` seam, wired in `lib.rs`). The close
+  then emits `automation://run-closed {runId, status}` (`RunClosedEmitter` seam);
+  the frontend `handleRunClosed` auto-closes a **succeeded** run's tab after a ~6s
+  linger (`shouldAutoCloseRun`) and keeps a failed / genuinely-raised one (R7). The
+  KTD5 gap: the completion Stop both closes the run *and* raises attention on the
+  never-focused pane, so `lib.rs`'s hook dispatch **suppresses the completion
+  raise for automation-linked panes** (`is_automation_pane` + `Reason::Finished`) —
+  else `succeeded && !isRaised` would never fire.
+
 ### Session, resume & handoff (`session/` + `lib/{resume,handoff}.ts`)
 Durable, backend-owned stores kept **separate** from the debounced layout blob
 (`session/mod.rs`), all under the `FLY_APP_NAME` root so a dev flavor stays

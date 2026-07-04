@@ -626,7 +626,12 @@ impl ScriptRunner {
 /// the unwired error until U7 lands its dispatcher (which will compose with
 /// this one in `lib.rs`).
 impl Dispatcher for ScriptRunner {
-    fn dispatch_agent(&self, _a: &Automation, _run_id: &str) -> Result<(), String> {
+    fn dispatch_agent(
+        &self,
+        _a: &Automation,
+        _run_id: &str,
+        _launch: &super::ResolvedLaunch,
+    ) -> Result<(), String> {
         Err("agent dispatch not wired yet (U7)".into())
     }
     fn dispatch_script(&self, a: &Automation, run_id: &str) -> Result<(), String> {

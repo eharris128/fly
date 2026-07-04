@@ -20,6 +20,10 @@ export interface SavedWorkspace {
   name: string;
   tabs: SavedTab[];
   activeTabIndex: number;
+  // Durable role marker (automations-workspace-and-model U6, R2/KTD1); absent on
+  // a normal or pre-feature workspace. The one field that lets the Automations
+  // workspace be found by role after a restart re-mints every in-memory id.
+  role?: "automations";
 }
 export interface SavedSession {
   workspaces: SavedWorkspace[];
@@ -83,6 +87,9 @@ export function toSavedWorkspaces(
       title: t.title,
     })),
     activeTabIndex: persistedActiveTabIndex(ws),
+    // Carry the durable role marker (U6). Undefined on normal workspaces →
+    // dropped by JSON serialization, so the document is unchanged for them.
+    role: ws.role,
   }));
 }
 

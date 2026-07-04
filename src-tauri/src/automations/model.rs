@@ -50,8 +50,20 @@ pub const ERR_DELETED: &str = "deleted";
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Mode {
     /// Spawn a fresh pane running `claude "<prompt>"` in the automation's cwd
-    /// (R9).
-    Agent { prompt: String },
+    /// (R9). `model`/`effort` (automations-workspace-and-model plan, U1 —
+    /// R9/R10) optionally pin the launch model + reasoning effort; they are
+    /// resolved deterministically at dispatch (automation → shared default →
+    /// Claude's own default, U4a) and always passed explicitly so a run never
+    /// inherits the last interactive pick. `#[serde(default)]` is per-field —
+    /// the `Mode` enum carries no container default, so a legacy `{kind,
+    /// prompt}` row still loads with `model: None, effort: None`.
+    Agent {
+        prompt: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+    },
     /// Run a stored script with no model spend (R13–R15). `script_file` is a
     /// path under the store's script dir (U3); `interpreter` is a closed-enum
     /// name resolved by the CLI/server (U9), opaque here.
@@ -132,6 +144,15 @@ pub struct RunRow {
     pub status: RunStatus,
     /// Linked pane for agent runs, threaded through `spawn_pane` (R10, U7).
     pub pane_id: Option<u64>,
+    /// The model / reasoning effort this agent run launched with
+    /// (automations-workspace-and-model plan, U1/U4a — R13). Stamped at
+    /// dispatch after deterministic resolution; `None` for script runs and for
+    /// agent runs that fell through to Claude's own default.
+    /// `#[serde(default)]` keeps legacy rows loading unchanged.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
     /// Captured output, capped to an [`OUTPUT_TAIL_CAP_BYTES`] tail (R8).
     pub output: Option<String>,
     pub exit_code: Option<i32>,
@@ -263,6 +284,8 @@ impl Automation {
             trigger,
             status: RunStatus::Running,
             pane_id: None,
+            model: None,
+            effort: None,
             output: None,
             exit_code: None,
             error: None,
@@ -293,6 +316,8 @@ impl Automation {
             trigger,
             status: RunStatus::Skipped,
             pane_id: None,
+            model: None,
+            effort: None,
             output: None,
             exit_code: None,
             error: Some(reason.to_owned()),
@@ -468,6 +493,8 @@ mod tests {
     fn manual_claim_on_paused_automation_runs_without_consuming_an_occurrence() {
         let mut a = automation(Mode::Agent {
             prompt: "summarize CI".into(),
+            model: None,
+            effort: None,
         });
         a.next_run_at = None; // paused
 
@@ -632,6 +659,8 @@ mod tests {
     fn history_eviction_preserves_a_running_row_and_drops_oldest_terminal() {
         let mut a = automation(Mode::Agent {
             prompt: "long agent".into(),
+            model: None,
+            effort: None,
         });
         // A claim mid-history: an agent run that stays Running while later
         // occurrences skip past it.
@@ -732,10 +761,82 @@ mod tests {
         // Agent mode carries its prompt under the same tag convention.
         let agent = serde_json::to_value(Mode::Agent {
             prompt: "summarize CI".into(),
+            model: None,
+            effort: None,
         })
         .unwrap();
         assert_eq!(agent["kind"], "agent");
         assert_eq!(agent["prompt"], "summarize CI");
+    }
+
+    // U1 (automations-workspace-and-model, R9/R10): Agent mode carries an
+    // optional pinned model + effort, round-tripping under camelCase.
+    #[test]
+    fn agent_mode_model_and_effort_round_trip() {
+        let mode = Mode::Agent {
+            prompt: "audit disk".into(),
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+        };
+        let v = serde_json::to_value(&mode).unwrap();
+        assert_eq!(v["kind"], "agent");
+        assert_eq!(v["prompt"], "audit disk");
+        assert_eq!(v["model"], "opus");
+        assert_eq!(v["effort"], "high");
+        let back: Mode = serde_json::from_value(v).unwrap();
+        assert_eq!(back, mode);
+    }
+
+    // U1 back-compat: a legacy `Mode::Agent` JSON with only `{kind, prompt}`
+    // (written before this plan) deserializes with `model: None, effort: None`
+    // — each new field defaults independently (the enum has no container
+    // default).
+    #[test]
+    fn legacy_agent_mode_without_model_effort_defaults_to_none() {
+        let json = serde_json::json!({ "kind": "agent", "prompt": "hi" });
+        let mode: Mode = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            mode,
+            Mode::Agent {
+                prompt: "hi".into(),
+                model: None,
+                effort: None,
+            }
+        );
+    }
+
+    // U1 back-compat: a legacy `RunRow` JSON missing `model`/`effort`
+    // deserializes with both `None` (no error), and a row carrying them
+    // round-trips under camelCase.
+    #[test]
+    fn run_row_model_effort_are_back_compat_and_round_trip() {
+        // Legacy row (no model/effort keys) still loads.
+        let legacy = serde_json::json!({
+            "id": "r1",
+            "mode": "agent",
+            "trigger": "schedule",
+            "status": "succeeded",
+            "paneId": 3,
+            "output": "done",
+            "exitCode": null,
+            "error": null,
+            "scheduledFor": 60_000,
+            "startedAt": 61_000,
+            "finishedAt": 62_000,
+        });
+        let row: RunRow = serde_json::from_value(legacy).unwrap();
+        assert_eq!(row.model, None);
+        assert_eq!(row.effort, None);
+
+        // A row carrying model/effort round-trips under camelCase.
+        let mut with = row.clone();
+        with.model = Some("sonnet".into());
+        with.effort = Some("medium".into());
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["model"], "sonnet");
+        assert_eq!(v["effort"], "medium");
+        let back: RunRow = serde_json::from_value(v).unwrap();
+        assert_eq!(back, with);
     }
 
     // R7: in-flight is exactly "a Running row exists" — skips and closed

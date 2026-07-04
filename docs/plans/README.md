@@ -39,6 +39,7 @@ a plan header's own `status:` field may lag behind the code.
 | `2026-07-01-002-feat-automations` | Cron-scheduled agent/script runs (`U1`–`U12`) | `automations/`, `cli/automation.rs`, `lib/automations.ts`, `lib/automation-panes.ts` |
 | `2026-07-02-001-feat-session-handoff` | Fresh agent handed a stale pane's previous session (`leader f`/`F`) | `session/handoff.rs`, `lib/handoff.ts` |
 | `2026-07-03-001-fix-session-pane-attribution` | Trust-ranked (`Poll < Hook < Pick`) SessionStart capture, poll abstention on same-cwd ambiguity, session pick-list, reset/re-pick (`leader g`) | `session/{resume,transcript,handoff}.rs`, `cli/{hooks,notify}.rs`, `hooks/protocol.rs`, `lib/session-picker.ts`, `lib/SessionPicker.svelte` |
+| `2026-07-03-002-feat-automations-workspace-and-model` | Dedicated **Automations** workspace (durable `role` marker, auto-provision, auto-close on success) + per-automation `--model`/`--effort` with a shared default + `sonnet` fallback; agent final message captured from the transcript | `automations/{model,mod}.rs`, `config/schema.rs`, `cli/automation.rs`, `session/transcript.rs`, `lib/{workspaces,serialize,automation-panes,automations}.ts`, `App.svelte` |
 
 ## Brainstorms
 
