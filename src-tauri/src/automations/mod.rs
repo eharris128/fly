@@ -37,7 +37,7 @@ pub mod schedule;
 pub mod script;
 pub mod store;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -195,6 +195,41 @@ pub struct RunClosedEvent {
 /// Tauri emit, tests wire a collector.
 pub type RunClosedEmitter = Arc<dyn Fn(&RunClosedEvent) + Send + Sync>;
 
+/// One run that a prior app instance's crash/restart left `Running`, closed
+/// `failed("interrupted")` by startup recovery (interrupt-resilience U2/R2).
+/// Carries just enough for the post-recovery step to (a) surface it through the
+/// alert pipeline and (b) decide whether it is eligible for a one-shot retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedRun {
+    pub automation_id: String,
+    pub run_id: String,
+    /// The automation's name — the alert line's `[name]`.
+    pub name: String,
+    /// The automation's opt-in flag at recovery time (R1).
+    pub retry_on_interrupt: bool,
+    /// The automation was enabled at recovery — a paused/disabled one never
+    /// retries (it only alerts).
+    pub enabled: bool,
+    /// The interrupted row itself was a [`Trigger::Retry`] run — the retry-once
+    /// crash-loop guard: such a run alerts but is never retried again (R4).
+    pub was_retry: bool,
+}
+
+impl InterruptedRun {
+    /// Whether this interrupted run should be re-dispatched once (R1/R4): the
+    /// automation opted in, is still enabled, and the interrupted run was not
+    /// itself a retry.
+    pub fn is_retry_eligible(&self) -> bool {
+        self.retry_on_interrupt && self.enabled && !self.was_retry
+    }
+}
+
+/// Seam: surface an interrupted run (interrupt-resilience U2/R2). Default no-op;
+/// `lib.rs` wires it to the alert pipeline (`AlertsLog` append + attention ring
+/// or R17 pending-queue), the same machinery a script alert uses. Called from
+/// the post-recovery step, never under the store lock (KTD-B).
+pub type InterruptSink = Arc<dyn Fn(&InterruptedRun) + Send + Sync>;
+
 /// How claimed runs leave the manager (KTD-C/E): the sweep claims + flushes
 /// under the store lock, releases it, then calls exactly one of these.
 /// Implementations must not call back into the manager *synchronously from
@@ -315,6 +350,9 @@ pub struct CreateSpec {
     pub timezone: String,
     pub cwd: String,
     pub mode: CreateMode,
+    /// Opt-in interrupt resilience (interrupt-resilience U1/R1). Default `false`
+    /// at the CLI/socket boundary; stamped onto the [`Automation`] as-is.
+    pub retry_on_interrupt: bool,
     /// Resolved by the caller at create time (R22/R9: pane id + workspace
     /// identity + label); the manager only stamps it.
     pub origin: Origin,
@@ -383,6 +421,21 @@ pub struct AutomationManager {
     /// U5: emit `automation://run-closed` on agent-run close (see
     /// [`RunClosedEmitter`]). Default no-op; `lib.rs` injects the Tauri emit.
     emit_run_closed: Mutex<RunClosedEmitter>,
+    /// Interrupt-resilience U2: surface an interrupted run through the alert
+    /// pipeline (see [`InterruptSink`]). Default no-op; `lib.rs` injects the
+    /// real one.
+    interrupt_sink: Mutex<InterruptSink>,
+    /// Interrupt-resilience U2/R2: runs that startup recovery closed
+    /// `interrupted`, stashed by [`AutomationManager::new`] and drained once by
+    /// [`AutomationManager::process_pending_interrupts`] on the first sweep tick
+    /// (once the alert sink is wired) — alert each, enqueue the retry-eligible.
+    pending_interrupts: Mutex<Vec<InterruptedRun>>,
+    /// Interrupt-resilience U2/R1: automation ids awaiting a one-shot
+    /// [`Trigger::Retry`] re-dispatch. Drained inside the sweep so a retry
+    /// honors the same readiness/overlap gates as a scheduled fire (an agent
+    /// retry waits for `frontend_ready`; a re-run is skipped if a run is already
+    /// in flight).
+    retry_queue: Mutex<VecDeque<String>>,
     /// R5 gate: while false, due **agent** automations are deferred —
     /// neither claimed nor skipped (see [`AutomationManager::sweep_once`]).
     frontend_ready: AtomicBool,
@@ -421,19 +474,29 @@ impl AutomationManager {
             ))),
             output_capturer: Mutex::new(Arc::new(|_cwd: &str, _since: u64| None)),
             emit_run_closed: Mutex::new(Arc::new(|_ev: &RunClosedEvent| {})),
+            interrupt_sink: Mutex::new(Arc::new(|_ir: &InterruptedRun| {})),
+            pending_interrupts: Mutex::new(Vec::new()),
+            retry_queue: Mutex::new(VecDeque::new()),
             frontend_ready: AtomicBool::new(false),
             automation_panes: Mutex::new(HashSet::new()),
             sweep_stop: Mutex::new(false),
             sweep_wake: Condvar::new(),
         };
-        mgr.recover_interrupted();
+        // Close orphaned Running rows and stash them; the alert + retry happen
+        // later, once the alert sink is wired (the first sweep tick drains).
+        let interrupted = mgr.recover_interrupted();
+        *mgr.pending_interrupts.lock().unwrap() = interrupted;
         mgr
     }
 
     /// R5 startup recovery: close all orphaned `Running` rows
-    /// failed([`ERR_INTERRUPTED`]) under one lock hold / one flush. No
-    /// `automation://changed` is emitted — this runs before any listener
-    /// exists, and the dashboard fetches on open anyway.
+    /// failed([`ERR_INTERRUPTED`]) under one lock hold / one flush, and **return
+    /// them** (interrupt-resilience U2/R2) so the caller can stash them for the
+    /// post-recovery alert + retry step. No `automation://changed` and no alert
+    /// fire here — this runs inside [`AutomationManager::new`], before the alert
+    /// sink or any listener exists; surfacing is deferred to
+    /// [`AutomationManager::process_pending_interrupts`], which the first sweep
+    /// tick calls once the sink is wired.
     ///
     /// Also **clears every persisted `pane_id`** (U7 launch-stability): pane
     /// ids reset each launch (they start at 1 and are never reused within a
@@ -443,18 +506,39 @@ impl AutomationManager {
     /// look permanently in-flight and never fire). One clear on load is the
     /// whole fix — within a launch, ids are unique, so no live row ever needs
     /// its id cleared.
-    fn recover_interrupted(&self) {
+    fn recover_interrupted(&self) -> Vec<InterruptedRun> {
         let now = (self.clock)();
+        // Collected into an outer Vec (not the closure's return) so it survives
+        // a flush failure: `store.mutate` drops the closure's value on flush
+        // error, but the in-memory close still applied (KTD-B), so the alert +
+        // retry must still fire.
+        let mut interrupted: Vec<InterruptedRun> = Vec::new();
         let _ = self.store.mutate(|map| {
             for a in map.values_mut() {
                 for r in a.runs.iter_mut() {
                     r.pane_id = None;
                 }
                 for run_id in running_run_ids(a) {
+                    // Read the row's trigger before the close (the close does not
+                    // change it) to honor the retry-once guard (R4).
+                    let was_retry = a
+                        .runs
+                        .iter()
+                        .find(|r| r.id == run_id)
+                        .is_some_and(|r| r.trigger == Trigger::Retry);
                     a.close(&run_id, failed(ERR_INTERRUPTED), now);
+                    interrupted.push(InterruptedRun {
+                        automation_id: a.id.clone(),
+                        run_id,
+                        name: a.name.clone(),
+                        retry_on_interrupt: a.retry_on_interrupt,
+                        enabled: a.enabled,
+                        was_retry,
+                    });
                 }
             }
         });
+        interrupted
     }
 
     // ---- seam injection (U5/U7 wire the real implementations) ---------------
@@ -495,6 +579,49 @@ impl AutomationManager {
     /// U5: inject the `automation://run-closed` emitter (see [`RunClosedEmitter`]).
     pub fn set_run_closed_emitter(&self, e: RunClosedEmitter) {
         *self.emit_run_closed.lock().unwrap() = e;
+    }
+
+    /// Interrupt-resilience U2: inject the interrupted-run alert sink (see
+    /// [`InterruptSink`]). Wire this **before** the sweep starts so the first
+    /// tick's [`AutomationManager::process_pending_interrupts`] can surface the
+    /// startup-recovery backlog.
+    pub fn set_interrupt_sink(&self, sink: InterruptSink) {
+        *self.interrupt_sink.lock().unwrap() = sink;
+    }
+
+    /// Interrupt-resilience U2/R2/R3: drain the startup-recovery backlog exactly
+    /// once — alert **every** interrupted run through the [`InterruptSink`], and
+    /// enqueue the retry-eligible ones ([`InterruptedRun::is_retry_eligible`])
+    /// for a one-shot [`Trigger::Retry`] re-dispatch by the sweep. Idempotent:
+    /// `mem::take` empties the backlog, so a second call is a no-op. Takes no
+    /// store lock — only the pending/sink/retry mutexes — so it is safe to call
+    /// from the top of `sweep_once` (KTD-B). Also fires `automation://changed`
+    /// per affected automation so an already-open dashboard refreshes the now
+    /// `interrupted` run row.
+    pub fn process_pending_interrupts(&self) {
+        let pending: Vec<InterruptedRun> =
+            std::mem::take(&mut *self.pending_interrupts.lock().unwrap());
+        if pending.is_empty() {
+            return;
+        }
+        let sink = Arc::clone(&self.interrupt_sink.lock().unwrap());
+        let mut to_retry: Vec<String> = Vec::new();
+        for ir in &pending {
+            sink(ir);
+            if ir.is_retry_eligible() {
+                to_retry.push(ir.automation_id.clone());
+            }
+        }
+        if !to_retry.is_empty() {
+            let mut q = self.retry_queue.lock().unwrap();
+            q.extend(to_retry);
+        }
+        // Emitted after the sink/queue work, holding no store lock (KTD-B). A
+        // listener may not exist yet at startup; the dashboard refetches on open
+        // regardless, so this is a best-effort live refresh.
+        for ir in &pending {
+            (self.emit_changed)(&ir.automation_id);
+        }
     }
 
     /// U5: fire `automation://run-closed` for an agent run that reached
@@ -581,6 +708,7 @@ impl AutomationManager {
             cron: spec.cron,
             timezone: spec.timezone,
             enabled: true,
+            retry_on_interrupt: spec.retry_on_interrupt,
             cwd: spec.cwd,
             mode,
             origin: spec.origin,
@@ -1007,13 +1135,28 @@ impl AutomationManager {
     /// dispatch normally: a webview that never loads must still run script
     /// watchdogs (R5).
     pub fn sweep_once(&self, now_ms: u64) {
+        // Interrupt-resilience U2: surface the startup-recovery backlog (alert +
+        // enqueue retries) before anything else this tick. Idempotent — a no-op
+        // after the first tick drains it. Takes no store lock (KTD-B).
+        self.process_pending_interrupts();
+
         let frontend_ready = self.frontend_ready.load(Ordering::Acquire);
         let alive = Arc::clone(&self.agent_pane_alive.lock().unwrap());
         let capacity = Arc::clone(&self.script_capacity.lock().unwrap());
+        // Interrupt-resilience U2/R1: this tick's retry candidates, taken out of
+        // the queue up front (no nested store↔queue lock). Agent retries that
+        // can't run yet (frontend not ready) are collected into `requeue` and
+        // put back after the mutate.
+        let retry_ids: Vec<String> = self.retry_queue.lock().unwrap().drain(..).collect();
+        let mut requeue: Vec<String> = Vec::new();
 
         // Phase 1: decide + mutate + flush under ONE lock hold.
         let mut changed: Vec<String> = Vec::new();
         let mut to_dispatch: Vec<(Automation, String)> = Vec::new();
+        // Interrupt-resilience U2/R1: retry claims dispatch on their own path
+        // (phase 2b) — unlike a scheduled claim, a retry-dispatch failure must
+        // NOT recompute the schedule (a retry consumes no occurrence).
+        let mut to_dispatch_retry: Vec<(Automation, String)> = Vec::new();
         // U5: agent runs the sweep itself closed failed (ack-timeout / deadline),
         // to emit `automation://run-closed` in phase 3 (outside the lock).
         let mut closed_agent_runs: Vec<(String, String)> = Vec::new();
@@ -1078,7 +1221,44 @@ impl AutomationManager {
                     changed.push(a.id.clone());
                 }
             }
+
+            // Interrupt-resilience U2/R1/R4: drain this tick's retry candidates
+            // under the same lock hold, so a retry claim is persisted before
+            // dispatch exactly like a scheduled one (R2). A retry honors the R5
+            // frontend-ready gate (an unattended re-run) and the R7 overlap
+            // check, and — like a manual run (R23) — passes `next_run_at`
+            // through unchanged so it never advances the schedule.
+            for rid in &retry_ids {
+                let Some(a) = map.get_mut(rid) else {
+                    continue; // deleted between recovery and now
+                };
+                if !a.enabled {
+                    continue; // paused/disabled since recovery — drop the retry
+                }
+                if a.mode.kind() == RunMode::Agent && !frontend_ready {
+                    requeue.push(rid.clone()); // defer until the frontend is up
+                    continue;
+                }
+                if in_flight_widened(a, &alive) {
+                    continue; // a run is already in flight — the retry is moot
+                }
+                let run_id = mint_id();
+                let keep = a.next_run_at;
+                if a.claim(keep, now_ms, Trigger::Retry, &run_id).is_ok() {
+                    to_dispatch_retry.push((a.clone(), run_id));
+                    changed.push(a.id.clone());
+                }
+            }
         });
+
+        // Re-queue retries deferred this tick (agent, frontend not yet ready).
+        // Outside the store lock; the next tick retries them.
+        if !requeue.is_empty() {
+            let mut q = self.retry_queue.lock().unwrap();
+            for id in requeue {
+                q.push_back(id);
+            }
+        }
 
         // R2 persist-before-dispatch: if the phase-1 claim flush FAILED (e.g.
         // ENOSPC), the Running rows live only in memory (KTD-B keeps them
@@ -1098,6 +1278,10 @@ impl AutomationManager {
                 );
             }
             to_dispatch.clear();
+            // Same R2 discipline for retry claims: their Running rows live only
+            // in memory on a flush failure, so defer their dispatch too (startup
+            // recovery / ack-timeout closes them on the next launch/tick).
+            to_dispatch_retry.clear();
         }
 
         // Phase 2: the store lock is RELEASED — dispatch (KTD-B: the
@@ -1123,6 +1307,26 @@ impl AutomationManager {
                         }
                     }
                 });
+            }
+        }
+
+        // Phase 2b (interrupt-resilience U2/R1): dispatch retry claims. A retry
+        // consumes no occurrence, so a dispatch failure only closes the row
+        // failed — it never recomputes `next_run_at` (unlike the scheduled path
+        // above). Retry-once: a failed retry is not re-enqueued.
+        for (automation, run_id) in to_dispatch_retry {
+            if let Err(e) = self.dispatch(&automation, &run_id) {
+                let _ = self.store.mutate(|map| {
+                    if let Some(a) = map.get_mut(&automation.id) {
+                        a.close(&run_id, failed(&e), now_ms);
+                    }
+                });
+                // The automation is already in `changed` (the phase-1 retry
+                // claim pushed it); only the run-closed emit is still owed so
+                // the frontend tab lifecycle reacts to a failed agent retry.
+                if automation.mode.kind() == RunMode::Agent {
+                    closed_agent_runs.push((automation.id.clone(), run_id));
+                }
             }
         }
 
@@ -1625,6 +1829,7 @@ mod tests {
                 interpreter: "bash".into(),
                 timeout_ms: 120_000,
             },
+            retry_on_interrupt: false,
             origin: origin(),
         }
     }
@@ -2491,6 +2696,7 @@ mod tests {
             cron: "*/5 * * * *".into(),
             timezone: "UTC".into(),
             enabled: true,
+            retry_on_interrupt: false,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "script".into(),
@@ -2503,5 +2709,156 @@ mod tests {
             next_run_at: Some(T0 + FIVE_MIN),
             runs: Vec::new(),
         }
+    }
+
+    // ---- interrupt-resilience (U1/U2) ----------------------------------------
+
+    fn script_mode() -> Mode {
+        Mode::Script {
+            script_file: "script".into(),
+            interpreter: "bash".into(),
+            timeout_ms: 120_000,
+        }
+    }
+
+    fn agent_mode() -> Mode {
+        Mode::Agent {
+            prompt: "audit".into(),
+            model: None,
+            effort: None,
+        }
+    }
+
+    /// Seed a store dir with one automation a prior app run left mid-flight: a
+    /// `Running` row claimed with `trigger` (persisted per R2), plus the retry
+    /// opt-in and mode under test.
+    fn seed_interrupted(
+        dir: &tempfile::TempDir,
+        retry_on_interrupt: bool,
+        mode: Mode,
+        trigger: Trigger,
+    ) {
+        let store = store_in(dir);
+        store
+            .mutate(|map| {
+                let mut a = raw_automation("a1");
+                a.retry_on_interrupt = retry_on_interrupt;
+                a.mode = mode;
+                a.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, trigger, "r1")
+                    .unwrap();
+                map.insert(a.id.clone(), a);
+            })
+            .unwrap();
+    }
+
+    /// A collecting interrupt sink: records `(automation_id, retry_eligible)`
+    /// per surfaced interrupt.
+    #[allow(clippy::type_complexity)]
+    fn collecting_sink() -> (InterruptSink, Arc<Mutex<Vec<(String, bool)>>>) {
+        let collected: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let c = Arc::clone(&collected);
+        let sink: InterruptSink = Arc::new(move |ir: &InterruptedRun| {
+            c.lock()
+                .unwrap()
+                .push((ir.automation_id.clone(), ir.is_retry_eligible()));
+        });
+        (sink, collected)
+    }
+
+    // U2/R1/R2: an opted-in automation's interrupted run is surfaced through the
+    // sink AND re-dispatched once as a Trigger::Retry run (a script needs no
+    // frontend-ready gate). The retry consumes no occurrence (scheduled_for
+    // None). Idempotent: a second sweep neither re-alerts nor re-dispatches.
+    #[test]
+    fn interrupted_run_alerts_and_opt_in_retries_as_trigger_retry_u2() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_interrupted(&dir, true, script_mode(), Trigger::Schedule);
+        let h = harness_in(dir);
+        let (sink, alerts) = collecting_sink();
+        h.mgr.set_interrupt_sink(sink);
+
+        // Recovery closed the original row failed(interrupted).
+        assert_eq!(h.runs("a1")[0].status, RunStatus::Failed);
+        assert_eq!(h.runs("a1")[0].error.as_deref(), Some(ERR_INTERRUPTED));
+
+        h.sweep();
+        assert_eq!(
+            alerts.lock().unwrap().as_slice(),
+            &[("a1".to_string(), true)],
+            "surfaced once, retry-eligible"
+        );
+        assert_eq!(h.dispatcher.count(), 1, "retry dispatched");
+        let runs = h.runs("a1");
+        assert_eq!(runs.len(), 2, "failed original + running retry");
+        assert_eq!(runs[1].trigger, Trigger::Retry);
+        assert_eq!(runs[1].status, RunStatus::Running);
+        assert_eq!(runs[1].scheduled_for, None, "a retry consumes no occurrence");
+
+        h.sweep();
+        assert_eq!(alerts.lock().unwrap().len(), 1, "backlog drained — no re-alert");
+        assert_eq!(h.dispatcher.count(), 1, "retry already in flight — no re-dispatch");
+    }
+
+    // U2/R1: without the opt-in, an interrupted run is still surfaced but never
+    // re-dispatched (the curve-read case — money agents must not silently rerun).
+    #[test]
+    fn interrupt_without_opt_in_alerts_but_never_retries_u2() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_interrupted(&dir, false, script_mode(), Trigger::Schedule);
+        let h = harness_in(dir);
+        let (sink, alerts) = collecting_sink();
+        h.mgr.set_interrupt_sink(sink);
+
+        h.sweep();
+        assert_eq!(
+            alerts.lock().unwrap().as_slice(),
+            &[("a1".to_string(), false)],
+            "surfaced, not eligible"
+        );
+        assert_eq!(h.dispatcher.count(), 0, "opt-out never retries");
+        assert_eq!(h.runs("a1").len(), 1, "no retry row appended");
+    }
+
+    // U2/R4 retry-once crash-loop guard: a run BORN from a retry that is itself
+    // interrupted is surfaced but never retried again.
+    #[test]
+    fn a_retry_run_interrupted_again_alerts_but_never_retries_again_r4() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_interrupted(&dir, true, script_mode(), Trigger::Retry);
+        let h = harness_in(dir);
+        let (sink, alerts) = collecting_sink();
+        h.mgr.set_interrupt_sink(sink);
+
+        h.sweep();
+        assert_eq!(
+            alerts.lock().unwrap().as_slice(),
+            &[("a1".to_string(), false)],
+            "retry-once: a re-run's own interrupt is not eligible"
+        );
+        assert_eq!(h.dispatcher.count(), 0, "no second retry");
+        assert_eq!(h.runs("a1").len(), 1);
+    }
+
+    // U2/R5: an agent retry honors the frontend-ready gate — it alerts
+    // immediately but defers the re-dispatch (re-queued) until the frontend is
+    // up, then fires on the next sweep.
+    #[test]
+    fn agent_retry_defers_until_frontend_ready_r5() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_interrupted(&dir, true, agent_mode(), Trigger::Schedule);
+        let h = harness_in(dir);
+        let (sink, alerts) = collecting_sink();
+        h.mgr.set_interrupt_sink(sink);
+
+        h.sweep();
+        assert_eq!(alerts.lock().unwrap().len(), 1, "alert fires regardless of readiness");
+        assert_eq!(h.dispatcher.count(), 0, "agent retry waits for the frontend (R5)");
+        assert_eq!(h.runs("a1").len(), 1, "no retry row yet");
+
+        h.mgr.set_frontend_ready();
+        h.sweep();
+        assert_eq!(alerts.lock().unwrap().len(), 1, "not re-alerted on the second tick");
+        assert_eq!(h.dispatcher.count(), 1, "agent retry now dispatched");
+        assert_eq!(h.runs("a1")[1].trigger, Trigger::Retry);
     }
 }

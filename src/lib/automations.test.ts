@@ -39,6 +39,7 @@ function automation(over: Partial<Automation> = {}): Automation {
     cron: "*/5 * * * *",
     timezone: "America/New_York",
     enabled: true,
+    retryOnInterrupt: false,
     cwd: "/tmp",
     origin: { paneId: 7, workspaceId: "ws-1", label: "cli" },
     createdAt: 1_000,

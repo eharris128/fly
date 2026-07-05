@@ -24,6 +24,9 @@ export interface AutomationRow {
   schedule: string;
   /** True when `nextRunAt` is null — the automation is paused (R23). */
   paused: boolean;
+  /** Opt-in interrupt resilience (interrupt-resilience U5/R1): a small "retry"
+   * tag so the operator can see which automations re-run after a crash. */
+  retryOnInterrupt: boolean;
   /** Relative next-occurrence time (`"in 5 minutes"`), or null when paused. */
   nextRun: string | null;
   /** Derived from the last run row (R25) — `"never run"` when there is none. */
@@ -82,6 +85,7 @@ function toRow(a: Automation, nowMs: number): AutomationRow {
     mode: a.mode.kind,
     schedule: humanSchedule(a.cron, a.timezone),
     paused: a.nextRunAt == null,
+    retryOnInterrupt: a.retryOnInterrupt,
     nextRun: a.nextRunAt != null ? relativeTime(a.nextRunAt, nowMs) : null,
     lastStatus: last ? last.status : "never run",
     lastRun: lastRunAt != null ? relativeTime(lastRunAt, nowMs) : null,

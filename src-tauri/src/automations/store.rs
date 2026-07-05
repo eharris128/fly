@@ -424,6 +424,7 @@ mod tests {
             cron: "*/5 * * * *".into(),
             timezone: "America/New_York".into(),
             enabled: true,
+            retry_on_interrupt: false,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "script".into(),
