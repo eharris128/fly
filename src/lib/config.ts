@@ -18,6 +18,17 @@ export interface ReasonEffectsConfig {
   error: ReasonEffects;
 }
 
+/** Local read-only agent/automation feed (mirrors Rust FeedConfig,
+ * feat-agent-state-local-feed). Loopback-only HTTP + bearer token. */
+export interface FeedConfig {
+  /** Whether the feed listener starts (on by default). */
+  enabled: boolean;
+  /** Loopback TCP port the SSE endpoint binds. */
+  port: number;
+  /** Bearer token a consumer must present; null until minted on first run. */
+  token: string | null;
+}
+
 /** Shared defaults for automation agent runs (mirrors Rust AutomationDefaults,
  * automations-workspace-and-model U3, R12/R15). Resolution at dispatch is
  * automation → this default → Claude's own default. */
@@ -56,6 +67,8 @@ export interface Config {
   resumeDefaultArgs: string[];
   /** Shared default model/effort + fallback for automation agent runs (U3). */
   automationDefaults: AutomationDefaults;
+  /** Local read-only agent/automation feed (feat-agent-state-local-feed). */
+  feed: FeedConfig;
 }
 
 let cached: Config | null = null;

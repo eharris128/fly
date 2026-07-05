@@ -7,6 +7,7 @@ pub mod automations;
 pub mod cli;
 pub mod config;
 pub mod cwd;
+pub mod feed;
 pub mod hooks;
 pub mod lifecycle;
 pub mod notify;
@@ -19,7 +20,7 @@ pub mod usage;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Listener, Manager};
 
 use config::ConfigStore;
 use hooks::{Dispatch, HookServer, TokenRegistry, ValidatedHook};
@@ -598,6 +599,59 @@ pub fn run() {
             let sweep = automations::start_sweep(automations_mgr)
                 .map_err(|e| format!("failed to start automation sweep: {e}"))?;
             app.manage(sweep);
+
+            // Local read-only agent/automation feed (feat-agent-state-local-feed,
+            // U6). FeedState is managed UNCONDITIONALLY so the publish command
+            // never errors on a disabled feed — the pushed roster is just cached,
+            // not served. The HTTP listener starts only when enabled and a bearer
+            // token exists. A bind failure is non-fatal (never block launch): log
+            // and continue without the feed (plan Open Question).
+            let feed_state = Arc::new(feed::FeedState::new());
+            app.manage(Arc::clone(&feed_state));
+            let config_store = app.state::<Arc<ConfigStore>>().inner().clone();
+            let feed_cfg = config_store.get().feed;
+            if feed_cfg.enabled {
+                match config::ensure_feed_token(&config_store) {
+                    Some(token) => {
+                        // Automations half of the snapshot: projected from the
+                        // authoritative store at emit time (KTD4), so it needs no
+                        // frontend push and stays live on its own.
+                        let mgr_for_feed =
+                            app.state::<Arc<automations::AutomationManager>>().inner().clone();
+                        let automations_fn: feed::server::AutomationsFn = Arc::new(move || {
+                            mgr_for_feed
+                                .list()
+                                .iter()
+                                .map(feed::wire::AutomationEntry::from_automation)
+                                .collect()
+                        });
+                        let now_fn: feed::server::NowFn = Arc::new(notify::now_unix_ms);
+                        match feed::FeedServer::start(
+                            feed_cfg.port,
+                            token,
+                            Arc::clone(&feed_state),
+                            automations_fn,
+                            now_fn,
+                        ) {
+                            Ok(server) => {
+                                // An automation mutation bumps the feed so every
+                                // connected consumer re-reads (KTD4).
+                                let feed_for_changed = Arc::clone(&feed_state);
+                                app.listen(automations::AUTOMATION_CHANGED_EVENT, move |_| {
+                                    feed_for_changed.bump()
+                                });
+                                app.manage(server);
+                            }
+                            Err(e) => {
+                                eprintln!("[fly] feed server disabled: bind failed: {e}");
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!("[fly] feed server disabled: could not persist bearer token");
+                    }
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -638,6 +692,7 @@ pub fn run() {
             usage::usage_snapshot,
             automations::automations_frontend_ready,
             automations::list_automations,
+            feed::publish_agent_feed,
             register_alert_sink,
         ])
         .build(tauri::generate_context!())

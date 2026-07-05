@@ -39,9 +39,17 @@ pub fn shutdown(app: &AppHandle) {
     if let Some(automations) = app.try_state::<Arc<crate::automations::AutomationManager>>() {
         automations.shutdown();
     }
+    // Local feed (feat-agent-state-local-feed): signal teardown so every blocked
+    // SSE reader thread wakes and exits promptly. The listener thread itself is
+    // joined by `FeedServer::Drop` when the managed state drops on exit (same
+    // Drop-owned pattern as the hook socket below). Ordered here so readers stop
+    // before the panes they describe are reaped.
+    if let Some(feed) = app.try_state::<Arc<crate::feed::FeedState>>() {
+        feed.shutdown();
+    }
     if let Some(pty) = app.try_state::<Arc<PtyManager>>() {
         pty.close_all();
     }
-    // The hook socket and single-instance lock are released by their Drop impls
-    // as the managed state is dropped on exit.
+    // The hook socket, feed server, and single-instance lock are released by
+    // their Drop impls as the managed state is dropped on exit.
 }

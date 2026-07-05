@@ -5,7 +5,7 @@
 
 mod schema;
 
-pub use schema::{AutomationDefaults, Config, ReasonEffectsConfig, Renderer};
+pub use schema::{AutomationDefaults, Config, FeedConfig, ReasonEffectsConfig, Renderer};
 
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -101,6 +101,45 @@ pub fn load_with_fallback(path: &Path) -> Config {
     }
 }
 
+/// Ensure the feed has a bearer token, minting + persisting one on first run
+/// (feat-agent-state-local-feed, U4). A `127.0.0.1` listener is reachable by any
+/// local process, so the token is the boundary — it must exist before the feed
+/// server binds. Returns the live token (existing or freshly minted), or `None`
+/// only if the mint could not be persisted (the caller then skips the feed
+/// rather than serving with an unsaved secret the consumer can't learn).
+///
+/// A 256-bit CSPRNG hex token, matching the hook channel's strength
+/// (`hooks::token`). Never logged.
+pub fn ensure_feed_token(store: &ConfigStore) -> Option<String> {
+    let cfg = store.get();
+    if let Some(tok) = cfg.feed.token.clone() {
+        return Some(tok);
+    }
+    let token = mint_feed_token();
+    let mut next = cfg;
+    next.feed.token = Some(token.clone());
+    match store.set(next) {
+        Ok(()) => Some(token),
+        // A failed flush (ENOSPC, perms) leaves config unchanged; don't serve a
+        // token the consumer can never read back from disk.
+        Err(_) => None,
+    }
+}
+
+/// A 256-bit CSPRNG token as lowercase hex — same strength/shape as the hook
+/// per-pane tokens.
+fn mint_feed_token() -> String {
+    use rand::RngCore;
+    let mut raw = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut raw);
+    use std::fmt::Write;
+    let mut s = String::with_capacity(raw.len() * 2);
+    for b in raw {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// Command: the frontend reads settings (leader key, renderer, …) from here.
 #[tauri::command]
 pub fn get_config(store: tauri::State<'_, std::sync::Arc<ConfigStore>>) -> Config {
@@ -144,6 +183,26 @@ mod tests {
         let reloaded = load_with_fallback(&path);
         assert!(!reloaded.show_notifications_icon);
         assert_eq!(reloaded.font_size, 21);
+    }
+
+    #[test]
+    fn ensure_feed_token_mints_once_and_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let store = ConfigStore::load(path.clone());
+
+        // No token initially; ensure mints + persists one.
+        assert_eq!(store.get().feed.token, None);
+        let first = ensure_feed_token(&store).unwrap();
+        assert!(!first.is_empty());
+        assert_eq!(first.len(), 64, "256-bit hex");
+
+        // A second call returns the same token (not re-minted).
+        assert_eq!(ensure_feed_token(&store).as_deref(), Some(first.as_str()));
+
+        // And it survives a reload from disk (persisted, not just in-memory).
+        let reloaded = ConfigStore::load(path);
+        assert_eq!(reloaded.get().feed.token.as_deref(), Some(first.as_str()));
     }
 
     #[test]

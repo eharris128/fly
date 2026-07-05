@@ -108,6 +108,40 @@ impl Default for AutomationDefaults {
     }
 }
 
+/// Settings for the local, read-only agent/automation feed
+/// (feat-agent-state-local-feed). The feed binds a **loopback-only** HTTP
+/// listener guarded by a bearer `token`, so an external local consumer (the
+/// `game` portfolio) can read what agents/automations are live.
+///
+/// The nested-serde recipe (see [`ReasonEffectsConfig`]): struct-level
+/// `#[serde(default)]` here **plus** the parent `Config`'s container default
+/// means a partial `{"port":5000}` still fills the omitted `enabled`/`token`
+/// from `Default`. `token` is `None` until minted on first run (see
+/// `config::ensure_feed_token`); a `127.0.0.1` listener is reachable by any
+/// local process, so the token — not the bind — is what scopes the feed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FeedConfig {
+    /// Whether the feed listener starts at all. On by default for this
+    /// single-user tool; a broad distribution should reconsider (plan Open Q).
+    pub enabled: bool,
+    /// Loopback TCP port the SSE endpoint binds.
+    pub port: u16,
+    /// Bearer token a consumer must present. `None` until minted + persisted on
+    /// first run. Never logged.
+    pub token: Option<String>,
+}
+
+impl Default for FeedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 4939,
+            token: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Config {
@@ -158,6 +192,9 @@ pub struct Config {
     /// Shared default model / effort + fallback model for automation agent runs
     /// (automations-workspace-and-model U3, R12/R15). See [`AutomationDefaults`].
     pub automation_defaults: AutomationDefaults,
+    /// Local read-only agent/automation feed (feat-agent-state-local-feed).
+    /// See [`FeedConfig`].
+    pub feed: FeedConfig,
 }
 
 impl Default for Config {
@@ -181,6 +218,7 @@ impl Default for Config {
             reason_effects: ReasonEffectsConfig::default(),
             resume_default_args: vec!["--dangerously-skip-permissions".into()],
             automation_defaults: AutomationDefaults::default(),
+            feed: FeedConfig::default(),
         }
     }
 }
@@ -252,5 +290,46 @@ mod tests {
     fn missing_show_notifications_icon_defaults_shown() {
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(cfg.show_notifications_icon);
+    }
+
+    /// A config predating the feed block loads with the feed enabled on the
+    /// default port and no token yet (minted on first run).
+    #[test]
+    fn empty_config_has_feed_defaults() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.feed.enabled);
+        assert_eq!(cfg.feed.port, 4939);
+        assert_eq!(cfg.feed.token, None);
+    }
+
+    /// The nested-serde gotcha: a *partial* `feed` object keeps omitted siblings
+    /// at their defaults (enabled stays true) rather than dropping them.
+    #[test]
+    fn partial_feed_retains_sibling_defaults() {
+        let cfg: Config = serde_json::from_str(r#"{"feed":{"port":5000}}"#).unwrap();
+        assert_eq!(cfg.feed.port, 5000);
+        assert!(cfg.feed.enabled, "omitted sibling kept its default");
+        assert_eq!(cfg.feed.token, None);
+    }
+
+    /// An explicit `enabled: false` is preserved across a load (the disable
+    /// switch is honored, not reset by the default).
+    #[test]
+    fn feed_disabled_is_preserved() {
+        let cfg: Config = serde_json::from_str(r#"{"feed":{"enabled":false}}"#).unwrap();
+        assert!(!cfg.feed.enabled);
+    }
+
+    /// The feed block round-trips under camelCase.
+    #[test]
+    fn feed_round_trips_camel_case() {
+        let mut c = Config::default();
+        c.feed.port = 5050;
+        c.feed.token = Some("abc123".into());
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["feed"]["port"], 5050);
+        assert_eq!(v["feed"]["token"], "abc123");
+        let back: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(back, c);
     }
 }

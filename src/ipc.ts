@@ -1,6 +1,8 @@
 // Typed wrappers over the Tauri command + Channel surface (U3).
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+// Type-only (erased at runtime, so the feed.ts ↔ ipc.ts cycle is harmless).
+import type { FeedPublishPayload } from "./lib/feed";
 
 export type PaneId = number;
 
@@ -492,6 +494,17 @@ export interface PaneActivity {
 /** Poll a pane's agent/work-stretch state (U4). */
 export function paneActivity(paneId: PaneId): Promise<PaneActivity> {
   return invoke<PaneActivity>("pane_activity", { paneId });
+}
+
+/**
+ * Push the assembled agent roster to the backend feed cache
+ * (feat-agent-state-local-feed, U5). The backend merges it with automations and
+ * re-serves over the local read-only SSE endpoint. Always safe to call — a
+ * disabled feed just caches and never serves. Returns whether the roster
+ * changed (bumped the stream version).
+ */
+export function publishAgentFeed(payload: FeedPublishPayload): Promise<boolean> {
+  return invoke<boolean>("publish_agent_feed", { payload });
 }
 
 /**
