@@ -42,6 +42,7 @@
     type Workspace,
   } from "./lib/workspaces";
   import { buildHomeModel, effectiveAttention, effectiveTaskCount } from "./lib/home";
+  import { buildFeedPayload } from "./lib/feed";
   import {
     findAutomationsWorkspace,
     buildAgentArgv,
@@ -79,6 +80,7 @@
     paneCommand,
     paneSessionId,
     paneActivity,
+    publishAgentFeed,
     usageSnapshot,
     saveResumeRecord,
     saveResumeSession,
@@ -305,6 +307,11 @@
   // Idle delay (ms) before the attention-triage nudge appears once the focused
   // agent stops needing you (R16). Seeded from config on restore.
   let nudgeIdleMs = $state(1500);
+  // Whether the local read-only feed is enabled (feat-agent-state-local-feed).
+  // Seeded from config on restore. When on, the agent poll runs always (not just
+  // while the dashboard is open) so the feed the `game` portfolio reads stays
+  // live; the backend caches the pushed roster and serves it over SSE.
+  let feedEnabled = $state(false);
   // Whether the "move along" nudge overlay is showing for the focused pane (U6).
   let nudgeActive = $state(false);
   // Keystroke-only idle clock (R9, KTD6): wall-clock ms of your last keydown.
@@ -1518,13 +1525,27 @@
     const att = effectiveAttention(attentionByLeaf, agentByLeaf, lastEngagedAt, now);
     return buildHomeModel(workspaces, agents, cwdByLeaf, att, reasonByLeaf);
   });
-  // Run the agent poll only while the dashboard is open (KTD-C): an immediate
-  // fetch so it isn't blank, then every 1.5s; the cleanup tears down the timer.
+  // Run the agent poll while the dashboard is open OR the local feed is enabled
+  // (feat-agent-state-local-feed, U5). The feed needs a live roster whenever the
+  // app runs, not just while the dashboard drives the poll (KTD-C) — so an
+  // enabled feed keeps the same 1.5s poll going with the dashboard closed. An
+  // immediate fetch so it isn't blank, then every 1.5s; cleanup tears the timer
+  // down (and re-runs when either gate flips).
   $effect(() => {
-    if (!homeViewOpen) return;
+    if (!homeViewOpen && !feedEnabled) return;
     void refreshAgents();
     const timer = setInterval(() => void refreshAgents(), 1500);
     return () => clearInterval(timer);
+  });
+  // Publish the assembled roster to the backend feed cache whenever it changes
+  // (U5). Reads the same `homeModel` the dashboard renders, so the feed can
+  // never drift from what fly shows. The backend dedups (a no-op publish when
+  // the roster is unchanged never bumps the SSE stream), so pushing on every
+  // recompute is cheap. Gated on `feedEnabled` so a disabled feed adds no IPC.
+  $effect(() => {
+    if (!feedEnabled) return;
+    const payload = buildFeedPayload(homeModel);
+    void publishAgentFeed(payload);
   });
   // Fetch the live `/usage` gauges once per dashboard open (no timer): this
   // effect re-runs only when `homeViewOpen` flips, so reopening re-fetches while
@@ -1922,6 +1943,7 @@
     saveScrollbackEnabled = cfg.saveScrollback;
     leaderKey = cfg.leaderKey;
     nudgeIdleMs = cfg.nudgeIdleMs;
+    feedEnabled = cfg.feed.enabled;
     showNotificationsIcon = cfg.showNotificationsIcon;
     // Seed global mute from the config default; the backend seeds the same value
     // at startup, so they start in sync (the runtime toggle keeps them so).
