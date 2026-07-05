@@ -812,4 +812,14 @@ mod tests {
         assert!(cli::is_cli_subcommand("hooks"));
         assert!(cli::is_cli_subcommand("automation"));
     }
+
+    #[test]
+    fn help_is_a_cli_subcommand() {
+        // `fly --help` must print and exit as a CLI, not launch the app.
+        assert!(cli::is_cli_subcommand("help"));
+        assert!(cli::is_cli_subcommand("--help"));
+        assert!(cli::is_cli_subcommand("-h"));
+        // The overview names the discovery target that motivated this.
+        assert!(cli::top_level_help().contains("automation"));
+    }
 }
