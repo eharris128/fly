@@ -11,7 +11,10 @@
 //! (`server`, U3). The `wire` module is the single source of truth for the
 //! boundary shape, mirrored by `src/lib/feed.ts`.
 
+pub mod server;
 pub mod wire;
+
+pub use server::FeedServer;
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
