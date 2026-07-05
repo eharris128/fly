@@ -165,6 +165,92 @@ mod tests {
     }
 
     #[test]
+    fn from_automation_projects_schedule_and_last_run() {
+        use crate::automations::model::{
+            Automation, Mode, Origin, RunMode, RunRow, RunStatus, Trigger,
+        };
+        let run = RunRow {
+            id: "r1".into(),
+            mode: RunMode::Agent,
+            trigger: Trigger::Schedule,
+            status: RunStatus::Succeeded,
+            pane_id: Some(3),
+            model: None,
+            effort: None,
+            output: None,
+            exit_code: None,
+            error: None,
+            scheduled_for: Some(1_000),
+            started_at: Some(1_100),
+            finished_at: Some(1_200),
+        };
+        let a = Automation {
+            id: "a1".into(),
+            name: "nightly".into(),
+            cron: "0 2 * * *".into(),
+            timezone: "America/New_York".into(),
+            enabled: true,
+            cwd: "/tmp".into(),
+            mode: Mode::Agent {
+                prompt: "do it".into(),
+                model: None,
+                effort: None,
+            },
+            origin: Origin {
+                pane_id: 1,
+                workspace_id: "ws".into(),
+                label: "cli".into(),
+            },
+            created_at: 0,
+            updated_at: 0,
+            next_run_at: Some(2_000),
+            runs: vec![run],
+        };
+        let e = AutomationEntry::from_automation(&a);
+        assert_eq!(e.id, "a1");
+        assert_eq!(e.name, "nightly");
+        assert_eq!(e.cron, "0 2 * * *");
+        assert_eq!(e.timezone, "America/New_York");
+        assert!(e.enabled);
+        assert_eq!(e.next_run_at, Some(2_000));
+        assert_eq!(e.last_status.as_deref(), Some("succeeded"));
+        // Terminal row → finished_at is the last-run stamp.
+        assert_eq!(e.last_run_at, Some(1_200));
+    }
+
+    #[test]
+    fn from_automation_with_no_runs_has_null_last_run() {
+        use crate::automations::model::{Automation, Mode, Origin};
+        let a = Automation {
+            id: "a2".into(),
+            name: "never ran".into(),
+            cron: "* * * * *".into(),
+            timezone: "UTC".into(),
+            enabled: false,
+            cwd: "/tmp".into(),
+            mode: Mode::Script {
+                script_file: "s.sh".into(),
+                interpreter: "bash".into(),
+                timeout_ms: 1000,
+            },
+            origin: Origin {
+                pane_id: 0,
+                workspace_id: String::new(),
+                label: "cli".into(),
+            },
+            created_at: 0,
+            updated_at: 0,
+            next_run_at: None,
+            runs: vec![],
+        };
+        let e = AutomationEntry::from_automation(&a);
+        assert!(!e.enabled);
+        assert_eq!(e.next_run_at, None);
+        assert_eq!(e.last_status, None);
+        assert_eq!(e.last_run_at, None);
+    }
+
+    #[test]
     fn empty_roster_serializes_to_empty_arrays() {
         let snap = FeedSnapshot {
             version: 0,
