@@ -1525,17 +1525,44 @@
     const att = effectiveAttention(attentionByLeaf, agentByLeaf, lastEngagedAt, now);
     return buildHomeModel(workspaces, agents, cwdByLeaf, att, reasonByLeaf);
   });
+  // A worker-driven interval that survives window backgrounding
+  // (fix-feed-stale-status-while-backgrounded). WebKit throttles/pauses
+  // main-thread `setInterval` when the fly window is occluded/minimized (the same
+  // finding `reportForeground` documents), which freezes the agent poll — so the
+  // dashboard reads stale on switch-back AND the SSE feed the `game` portfolio
+  // consumes goes stale until the throttled poll resumes. A Web Worker's timer
+  // runs on its own thread and is *not* subject to page-visibility throttling, so
+  // ticks keep arriving at full cadence while fly is backgrounded. Classic
+  // Blob-URL worker (no bundling / module / asset-protocol — that path is the
+  // WebKitGTK blank-window minefield `fly-strip-crossorigin` guards). Falls back
+  // to a plain `setInterval` if a worker can't be created, so the poll degrades
+  // to today's behavior rather than stopping entirely.
+  function startPollTicker(ms: number, onTick: () => void): () => void {
+    try {
+      const url = URL.createObjectURL(
+        new Blob([`setInterval(()=>postMessage(0),${ms})`], {
+          type: "text/javascript",
+        }),
+      );
+      const worker = new Worker(url);
+      URL.revokeObjectURL(url); // worker script is already loaded; free the URL
+      worker.onmessage = () => onTick();
+      return () => worker.terminate();
+    } catch {
+      const timer = setInterval(onTick, ms);
+      return () => clearInterval(timer);
+    }
+  }
   // Run the agent poll while the dashboard is open OR the local feed is enabled
   // (feat-agent-state-local-feed, U5). The feed needs a live roster whenever the
   // app runs, not just while the dashboard drives the poll (KTD-C) — so an
   // enabled feed keeps the same 1.5s poll going with the dashboard closed. An
-  // immediate fetch so it isn't blank, then every 1.5s; cleanup tears the timer
-  // down (and re-runs when either gate flips).
+  // immediate fetch so it isn't blank, then every 1.5s via the un-throttled
+  // ticker; cleanup tears it down (and re-runs when either gate flips).
   $effect(() => {
     if (!homeViewOpen && !feedEnabled) return;
     void refreshAgents();
-    const timer = setInterval(() => void refreshAgents(), 1500);
-    return () => clearInterval(timer);
+    return startPollTicker(1500, () => void refreshAgents());
   });
   // Publish the assembled roster to the backend feed cache whenever it changes
   // (U5). Reads the same `homeModel` the dashboard renders, so the feed can
@@ -2049,10 +2076,12 @@
     // the 1.5s cadence). Pull a poll forward to the moment focus returns so the
     // dashboard reads current on glance, not one interval later. Cheap: the same
     // probes the timers already run, just not made to wait for the throttle to
-    // wake. Agents only while the dashboard drives that poll (homeViewOpen); cwds
+    // wake. Agents whenever that poll runs at all — the dashboard OR the feed
+    // drives it (homeViewOpen || feedEnabled), matching the poll effect's gate so
+    // a focus with the dashboard closed still refreshes the feed roster; cwds
     // always, mirroring their unconditional timer.
     if (focused) {
-      if (homeViewOpen) void refreshAgents();
+      if (homeViewOpen || feedEnabled) void refreshAgents();
       void refreshCwds();
     }
   }
