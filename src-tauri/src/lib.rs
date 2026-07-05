@@ -639,6 +639,7 @@ pub fn run() {
             usage::usage_snapshot,
             automations::automations_frontend_ready,
             automations::list_automations,
+            feed::publish_agent_feed,
             register_alert_sink,
         ])
         .build(tauri::generate_context!())

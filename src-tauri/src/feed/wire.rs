@@ -66,6 +66,14 @@ pub struct AutomationEntry {
     pub last_run_at: Option<u64>,
 }
 
+/// What the webview pushes each poll — just the agent half (the automations
+/// half is assembled backend-side). Mirrors `FeedPublishPayload` in `feed.ts`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedPublishPayload {
+    pub agents: Vec<AgentEntry>,
+}
+
 /// The full snapshot streamed on every SSE frame. `version` is the monotonic
 /// counter the server bumps on any change; `emittedAt` is the frame's stamp.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
