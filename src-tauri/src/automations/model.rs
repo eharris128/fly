@@ -99,6 +99,14 @@ pub enum RunMode {
 pub enum Trigger {
     Schedule,
     Manual,
+    /// An automatic re-run of a run that a prior app instance's crash/restart
+    /// left interrupted (automations-interrupt-resilience U1). Like `Manual` it
+    /// consumes no scheduled occurrence (never advances `next_run_at`); unlike
+    /// it, a retry is *unattended*, so the sweep honors the R5 frontend-ready
+    /// gate before dispatching an agent retry. Retry-once crash-loop guard: a
+    /// run *born* from a `Retry` is never retried again — startup recovery reads
+    /// the interrupted row's trigger and only alerts for a `Retry` row.
+    Retry,
 }
 
 /// Run-row status. `Running` is the only non-terminal state; interrupted,
@@ -183,6 +191,14 @@ pub struct Automation {
     /// IANA timezone name (R1) — validated by U2, opaque here.
     pub timezone: String,
     pub enabled: bool,
+    /// Opt-in resilience (automations-interrupt-resilience U1/R1): when true, a
+    /// run this automation leaves `Running` at an app crash/restart is
+    /// re-dispatched **once** on the next launch as a [`Trigger::Retry`] run.
+    /// Default **off** — a money/cloud agent (the curve-read case) must never
+    /// silently re-run, so only automations explicitly opted in retry.
+    /// `#[serde(default)]` keeps every legacy store row loading as `false`.
+    #[serde(default)]
+    pub retry_on_interrupt: bool,
     pub cwd: String,
     pub mode: Mode,
     pub origin: Origin,
@@ -272,9 +288,11 @@ impl Automation {
         if !self.enabled {
             return Err(ClaimError::Disabled);
         }
+        // A retry consumes no occurrence (like a manual run) — only a scheduled
+        // claim records the occurrence it is burning.
         let scheduled_for = match trigger {
             Trigger::Schedule => self.next_run_at,
-            Trigger::Manual => None,
+            Trigger::Manual | Trigger::Retry => None,
         };
         self.next_run_at = next_run_at;
         self.updated_at = now_ms;
@@ -307,7 +325,7 @@ impl Automation {
     pub fn skip(&mut self, now_ms: u64, trigger: Trigger, reason: &str, run_id: &str) {
         let scheduled_for = match trigger {
             Trigger::Schedule => self.next_run_at,
-            Trigger::Manual => None,
+            Trigger::Manual | Trigger::Retry => None,
         };
         self.updated_at = now_ms;
         self.push_row(RunRow {
@@ -428,6 +446,7 @@ mod tests {
             cron: "*/5 * * * *".into(),
             timezone: "America/New_York".into(),
             enabled: true,
+            retry_on_interrupt: false,
             cwd: "/tmp".into(),
             mode,
             origin: Origin {
@@ -504,6 +523,23 @@ mod tests {
         assert_eq!(row.trigger, Trigger::Manual);
         assert_eq!(row.mode, RunMode::Agent);
         assert_eq!(row.scheduled_for, None);
+        assert_eq!(row.status, RunStatus::Running);
+    }
+
+    // Interrupt-resilience U1: a Trigger::Retry claim behaves like a manual one
+    // for scheduling — the caller passes the current next_run_at through
+    // unchanged and the row records no scheduled_for (a retry consumes no
+    // occurrence).
+    #[test]
+    fn retry_claim_consumes_no_occurrence() {
+        let mut a = automation(script_mode());
+        let keep = a.next_run_at;
+
+        assert_eq!(a.claim(keep, 61_000, Trigger::Retry, "r1"), Ok(()));
+        assert_eq!(a.next_run_at, keep, "retry never advances the schedule");
+        let row = &a.runs[0];
+        assert_eq!(row.trigger, Trigger::Retry);
+        assert_eq!(row.scheduled_for, None, "no occurrence consumed");
         assert_eq!(row.status, RunStatus::Running);
     }
 

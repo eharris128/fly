@@ -94,6 +94,12 @@ pub struct AutomationRequest {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Opt-in interrupt resilience (interrupt-resilience U4/R1): re-run once on
+    /// the next launch a run this automation leaves interrupted by an app
+    /// crash/restart. Create-only; `#[serde(default)]` = `false` for legacy
+    /// clients and every other op.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry_on_interrupt: bool,
 }
 
 /// The app's response to an `automation/*` request.
@@ -253,6 +259,7 @@ fn handle_create(args: &[String]) -> i32 {
     let mut timeout_ms: Option<u64> = None;
     let mut model: Option<String> = None;
     let mut effort: Option<String> = None;
+    let mut retry_on_interrupt = false;
     let mut json = false;
 
     let mut it = args.iter();
@@ -273,6 +280,8 @@ fn handle_create(args: &[String]) -> i32 {
                 println!("  --script-file <path>    script mode: read script from file");
                 println!("  --interpreter <name>    script interpreter: bash, sh, python3 (default: bash)");
                 println!("  --timeout <ms>          script timeout in milliseconds (default: 120000)");
+                println!("  --retry-on-interrupt    re-run once on the next launch if an app");
+                println!("                          crash/restart interrupts a run (default: off)");
                 println!("  --json                  output response as JSON");
                 println!();
                 println!("Either --prompt (agent mode) or --script/--script-file (script mode) is required.");
@@ -294,6 +303,7 @@ fn handle_create(args: &[String]) -> i32 {
             "--effort" => effort = it.next().cloned(),
             "--script" => script = it.next().cloned(),
             "--script-file" => script_file = it.next().cloned(),
+            "--retry-on-interrupt" => retry_on_interrupt = true,
             "--interpreter" => interpreter = it.next().cloned(),
             "--timeout" => {
                 timeout_ms = match it.next().map(|s| s.parse::<u64>()) {
@@ -386,6 +396,7 @@ fn handle_create(args: &[String]) -> i32 {
         timeout_ms,
         model,
         effort,
+        retry_on_interrupt,
         ..Default::default()
     };
     send_and_report(req, "created", json)
@@ -544,6 +555,7 @@ fn handle_show(args: &[String]) -> i32 {
     println!("schedule  {} {}", a.cron, a.timezone);
     println!("cwd       {}", notify::sanitize_title(&a.cwd));
     println!("enabled   {}", a.enabled);
+    println!("retry     {}", if a.retry_on_interrupt { "on interrupt" } else { "off" });
     println!("next run  {}", next_run_label(a.next_run_at, now));
     println!("last run  {}", last_run_label(&a));
     println!("runs      {} in history", a.runs.len());
@@ -774,6 +786,7 @@ mod tests {
             cron: "*/5 * * * *".into(),
             timezone: "UTC".into(),
             enabled: true,
+            retry_on_interrupt: false,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "s".into(),

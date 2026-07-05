@@ -1026,6 +1026,7 @@ mod tests {
                 cron: "*/5 * * * *".into(),
                 timezone: "UTC".into(),
                 enabled: true,
+                retry_on_interrupt: false,
                 cwd: self.dir.path().to_string_lossy().into_owned(),
                 mode: Mode::Script {
                     script_file: path.to_string_lossy().into_owned(),

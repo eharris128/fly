@@ -190,6 +190,7 @@ mod tests {
             cron: "0 2 * * *".into(),
             timezone: "America/New_York".into(),
             enabled: true,
+            retry_on_interrupt: false,
             cwd: "/tmp".into(),
             mode: Mode::Agent {
                 prompt: "do it".into(),
@@ -227,6 +228,7 @@ mod tests {
             cron: "* * * * *".into(),
             timezone: "UTC".into(),
             enabled: false,
+            retry_on_interrupt: false,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "s.sh".into(),

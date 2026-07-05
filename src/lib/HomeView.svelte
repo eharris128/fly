@@ -238,7 +238,7 @@
         {#each automations as a (a.id)}
           <li class="auto-row" class:paused={a.paused} title={a.lastError ?? ""}>
             <span class="a-status s-{statusWord(a.lastStatus)}">{statusWord(a.lastStatus)}</span>
-            <span class="a-name">{a.name}<span class="a-mode">{a.mode}</span></span>
+            <span class="a-name">{a.name}<span class="a-mode">{a.mode}</span>{#if a.retryOnInterrupt}<span class="a-retry" title="re-runs once if an app crash/restart interrupts it">retry</span>{/if}</span>
             <span class="a-meta">
               <span class="a-sched">{a.schedule}</span>
               <span class="a-model" title="launch model · effort">{modelLabel(a)}</span>
@@ -722,6 +722,18 @@
     letter-spacing: 0.04em;
     color: #8b93b2;
     background: #2a3350;
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  /* Interrupt-resilience tag (interrupt-resilience U5): only shown when opted in,
+     so it reads as an at-a-glance "this one survives a crash" marker. */
+  .a-retry {
+    margin-left: 6px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #9ecbff;
+    background: #1f3350;
     border-radius: 4px;
     padding: 1px 5px;
   }

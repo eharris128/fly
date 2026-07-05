@@ -196,8 +196,9 @@ export function registerAlertSink(paneId: PaneId): Promise<void> {
 export type AutomationMode = "agent" | "script";
 /** Run-row status (`RunStatus` in model.rs). `running` is the only non-terminal. */
 export type RunStatus = "running" | "succeeded" | "failed" | "skipped";
-/** What started a run (`Trigger` in model.rs). */
-export type RunTrigger = "schedule" | "manual";
+/** What started a run (`Trigger` in model.rs). `retry` is a one-shot re-run of a
+ * run an app crash/restart interrupted (interrupt-resilience U1). */
+export type RunTrigger = "schedule" | "manual" | "retry";
 
 /** One bounded run-history row (mirrors Rust `RunRow`, R8). */
 export interface RunRow {
@@ -247,6 +248,9 @@ export interface Automation {
   cron: string;
   timezone: string;
   enabled: boolean;
+  /** Opt-in interrupt resilience (interrupt-resilience U1/R1): re-run once on the
+   * next launch if an app crash/restart interrupts a run. Default false. */
+  retryOnInterrupt: boolean;
   cwd: string;
   mode: AutomationSpec;
   origin: AutomationOrigin;

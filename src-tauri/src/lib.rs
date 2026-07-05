@@ -466,44 +466,63 @@ pub fn run() {
                 },
             )));
 
-            // U6 alert surfacing (R16/R17/R18): the alerts log + sink registry,
-            // and the real alert sink replacing the runner's no-op. The sink
-            // closure runs on the reaper thread and takes only the AlertsLog
-            // lock + the log file — never the store lock (KTD-B). For each
-            // alert-classified run it appends the sanitized `[name] first-line`
-            // (R16), then either rings the registered sink pane through the
-            // attention pipeline (R18) or queues the alert and asks the frontend
-            // to open the "Automations" sink pane (R17).
+            // U6 alert surfacing (R16/R17/R18): the alerts log + sink registry.
+            // `surface_alert` is the one shared path — append the sanitized
+            // `[name] first-line` (R16), then either ring the registered sink
+            // pane through the attention pipeline (R18) or queue it and ask the
+            // frontend to open the "Automations" sink pane (R17). It runs on the
+            // reaper thread and takes only the AlertsLog lock + the log file —
+            // never the store lock (KTD-B). Both the script alert path (U6) and
+            // the interrupt-resilience path (interrupt-resilience U3) go through
+            // it, so the two cannot drift on the R16/R17/R18 machinery.
             let alerts_log = automations::alerts::AlertsLog::open_default();
-            let alerts_for_sink = Arc::clone(&alerts_log);
-            let attention_for_alerts = app.state::<Arc<AttentionManager>>().inner().clone();
-            let alert_handle = app.handle().clone();
-            script_runner.set_alert_sink(Arc::new(
-                move |ev: automations::script::AlertEvent| {
-                    alerts_for_sink.append(&ev.automation_name, &ev.first_line); // R16
+            let surface_alert: Arc<dyn Fn(&str, &str) + Send + Sync> = {
+                let log = Arc::clone(&alerts_log);
+                let attention = app.state::<Arc<AttentionManager>>().inner().clone();
+                let handle = app.handle().clone();
+                Arc::new(move |name: &str, first_line: &str| {
+                    log.append(name, first_line); // R16
                     let queued = automations::alerts::QueuedAlert {
-                        automation_name: ev.automation_name,
-                        first_line: ev.first_line,
+                        automation_name: name.to_string(),
+                        first_line: first_line.to_string(),
                     };
-                    match alerts_for_sink.sink_or_queue(queued) {
+                    match log.sink_or_queue(queued) {
                         // R18: a live sink pane rings via the attention pipeline.
-                        Some(pane_id) => {
-                            raise_alert(&alert_handle, &attention_for_alerts, pane_id)
-                        }
+                        Some(pane_id) => raise_alert(&handle, &attention, pane_id),
                         // R17: no sink yet — queued; ask the frontend to open
                         // the sink pane, which registers and drains the backlog.
                         None => {
-                            let _ = alert_handle.emit(
+                            let _ = handle.emit(
                                 "automation://alert-pending",
                                 AlertPendingEvent {
-                                    log_path: alerts_for_sink
-                                        .log_path()
-                                        .to_string_lossy()
-                                        .into_owned(),
+                                    log_path: log.log_path().to_string_lossy().into_owned(),
                                 },
                             );
                         }
                     }
+                })
+            };
+            // Script alert sink (U6).
+            let script_alert = Arc::clone(&surface_alert);
+            script_runner.set_alert_sink(Arc::new(
+                move |ev: automations::script::AlertEvent| {
+                    script_alert(&ev.automation_name, &ev.first_line);
+                },
+            ));
+            // Interrupt-resilience alert sink (interrupt-resilience U3): a run an
+            // app crash/restart left interrupted surfaces exactly like a script
+            // alert. The line notes whether a one-shot retry will follow, so the
+            // operator sees the difference between "lost, act if you care" and
+            // "lost but being re-run".
+            let interrupt_alert = Arc::clone(&surface_alert);
+            automations_mgr.set_interrupt_sink(Arc::new(
+                move |ir: &automations::InterruptedRun| {
+                    let line = if ir.is_retry_eligible() {
+                        "interrupted by restart — retrying"
+                    } else {
+                        "interrupted by restart"
+                    };
+                    interrupt_alert(&ir.name, line);
                 },
             ));
             app.manage(alerts_log);
@@ -792,6 +811,7 @@ pub fn dispatch_automation_op(
                 timezone,
                 cwd,
                 mode,
+                retry_on_interrupt: req.retry_on_interrupt,
                 origin,
             }) {
                 Ok(created) => AutomationResponse::ok(Some(created.automation.id), created.warning),
