@@ -14,8 +14,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+use super::wire::{QuestionBody, QuestionOption, QuestionSpec};
+use crate::automations::redact;
 use crate::session::resume;
-use crate::session::transcript::{self, LastReply};
+use crate::session::transcript::{self, LastReply, PendingInteraction, PendingKind};
 
 /// Resolve a leaf key's latest assistant reply from durable state (U3):
 /// resume record (leaf → `session_id` + `session_cwd`) → transcript path
@@ -34,16 +36,31 @@ use crate::session::transcript::{self, LastReply};
 pub struct ReplyResolver {
     resume_path: PathBuf,
     projects_root: Option<PathBuf>,
-    cache: Mutex<HashMap<String, CachedReply>>,
+    cache: Mutex<HashMap<String, CachedIo>>,
 }
 
 /// One leaf's memoized resolution: the transcript identity it was computed
-/// from, and the reply (or confirmed absence) it yielded.
-struct CachedReply {
+/// from, and the reply + pending question (or confirmed absence) it yielded.
+/// Only transcript-derived facts live here (feed-pending-question KTD4) — the
+/// attention-dependent permission gate is applied at emit/response time,
+/// outside the cache, so a stale entry degrades to "not exposed", never to a
+/// wrong exposure.
+struct CachedIo {
     transcript: PathBuf,
     mtime: SystemTime,
     len: u64,
-    reply: Option<LastReply>,
+    io: ResolvedIo,
+}
+
+/// Both per-leaf IO facts from one transcript resolution (feed-pending-question
+/// U3): the latest completed reply and the pending question, already scrubbed /
+/// sanitized / truncated into the wire shape. Every surface reads this one
+/// source, so `/feed`'s `questionPendingAt` and `/output`'s `question.askedAt`
+/// cannot drift for a choice question (R4).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ResolvedIo {
+    pub reply: Option<LastReply>,
+    pub question: Option<QuestionBody>,
 }
 
 impl ReplyResolver {
@@ -63,49 +80,197 @@ impl ReplyResolver {
         }
     }
 
-    /// The leaf's latest reply, or `None` when any link is missing: no resume
-    /// record, no captured session/cwd, no transcript on disk, or a text-free
-    /// assistant tail. All of those mean "no reply yet" — the endpoint's empty
-    /// state — never an error. Text is control-sanitized here (R16 posture for
-    /// agent-authored text; newlines/tabs kept) so every consumer of the pair
-    /// sees the same bytes; a reply that sanitizes to blank counts as absent.
+    /// The leaf's latest reply — the read `GET /agents/{key}/output` and the
+    /// frame's `lastReplyAt` share. Kept as a thin front over [`resolve_io`]
+    /// so pre-question callers are untouched.
     pub fn resolve(&self, leaf_key: &str) -> Option<LastReply> {
-        let record = resume::read_records(&self.resume_path).remove(leaf_key)?;
-        let session_id = record.session_id?;
-        let session_cwd = record.session_cwd?;
-        let root = self.projects_root.as_ref()?;
-        let path = root
-            .join(transcript::encode_cwd(&session_cwd))
-            .join(format!("{session_id}.jsonl"));
+        self.resolve_io(leaf_key).reply
+    }
 
-        let meta = std::fs::metadata(&path).ok()?;
+    /// Both IO facts for a leaf from one transcript read (feed-pending-question
+    /// U3/KTD4): the latest reply, and the pending question already in wire
+    /// shape. Either half is `None` when any link is missing — no resume
+    /// record, no captured session/cwd, no transcript on disk, a text-free
+    /// tail, nothing pending. All of those mean "no data" — never an error.
+    ///
+    /// Reply text is control-sanitized (R16 posture; newlines/tabs kept) so
+    /// every consumer of the pair sees the same bytes; a reply that sanitizes
+    /// to blank counts as absent. Question strings additionally pass secret
+    /// scrubbing **before** sanitize + truncation (R8/KTD7 — see [`clean`]);
+    /// the reply itself stays unscrubbed (unchanged, deferred parity — the
+    /// trust model remains "token holder ≈ user at the keyboard").
+    pub fn resolve_io(&self, leaf_key: &str) -> ResolvedIo {
+        let Some(path) = self.transcript_path(leaf_key) else {
+            return ResolvedIo::default();
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return ResolvedIo::default();
+        };
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         let len = meta.len();
 
         let mut cache = self.cache.lock().unwrap();
         if let Some(hit) = cache.get(leaf_key) {
             if hit.transcript == path && hit.mtime == mtime && hit.len == len {
-                return hit.reply.clone();
+                return hit.io.clone();
             }
         }
-        let reply = transcript::last_assistant_reply(&path).and_then(|r| {
-            let text = crate::notify::sanitize_multiline(&r.text);
-            (!text.trim().is_empty()).then_some(LastReply {
-                text,
-                replied_at_ms: r.replied_at_ms,
+        let io = transcript::transcript_io(&path)
+            .map(|t| ResolvedIo {
+                reply: t.reply.and_then(|r| {
+                    let text = crate::notify::sanitize_multiline(&r.text);
+                    (!text.trim().is_empty()).then_some(LastReply {
+                        text,
+                        replied_at_ms: r.replied_at_ms,
+                    })
+                }),
+                question: t.pending.as_ref().and_then(question_body),
             })
-        });
+            .unwrap_or_default();
         cache.insert(
             leaf_key.to_string(),
-            CachedReply {
+            CachedIo {
                 transcript: path,
                 mtime,
                 len,
-                reply: reply.clone(),
+                io: io.clone(),
             },
         );
-        reply
+        io
     }
+
+    /// The leaf's transcript path via its resume record (leaf → `session_id` +
+    /// `session_cwd` → `<projects-root>/<encoded-cwd>/<session-id>.jsonl`).
+    fn transcript_path(&self, leaf_key: &str) -> Option<PathBuf> {
+        let record = resume::read_records(&self.resume_path).remove(leaf_key)?;
+        let session_id = record.session_id?;
+        let session_cwd = record.session_cwd?;
+        let root = self.projects_root.as_ref()?;
+        Some(
+            root.join(transcript::encode_cwd(&session_cwd))
+                .join(format!("{session_id}.jsonl")),
+        )
+    }
+}
+
+// ---- question shaping: scrub → sanitize → truncate (U3, R8/KTD7) -----------
+
+/// Exposure ceilings, in chars, pinned per the plan (values negotiable; the
+/// contract is that they are pinned and oversized content is
+/// **truncated-and-served, never abstained** — an oversized injected question
+/// must not suppress exposure).
+const MAX_QUESTIONS: usize = 4;
+const MAX_OPTIONS: usize = 8;
+const QUESTION_CAP: usize = 512;
+const HEADER_CAP: usize = 512;
+const LABEL_CAP: usize = 128;
+const DESCRIPTION_CAP: usize = 1024;
+const CONTEXT_CAP: usize = 2048;
+const REQUEST_CAP: usize = 512;
+
+/// The one string pipeline for every newly exposed question string (R8, fixed
+/// order): secret-scrub the **full, untruncated** value first
+/// (`automations/redact.rs`), *then* control-sanitize (R16 posture,
+/// newlines/tabs kept), *then* truncate to `cap` on a char boundary with an
+/// ellipsis — so a secret straddling the truncation boundary is masked before
+/// its tail is cut. `None` when the result is blank (a blank string is absent,
+/// never served empty).
+fn clean(raw: &str, cap: usize) -> Option<String> {
+    let scrubbed = redact::scrub_secrets(raw);
+    let sane = crate::notify::sanitize_multiline(&scrubbed);
+    if sane.trim().is_empty() {
+        return None;
+    }
+    let mut out: String = sane.chars().take(cap).collect();
+    if sane.chars().count() > cap {
+        out.push('…');
+    }
+    Some(out)
+}
+
+/// Shape a parsed pending interaction into the wire `QuestionBody`, applying
+/// the [`clean`] pipeline to every exposed string and the pinned count
+/// ceilings. `None` when nothing exposable survives (every question blank —
+/// the KTD1 abstain posture, extended to the display layer).
+///
+/// `answerable` is recomputed *here*, after cleaning, and is stricter than the
+/// parse-time flag: any dropped question or dropped option (blank after
+/// sanitize) breaks the wire↔screen index mapping a digit answer relies on, so
+/// it forces `answerable: false`. Truncating a >8-option tail keeps the prefix
+/// mapping intact and stays answerable.
+fn question_body(p: &PendingInteraction) -> Option<QuestionBody> {
+    match p.kind {
+        PendingKind::Choice => {
+            let mut dropped_any = false;
+            let mut questions: Vec<QuestionSpec> = Vec::new();
+            for q in p.questions.iter().take(MAX_QUESTIONS) {
+                let Some(question) = clean(&q.question, QUESTION_CAP) else {
+                    dropped_any = true;
+                    continue;
+                };
+                let mut options: Vec<QuestionOption> = Vec::new();
+                for o in q.options.iter().take(MAX_OPTIONS) {
+                    let Some(label) = clean(&o.label, LABEL_CAP) else {
+                        dropped_any = true;
+                        continue;
+                    };
+                    options.push(QuestionOption {
+                        label,
+                        description: clean(&o.description, DESCRIPTION_CAP).unwrap_or_default(),
+                    });
+                }
+                questions.push(QuestionSpec {
+                    question,
+                    header: clean(&q.header, HEADER_CAP).unwrap_or_default(),
+                    multi_select: q.multi_select,
+                    options,
+                });
+            }
+            if questions.is_empty() {
+                return None;
+            }
+            let answerable = !dropped_any
+                && p.questions.len() == 1
+                && questions.len() == 1
+                && !questions[0].multi_select
+                && !questions[0].options.is_empty();
+            Some(QuestionBody {
+                asked_at: p.asked_at_ms,
+                kind: "choice".into(),
+                tool: p.tool.clone(),
+                answerable,
+                context: p.context.as_deref().and_then(|c| clean(c, CONTEXT_CAP)),
+                questions,
+                request: None,
+            })
+        }
+        PendingKind::Permission => Some(QuestionBody {
+            asked_at: p.asked_at_ms,
+            kind: "permission".into(),
+            tool: p.tool.clone(),
+            answerable: false,
+            context: p.context.as_deref().and_then(|c| clean(c, CONTEXT_CAP)),
+            questions: Vec::new(),
+            request: p.input.as_ref().and_then(|i| permission_request(&p.tool, i)),
+        }),
+    }
+}
+
+/// A one-line, scrubbed summary of a permission request's input, from
+/// well-known fields only: `Bash` → `command`, `Edit`/`Write` → `file_path`.
+/// Other tools get no summary (their `tool` name is already on the body) —
+/// guessing at arbitrary input shapes would risk exposing more than the
+/// dialog shows (KTD1 posture).
+fn permission_request(tool: &str, input: &serde_json::Value) -> Option<String> {
+    let field = match tool {
+        "Bash" => "command",
+        "Edit" | "Write" => "file_path",
+        _ => return None,
+    };
+    input
+        .get(field)
+        .and_then(|v| v.as_str())
+        .and_then(|s| clean(s, REQUEST_CAP))
 }
 
 /// Build the paste half of one remotely-submitted message (U5): the text
@@ -248,6 +413,153 @@ mod tests {
         let blank = r#"{"type":"assistant","message":{"role":"assistant","content":"\u0007\u001b"}}"#;
         let r = fixture(dir.path(), "leaf-2", "sid-def", "/q", &format!("{blank}\n"));
         assert_eq!(r.resolve("leaf-2"), None);
+    }
+
+    // ---- resolve_io: reply + pending from one read (feed-pending-question U3)
+
+    /// A transcript with a completed, stamped reply followed by a pending
+    /// AskUserQuestion whose context is that same reply text.
+    const PENDING_ASK: &str = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"pick for me"}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-06-19T19:17:16.402Z","message":{"role":"assistant","content":[{"type":"text","text":"Two options stand out."}]}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"ask1","name":"AskUserQuestion","input":{"questions":[{"question":"Which one?","header":"Pick","multiSelect":false,"options":[{"label":"Alpha","description":"first"},{"label":"Beta","description":"second"}]}]}}]}}"#,
+        "\n",
+    );
+    const PENDING_ASKED_AT: u64 = 1_781_896_640_000;
+
+    #[test]
+    fn resolve_io_yields_reply_and_pending_question_from_one_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", PENDING_ASK);
+        let io = r.resolve_io("leaf-1");
+        // The reply half: the completed text turn (duplication with context is
+        // blessed by design — the last text entry IS the context).
+        assert_eq!(io.reply.as_ref().unwrap().text, "Two options stand out.");
+        assert_eq!(io.reply.as_ref().unwrap().replied_at_ms, Some(REPLIED_AT));
+        // The pending half, in wire shape.
+        let q = io.question.expect("pending question");
+        assert_eq!(q.asked_at, PENDING_ASKED_AT);
+        assert_eq!(q.kind, "choice");
+        assert!(q.answerable);
+        assert_eq!(q.context.as_deref(), Some("Two options stand out."));
+        assert_eq!(q.questions.len(), 1);
+        assert_eq!(q.questions[0].options.len(), 2);
+        // And the thin resolve() front still serves the reply alone.
+        assert_eq!(r.resolve("leaf-1").unwrap().text, "Two options stand out.");
+    }
+
+    #[test]
+    fn appending_the_tool_result_clears_pending_on_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = "/p";
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", cwd, PENDING_ASK);
+        assert!(r.resolve_io("leaf-1").question.is_some());
+        // The answer lands (mtime/len change) → the cache re-reads → cleared.
+        let path = dir
+            .path()
+            .join("projects")
+            .join(transcript::encode_cwd(cwd))
+            .join("sid-abc.jsonl");
+        let answered = format!(
+            "{PENDING_ASK}{}\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask1","content":"chose Alpha"}]}}"#
+        );
+        std::fs::write(&path, answered).unwrap();
+        let io = r.resolve_io("leaf-1");
+        assert_eq!(io.question, None);
+        assert!(io.reply.is_some(), "the reply half is unaffected");
+    }
+
+    #[test]
+    fn a_secret_straddling_the_truncation_boundary_is_still_masked() {
+        // R8 ordering: scrub runs on the FULL string, then truncate. Build a
+        // description whose sk-ant token starts just before the cap — a
+        // truncate-first pipeline would slice the token and leak its head.
+        let secret = format!("sk-ant-api03-{}", "a".repeat(30));
+        let desc = format!("{} {} tail", "x".repeat(1010), secret);
+        let entry = format!(
+            r#"{{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{{"questions":[{{"question":"Q?","options":[{{"label":"A","description":"{desc}"}}]}}]}}}}]}}}}"#
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{entry}\n"));
+        let q = r.resolve_io("leaf-1").question.expect("pending");
+        let served = &q.questions[0].options[0].description;
+        assert!(!served.contains("sk-ant"), "leaked head: {served}");
+        assert!(served.contains("[redacted]"));
+    }
+
+    #[test]
+    fn secrets_are_scrubbed_across_the_whole_surface() {
+        // A secret in a Bash permission input AND one in an option description
+        // are both masked (KTD7 spans every newly exposed string).
+        let bash = r#"{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"curl -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6' api"}}]}}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{bash}\n"));
+        let q = r.resolve_io("leaf-1").question.expect("pending");
+        assert_eq!(q.kind, "permission");
+        assert_eq!(q.tool, "Bash");
+        let req = q.request.expect("summary");
+        assert!(req.contains("[redacted]"), "was: {req}");
+        assert!(!req.contains("eyJ"), "was: {req}");
+        assert!(q.context.is_none());
+    }
+
+    #[test]
+    fn oversized_batches_truncate_to_ceilings_and_still_serve() {
+        // 6 questions × 12 options with an oversized description: served at
+        // 4 × 8 with capped strings — never abstained (the contract).
+        let options: Vec<String> = (0..12)
+            .map(|i| format!(r#"{{"label":"opt{i}","description":"{}"}}"#, "d".repeat(1500)))
+            .collect();
+        let questions: Vec<String> = (0..6)
+            .map(|i| {
+                format!(
+                    r#"{{"question":"Q{i}?","header":"H","multiSelect":false,"options":[{}]}}"#,
+                    options.join(",")
+                )
+            })
+            .collect();
+        let entry = format!(
+            r#"{{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{{"questions":[{}]}}}}]}}}}"#,
+            questions.join(",")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{entry}\n"));
+        let q = r.resolve_io("leaf-1").question.expect("served, not abstained");
+        assert_eq!(q.questions.len(), 4);
+        assert_eq!(q.questions[0].options.len(), 8);
+        let d = &q.questions[0].options[0].description;
+        assert!(d.chars().count() <= 1025, "capped (+ellipsis), was {}", d.len());
+        assert!(d.ends_with('…'));
+        assert!(!q.answerable, "a multi-question batch is read-only");
+    }
+
+    #[test]
+    fn control_chars_strip_and_a_blank_label_drops_its_option_and_answerability() {
+        // One option's label is nothing but control chars → dropped; the drop
+        // breaks the wire↔screen digit mapping, so answerable goes false even
+        // though one clean option remains.
+        let entry = r#"{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"question":"Q\u001b[2J?","options":[{"label":"\u0007\u001b","description":"gone"},{"label":"Keep","description":"stays"}]}]}}]}}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{entry}\n"));
+        let q = r.resolve_io("leaf-1").question.expect("pending");
+        assert_eq!(q.questions[0].question, "Q[2J?", "control byte stripped");
+        assert_eq!(q.questions[0].options.len(), 1);
+        assert_eq!(q.questions[0].options[0].label, "Keep");
+        assert!(!q.answerable, "a dropped option breaks digit mapping");
+    }
+
+    #[test]
+    fn missing_links_yield_empty_io_never_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", PENDING_ASK);
+        // Unknown leaf → both halves None.
+        assert_eq!(r.resolve_io("leaf-ghost"), ResolvedIo::default());
+        // Transcript gone from disk → both halves None.
+        std::fs::remove_dir_all(dir.path().join("projects")).unwrap();
+        assert_eq!(r.resolve_io("leaf-1"), ResolvedIo::default());
     }
 
     // ---- paste_payload / SUBMIT (U5) ----------------------------------------
