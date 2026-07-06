@@ -463,10 +463,39 @@ pub fn last_assistant_text(path: &Path) -> Option<String> {
     last_assistant_text_from_str(&body)
 }
 
-/// Pure core of [`last_assistant_text`] — tolerant of a non-JSON / unterminated
-/// trailing line (skipped), matching the thin-reader contract elsewhere.
+/// Pure core of [`last_assistant_text`] — the text half of
+/// [`last_assistant_reply_from_str`], kept as the automations capture's entry
+/// point (its callers never need the stamp).
 fn last_assistant_text_from_str(body: &str) -> Option<String> {
-    let mut last: Option<String> = None;
+    last_assistant_reply_from_str(body).map(|r| r.text)
+}
+
+/// An agent's latest textual reply (feed-agent-reply-io U2): the last assistant
+/// turn's text plus, when that turn carries a parseable ISO-8601 `timestamp`,
+/// its epoch-ms stamp. The stamp is the feed's `lastReplyAt`/`repliedAt` value,
+/// so text and stamp MUST come from the same turn — which this pairing
+/// guarantees by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastReply {
+    pub text: String,
+    pub replied_at_ms: Option<u64>,
+}
+
+/// Read a transcript and return its last assistant reply (text + stamp), or
+/// `None` for a missing/empty/corrupt transcript or a text-free assistant tail
+/// (same contract as [`last_assistant_text`]).
+pub fn last_assistant_reply(path: &Path) -> Option<LastReply> {
+    let body = std::fs::read_to_string(path).ok()?;
+    last_assistant_reply_from_str(&body)
+}
+
+/// The one last-assistant scan: walk JSONL `body` keeping the last
+/// `type == "assistant"` entry that yields text ([`assistant_text_blocks`]),
+/// paired with that same entry's timestamp. Tolerant of a non-JSON /
+/// unterminated trailing line (skipped), matching the thin-reader contract
+/// elsewhere.
+fn last_assistant_reply_from_str(body: &str) -> Option<LastReply> {
+    let mut last: Option<LastReply> = None;
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -479,7 +508,13 @@ fn last_assistant_text_from_str(body: &str) -> Option<String> {
             continue;
         }
         if let Some(text) = assistant_text_blocks(&v) {
-            last = Some(text);
+            last = Some(LastReply {
+                text,
+                replied_at_ms: v
+                    .get("timestamp")
+                    .and_then(|t| t.as_str())
+                    .and_then(iso8601_to_ms),
+            });
         }
     }
     last
@@ -1038,6 +1073,45 @@ mod tests {
         // A tool-use-only transcript (no assistant text at all) → None.
         let tools = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use"}]}}"#;
         assert_eq!(last_assistant_text_from_str(tools), None);
+    }
+
+    #[test]
+    fn last_assistant_reply_pairs_text_with_that_turns_timestamp() {
+        // The stamp must come from the SAME turn as the text (U2): a later
+        // tool-use-only turn's newer timestamp must not restamp the reply.
+        let body = concat!(
+            r#"{"type":"assistant","timestamp":"2026-06-19T19:17:04.506Z","message":{"role":"assistant","content":[{"type":"text","text":"early"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-06-19T19:17:16.402Z","message":{"role":"assistant","content":[{"type":"text","text":"the reply"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-06-19T19:18:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]}}"#,
+            "\n",
+        );
+        assert_eq!(
+            last_assistant_reply_from_str(body),
+            Some(LastReply {
+                text: "the reply".into(),
+                replied_at_ms: Some(1_781_896_636_402),
+            })
+        );
+    }
+
+    #[test]
+    fn last_assistant_reply_without_timestamp_still_carries_text() {
+        // A stampless turn (or unparseable timestamp) degrades to a stampless
+        // reply, never a dropped one — the feed then serves text without
+        // repliedAt rather than pretending the agent never replied.
+        let s = r#"{"type":"assistant","message":{"role":"assistant","content":"done"}}"#;
+        assert_eq!(
+            last_assistant_reply_from_str(s),
+            Some(LastReply {
+                text: "done".into(),
+                replied_at_ms: None,
+            })
+        );
+        // And the degenerate inputs match last_assistant_text's contract.
+        assert_eq!(last_assistant_reply_from_str(""), None);
+        assert_eq!(last_assistant_reply_from_str("{ not json"), None);
     }
 
     #[test]

@@ -1,16 +1,22 @@
-//! The local, read-only agent/automation feed (feat-agent-state-local-feed).
+//! The local agent/automation feed (feat-agent-state-local-feed) plus its
+//! per-agent reply/input endpoints (feed-agent-reply-io).
 //!
 //! A narrowly-scoped, loopback-only realization of the browser-reachable HTTP
 //! endpoint the hook socket deliberately deferred (`hooks/CLAUDE.md`, KTD7). It
 //! lets an external local consumer (the `game` portfolio) *see* what agents are
-//! running and what automations exist — never act on them.
+//! running and what automations exist, read an agent's latest reply
+//! (`GET /agents/{key}/output`), and submit a prompt back to it
+//! (`POST /agents/{key}/input`) — the one deliberate mutation route, equivalent
+//! to typing into the pane (feed-agent-reply-io KTD3; see `server`).
 //!
 //! Data flow (see the plan's High-Level Technical Design): the webview PUSHES
 //! its assembled agent roster (`publish`, U2), the backend merges it with
 //! automations from the authoritative store and streams the result over SSE
 //! (`server`, U3). The `wire` module is the single source of truth for the
-//! boundary shape, mirrored by `src/lib/feed.ts`.
+//! boundary shape, mirrored by `src/lib/feed.ts`. The `io` module resolves a
+//! leaf's latest reply and builds the injected input payload.
 
+pub mod io;
 pub mod server;
 pub mod wire;
 
@@ -95,6 +101,19 @@ impl FeedState {
         self.inner.lock().unwrap().version
     }
 
+    /// Whether `leaf_key` is in the currently-published roster — the key
+    /// authority for the per-agent endpoints (feed-agent-reply-io KTD2): a key
+    /// the feed has never served is "unknown agent" (404), and a pane that is
+    /// not an agent never becomes remotely addressable.
+    pub fn agent_exists(&self, leaf_key: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .iter()
+            .any(|a| a.leaf_key == leaf_key)
+    }
+
     /// Assemble the frame to emit: the cached roster + the caller-supplied
     /// automations (read from the store at emit time, KTD4) + stamp. Kept free
     /// of any store/manager dependency so it is unit-tested in isolation.
@@ -169,7 +188,19 @@ mod tests {
             working_for_ms: None,
             live_task_count: 0,
             num: None,
+            last_reply_at: None,
         }
+    }
+
+    #[test]
+    fn agent_exists_tracks_the_published_roster() {
+        let s = FeedState::new();
+        assert!(!s.agent_exists("l1"));
+        s.publish(vec![agent("l1", "working")]);
+        assert!(s.agent_exists("l1"));
+        assert!(!s.agent_exists("l2"));
+        s.publish(vec![]);
+        assert!(!s.agent_exists("l1"), "a gone agent is unknown again");
     }
 
     #[test]

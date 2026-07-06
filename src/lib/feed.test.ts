@@ -74,6 +74,14 @@ describe("buildFeedPayload", () => {
     expect(agents[0].num).toBeNull();
   });
 
+  it("always pushes lastReplyAt as null — the backend stamps it at emit", () => {
+    // feed-agent-reply-io U1: the webview never knows reply times; a pushed
+    // non-null value could go stale in the roster cache and desync from
+    // /agents/{key}/output's repliedAt.
+    const { agents } = buildFeedPayload(model([row({ leafKey: "leaf-4" })]));
+    expect(agents[0].lastReplyAt).toBeNull();
+  });
+
   it("returns an empty roster (not undefined) when no agents run", () => {
     expect(buildFeedPayload([])).toEqual({ agents: [] });
     expect(buildFeedPayload(model([]))).toEqual({ agents: [] });
