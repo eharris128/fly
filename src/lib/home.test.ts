@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   buildHomeModel,
+  busyAgentCount,
   effectiveAttention,
   effectiveTaskCount,
   formatDuration,
@@ -142,6 +143,45 @@ describe("buildHomeModel", () => {
 
   it("returns [] for empty inputs", () => {
     expect(buildHomeModel([], {}, {}, {})).toEqual([]);
+  });
+});
+
+describe("busyAgentCount", () => {
+  it("counts only working and running rows, not waiting/idle", () => {
+    const workspaces = [
+      ws("ws-1", "Alpha", [
+        tab(
+          "tab-1",
+          split("s1", leaf("a"), split("s2", leaf("b"), split("s3", leaf("c"), leaf("d")))),
+          "a",
+        ),
+      ]),
+    ];
+    const model = buildHomeModel(
+      workspaces,
+      {
+        a: agent(true, 9000, 0), // raised → waiting
+        b: agent(true, 3000, 0), // stretch → working
+        c: agent(true, null, 2), // acknowledged + tasks → running
+        d: agent(true, null, 0), // idle
+      },
+      {},
+      { a: "raised", c: "acknowledged" },
+    );
+    expect(model[0].tabs[0].rows.map((r) => r.status)).toEqual([
+      "waiting",
+      "working",
+      "running",
+      "idle",
+    ]);
+    expect(busyAgentCount(model)).toBe(2); // b (working) + c (running)
+  });
+
+  it("returns 0 for an empty model or an all-idle/waiting model", () => {
+    expect(busyAgentCount([])).toBe(0);
+    const workspaces = [ws("ws-1", "Alpha", [tab("tab-1", leaf("a"), "a")])];
+    const model = buildHomeModel(workspaces, { a: agent(true, null, 0) }, {}, {});
+    expect(busyAgentCount(model)).toBe(0);
   });
 });
 

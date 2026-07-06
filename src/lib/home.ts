@@ -229,6 +229,21 @@ export function agentCount(model: HomeWorkspaceGroup[]): number {
 }
 
 /**
+ * Rows whose status is in-progress work that quitting would cut off: a live
+ * turn (`working`) or a live background task (`running`). Gates the app-close
+ * confirmation dialog — `waiting` (parked, needs you) and `idle` don't count,
+ * since quitting there loses nothing that was actively in flight.
+ */
+export function busyAgentCount(model: HomeWorkspaceGroup[]): number {
+  let n = 0;
+  for (const ws of model)
+    for (const tab of ws.tabs)
+      for (const row of tab.rows)
+        if (row.status === "working" || row.status === "running") n++;
+  return n;
+}
+
+/**
  * Resolve a dashboard digit keypress (U4, R6/R8) to a jump target: the agent at
  * the flat workspace→tab→pane position the digit addresses. `1`–`9` are 1-based
  * positions; `0` is the tenth — mirroring the per-row `num` badges. Returns null

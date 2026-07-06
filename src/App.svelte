@@ -41,7 +41,12 @@
     type Tab,
     type Workspace,
   } from "./lib/workspaces";
-  import { buildHomeModel, effectiveAttention, effectiveTaskCount } from "./lib/home";
+  import {
+    buildHomeModel,
+    busyAgentCount,
+    effectiveAttention,
+    effectiveTaskCount,
+  } from "./lib/home";
   import { buildFeedPayload } from "./lib/feed";
   import {
     findAutomationsWorkspace,
@@ -2055,14 +2060,28 @@
 
     // Flush a final save before the window closes, while the shells are still
     // alive so their cwds are captured (R13/R14). Then the backend reaps panes.
+    // A busy agent (working a live turn, or running a live background task —
+    // busyAgentCount) gets one confirm first, via the shared destructive-confirm
+    // overlay, so an accidental × doesn't silently kill in-progress work.
     const win = getCurrentWindow();
-    await win.onCloseRequested(async (event) => {
-      event.preventDefault();
+    const closeNow = async () => {
       try {
         await persist();
       } finally {
         await win.destroy();
       }
+    };
+    await win.onCloseRequested(async (event) => {
+      event.preventDefault();
+      const busy = busyAgentCount(homeModel);
+      if (busy > 0) {
+        pendingConfirm = {
+          message: `${busy} agent${busy === 1 ? " is" : "s are"} still working. Quit anyway?`,
+          onConfirm: () => void closeNow(),
+        };
+        return;
+      }
+      await closeNow();
     });
   }
 
