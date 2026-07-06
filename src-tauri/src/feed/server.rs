@@ -263,10 +263,12 @@ fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec
         Some(reply) => AgentOutputBody {
             text: reply.text,
             replied_at: reply.replied_at_ms,
+            question: None,
         },
         None => AgentOutputBody {
             text: String::new(),
             replied_at: None,
+            question: None,
         },
     };
     json_response(serde_json::to_string(&body).unwrap_or_else(|_| "{\"text\":\"\"}".into()))

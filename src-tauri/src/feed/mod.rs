@@ -189,6 +189,7 @@ mod tests {
             live_task_count: 0,
             num: None,
             last_reply_at: None,
+            question_pending_at: None,
         }
     }
 

@@ -48,6 +48,66 @@ pub struct AgentEntry {
     /// pushed roster never carries it (`default`), keeping old pushes valid.
     #[serde(default)]
     pub last_reply_at: Option<u64>,
+    /// Epoch ms of the agent's pending question, or null when nothing is
+    /// pending (feed-pending-question R4). Backend-stamped at emit like
+    /// `last_reply_at`: for a **choice** question it is resolver-cache-derived
+    /// and equals `/output`'s `question.askedAt`; for a **permission** question
+    /// it is best-effort (the attention gate is evaluated independently at emit
+    /// and at request — KTD4) and may briefly lead or lag `/output`. A changed
+    /// value means a new question. The pushed roster never carries it.
+    #[serde(default)]
+    pub question_pending_at: Option<u64>,
+}
+
+/// One selectable option of a pending question, as the wire carries it
+/// (feed-pending-question U2; mirrors `session/transcript.rs::QuestionOption`
+/// after the U3 scrub/sanitize/truncate pass).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// One question of a pending AskUserQuestion batch, on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionSpec {
+    pub question: String,
+    pub header: String,
+    pub multi_select: bool,
+    pub options: Vec<QuestionOption>,
+}
+
+/// The pending question riding `GET /agents/{key}/output` while an agent is
+/// blocked on an interaction (feed-pending-question R1/R3/R7). Omitted — not
+/// null — when nothing is pending (R5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionBody {
+    /// Epoch ms the question was asked (the pending `tool_use`'s own stamp).
+    /// Equals the frame's `questionPendingAt` for a choice question (R4), and
+    /// keys the answer path's `ifAskedAt` guard.
+    pub asked_at: u64,
+    /// `"choice"` (AskUserQuestion picker) or `"permission"` (tool dialog).
+    pub kind: String,
+    /// `AskUserQuestion` for a choice; the pending tool's name for a permission.
+    pub tool: String,
+    /// R7: true only for the one shape v1 answers remotely — a single
+    /// single-select question. The consumer must not build answer UX when
+    /// false; the input route's guard rejects it anyway.
+    pub answerable: bool,
+    /// The context sentence above the ask, only when it provably belongs to it
+    /// (R2); omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// The question batch (choice kind; empty and omitted for permission).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<QuestionSpec>,
+    /// Secret-scrubbed one-line summary of a permission request's input
+    /// (permission kind; omitted for choice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
 }
 
 /// One automation, projected from `automations::model::Automation` + its derived
@@ -94,6 +154,13 @@ pub struct AgentOutputBody {
     /// number, so absence is cleaner than null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replied_at: Option<u64>,
+    /// The pending question, when the agent is blocked on one
+    /// (feed-pending-question R1/R5). Omitted when nothing is pending. During
+    /// a pending question `text`/`repliedAt` may legitimately equal the
+    /// question's own context sentence (the last text-bearing assistant entry
+    /// *is* the context) — expected duplication, not suppressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<QuestionBody>,
 }
 
 /// The full snapshot streamed on every SSE frame. `version` is the monotonic
@@ -159,6 +226,7 @@ mod tests {
                 live_task_count: 2,
                 num: Some(1),
                 last_reply_at: Some(1_699_999_999_000),
+                question_pending_at: Some(1_700_000_000_500),
             }],
             automations: vec![AutomationEntry {
                 id: "a1".into(),
@@ -180,6 +248,7 @@ mod tests {
         assert_eq!(v["agents"][0]["workingForMs"], 4200.0);
         assert_eq!(v["agents"][0]["liveTaskCount"], 2);
         assert_eq!(v["agents"][0]["lastReplyAt"], 1_699_999_999_000u64);
+        assert_eq!(v["agents"][0]["questionPendingAt"], 1_700_000_000_500u64);
         assert_eq!(v["automations"][0]["cron"], "*/5 * * * *");
         assert_eq!(v["automations"][0]["nextRunAt"], 1_700_000_300_000u64);
         assert_eq!(v["automations"][0]["lastStatus"], "succeeded");
@@ -278,9 +347,10 @@ mod tests {
 
     #[test]
     fn agent_entry_without_last_reply_at_deserializes_to_null() {
-        // Back-compat both ways: an old webview push (no lastReplyAt) loads as
-        // None, and a never-replied agent serializes an explicit null (the
-        // consumer's "never unread" state), not an absent key.
+        // Back-compat both ways: an old webview push (no lastReplyAt /
+        // questionPendingAt) loads as None, and a never-replied agent
+        // serializes an explicit null (the consumer's "never unread" /
+        // "nothing pending" state), not an absent key.
         let v = serde_json::json!({
             "leafKey": "leaf-1", "workspace": "home", "tab": "fly",
             "cwd": null, "status": "idle", "needsAttention": false,
@@ -288,8 +358,100 @@ mod tests {
         });
         let e: AgentEntry = serde_json::from_value(v).unwrap();
         assert_eq!(e.last_reply_at, None);
+        assert_eq!(e.question_pending_at, None);
         let out = serde_json::to_value(&e).unwrap();
         assert!(out["lastReplyAt"].is_null());
+        assert!(out["questionPendingAt"].is_null());
+    }
+
+    #[test]
+    fn output_body_choice_question_round_trips_golden_keys() {
+        // The full choice shape the `game` consumer pins against
+        // (feed-pending-question R1/R4/R7).
+        let body = AgentOutputBody {
+            text: "Pick a lag feel.".into(),
+            replied_at: Some(1_700_000_000_000),
+            question: Some(QuestionBody {
+                asked_at: 1_700_000_001_000,
+                kind: "choice".into(),
+                tool: "AskUserQuestion".into(),
+                answerable: true,
+                context: Some("Pick a lag feel.".into()),
+                questions: vec![QuestionSpec {
+                    question: "Lag feel?".into(),
+                    header: "Lag".into(),
+                    multi_select: false,
+                    options: vec![QuestionOption {
+                        label: "Snappy".into(),
+                        description: "Fast and tight".into(),
+                    }],
+                }],
+                request: None,
+            }),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["question"]["askedAt"], 1_700_000_001_000u64);
+        assert_eq!(v["question"]["kind"], "choice");
+        assert_eq!(v["question"]["tool"], "AskUserQuestion");
+        assert_eq!(v["question"]["answerable"], true);
+        assert_eq!(v["question"]["context"], "Pick a lag feel.");
+        assert_eq!(v["question"]["questions"][0]["question"], "Lag feel?");
+        assert_eq!(v["question"]["questions"][0]["header"], "Lag");
+        assert_eq!(v["question"]["questions"][0]["multiSelect"], false);
+        assert_eq!(v["question"]["questions"][0]["options"][0]["label"], "Snappy");
+        assert_eq!(
+            v["question"]["questions"][0]["options"][0]["description"],
+            "Fast and tight"
+        );
+        // Permission-only key absent on a choice.
+        assert!(v["question"].get("request").is_none());
+        // And it round-trips back byte-equal.
+        let back: AgentOutputBody = serde_json::from_value(v).unwrap();
+        assert_eq!(back, body);
+    }
+
+    #[test]
+    fn output_body_permission_question_round_trips_golden_keys() {
+        let body = AgentOutputBody {
+            text: String::new(),
+            replied_at: None,
+            question: Some(QuestionBody {
+                asked_at: 1_700_000_002_000,
+                kind: "permission".into(),
+                tool: "Bash".into(),
+                answerable: false,
+                context: None,
+                questions: vec![],
+                request: Some("cargo build".into()),
+            }),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["question"]["kind"], "permission");
+        assert_eq!(v["question"]["tool"], "Bash");
+        assert_eq!(v["question"]["answerable"], false);
+        assert_eq!(v["question"]["request"], "cargo build");
+        // Choice-only keys absent on a permission.
+        assert!(v["question"].get("questions").is_none());
+        assert!(v["question"].get("context").is_none());
+        let back: AgentOutputBody = serde_json::from_value(v).unwrap();
+        assert_eq!(back, body);
+    }
+
+    #[test]
+    fn output_body_without_question_omits_the_key() {
+        // R5: no pending question → the `question` key is absent (not null),
+        // so a consumer ignoring the new field sees today's body unchanged.
+        let body = AgentOutputBody {
+            text: "done".into(),
+            replied_at: Some(1),
+            question: None,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v.get("question").is_none());
+        // And an old-style body (no question key) still deserializes.
+        let old = serde_json::json!({"text": "done", "repliedAt": 1});
+        let back: AgentOutputBody = serde_json::from_value(old).unwrap();
+        assert_eq!(back.question, None);
     }
 
     #[test]
