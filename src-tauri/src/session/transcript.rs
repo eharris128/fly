@@ -636,6 +636,379 @@ fn capture_final_assistant_in_dir_since(
     None
 }
 
+// ---- pending interaction scan (feed-pending-question U1) -------------------
+
+/// One selectable option of a pending AskUserQuestion question. Parsed
+/// defensively from the undocumented `input.questions[].options[]` shape
+/// (KTD1): `label` is required, `description` defaults to empty, and a
+/// malformed option entry is skipped rather than failing the question.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// One question of a pending AskUserQuestion batch (verified live shape:
+/// `question`/`header`/`multiSelect`/`options[{label,description}]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuestionSpec {
+    pub question: String,
+    pub header: String,
+    pub multi_select: bool,
+    pub options: Vec<QuestionOption>,
+}
+
+/// Which kind of interaction the transcript tail is blocked on (KTD3):
+/// `Choice` is an AskUserQuestion picker — its pending `tool_use` *always*
+/// means waiting, classified from the transcript alone; `Permission` is any
+/// other tool's unresolved `tool_use`, which only means "waiting on a
+/// permission dialog" when the caller corroborates it against the pane's live
+/// attention reason (the transcript can't distinguish waiting from executing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingKind {
+    Choice,
+    Permission,
+}
+
+/// The transcript's pending interaction (feed-pending-question U1, R1/R2):
+/// what the agent stopped to ask, parsed from the unresolved `tool_use` tail.
+/// All strings are **raw and untrusted** — agent-authored, uncapped,
+/// unsanitized; the caller scrubs secrets, control-sanitizes, and truncates
+/// before exposing anything (R8, same posture as [`last_assistant_text`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingInteraction {
+    pub kind: PendingKind,
+    /// Epoch ms of the pending `tool_use` entry — when the question was asked.
+    /// Always present: a stampless pending entry abstains instead (the stamp
+    /// keys the wire marker and the answer guard, so exposure without it would
+    /// be unguardable).
+    pub asked_at_ms: u64,
+    /// The tool name: `AskUserQuestion` for `Choice`, the pending tool for
+    /// `Permission`.
+    pub tool: String,
+    /// R7: true only for the one shape v1 can answer remotely — a `Choice`
+    /// carrying exactly one single-select question with at least one option.
+    pub answerable: bool,
+    /// R2 context sentence: text from the same assistant entry as the ask, or
+    /// from the immediately preceding assistant entry with nothing but
+    /// metadata / sidechain / thinking-only entries between. `None` otherwise —
+    /// never an older reply masquerading as context.
+    pub context: Option<String>,
+    /// The parsed question batch (`Choice` only; empty for `Permission`).
+    pub questions: Vec<QuestionSpec>,
+    /// The pending tool's raw `input` object (`Permission` only) — the caller
+    /// builds a scrubbed summary from well-known fields (U3).
+    pub input: Option<serde_json::Value>,
+}
+
+/// Both per-agent IO facts from one transcript read (U1 → U3 seam): the last
+/// *completed* assistant reply and the *pending* interaction, so the resolver
+/// caches both from a single parse instead of reading the file twice.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptIo {
+    pub reply: Option<LastReply>,
+    pub pending: Option<PendingInteraction>,
+}
+
+/// Read a transcript once and resolve both IO halves. `None` for a missing /
+/// unreadable file (the caller's "no data" state, never an error).
+pub fn transcript_io(path: &Path) -> Option<TranscriptIo> {
+    let body = std::fs::read_to_string(path).ok()?;
+    Some(TranscriptIo {
+        reply: last_assistant_reply_from_str(&body),
+        pending: pending_interaction_from_str(&body),
+    })
+}
+
+/// Tools that delegate to a subagent whose own dialog is what's actually on
+/// screen (KTD3 rule 1): the main chain shows only the delegating `tool_use`
+/// (the inner conversation lives in a separate sidechain/session file), so the
+/// named tool and summary would not match what a keystroke approves — a
+/// confused-deputy hole, not a benign miss. Abstain. `Task` is the historical
+/// name; `Agent` is the name current Claude Code writes (verified live,
+/// 2026-07-06 — no `Task` occurrences remain in this machine's transcripts).
+fn is_delegating_tool(name: &str) -> bool {
+    matches!(name, "Task" | "Agent")
+}
+
+/// One real conversational entry of the tail window, newest-first, as the
+/// backward walk sees it (KTD2). Metadata, sidechain, and thinking-only
+/// entries never become items (transparent to contiguity *and* to context
+/// adjacency); `tool_result`-only user entries become [`WalkItem::Results`]
+/// (transparent to the pending walk, but they *break* R2 context adjacency —
+/// a tool ran between the candidate context text and the ask).
+enum WalkItem {
+    Assistant {
+        /// This entry's `tool_use` blocks: `(id, name, input)`.
+        tools: Vec<(String, String, serde_json::Value)>,
+        /// This entry's own text (context candidate), if any.
+        text: Option<String>,
+        /// This entry's parsed timestamp.
+        ts: Option<u64>,
+    },
+    Results,
+}
+
+/// The KTD2 backward walk: report the transcript's pending interaction, or
+/// `None` when nothing is pending / the shape is ambiguous (abstain-on-surprise,
+/// KTD1). Walks from the tail so the parallel-batch shape — every sibling's
+/// `tool_result` appended *after* all the `tool_use` lines — resolves
+/// correctly, and stops at the first text-bearing `user` entry (real
+/// conversation resuming, which clears pending). Verified live shapes this
+/// rests on (2026-07-06): the ask's `tool_use` flushes at ask time with its
+/// own timestamp; an Esc/reject writes an `is_error` `tool_result` for the
+/// same id (consumed like any other), often followed by a text user entry
+/// (the boundary).
+pub(crate) fn pending_interaction_from_str(body: &str) -> Option<PendingInteraction> {
+    use std::collections::HashSet;
+
+    let mut consumed: HashSet<String> = HashSet::new();
+    let mut items: Vec<WalkItem> = Vec::new();
+
+    for line in body.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue; // corrupt / unterminated line: transparent
+        };
+        if v.get("isSidechain").and_then(|s| s.as_bool()) == Some(true) {
+            continue; // subagent activity: transparent (KTD2)
+        }
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("user") => {
+                let (result_ids, has_text) = user_blocks(&v);
+                let had_results = !result_ids.is_empty();
+                for id in result_ids {
+                    consumed.insert(id);
+                }
+                if has_text {
+                    break; // the boundary: real conversation resumed
+                }
+                if had_results {
+                    items.push(WalkItem::Results);
+                }
+                // else: attachment-only/empty user entry — transparent.
+            }
+            Some("assistant") => {
+                let tools = tool_use_blocks(&v);
+                let text = assistant_text_blocks(&v);
+                if tools.is_empty() && text.is_none() {
+                    continue; // thinking-only entry — transparent
+                }
+                let ts = v
+                    .get("timestamp")
+                    .and_then(|t| t.as_str())
+                    .and_then(iso8601_to_ms);
+                items.push(WalkItem::Assistant { tools, text, ts });
+            }
+            _ => {} // metadata (`mode`, `ai-title`, `system`, …) — transparent
+        }
+    }
+
+    // Unconsumed tool_use candidates, newest-first, each with its item index
+    // (for the R2 context adjacency look-behind).
+    let mut unconsumed: Vec<(usize, &str, &str, &serde_json::Value, Option<u64>)> = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        if let WalkItem::Assistant { tools, ts, .. } = item {
+            for (id, name, input) in tools {
+                if !consumed.contains(id.as_str()) {
+                    unconsumed.push((idx, id, name, input, *ts));
+                }
+            }
+        }
+    }
+    if unconsumed.is_empty() {
+        return None;
+    }
+
+    // An AskUserQuestion among the unconsumed ids wins outright (KTD2): it
+    // never "executes", so pending means waiting even beside an unresolved
+    // sibling. Newest one if several.
+    if let Some(&(idx, _, _, input, ts)) = unconsumed
+        .iter()
+        .find(|(_, _, name, _, _)| *name == "AskUserQuestion")
+    {
+        let asked_at_ms = ts?; // stampless → unguardable → abstain
+        let (questions, dropped) = parse_questions(input)?;
+        let answerable = !dropped
+            && questions.len() == 1
+            && !questions[0].multi_select
+            && !questions[0].options.is_empty();
+        return Some(PendingInteraction {
+            kind: PendingKind::Choice,
+            asked_at_ms,
+            tool: "AskUserQuestion".to_string(),
+            answerable,
+            context: context_for(&items, idx),
+            questions,
+            input: None,
+        });
+    }
+
+    // No ask: expose the sole unconsumed tool as a permission candidate.
+    // More than one → the on-screen dialog serializes to the first, which
+    // post-hoc parsing can't identify — abstain (the `sole_transcript_since`
+    // posture). A delegating tool → abstain (KTD3).
+    if unconsumed.len() != 1 {
+        return None;
+    }
+    let (idx, _, name, input, ts) = unconsumed[0];
+    if is_delegating_tool(name) {
+        return None;
+    }
+    let asked_at_ms = ts?;
+    Some(PendingInteraction {
+        kind: PendingKind::Permission,
+        asked_at_ms,
+        tool: name.to_string(),
+        answerable: false,
+        context: context_for(&items, idx),
+        questions: Vec::new(),
+        input: Some(input.clone()),
+    })
+}
+
+/// A user entry's blocks, split for the walk: the `tool_use_id`s of its
+/// `tool_result` blocks, and whether it bears real text (a non-empty string
+/// body, or a non-empty `{"type":"text"}` block) — the KTD2 boundary signal.
+fn user_blocks(v: &serde_json::Value) -> (Vec<String>, bool) {
+    let Some(content) = v.get("message").and_then(|m| m.get("content")) else {
+        return (Vec::new(), false);
+    };
+    match content {
+        serde_json::Value::String(s) => (Vec::new(), !s.trim().is_empty()),
+        serde_json::Value::Array(blocks) => {
+            let mut ids = Vec::new();
+            let mut has_text = false;
+            for b in blocks {
+                match b.get("type").and_then(|t| t.as_str()) {
+                    Some("tool_result") => {
+                        if let Some(id) = b.get("tool_use_id").and_then(|i| i.as_str()) {
+                            ids.push(id.to_string());
+                        }
+                    }
+                    Some("text") => {
+                        if b.get("text")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(|t| !t.trim().is_empty())
+                        {
+                            has_text = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (ids, has_text)
+        }
+        _ => (Vec::new(), false),
+    }
+}
+
+/// An assistant entry's `tool_use` blocks as `(id, name, input)` — blocks
+/// missing an id or name are skipped (KTD1 defensive posture).
+fn tool_use_blocks(v: &serde_json::Value) -> Vec<(String, String, serde_json::Value)> {
+    let Some(serde_json::Value::Array(blocks)) = v.get("message").and_then(|m| m.get("content"))
+    else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+        .filter_map(|b| {
+            let id = b.get("id").and_then(|i| i.as_str())?;
+            let name = b.get("name").and_then(|n| n.as_str())?;
+            let input = b.get("input").cloned().unwrap_or(serde_json::Value::Null);
+            Some((id.to_string(), name.to_string(), input))
+        })
+        .collect()
+}
+
+/// The R2 context sentence for the pending entry at `items[idx]` (items are
+/// newest-first): text in the same assistant entry, else the immediately
+/// preceding entry's text — but only when that entry is an assistant one
+/// (`items[idx + 1]`, since transparent entries never made it into `items`).
+/// A `tool_result`-only user entry in between ([`WalkItem::Results`]) breaks
+/// adjacency: the candidate text narrated the *tool*, not the ask.
+fn context_for(items: &[WalkItem], idx: usize) -> Option<String> {
+    if let WalkItem::Assistant {
+        text: Some(text), ..
+    } = &items[idx]
+    {
+        return Some(text.clone());
+    }
+    match items.get(idx + 1) {
+        Some(WalkItem::Assistant {
+            text: Some(text), ..
+        }) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// Parse an AskUserQuestion `input.questions[]` batch defensively (KTD1): a
+/// question needs a non-empty `question` string (header defaults empty,
+/// `multiSelect` false — cosmetic omissions shouldn't suppress exposure); an
+/// option needs a `label`. Unparseable questions/options are skipped; zero
+/// parseable questions → `None` (abstain rather than expose an empty shell).
+///
+/// Returns `(specs, dropped)` where `dropped` is true if **any** question or
+/// option present in the raw arrays failed to parse. A parse-time drop shifts
+/// the wire's question/option indices out of alignment with the on-screen
+/// picker (which renders every raw entry), so a digit answer would select the
+/// wrong option — `pending_interaction_from_str` folds `dropped` into
+/// `answerable` so such an ask is never marked remotely answerable (the
+/// display-layer `question_body` catches blank-after-sanitize drops; this
+/// catches the earlier parse-layer drops it can't see).
+fn parse_questions(input: &serde_json::Value) -> Option<(Vec<QuestionSpec>, bool)> {
+    let questions = input.get("questions")?.as_array()?;
+    let mut dropped = false;
+    let mut parsed: Vec<QuestionSpec> = Vec::new();
+    for q in questions {
+        let Some(question) = q.get("question").and_then(|s| s.as_str()) else {
+            dropped = true;
+            continue;
+        };
+        if question.trim().is_empty() {
+            dropped = true;
+            continue;
+        }
+        let header = q
+            .get("header")
+            .and_then(|h| h.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let multi_select = q
+            .get("multiSelect")
+            .and_then(|m| m.as_bool())
+            .unwrap_or(false);
+        let mut options: Vec<QuestionOption> = Vec::new();
+        if let Some(opts) = q.get("options").and_then(|o| o.as_array()) {
+            for o in opts {
+                let Some(label) = o.get("label").and_then(|l| l.as_str()) else {
+                    dropped = true;
+                    continue;
+                };
+                options.push(QuestionOption {
+                    label: label.to_string(),
+                    description: o
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+        }
+        parsed.push(QuestionSpec {
+            question: question.to_string(),
+            header,
+            multi_select,
+            options,
+        });
+    }
+    (!parsed.is_empty()).then_some((parsed, dropped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,5 +1585,244 @@ mod tests {
             capture_final_assistant_in_dir_since(dir.path(), 0, 4, Duration::ZERO),
             None
         );
+    }
+
+    // ---- pending_interaction_from_str (feed-pending-question U1, KTD2) ------
+
+    /// The verified live shape of an AskUserQuestion ask (2026-07-06): one
+    /// `tool_use` flushed on its own assistant line, stamped at ask time, with
+    /// `questions[].question/header/multiSelect/options[{label,description}]`.
+    const ASK_ENTRY: &str = r#"{"type":"assistant","timestamp":"2026-07-06T13:12:27.103Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_ask1","name":"AskUserQuestion","input":{"questions":[{"question":"Lag feel?","header":"Lag","multiSelect":false,"options":[{"label":"Snappy","description":"Fast and tight"},{"label":"Floaty","description":"Loose"}]}]}}]}}"#;
+    const ASKED_AT: u64 = 1_783_343_547_103;
+
+    #[test]
+    fn a_pending_ask_reports_choice_with_stamp_and_options() {
+        let body = format!("{ASK_ENTRY}\n");
+        let p = pending_interaction_from_str(&body).expect("pending");
+        assert_eq!(p.kind, PendingKind::Choice);
+        assert_eq!(p.asked_at_ms, ASKED_AT);
+        assert_eq!(p.tool, "AskUserQuestion");
+        assert!(p.answerable, "one single-select question is answerable");
+        assert_eq!(p.questions.len(), 1);
+        assert_eq!(p.questions[0].question, "Lag feel?");
+        assert_eq!(p.questions[0].header, "Lag");
+        assert!(!p.questions[0].multi_select);
+        assert_eq!(p.questions[0].options.len(), 2);
+        assert_eq!(p.questions[0].options[0].label, "Snappy");
+        assert_eq!(p.questions[0].options[0].description, "Fast and tight");
+        assert_eq!(p.input, None);
+    }
+
+    #[test]
+    fn multi_select_and_multi_question_asks_are_not_answerable() {
+        // multiSelect: exposed but read-only in v1 (R7).
+        let multi = r#"{"type":"assistant","timestamp":"2026-07-06T13:12:27.103Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"question":"Which?","header":"H","multiSelect":true,"options":[{"label":"A"},{"label":"B"}]}]}}]}}"#;
+        let p = pending_interaction_from_str(&format!("{multi}\n")).unwrap();
+        assert!(!p.answerable);
+        assert!(p.questions[0].multi_select);
+        // Two questions: the answered latch keys on one askedAt, so a batch is
+        // read-only too.
+        let two = r#"{"type":"assistant","timestamp":"2026-07-06T13:12:27.103Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"question":"One?","options":[{"label":"A"}]},{"question":"Two?","options":[{"label":"B"}]}]}}]}}"#;
+        let p = pending_interaction_from_str(&format!("{two}\n")).unwrap();
+        assert!(!p.answerable);
+        assert_eq!(p.questions.len(), 2);
+        // Cosmetic omissions (header/multiSelect/description) default, not
+        // abstain — the question text and options are what matter.
+        assert_eq!(p.questions[0].header, "");
+        assert!(!p.questions[0].multi_select);
+        assert_eq!(p.questions[0].options[0].description, "");
+    }
+
+    #[test]
+    fn a_matching_tool_result_clears_pending_but_a_different_id_does_not() {
+        // Resolved: the answering tool_result lands as its own user entry.
+        let resolved = format!(
+            "{ASK_ENTRY}\n{}\n",
+            r#"{"type":"user","timestamp":"2026-07-06T13:14:06.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_ask1","content":"chose Snappy"}]}}"#
+        );
+        assert_eq!(pending_interaction_from_str(&resolved), None);
+        // Non-subsumption: a result for a DIFFERENT id leaves the ask pending.
+        let other = format!(
+            "{ASK_ENTRY}\n{}\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_other","content":"ok"}]}}"#
+        );
+        let p = pending_interaction_from_str(&other).expect("still pending");
+        assert_eq!(p.kind, PendingKind::Choice);
+    }
+
+    #[test]
+    fn parallel_batch_tail_results_resolve_by_id_not_position() {
+        // The verified batch shape: both tool_use lines flush first, the
+        // sibling results append after them. A result for A only leaves B
+        // pending — the backward walk consumes ids through the transparent
+        // tail results (KTD2, AE6).
+        let use_a = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tA","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let use_b = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tB","name":"Bash","input":{"command":"pwd"}}]}}"#;
+        let res_a = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tA","content":"done"}]}}"#;
+        let res_b = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tB","content":"done"}]}}"#;
+        let one_resolved = format!("{use_a}\n{use_b}\n{res_a}\n");
+        let p = pending_interaction_from_str(&one_resolved).expect("B pending");
+        assert_eq!(p.kind, PendingKind::Permission);
+        assert_eq!(p.tool, "Bash");
+        assert_eq!(p.input.as_ref().unwrap()["command"], "pwd");
+        // Both resolved → nothing pending.
+        let both = format!("{use_a}\n{use_b}\n{res_a}\n{res_b}\n");
+        assert_eq!(pending_interaction_from_str(&both), None);
+        // Both unresolved → ambiguous (>1 non-ask) → abstain.
+        let neither = format!("{use_a}\n{use_b}\n");
+        assert_eq!(pending_interaction_from_str(&neither), None);
+    }
+
+    #[test]
+    fn an_ask_wins_even_beside_an_unresolved_sibling() {
+        // KTD2: AskUserQuestion never "executes", so it is exposed even when a
+        // parallel sibling is also unconsumed (where a non-ask pair abstains).
+        let use_b = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tB","name":"Bash","input":{"command":"pwd"}}]}}"#;
+        let body = format!("{use_b}\n{ASK_ENTRY}\n");
+        let p = pending_interaction_from_str(&body).expect("ask pending");
+        assert_eq!(p.kind, PendingKind::Choice);
+    }
+
+    #[test]
+    fn conversation_moving_on_or_an_interrupt_clears_pending() {
+        // A plain text user entry (no tool_result) is the boundary: the
+        // conversation resumed, whatever ids sit beyond it.
+        let moved_on = format!(
+            "{ASK_ENTRY}\n{}\n",
+            r#"{"type":"user","message":{"role":"user","content":"actually, never mind"}}"#
+        );
+        assert_eq!(pending_interaction_from_str(&moved_on), None);
+        // The verified Esc/reject shape: an is_error tool_result for the same
+        // id (consumed like any answer), then a text user entry.
+        let rejected = format!(
+            "{ASK_ENTRY}\n{}\n{}\n",
+            r#"{"type":"user","timestamp":"2026-07-06T16:36:27.791Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_ask1","is_error":true,"content":"The user doesn't want to proceed with this tool use."}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}"#
+        );
+        assert_eq!(pending_interaction_from_str(&rejected), None);
+        // The synthesized single-entry interrupt shape: tool_result + text in
+        // ONE user entry — consumed AND the boundary.
+        let synthesized = format!(
+            "{ASK_ENTRY}\n{}\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_ask1","content":"[Request interrupted]"},{"type":"text","text":"[Request interrupted by user]"}]}}"#
+        );
+        assert_eq!(pending_interaction_from_str(&synthesized), None);
+    }
+
+    #[test]
+    fn trailing_metadata_and_sidechain_entries_are_transparent() {
+        // Metadata after the ask must not hide it…
+        let with_meta = format!(
+            "{ASK_ENTRY}\n{}\n{}\n",
+            r#"{"type":"ai-title"}"#, r#"{"type":"mode"}"#
+        );
+        assert!(pending_interaction_from_str(&with_meta).is_some());
+        // …and a sidechain tool_use at the tail is ignored outright (a
+        // subagent's pending tool is not THIS conversation's question).
+        let sidechain_tail = format!(
+            "{ASK_ENTRY}\n{}\n{}\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_ask1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-07-06T13:20:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"sc1","name":"Bash","input":{}}]}}"#
+        );
+        assert_eq!(pending_interaction_from_str(&sidechain_tail), None);
+    }
+
+    #[test]
+    fn a_sole_pending_delegating_tool_abstains() {
+        // KTD3: the on-screen dialog belongs to the subagent's inner tool, so
+        // exposing (or answering) the delegating tool would mislabel it.
+        // `Agent` is the live name (verified 2026-07-06); `Task` the historical.
+        for tool in ["Agent", "Task"] {
+            let body = format!(
+                "{}\n",
+                format!(
+                    r#"{{"type":"assistant","timestamp":"2026-07-06T10:00:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"{tool}","input":{{"prompt":"go"}}}}]}}}}"#
+                )
+            );
+            assert_eq!(pending_interaction_from_str(&body), None, "{tool} must abstain");
+        }
+    }
+
+    #[test]
+    fn a_sole_pending_ordinary_tool_reports_permission_with_input() {
+        let body = format!(
+            "{}\n",
+            r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"rm -rf build"}}]}}"#
+        );
+        let p = pending_interaction_from_str(&body).expect("pending");
+        assert_eq!(p.kind, PendingKind::Permission);
+        assert_eq!(p.tool, "Bash");
+        assert!(!p.answerable);
+        assert!(p.questions.is_empty());
+        assert_eq!(p.input.as_ref().unwrap()["command"], "rm -rf build");
+    }
+
+    #[test]
+    fn context_comes_from_the_same_or_immediately_preceding_assistant_entry() {
+        // Same-entry text beside the tool_use → context.
+        let same = r#"{"type":"assistant","timestamp":"2026-07-06T13:12:27.103Z","message":{"role":"assistant","content":[{"type":"text","text":"Pick a lag feel for the game."},{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"question":"Lag?","options":[{"label":"A"}]}]}}]}}"#;
+        let p = pending_interaction_from_str(&format!("{same}\n")).unwrap();
+        assert_eq!(p.context.as_deref(), Some("Pick a lag feel for the game."));
+        // Immediately preceding assistant text entry → context; thinking-only
+        // entries between are transparent (the verified live shape: text,
+        // thinking, ask).
+        let text = r#"{"type":"assistant","timestamp":"2026-07-06T13:12:20.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Two options stand out."}]}}"#;
+        let thinking = r#"{"type":"assistant","timestamp":"2026-07-06T13:12:25.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"}]}}"#;
+        let p = pending_interaction_from_str(&format!("{text}\n{thinking}\n{ASK_ENTRY}\n")).unwrap();
+        assert_eq!(p.context.as_deref(), Some("Two options stand out."));
+        // A tool_result-only user entry between breaks adjacency: that text
+        // narrated the tool, not the ask (R2 — never stale context).
+        let use_x = r#"{"type":"assistant","timestamp":"2026-07-06T13:12:22.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tX","name":"Bash","input":{}}]}}"#;
+        let res_x = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tX","content":"out"}]}}"#;
+        let p = pending_interaction_from_str(&format!("{text}\n{use_x}\n{res_x}\n{ASK_ENTRY}\n"))
+            .unwrap();
+        assert_eq!(p.context, None);
+    }
+
+    #[test]
+    fn a_parse_time_dropped_option_forces_not_answerable() {
+        // A single single-select question whose options array carries a
+        // malformed (label-less) entry: the good options still parse, but the
+        // on-screen picker renders all three positions, so a wire digit would
+        // map to the wrong option. `dropped` must force answerable=false even
+        // though the surviving shape looks answerable (a dropped question does
+        // too — covered by the len check).
+        let entry = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"question":"Pick?","options":[{"label":"A"},{"description":"no label"},{"label":"C"}]}]}}]}}"#;
+        let p = pending_interaction_from_str(&format!("{entry}\n")).expect("pending");
+        assert_eq!(p.kind, PendingKind::Choice);
+        assert_eq!(p.questions[0].options.len(), 2, "only the two labelled options parse");
+        assert!(!p.answerable, "a parse-time option drop breaks the digit mapping");
+    }
+
+    #[test]
+    fn surprise_shapes_abstain_rather_than_guess() {
+        // A stampless pending entry can't key the wire marker or the answer
+        // guard → abstain.
+        let stampless = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"question":"Q?","options":[{"label":"A"}]}]}}]}}"#;
+        assert_eq!(pending_interaction_from_str(&format!("{stampless}\n")), None);
+        // An ask whose questions are all unparseable → abstain, not an empty shell.
+        let empty_qs = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"header":"no question field"}]}}]}}"#;
+        assert_eq!(pending_interaction_from_str(&format!("{empty_qs}\n")), None);
+        // Malformed lines are skipped; empty body → None.
+        assert_eq!(pending_interaction_from_str("{ not json\ngarbage\n"), None);
+        assert_eq!(pending_interaction_from_str(""), None);
+    }
+
+    #[test]
+    fn transcript_io_resolves_both_halves_from_one_read() {
+        // A completed reply AND a later pending ask coexist: during a pending
+        // question the last text-bearing assistant entry legitimately doubles
+        // as the reply (the design blesses the duplication).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let reply = r#"{"type":"assistant","timestamp":"2026-07-06T13:12:20.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Here is the summary."}]}}"#;
+        std::fs::write(&path, format!("{reply}\n{ASK_ENTRY}\n")).unwrap();
+        let io = transcript_io(&path).expect("readable");
+        assert_eq!(io.reply.as_ref().unwrap().text, "Here is the summary.");
+        let p = io.pending.expect("pending");
+        assert_eq!(p.asked_at_ms, ASKED_AT);
+        assert_eq!(p.context.as_deref(), Some("Here is the summary."));
+        // Missing file → None (never an error).
+        assert_eq!(transcript_io(&dir.path().join("gone.jsonl")), None);
     }
 }

@@ -32,6 +32,66 @@ export interface AgentEntry {
    * that endpoint's `repliedAt`; the pushed roster always carries null.
    */
   lastReplyAt: number | null;
+  /**
+   * Epoch ms of the agent's pending question, or null when nothing is pending
+   * (feed-pending-question R4). Backend-stamped at emit like `lastReplyAt`:
+   * for a choice question it equals `/output`'s `question.askedAt`; for a
+   * permission question it is best-effort. A changed value means a new
+   * question. The pushed roster always carries null.
+   */
+  questionPendingAt: number | null;
+}
+
+/**
+ * One selectable option of a pending question (mirrors Rust `QuestionOption`).
+ * Rides `GET /agents/{key}/output` — the frontend never populates these; they
+ * document the boundary for the external consumer.
+ */
+export interface QuestionOption {
+  /**
+   * The answer primitive: the 1-based digit the on-screen picker binds this
+   * option to. To answer an `answerable` question, POST this string as
+   * `mode:"keys"` input — no need to reverse-engineer the keybinding.
+   */
+  key: string;
+  label: string;
+  description: string;
+}
+
+/** One question of a pending AskUserQuestion batch (mirrors Rust `QuestionSpec`). */
+export interface QuestionSpec {
+  question: string;
+  header: string;
+  multiSelect: boolean;
+  options: QuestionOption[];
+}
+
+/**
+ * The pending question on `GET /agents/{key}/output` (mirrors Rust
+ * `QuestionBody`; feed-pending-question R1/R7). Absent when nothing is
+ * pending. `answerable` is true only for the one v1-answerable shape — a
+ * single single-select question; consumers must not build answer UX otherwise.
+ */
+export interface QuestionBody {
+  askedAt: number;
+  kind: "choice" | "permission";
+  tool: string;
+  answerable: boolean;
+  context?: string;
+  questions?: QuestionSpec[];
+  request?: string;
+}
+
+/**
+ * `GET /agents/{key}/output` response body (mirrors Rust `AgentOutputBody`).
+ * Empty `text` with no `repliedAt` is the "no reply yet" state; `question` is
+ * present only while the agent is blocked on one (feed-pending-question). The
+ * frontend never populates this — it documents the boundary for the consumer.
+ */
+export interface AgentOutputBody {
+  text: string;
+  repliedAt?: number;
+  question?: QuestionBody;
 }
 
 /** One automation on the wire (mirrors Rust `AutomationEntry`). Backend-filled. */
@@ -81,6 +141,7 @@ export function buildFeedPayload(model: HomeWorkspaceGroup[]): FeedPublishPayloa
           liveTaskCount: row.liveTaskCount,
           num: row.num ?? null,
           lastReplyAt: null, // backend-stamped at emit; never pushed
+          questionPendingAt: null, // backend-stamped at emit; never pushed
         });
       }
     }

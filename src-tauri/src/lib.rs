@@ -347,6 +347,29 @@ pub fn run() {
                     return;
                 }
 
+                // Feed settle bump for Notification (feed-pending-question
+                // U5/KTD5): a permission dialog raises attention *now*, but its
+                // `tool_use` may not have flushed to the transcript yet — the
+                // frame emitted on this roster change would carry no
+                // `questionPendingAt`, and `FeedState::publish` dedups
+                // identical rosters, so nothing would re-emit until the roster
+                // next moved. One delayed bump re-reads after the flush
+                // settles. Placed after the capture-only and
+                // automation-suppression early returns, NOT gated on
+                // `recordable` (a debounced duplicate still means a dialog is
+                // up), off-thread because Claude Code blocks on this hook.
+                // Mirrors the post-Stop bump above; AskUserQuestion fires no
+                // hook at all, so its marker rides the normal roster poll.
+                if hook.hook_event.as_deref() == Some("Notification") {
+                    if let Some(feed) = handle.try_state::<Arc<feed::FeedState>>() {
+                        let feed = feed.inner().clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            feed.bump();
+                        });
+                    }
+                }
+
                 let signal = Signal {
                     reason,
                     tier: Tier::Hook,
@@ -661,35 +684,47 @@ pub fn run() {
                                 .collect()
                         });
                         let now_fn: feed::server::NowFn = Arc::new(notify::now_unix_ms);
-                        // Latest-reply resolver (feed-agent-reply-io U3): one
-                        // shared, cached instance behind both the /output
-                        // endpoint and the frame's lastReplyAt stamp (R3).
+                        // Per-leaf IO resolver (feed-agent-reply-io U3;
+                        // feed-pending-question U3/U4): one shared, cached
+                        // instance behind the /output endpoint and the frame's
+                        // lastReplyAt + questionPendingAt stamps (R3/R4) — one
+                        // transcript read serves every surface.
                         let resolver =
                             Arc::new(feed::io::ReplyResolver::new(session::resume::resume_path()));
-                        let reply_fn: feed::server::ReplyFn =
-                            Arc::new(move |leaf_key| resolver.resolve(leaf_key));
-                        // Input delivery (U5): leaf → live pane → sanitized
-                        // bracketed paste, then Enter as its OWN delayed write
-                        // (a same-chunk \r is swallowed as pasted content —
-                        // see `io::paste_payload`), then the same attention
-                        // clear local typing performs (`pty::pty_write`) — the
-                        // agent was just answered, so its ring must drop. The
-                        // sleep rides the HTTP connection thread, never a
-                        // dispatch/PTY thread.
+                        let io_fn: feed::server::IoFn =
+                            Arc::new(move |leaf_key| resolver.resolve_io(leaf_key));
+                        // Input delivery (U5; feed-pending-question U6): leaf
+                        // → live pane → the action's bytes. Submit is the
+                        // sanitized bracketed paste, then Enter as its OWN
+                        // delayed write (a same-chunk \r is swallowed as
+                        // pasted content — see `io::paste_payload`); Keys is
+                        // the raw R9-filtered answer bytes, no wrap, no Enter
+                        // (KTD6 — a digit selects a picker option instantly).
+                        // BOTH end in the same attention clear local typing
+                        // performs (`pty::pty_write`) — the agent was just
+                        // answered, so its ring must drop, and a remote keys
+                        // answer must not leave `reason: permission` stale
+                        // (KTD4/R9). The sleep rides the HTTP connection
+                        // thread, never a dispatch/PTY thread.
                         let input_fn: feed::server::InputFn = {
                             let pty = app.state::<Arc<PtyManager>>().inner().clone();
                             let attention = app.state::<Arc<AttentionManager>>().inner().clone();
                             let input_handle = app.handle().clone();
-                            Arc::new(move |leaf_key, text| {
+                            Arc::new(move |leaf_key, action| {
                                 let Some(pane) = pty.pane_by_leaf(leaf_key) else {
                                     return feed::server::InputOutcome::UnknownPane;
                                 };
-                                let delivered = pty
-                                    .write(pane, &feed::io::paste_payload(text))
-                                    .and_then(|()| {
-                                        std::thread::sleep(feed::io::SUBMIT_DELAY);
-                                        pty.write(pane, feed::io::SUBMIT)
-                                    });
+                                let delivered = match &action {
+                                    feed::server::InputAction::Submit(text) => pty
+                                        .write(pane, &feed::io::paste_payload(text))
+                                        .and_then(|()| {
+                                            std::thread::sleep(feed::io::SUBMIT_DELAY);
+                                            pty.write(pane, feed::io::SUBMIT)
+                                        }),
+                                    feed::server::InputAction::Keys(bytes) => {
+                                        pty.write(pane, bytes)
+                                    }
+                                };
                                 match delivered {
                                     Ok(()) => {
                                         if let Some(outcome) = attention.on_input(pane) {
@@ -701,14 +736,22 @@ pub fn run() {
                                 }
                             })
                         };
+                        // Live read of the keys-answer permission opt-in
+                        // (KTD6, default off) — a settings change applies to
+                        // the next request without a restart.
+                        let permission_answers_fn: feed::server::PermissionAnswersFn = {
+                            let cfg = Arc::clone(&config_store);
+                            Arc::new(move || cfg.get().feed.allow_permission_answers)
+                        };
                         match feed::FeedServer::start(
                             feed_cfg.port,
                             token,
                             Arc::clone(&feed_state),
                             automations_fn,
                             now_fn,
-                            reply_fn,
+                            io_fn,
                             input_fn,
+                            permission_answers_fn,
                         ) {
                             Ok(server) => {
                                 // An automation mutation bumps the feed so every

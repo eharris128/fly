@@ -130,6 +130,13 @@ pub struct FeedConfig {
     /// Bearer token a consumer must present. `None` until minted + persisted on
     /// first run. Never logged.
     pub token: Option<String>,
+    /// Whether `mode: "keys"` on `POST /agents/{key}/input` may answer a
+    /// **permission** dialog (feed-pending-question KTD6; Open Question
+    /// resolved as opt-in). **Off by default**: a digit on a permission dialog
+    /// can pick a durable "don't ask again", which would turn the bearer token
+    /// into a remote permission-approval credential. AskUserQuestion *choice*
+    /// answering is not gated by this — it needs no flag.
+    pub allow_permission_answers: bool,
 }
 
 impl Default for FeedConfig {
@@ -138,6 +145,7 @@ impl Default for FeedConfig {
             enabled: true,
             port: 4939,
             token: None,
+            allow_permission_answers: false,
         }
     }
 }
@@ -293,13 +301,16 @@ mod tests {
     }
 
     /// A config predating the feed block loads with the feed enabled on the
-    /// default port and no token yet (minted on first run).
+    /// default port, no token yet (minted on first run), and remote
+    /// permission-answering OFF (feed-pending-question KTD6 — the safety
+    /// default must hold for every pre-existing config).
     #[test]
     fn empty_config_has_feed_defaults() {
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(cfg.feed.enabled);
         assert_eq!(cfg.feed.port, 4939);
         assert_eq!(cfg.feed.token, None);
+        assert!(!cfg.feed.allow_permission_answers);
     }
 
     /// The nested-serde gotcha: a *partial* `feed` object keeps omitted siblings

@@ -11,28 +11,76 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fly_lib::feed::server::{FeedServer, InputOutcome, ReplyFn};
-use fly_lib::feed::wire::AgentEntry;
+use fly_lib::feed::io::{ReplyResolver, ResolvedIo};
+use fly_lib::feed::server::{FeedServer, InputAction, InputOutcome, IoFn};
+use fly_lib::feed::wire::{AgentEntry, QuestionBody, QuestionOption, QuestionSpec};
 use fly_lib::feed::FeedState;
 use fly_lib::session::transcript::LastReply;
 
 const TOKEN: &str = "test-token-abc123";
 const REPLIED_AT: u64 = 1_781_896_636_402;
+const ASKED_AT: u64 = 1_781_896_640_000;
 
-/// A reply resolver that knows one leaf: `leaf-replied` → a stamped reply.
-fn fake_replies() -> ReplyFn {
+/// An IO resolver that knows three leaves: `leaf-replied` → a stamped reply,
+/// `leaf-choice` → that reply + a pending choice question, `leaf-permission` →
+/// a pending Bash permission question (exposure of which the server must gate
+/// on the roster reason — feed-pending-question KTD3/KTD4).
+fn fake_io() -> IoFn {
     Arc::new(|leaf_key| {
-        (leaf_key == "leaf-replied").then(|| LastReply {
+        let reply = || LastReply {
             text: "All tests pass.".into(),
             replied_at_ms: Some(REPLIED_AT),
-        })
+        };
+        match leaf_key {
+            "leaf-replied" => ResolvedIo {
+                reply: Some(reply()),
+                question: None,
+            },
+            "leaf-choice" => ResolvedIo {
+                reply: Some(reply()),
+                question: Some(QuestionBody {
+                    asked_at: ASKED_AT,
+                    kind: "choice".into(),
+                    tool: "AskUserQuestion".into(),
+                    answerable: true,
+                    context: Some("Pick one.".into()),
+                    questions: vec![QuestionSpec {
+                        question: "Which?".into(),
+                        header: "Pick".into(),
+                        multi_select: false,
+                        options: vec![QuestionOption {
+                            key: "1".into(),
+                            label: "Alpha".into(),
+                            description: "first".into(),
+                        }],
+                    }],
+                    request: None,
+                }),
+            },
+            "leaf-permission" => ResolvedIo {
+                reply: None,
+                question: Some(QuestionBody {
+                    asked_at: ASKED_AT,
+                    kind: "permission".into(),
+                    tool: "Bash".into(),
+                    answerable: false,
+                    context: None,
+                    questions: vec![],
+                    request: Some("cargo build".into()),
+                }),
+            },
+            _ => ResolvedIo::default(),
+        }
     })
 }
 
-/// Start a server whose input seam records deliveries into the returned log;
-/// any leaf except `leaf-gone` (roster-listed but its pane just exited)
-/// delivers.
-fn start() -> (Arc<FeedState>, FeedServer, Arc<Mutex<Vec<(String, String)>>>) {
+/// Start a server whose input seam records deliveries into the returned log
+/// as `("leaf", "submit:<text>" | "keys:<bytes>")`; any leaf except
+/// `leaf-gone` (roster-listed but its pane just exited) delivers. Keys-mode
+/// permission answering follows `allow_permission_answers` (the KTD6 opt-in).
+fn start_with(
+    allow_permission_answers: bool,
+) -> (Arc<FeedState>, FeedServer, Arc<Mutex<Vec<(String, String)>>>) {
     let state = Arc::new(FeedState::new());
     let delivered: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&delivered);
@@ -42,19 +90,28 @@ fn start() -> (Arc<FeedState>, FeedServer, Arc<Mutex<Vec<(String, String)>>>) {
         Arc::clone(&state),
         Arc::new(Vec::new), // no automations in these tests
         Arc::new(|| 42),    // fixed stamp
-        fake_replies(),
-        Arc::new(move |leaf_key: &str, text: &str| {
+        fake_io(),
+        Arc::new(move |leaf_key: &str, action: InputAction| {
             if leaf_key == "leaf-gone" {
                 return InputOutcome::UnknownPane;
             }
-            log.lock()
-                .unwrap()
-                .push((leaf_key.to_string(), text.to_string()));
+            let describe = match &action {
+                InputAction::Submit(text) => format!("submit:{text}"),
+                InputAction::Keys(bytes) => {
+                    format!("keys:{}", String::from_utf8_lossy(bytes))
+                }
+            };
+            log.lock().unwrap().push((leaf_key.to_string(), describe));
             InputOutcome::Delivered
         }),
+        Arc::new(move || allow_permission_answers),
     )
     .unwrap();
     (state, server, delivered)
+}
+
+fn start() -> (Arc<FeedState>, FeedServer, Arc<Mutex<Vec<(String, String)>>>) {
+    start_with(false)
 }
 
 /// Send a raw HTTP/1.1 request and return (status line + headers, body read
@@ -123,6 +180,17 @@ fn agent(leaf: &str, status: &str) -> AgentEntry {
         live_task_count: 0,
         num: None,
         last_reply_at: None,
+        question_pending_at: None,
+    }
+}
+
+/// An [`agent`] whose pushed roster entry carries an attention reason — the
+/// corroboration signal the permission gate reads (feed-pending-question KTD3).
+fn agent_with_reason(leaf: &str, status: &str, reason: &str) -> AgentEntry {
+    AgentEntry {
+        reason: Some(reason.into()),
+        needs_attention: true,
+        ..agent(leaf, status)
     }
 }
 
@@ -227,6 +295,171 @@ fn feed_frames_stamp_last_reply_at_from_the_resolver() {
     assert!(body.contains("\"lastReplyAt\":null"), "body was: {body}");
 }
 
+// ---- questionPendingAt + /output question (feed-pending-question U4) --------
+
+#[test]
+fn a_pending_choice_stamps_the_frame_and_matches_output_asked_at() {
+    // R4's choice-kind invariant: the SSE marker and /output's askedAt are the
+    // same resolver-cached value, on both surfaces, regardless of reason.
+    let (state, server, _) = start();
+    state.publish(vec![agent_with_reason("leaf-choice", "waiting", "question")]);
+    let (_, sse) = get(
+        server.local_addr(),
+        "/feed",
+        Some(TOKEN),
+        Duration::from_millis(400),
+    );
+    assert!(
+        sse.contains(&format!("\"questionPendingAt\":{ASKED_AT}")),
+        "sse was: {sse}"
+    );
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-choice/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(v["question"]["askedAt"], ASKED_AT);
+    assert_eq!(v["question"]["kind"], "choice");
+    assert_eq!(v["question"]["answerable"], true);
+    assert_eq!(v["question"]["questions"][0]["options"][0]["label"], "Alpha");
+    // The reply half rides along unchanged (blessed duplication).
+    assert_eq!(v["text"], "All tests pass.");
+}
+
+#[test]
+fn a_pending_choice_on_a_working_row_is_still_exposed() {
+    // KTD5's blessed consequence: `status: "working"` with a pending question
+    // for up to ~IDLE_GAP_MS after the picker draws — not exclusive to waiting.
+    let (state, server, _) = start();
+    state.publish(vec![agent("leaf-choice", "working")]); // no reason at all
+    let (_, sse) = get(
+        server.local_addr(),
+        "/feed",
+        Some(TOKEN),
+        Duration::from_millis(400),
+    );
+    assert!(
+        sse.contains(&format!("\"questionPendingAt\":{ASKED_AT}")),
+        "sse was: {sse}"
+    );
+}
+
+#[test]
+fn a_permission_question_is_gated_on_the_permission_reason() {
+    // With the roster reason "permission" (fly backgrounded, pane raised) the
+    // question reaches both surfaces…
+    let (state, server, _) = start();
+    state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
+    let (_, sse) = get(
+        server.local_addr(),
+        "/feed",
+        Some(TOKEN),
+        Duration::from_millis(400),
+    );
+    assert!(
+        sse.contains(&format!("\"questionPendingAt\":{ASKED_AT}")),
+        "sse was: {sse}"
+    );
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-permission/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(v["question"]["kind"], "permission");
+    assert_eq!(v["question"]["tool"], "Bash");
+    assert_eq!(v["question"]["request"], "cargo build");
+
+    // …and with no (or another) reason, the same pending tool_use means
+    // "executing", so neither surface exposes it (KTD3).
+    state.publish(vec![agent("leaf-permission", "working")]);
+    let (_, sse) = get(
+        server.local_addr(),
+        "/feed",
+        Some(TOKEN),
+        Duration::from_millis(400),
+    );
+    assert!(
+        sse.contains("\"questionPendingAt\":null"),
+        "sse was: {sse}"
+    );
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-permission/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert!(v.get("question").is_none(), "body was: {body}");
+}
+
+#[test]
+fn a_delegating_tool_pending_abstains_end_to_end() {
+    // KTD3's confused-deputy rule through the REAL resolver: a sole pending
+    // `Agent` tool_use (a subagent's inner dialog is what's on screen) is not
+    // exposed even with reason "permission" — the transcript layer abstains,
+    // so no marker and no question object reach either surface.
+    let dir = tempfile::tempdir().unwrap();
+    let resume_path = dir.path().join("resume.json");
+    fly_lib::session::resume::upsert_at(
+        &resume_path,
+        "leaf-task",
+        fly_lib::session::resume::ResumePartial {
+            session_id: Some("sid-task".into()),
+            session_cwd: Some("/p".into()),
+            session_source: Some(fly_lib::session::resume::SessionSource::Hook),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let root = dir.path().join("projects");
+    let project = root.join("-p");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("sid-task.jsonl"),
+        concat!(
+            r#"{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{"prompt":"go"}}]}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let resolver = Arc::new(ReplyResolver::with_projects_root(resume_path, Some(root)));
+    let io_fn: IoFn = Arc::new(move |leaf| resolver.resolve_io(leaf));
+
+    let state = Arc::new(FeedState::new());
+    let server = FeedServer::start(
+        0,
+        TOKEN.to_string(),
+        Arc::clone(&state),
+        Arc::new(Vec::new),
+        Arc::new(|| 42),
+        io_fn,
+        Arc::new(|_: &str, _: InputAction| InputOutcome::Delivered),
+        Arc::new(|| true), // even fully opted in, the abstention holds
+    )
+    .unwrap();
+    state.publish(vec![agent_with_reason("leaf-task", "waiting", "permission")]);
+
+    let (_, sse) = get(
+        server.local_addr(),
+        "/feed",
+        Some(TOKEN),
+        Duration::from_millis(400),
+    );
+    assert!(sse.contains("\"questionPendingAt\":null"), "sse was: {sse}");
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-task/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert!(v.get("question").is_none(), "body was: {body}");
+}
+
 // ---- GET /agents/{key}/output (feed-agent-reply-io U4) ----------------------
 
 #[test]
@@ -269,6 +502,9 @@ fn output_serves_the_latest_reply_with_its_stamp() {
     let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
     assert_eq!(v["text"], "All tests pass.");
     assert_eq!(v["repliedAt"], REPLIED_AT);
+    // Regression guard (feed-pending-question R5): nothing pending → the
+    // `question` key is absent, the reply shape byte-identical to before.
+    assert!(v.get("question").is_none(), "body was: {body}");
 }
 
 #[test]
@@ -333,7 +569,7 @@ fn input_delivers_and_acks_ok() {
     assert_eq!(v["ok"], true);
     assert_eq!(
         delivered.lock().unwrap().as_slice(),
-        &[("l1".to_string(), "looks good, ship it".to_string())]
+        &[("l1".to_string(), "submit:looks good, ship it".to_string())]
     );
 }
 
@@ -362,6 +598,231 @@ fn input_with_a_malformed_body_is_400() {
         assert!(head.starts_with("HTTP/1.1 400"), "body {bad:?} → head: {head}");
     }
     assert!(delivered.lock().unwrap().is_empty());
+}
+
+// ---- POST /agents/{key}/input mode:keys + guard + latch (U6, KTD6/R11) -----
+
+#[test]
+fn keys_mode_requires_if_asked_at_and_a_sane_body() {
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("leaf-choice", "waiting")]);
+    // keys without ifAskedAt → 400 (mandatory, KTD6); unknown mode → 400;
+    // over-cap keys text → 400; control-only keys text → 400.
+    for bad in [
+        r#"{"text":"2","mode":"keys"}"#,
+        r#"{"text":"2","mode":"noise","ifAskedAt":1781896640000}"#,
+        r#"{"text":"22222222222222222","mode":"keys","ifAskedAt":1781896640000}"#,
+        "{\"text\":\"\\u001b\\r\\n\",\"mode\":\"keys\",\"ifAskedAt\":1781896640000}",
+    ] {
+        let (head, _) = post(server.local_addr(), "/agents/leaf-choice/input", Some(TOKEN), bad);
+        assert!(head.starts_with("HTTP/1.1 400"), "body {bad:?} → head: {head}");
+    }
+    assert!(delivered.lock().unwrap().is_empty());
+}
+
+#[test]
+fn keys_mode_answers_a_choice_with_raw_bytes_and_no_submit() {
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("leaf-choice", "waiting")]);
+    let (head, body) = post(
+        server.local_addr(),
+        "/agents/leaf-choice/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"2","mode":"keys","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(v["ok"], true);
+    // Raw bytes, no paste markers, no trailing Enter — the fake records the
+    // exact action shape (KTD6).
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[("leaf-choice".to_string(), "keys:2".to_string())]
+    );
+}
+
+#[test]
+fn a_stale_or_absent_pending_question_409s_and_delivers_nothing() {
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("leaf-choice", "waiting"), agent("l-idle", "idle")]);
+    // ifAskedAt mismatch (an older question's stamp) → 409.
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-choice/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"2","mode":"keys","ifAskedAt":{}}}"#, ASKED_AT - 5_000),
+    );
+    assert!(head.starts_with("HTTP/1.1 409"), "head was: {head}");
+    // A leaf with nothing pending: any guarded delivery (either mode) → 409.
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/l-idle/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"ok","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 409"), "head was: {head}");
+    assert!(delivered.lock().unwrap().is_empty());
+    // An unpublished key 404s BEFORE any pending comparison (precedence).
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-ghost/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"2","mode":"keys","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 404"), "head was: {head}");
+}
+
+#[test]
+fn the_answered_latch_admits_exactly_one_guarded_delivery() {
+    // AE7: two answers carrying the same valid ifAskedAt — the first delivers,
+    // the second 409s before the transcript could possibly reflect the first
+    // (the fake resolver never clears), and only ONE write reaches the seam.
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("leaf-choice", "waiting")]);
+    let body = format!(r#"{{"text":"2","mode":"keys","ifAskedAt":{ASKED_AT}}}"#);
+    let (head, _) = post(server.local_addr(), "/agents/leaf-choice/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    let (head, _) = post(server.local_addr(), "/agents/leaf-choice/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 409"), "second same-ifAskedAt: {head}");
+    assert_eq!(delivered.lock().unwrap().len(), 1, "exactly one delivery");
+    // A guarded submit against the same askedAt is latched too (R11 applies
+    // to any guarded delivery, not only keys).
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-choice/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"Alpha please","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 409"), "guarded submit after latch: {head}");
+}
+
+#[test]
+fn keys_answers_to_permission_dialogs_are_config_gated() {
+    // Default off: a keys answer to a pending *permission* question is 403 —
+    // the bearer token must not be a remote permission-approval credential
+    // unless explicitly opted in (KTD6, resolved Open Question). The 403
+    // carries a JSON discriminator body so a consumer doesn't mistake this
+    // policy refusal for an auth failure (api-contract review — the game
+    // consumer blanket-maps 403→auth-error).
+    let (state, server, delivered) = start();
+    state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
+    let body = format!(r#"{{"text":"1","mode":"keys","ifAskedAt":{ASKED_AT}}}"#);
+    let (head, resp_body) =
+        post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 403"), "head was: {head}");
+    assert!(
+        resp_body.contains("permissionAnswersDisabled"),
+        "403 must carry the discriminator body, was: {resp_body}"
+    );
+    assert!(delivered.lock().unwrap().is_empty());
+
+    // Opted in → delivers.
+    let (state, server, delivered) = start_with(true);
+    state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
+    let (head, _) = post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[("leaf-permission".to_string(), "keys:1".to_string())]
+    );
+
+    // The un-corroborated case, isolated from the latch (a FRESH server so no
+    // prior reservation confounds it): with the reason not "permission" the
+    // question is unexposed, so the guard 409s BEFORE the opt-in 403 — proving
+    // the reason re-check itself gates, even fully opted in.
+    let (state, server, delivered) = start_with(true);
+    state.publish(vec![agent("leaf-permission", "working")]); // no permission reason
+    let (head, _) = post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 409"), "unexposed permission → 409: {head}");
+    assert!(delivered.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_guarded_submit_to_a_permission_dialog_is_gated_like_keys() {
+    // The review's cross-cutting finding: a guarded SUBMIT (mode omitted) whose
+    // ifAskedAt matches a permission question confirms the dialog via its
+    // trailing Enter, so it is remote permission approval and requires the same
+    // opt-in as keys. Default off → 403, nothing delivered.
+    let (state, server, delivered) = start();
+    state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
+    let body = format!(r#"{{"text":"yes","ifAskedAt":{ASKED_AT}}}"#);
+    let (head, _) = post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 403"), "guarded submit to permission: {head}");
+    assert!(delivered.lock().unwrap().is_empty());
+    // Opted in → the guarded submit delivers (paste text recorded).
+    let (state, server, delivered) = start_with(true);
+    state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
+    let (head, _) = post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[("leaf-permission".to_string(), "submit:yes".to_string())]
+    );
+}
+
+#[test]
+fn a_guarded_answer_carries_the_option_key_the_consumer_posts() {
+    // The wire hands the consumer the digit; a keys answer echoes it back
+    // through the seam verbatim (feed-pending-question, agent-native review).
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("leaf-choice", "waiting")]);
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-choice/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    let key = v["question"]["questions"][0]["options"][0]["key"].as_str().unwrap();
+    assert_eq!(key, "1");
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-choice/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"{key}","mode":"keys","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[("leaf-choice".to_string(), format!("keys:{key}"))]
+    );
+}
+
+#[test]
+fn an_explicit_submit_mode_delivers_like_the_omitted_default() {
+    // api-contract gap: an explicit "mode":"submit" is the same inject-anytime
+    // paste+Enter as the omitted-mode default.
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("l1", "waiting")]);
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/l1/input",
+        Some(TOKEN),
+        r#"{"text":"ship it","mode":"submit"}"#,
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[("l1".to_string(), "submit:ship it".to_string())]
+    );
+}
+
+#[test]
+fn unguarded_submit_keeps_the_inject_anytime_contract() {
+    // No ifAskedAt → no guard, no latch: two identical submits both deliver
+    // (today's behavior, byte-for-byte).
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("l1", "waiting")]);
+    for _ in 0..2 {
+        let (head, _) = post(
+            server.local_addr(),
+            "/agents/l1/input",
+            Some(TOKEN),
+            r#"{"text":"keep going"}"#,
+        );
+        assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    }
+    assert_eq!(delivered.lock().unwrap().len(), 2);
 }
 
 #[test]

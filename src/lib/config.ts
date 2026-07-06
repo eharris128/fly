@@ -27,6 +27,11 @@ export interface FeedConfig {
   port: number;
   /** Bearer token a consumer must present; null until minted on first run. */
   token: string | null;
+  /** Whether a feed consumer may answer a *permission* dialog via
+   * `mode:"keys"` (feed-pending-question KTD6). Off by default — a digit can
+   * pick a durable "don't ask again", so remote permission approval is opt-in.
+   * AskUserQuestion choice answering is not gated by this. */
+  allowPermissionAnswers: boolean;
 }
 
 /** Shared defaults for automation agent runs (mirrors Rust AutomationDefaults,
