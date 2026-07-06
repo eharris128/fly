@@ -65,11 +65,15 @@ impl ConfigStore {
 /// The file is `0600` **on every write**, not only at token mint
 /// (feed-pending-question U5, R10): `config.json` carries the feed bearer
 /// token, and a rename replaces the inode — so a mint-time-only chmod would be
-/// clobbered by the next unrelated settings write. The mode is set on the temp
-/// file *before* the rename, so the token-bearing bytes are never readable by
-/// another local user even transiently (matches the `0600` automations store).
-/// This narrows only the cross-user threat: a same-uid process can still read
-/// the file, so the token-holder-equals-user trust model is unchanged.
+/// clobbered by the next unrelated settings write. On unix the temp file is
+/// created `0600` *before any token bytes are written* (via `OpenOptions` +
+/// `mode`, not a write-then-chmod that would leave a world-readable window),
+/// and the mode is re-forced before the write to cover a `0644` leftover temp
+/// a prior crash may have left for `create(true)` to reuse — so the
+/// token-bearing bytes are never readable by another local user, not even
+/// transiently (matches the `0600` automations store). This narrows only the
+/// cross-user threat: a same-uid process can still read the file, so the
+/// token-holder-equals-user trust model is unchanged.
 fn write_atomic(path: &Path, config: &Config) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -77,12 +81,24 @@ fn write_atomic(path: &Path, config: &Config) -> std::io::Result<()> {
     let json = serde_json::to_vec_pretty(config)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        // A reused leftover temp keeps its old (possibly 0644) mode on open —
+        // force 0600 while it is still empty, before the token bytes land.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(&json)?;
+        f.sync_all()?;
     }
+    #[cfg(not(unix))]
+    std::fs::write(&tmp, &json)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }

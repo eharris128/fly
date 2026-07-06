@@ -831,8 +831,9 @@ pub(crate) fn pending_interaction_from_str(body: &str) -> Option<PendingInteract
         .find(|(_, _, name, _, _)| *name == "AskUserQuestion")
     {
         let asked_at_ms = ts?; // stampless → unguardable → abstain
-        let questions = parse_questions(input)?;
-        let answerable = questions.len() == 1
+        let (questions, dropped) = parse_questions(input)?;
+        let answerable = !dropped
+            && questions.len() == 1
             && !questions[0].multi_select
             && !questions[0].options.is_empty();
         return Some(PendingInteraction {
@@ -950,52 +951,62 @@ fn context_for(items: &[WalkItem], idx: usize) -> Option<String> {
 /// `multiSelect` false — cosmetic omissions shouldn't suppress exposure); an
 /// option needs a `label`. Unparseable questions/options are skipped; zero
 /// parseable questions → `None` (abstain rather than expose an empty shell).
-fn parse_questions(input: &serde_json::Value) -> Option<Vec<QuestionSpec>> {
+///
+/// Returns `(specs, dropped)` where `dropped` is true if **any** question or
+/// option present in the raw arrays failed to parse. A parse-time drop shifts
+/// the wire's question/option indices out of alignment with the on-screen
+/// picker (which renders every raw entry), so a digit answer would select the
+/// wrong option — `pending_interaction_from_str` folds `dropped` into
+/// `answerable` so such an ask is never marked remotely answerable (the
+/// display-layer `question_body` catches blank-after-sanitize drops; this
+/// catches the earlier parse-layer drops it can't see).
+fn parse_questions(input: &serde_json::Value) -> Option<(Vec<QuestionSpec>, bool)> {
     let questions = input.get("questions")?.as_array()?;
-    let parsed: Vec<QuestionSpec> = questions
-        .iter()
-        .filter_map(|q| {
-            let question = q.get("question")?.as_str()?;
-            if question.trim().is_empty() {
-                return None;
+    let mut dropped = false;
+    let mut parsed: Vec<QuestionSpec> = Vec::new();
+    for q in questions {
+        let Some(question) = q.get("question").and_then(|s| s.as_str()) else {
+            dropped = true;
+            continue;
+        };
+        if question.trim().is_empty() {
+            dropped = true;
+            continue;
+        }
+        let header = q
+            .get("header")
+            .and_then(|h| h.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let multi_select = q
+            .get("multiSelect")
+            .and_then(|m| m.as_bool())
+            .unwrap_or(false);
+        let mut options: Vec<QuestionOption> = Vec::new();
+        if let Some(opts) = q.get("options").and_then(|o| o.as_array()) {
+            for o in opts {
+                let Some(label) = o.get("label").and_then(|l| l.as_str()) else {
+                    dropped = true;
+                    continue;
+                };
+                options.push(QuestionOption {
+                    label: label.to_string(),
+                    description: o
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
             }
-            let header = q
-                .get("header")
-                .and_then(|h| h.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let multi_select = q
-                .get("multiSelect")
-                .and_then(|m| m.as_bool())
-                .unwrap_or(false);
-            let options = q
-                .get("options")
-                .and_then(|o| o.as_array())
-                .map(|opts| {
-                    opts.iter()
-                        .filter_map(|o| {
-                            let label = o.get("label")?.as_str()?;
-                            Some(QuestionOption {
-                                label: label.to_string(),
-                                description: o
-                                    .get("description")
-                                    .and_then(|d| d.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            Some(QuestionSpec {
-                question: question.to_string(),
-                header,
-                multi_select,
-                options,
-            })
-        })
-        .collect();
-    (!parsed.is_empty()).then_some(parsed)
+        }
+        parsed.push(QuestionSpec {
+            question: question.to_string(),
+            header,
+            multi_select,
+            options,
+        });
+    }
+    (!parsed.is_empty()).then_some((parsed, dropped))
 }
 
 #[cfg(test)]
@@ -1766,6 +1777,21 @@ mod tests {
         let p = pending_interaction_from_str(&format!("{text}\n{use_x}\n{res_x}\n{ASK_ENTRY}\n"))
             .unwrap();
         assert_eq!(p.context, None);
+    }
+
+    #[test]
+    fn a_parse_time_dropped_option_forces_not_answerable() {
+        // A single single-select question whose options array carries a
+        // malformed (label-less) entry: the good options still parse, but the
+        // on-screen picker renders all three positions, so a wire digit would
+        // map to the wrong option. `dropped` must force answerable=false even
+        // though the surviving shape looks answerable (a dropped question does
+        // too — covered by the len check).
+        let entry = r#"{"type":"assistant","timestamp":"2026-07-06T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"question":"Pick?","options":[{"label":"A"},{"description":"no label"},{"label":"C"}]}]}}]}}"#;
+        let p = pending_interaction_from_str(&format!("{entry}\n")).expect("pending");
+        assert_eq!(p.kind, PendingKind::Choice);
+        assert_eq!(p.questions[0].options.len(), 2, "only the two labelled options parse");
+        assert!(!p.answerable, "a parse-time option drop breaks the digit mapping");
     }
 
     #[test]

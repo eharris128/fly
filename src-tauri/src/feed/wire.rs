@@ -65,6 +65,11 @@ pub struct AgentEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuestionOption {
+    /// The answer primitive: the 1-based source position the on-screen picker
+    /// binds this option to (verified live — a raw digit selects instantly).
+    /// A consumer answers an `answerable` question by `POST`ing this string as
+    /// `mode:"keys"` input, so it never has to reverse-engineer the keybinding.
+    pub key: String,
     pub label: String,
     pub description: String,
 }
@@ -382,6 +387,7 @@ mod tests {
                     header: "Lag".into(),
                     multi_select: false,
                     options: vec![QuestionOption {
+                        key: "1".into(),
                         label: "Snappy".into(),
                         description: "Fast and tight".into(),
                     }],
@@ -398,6 +404,7 @@ mod tests {
         assert_eq!(v["question"]["questions"][0]["question"], "Lag feel?");
         assert_eq!(v["question"]["questions"][0]["header"], "Lag");
         assert_eq!(v["question"]["questions"][0]["multiSelect"], false);
+        assert_eq!(v["question"]["questions"][0]["options"][0]["key"], "1");
         assert_eq!(v["question"]["questions"][0]["options"][0]["label"], "Snappy");
         assert_eq!(
             v["question"]["questions"][0]["options"][0]["description"],

@@ -288,6 +288,19 @@ fn empty_response(status: u16) -> Response<io::Cursor<Vec<u8>>> {
     Response::from_data(Vec::new()).with_status_code(status)
 }
 
+/// A JSON body with a non-200 status — used only for the post-auth policy
+/// refusal that needs a discriminator (see the `403` below). A body here is
+/// safe: the caller is already authenticated, so it leaks nothing the
+/// silent-rejection posture protects (that posture is about *unauthenticated*
+/// probing, which stays a bare 401).
+fn json_status(status: u16, body: &str) -> Response<io::Cursor<Vec<u8>>> {
+    let content_type = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+        .expect("static header is valid");
+    Response::from_string(body)
+        .with_header(content_type)
+        .with_status_code(status)
+}
+
 /// The KTD3/KTD4 exposure gate, shared verbatim by the frame stamp and the
 /// `/output` body so the two surfaces cannot apply different rules: a
 /// **choice** question is always exposed (an AskUserQuestion never "executes",
@@ -324,28 +337,44 @@ fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec
 
 /// `POST /agents/{key}/input`: parse `{"text", mode?, ifAskedAt?}` and deliver
 /// through the injected seam (feed-agent-reply-io U5; feed-pending-question
-/// U6/KTD6). Status precedence is pinned: 401 (upstream) → 404 (unpublished
-/// key — before any pending comparison) → 400 (bad body / unknown mode / keys
-/// without `ifAskedAt` / over-cap or empty-after-filter keys text) → 403
-/// (keys answer to a permission dialog without the config opt-in) → 409
-/// (stale-answer guard or answered latch). The seam re-checks the pane is
-/// live — a raced pane close is a 404, not a write into nothing.
+/// U6/KTD6). Status precedence is pinned, in the order the code checks it:
+/// 401 (upstream auth) → 404 (unpublished key, before any pending comparison)
+/// → 400 (bad body / unknown mode / keys without `ifAskedAt` / over-cap or
+/// empty-after-filter keys text) → **409** (the guarded question is not
+/// exposed — nothing pending, reason gone, or `ifAskedAt` mismatch) → **403**
+/// (a guarded answer to a *permission* dialog without the config opt-in) →
+/// **409** (a keys answer to an unanswerable choice shape, or the answered
+/// latch already holds this `askedAt`). The 403 carries a JSON discriminator
+/// body (`{"error":"permissionAnswersDisabled"}`) so a consumer does not
+/// mistake this policy refusal for an auth failure — auth failures in this
+/// feed are always a bare 401, never a 403.
 ///
 /// `mode` defaults to `"submit"` (today's paste + Enter, inject-anytime when
 /// `ifAskedAt` is absent). `ifAskedAt` — mandatory for `"keys"`, optional for
-/// `"submit"` — arms the R11 guard: the value must equal the current gated
-/// pending question's `askedAt`, and the per-leaf latch admits one guarded
-/// delivery per `askedAt` (reserved *before* the PTY write, released on a
-/// failed delivery so a transient failure stays retryable).
+/// `"submit"` — arms the R11 guard against the freshly re-read reason (not the
+/// entry snapshot, so a slow body read can't gate on a stale dialog state):
+/// the value must equal the current gated pending question's `askedAt`, and
+/// the per-leaf latch admits one guarded delivery per `askedAt` (reserved
+/// *before* the PTY write, released on a failed delivery — but only if this
+/// request's own reservation is still the one held, so a concurrent newer
+/// answer's reservation is never clobbered).
+///
+/// The permission opt-in gate covers **any** guarded delivery whose gated
+/// question is `permission`-kind, not only `mode:"keys"` — a guarded submit's
+/// trailing Enter confirms the dialog's default just as a digit does, so both
+/// are remote permission approval and both require the opt-in. An *unguarded*
+/// submit (no `ifAskedAt`) stays the pre-existing inject-anytime contract,
+/// byte-for-byte.
 fn agent_input_response(
     ctx: &HandlerCtx,
     key: &str,
     req: &mut tiny_http::Request,
 ) -> Response<io::Cursor<Vec<u8>>> {
-    // One roster snapshot for existence AND the reason the guard gates on.
-    let Some(reason) = ctx.state.agent_reason(key) else {
+    // Existence gate only (404). The reason the guard acts on is re-read fresh
+    // below, after the body read, so it can't be a stale pre-body snapshot.
+    if ctx.state.agent_reason(key).is_none() {
         return empty_response(404);
-    };
+    }
     let mut body = Vec::new();
     // Read one byte past the cap so an at-cap body is distinguishable from an
     // oversized one.
@@ -394,27 +423,29 @@ fn agent_input_response(
     // The stale-answer guard + answered latch (R11), armed by ifAskedAt.
     let mut reserved = false;
     if let Some(asked) = input.if_asked_at {
-        // Guard against the SAME gated view the read surfaces expose: an
-        // unexposed question (nothing pending, or a permission fact without
-        // the corroborating reason) is not answerable either.
+        // Re-read the reason NOW (after the body read) and gate the question on
+        // it, so reason + question are one fresh, body-independent read — a
+        // paced/chunked POST can't slip a locally-dismissed dialog's stale
+        // reason past the gate. A key that vanished meanwhile → unexposed.
+        let reason = ctx.state.agent_reason(key).flatten();
         let Some(q) = gated_question((ctx.io)(key).question, reason.as_deref()) else {
             return empty_response(409);
         };
         if q.asked_at != asked {
             return empty_response(409);
         }
-        if matches!(action, InputAction::Keys(_)) {
-            if q.kind == "permission" && !(ctx.permission_answers)() {
-                // The resolved Open Question: remote *permission* approval is
-                // config-gated, default off — a digit can pick a durable
-                // "don't ask again". Post-auth, so the 403 leaks nothing.
-                return empty_response(403);
-            }
-            if q.kind == "choice" && !q.answerable {
-                // R7: the guard rejects the shapes v1 can't answer
-                // (multi-question, multiSelect, dropped-option mapping).
-                return empty_response(409);
-            }
+        // Any guarded answer to a permission dialog is remote permission
+        // approval (a digit or a submit's Enter both confirm it), so the
+        // config opt-in gates both modes. Post-auth JSON body disambiguates
+        // the policy refusal from an auth 401.
+        if q.kind == "permission" && !(ctx.permission_answers)() {
+            return json_status(403, "{\"error\":\"permissionAnswersDisabled\"}");
+        }
+        // R7: a keys answer can only complete the one v1-answerable shape;
+        // reject the rest (multi-question, multiSelect, dropped-option mapping)
+        // rather than fire a mis-mapped digit into the picker.
+        if matches!(action, InputAction::Keys(_)) && q.kind == "choice" && !q.answerable {
+            return empty_response(409);
         }
         // Reserve before delivering: of two racing same-ifAskedAt answers,
         // exactly one proceeds (AE7).
@@ -428,8 +459,11 @@ fn agent_input_response(
 
     let outcome = (ctx.input)(key, action);
     if reserved && outcome != InputOutcome::Delivered {
-        // A failed delivery must stay retryable — release the reservation.
-        ctx.latch.lock().unwrap().remove(key);
+        // A failed delivery must stay retryable — release the reservation, but
+        // ONLY this request's own generation (see [`release_own_reservation`]).
+        if let Some(asked) = input.if_asked_at {
+            release_own_reservation(&ctx.latch, key, asked);
+        }
     }
     match outcome {
         InputOutcome::Delivered => json_response("{\"ok\":true}".into()),
@@ -439,6 +473,25 @@ fn agent_input_response(
             eprintln!("[fly] feed input delivery failed: {e}");
             empty_response(500)
         }
+    }
+}
+
+/// Release a leaf's answered-latch reservation **only when it still holds this
+/// request's own `asked` generation** (feed-pending-question R11). Between a
+/// request's reserve and its post-delivery release, a concurrent newer
+/// question can reserve a *different* `askedAt` for the same leaf; an
+/// unconditional `remove(key)` would erase that newer reservation and re-open
+/// the exactly-once guard for an answer that already delivered. The
+/// compare-and-remove makes a failed delivery release nothing but its own
+/// reservation.
+fn release_own_reservation(
+    latch: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    key: &str,
+    asked: u64,
+) {
+    let mut latch = latch.lock().unwrap();
+    if latch.get(key) == Some(&asked) {
+        latch.remove(key);
     }
 }
 
@@ -522,4 +575,67 @@ fn emit_frame(w: &mut Box<dyn Write + Send>, ctx: &HandlerCtx) -> Option<u64> {
 fn write_frame(w: &mut Box<dyn Write + Send>, bytes: &[u8]) -> io::Result<()> {
     w.write_all(bytes)?;
     w.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    fn choice(asked_at: u64, answerable: bool) -> QuestionBody {
+        QuestionBody {
+            asked_at,
+            kind: "choice".into(),
+            tool: "AskUserQuestion".into(),
+            answerable,
+            context: None,
+            questions: vec![],
+            request: None,
+        }
+    }
+
+    fn permission(asked_at: u64) -> QuestionBody {
+        QuestionBody {
+            asked_at,
+            kind: "permission".into(),
+            tool: "Bash".into(),
+            answerable: false,
+            context: None,
+            questions: vec![],
+            request: Some("cargo build".into()),
+        }
+    }
+
+    #[test]
+    fn gated_question_always_exposes_choice_but_gates_permission_on_reason() {
+        // Choice rides regardless of reason (an ask never "executes").
+        assert!(gated_question(Some(choice(1, true)), None).is_some());
+        assert!(gated_question(Some(choice(1, true)), Some("permission")).is_some());
+        // Permission needs the corroborating reason; anything else hides it.
+        assert!(gated_question(Some(permission(1)), Some("permission")).is_some());
+        assert!(gated_question(Some(permission(1)), None).is_none());
+        assert!(gated_question(Some(permission(1)), Some("question")).is_none());
+        // Nothing pending stays nothing.
+        assert!(gated_question(None, Some("permission")).is_none());
+    }
+
+    #[test]
+    fn release_own_reservation_only_removes_this_generation() {
+        let latch: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
+        // Holds our value → removed (a failed delivery stays retryable).
+        latch.lock().unwrap().insert("leaf".into(), 100);
+        release_own_reservation(&latch, "leaf", 100);
+        assert!(latch.lock().unwrap().get("leaf").is_none());
+
+        // Holds a NEWER generation's value → left intact (no clobber): a
+        // concurrent newer answer reserved 200 between our reserve and release.
+        latch.lock().unwrap().insert("leaf".into(), 200);
+        release_own_reservation(&latch, "leaf", 100);
+        assert_eq!(latch.lock().unwrap().get("leaf"), Some(&200));
+
+        // Absent key → no-op, no panic.
+        release_own_reservation(&latch, "other", 100);
+        assert!(latch.lock().unwrap().get("other").is_none());
+    }
 }

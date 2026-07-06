@@ -80,13 +80,6 @@ impl ReplyResolver {
         }
     }
 
-    /// The leaf's latest reply — the read `GET /agents/{key}/output` and the
-    /// frame's `lastReplyAt` share. Kept as a thin front over [`resolve_io`]
-    /// so pre-question callers are untouched.
-    pub fn resolve(&self, leaf_key: &str) -> Option<LastReply> {
-        self.resolve_io(leaf_key).reply
-    }
-
     /// Both IO facts for a leaf from one transcript read (feed-pending-question
     /// U3/KTD4): the latest reply, and the pending question already in wire
     /// shape. Either half is `None` when any link is missing — no resume
@@ -153,7 +146,7 @@ impl ReplyResolver {
     }
 }
 
-// ---- question shaping: scrub → sanitize → truncate (U3, R8/KTD7) -----------
+// ---- question shaping: sanitize → scrub → truncate (U3, R8/KTD7) -----------
 
 /// Exposure ceilings, in chars, pinned per the plan (values negotiable; the
 /// contract is that they are pinned and oversized content is
@@ -168,21 +161,34 @@ const DESCRIPTION_CAP: usize = 1024;
 const CONTEXT_CAP: usize = 2048;
 const REQUEST_CAP: usize = 512;
 
-/// The one string pipeline for every newly exposed question string (R8, fixed
-/// order): secret-scrub the **full, untruncated** value first
-/// (`automations/redact.rs`), *then* control-sanitize (R16 posture,
-/// newlines/tabs kept), *then* truncate to `cap` on a char boundary with an
-/// ellipsis — so a secret straddling the truncation boundary is masked before
-/// its tail is cut. `None` when the result is blank (a blank string is absent,
-/// never served empty).
+/// The one string pipeline for every newly exposed question string (R8):
+/// control-sanitize the **full, untruncated** value first (R16 posture,
+/// newlines/tabs kept), *then* secret-scrub, *then* truncate to `cap` on a
+/// char boundary with an ellipsis.
+///
+/// Order matters twice, and both properties hold because scrub sees the full,
+/// control-free string:
+/// - **Straddle (R8's original goal):** scrub runs on the full-length value,
+///   so a secret spanning the truncation boundary is masked before its tail is
+///   cut.
+/// - **Reassembly (review finding):** `redact::scrub_secrets` matches tokens by
+///   `starts_with(prefix)` / key-marker `contains`, both of which a control or
+///   zero-width char *inside* the token defeats. Sanitizing **before** scrub
+///   makes the token contiguous when the prefix/marker scan runs, so a crafted
+///   `sk-\u{200b}ant-…` can't slip past scrub and then be re-formed into
+///   cleartext by a later sanitize pass. (Scrubbing first, as the code
+///   originally did, left exactly that reassembly hole.)
+///
+/// `None` when the result is blank (a blank string is absent, never served
+/// empty).
 fn clean(raw: &str, cap: usize) -> Option<String> {
-    let scrubbed = redact::scrub_secrets(raw);
-    let sane = crate::notify::sanitize_multiline(&scrubbed);
-    if sane.trim().is_empty() {
+    let sane = crate::notify::sanitize_multiline(raw);
+    let scrubbed = redact::scrub_secrets(&sane);
+    if scrubbed.trim().is_empty() {
         return None;
     }
-    let mut out: String = sane.chars().take(cap).collect();
-    if sane.chars().count() > cap {
+    let mut out: String = scrubbed.chars().take(cap).collect();
+    if scrubbed.chars().count() > cap {
         out.push('…');
     }
     Some(out)
@@ -194,10 +200,19 @@ fn clean(raw: &str, cap: usize) -> Option<String> {
 /// the KTD1 abstain posture, extended to the display layer).
 ///
 /// `answerable` is recomputed *here*, after cleaning, and is stricter than the
-/// parse-time flag: any dropped question or dropped option (blank after
-/// sanitize) breaks the wire↔screen index mapping a digit answer relies on, so
-/// it forces `answerable: false`. Truncating a >8-option tail keeps the prefix
-/// mapping intact and stays answerable.
+/// parse-time flag on both ends: it ANDs `p.answerable` (which already carries
+/// the transcript-layer parse-drop verdict this function can't re-derive) with
+/// a fresh check that no question or option was dropped by *this* display-layer
+/// clean (blank after sanitize). Either kind of drop breaks the wire↔screen
+/// index mapping a digit answer relies on, so it forces `answerable: false`.
+/// Truncating a >8-option tail keeps the 1..8 prefix mapping intact and stays
+/// answerable.
+///
+/// Each wire option carries `key` — the 1-based **source** position (the digit
+/// the on-screen picker binds to that option, verified live). It is taken from
+/// the pre-drop enumeration index so a blank-dropped option leaves a gap rather
+/// than renumbering its successors (a renumber would silently mis-map a digit);
+/// for an answerable question no drops occur, so keys are contiguous `1..N`.
 fn question_body(p: &PendingInteraction) -> Option<QuestionBody> {
     match p.kind {
         PendingKind::Choice => {
@@ -209,12 +224,13 @@ fn question_body(p: &PendingInteraction) -> Option<QuestionBody> {
                     continue;
                 };
                 let mut options: Vec<QuestionOption> = Vec::new();
-                for o in q.options.iter().take(MAX_OPTIONS) {
+                for (i, o) in q.options.iter().take(MAX_OPTIONS).enumerate() {
                     let Some(label) = clean(&o.label, LABEL_CAP) else {
                         dropped_any = true;
                         continue;
                     };
                     options.push(QuestionOption {
+                        key: (i + 1).to_string(),
                         label,
                         description: clean(&o.description, DESCRIPTION_CAP).unwrap_or_default(),
                     });
@@ -229,7 +245,8 @@ fn question_body(p: &PendingInteraction) -> Option<QuestionBody> {
             if questions.is_empty() {
                 return None;
             }
-            let answerable = !dropped_any
+            let answerable = p.answerable
+                && !dropped_any
                 && p.questions.len() == 1
                 && questions.len() == 1
                 && !questions[0].multi_select
@@ -370,7 +387,7 @@ mod tests {
     fn resolves_a_leaf_to_its_transcripts_last_reply() {
         let dir = tempfile::tempdir().unwrap();
         let r = fixture(dir.path(), "leaf-1", "sid-abc", "/home/evan/projects/play", TRANSCRIPT);
-        let reply = r.resolve("leaf-1").expect("a reply resolves");
+        let reply = r.resolve_io("leaf-1").reply.expect("a reply resolves");
         assert_eq!(reply.text, "All tests pass.");
         assert_eq!(reply.replied_at_ms, Some(REPLIED_AT));
     }
@@ -380,7 +397,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let r = fixture(dir.path(), "leaf-1", "sid-abc", "/home/evan/projects/play", TRANSCRIPT);
         // Unknown leaf (no record) → None.
-        assert_eq!(r.resolve("leaf-ghost"), None);
+        assert_eq!(r.resolve_io("leaf-ghost").reply, None);
         // A record with no captured session yet → None.
         resume::upsert_at(
             &dir.path().join("resume.json"),
@@ -391,10 +408,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(r.resolve("leaf-2"), None);
+        assert_eq!(r.resolve_io("leaf-2").reply, None);
         // A record whose transcript is gone from disk → None.
         std::fs::remove_dir_all(dir.path().join("projects")).unwrap();
-        assert_eq!(r.resolve("leaf-1"), None);
+        assert_eq!(r.resolve_io("leaf-1").reply, None);
     }
 
     #[test]
@@ -402,7 +419,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = "/home/evan/projects/play";
         let r = fixture(dir.path(), "leaf-1", "sid-abc", cwd, TRANSCRIPT);
-        assert_eq!(r.resolve("leaf-1").unwrap().text, "All tests pass.");
+        assert_eq!(r.resolve_io("leaf-1").reply.unwrap().text, "All tests pass.");
         // Append a newer reply (mtime/len change) → the resolver re-reads.
         let path = dir
             .path()
@@ -414,7 +431,7 @@ mod tests {
             r#"{"type":"assistant","timestamp":"2026-06-19T19:20:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"One flaked on retry."}]}}"#
         );
         std::fs::write(&path, appended).unwrap();
-        let reply = r.resolve("leaf-1").unwrap();
+        let reply = r.resolve_io("leaf-1").reply.unwrap();
         assert_eq!(reply.text, "One flaked on retry.");
         assert!(reply.replied_at_ms.unwrap() > REPLIED_AT);
     }
@@ -427,11 +444,11 @@ mod tests {
         // printable residue and newline kept (sanitize_multiline, R16 posture).
         let body = r#"{"type":"assistant","message":{"role":"assistant","content":"ok\u001b[2J\ndone"}}"#;
         let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{body}\n"));
-        assert_eq!(r.resolve("leaf-1").unwrap().text, "ok[2J\ndone");
+        assert_eq!(r.resolve_io("leaf-1").reply.unwrap().text, "ok[2J\ndone");
         // A reply that is nothing but stripped chars counts as no reply.
         let blank = r#"{"type":"assistant","message":{"role":"assistant","content":"\u0007\u001b"}}"#;
         let r = fixture(dir.path(), "leaf-2", "sid-def", "/q", &format!("{blank}\n"));
-        assert_eq!(r.resolve("leaf-2"), None);
+        assert_eq!(r.resolve_io("leaf-2").reply, None);
     }
 
     // ---- resolve_io: reply + pending from one read (feed-pending-question U3)
@@ -466,7 +483,7 @@ mod tests {
         assert_eq!(q.questions.len(), 1);
         assert_eq!(q.questions[0].options.len(), 2);
         // And the thin resolve() front still serves the reply alone.
-        assert_eq!(r.resolve("leaf-1").unwrap().text, "Two options stand out.");
+        assert_eq!(r.resolve_io("leaf-1").reply.unwrap().text, "Two options stand out.");
     }
 
     #[test]
@@ -568,6 +585,81 @@ mod tests {
         assert_eq!(q.questions[0].options.len(), 1);
         assert_eq!(q.questions[0].options[0].label, "Keep");
         assert!(!q.answerable, "a dropped option breaks digit mapping");
+    }
+
+    #[test]
+    fn a_control_char_inside_a_secret_token_cannot_reassemble_past_the_scrubber() {
+        // Review finding: with scrub-before-sanitize a crafted secret carrying
+        // a zero-width/control char that breaks the token prefix (or a
+        // sensitive-key marker) slips past the scrubber, then sanitize strips
+        // the char and re-forms the secret in cleartext on the wire. The
+        // sanitize-then-scrub order closes it: scrub sees the contiguous token.
+        // A leading ZWSP before the prefix, and one splitting a KEY= marker.
+        let entry = r#"{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{"questions":[{"question":"ok?","options":[{"label":"A","description":"token \u200bsk-ant-api03-abcdefghijklmnop here"},{"label":"B","description":"AWS_SEC\u200bRET_ACCESS_KEY=wJalrXUtnFEMIabcdef"}]}]}}]}}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{entry}\n"));
+        let q = r.resolve_io("leaf-1").question.expect("pending");
+        let d0 = &q.questions[0].options[0].description;
+        let d1 = &q.questions[0].options[1].description;
+        assert!(!d0.contains("sk-ant-api03"), "zwsp-prefixed token leaked: {d0}");
+        assert!(d0.contains("[redacted]"), "was: {d0}");
+        assert!(!d1.contains("wJalrXUtnFEMI"), "zwsp-split key value leaked: {d1}");
+        assert!(d1.contains("[redacted]"), "was: {d1}");
+    }
+
+    #[test]
+    fn an_answerable_choice_carries_contiguous_source_position_keys() {
+        // R7/agent-native: an answerable question hands the consumer the exact
+        // digit each option binds to (`key`), 1-based and contiguous, so it
+        // never has to reverse-engineer the picker keybinding.
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", PENDING_ASK);
+        let q = r.resolve_io("leaf-1").question.expect("pending");
+        assert!(q.answerable);
+        assert_eq!(q.questions[0].options[0].key, "1");
+        assert_eq!(q.questions[0].options[1].key, "2");
+    }
+
+    #[test]
+    fn a_single_select_with_over_eight_options_truncates_but_stays_answerable() {
+        // The truncate-and-serve path for ONE single-select question: the >8
+        // tail is cut, the 1..8 prefix mapping is intact (no drops), so it
+        // stays answerable — distinct from the multi-question read-only path.
+        let options: Vec<String> = (0..12).map(|i| format!(r#"{{"label":"opt{i}"}}"#)).collect();
+        let entry = format!(
+            r#"{{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{{"questions":[{{"question":"Pick?","multiSelect":false,"options":[{}]}}]}}}}]}}}}"#,
+            options.join(",")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{entry}\n"));
+        let q = r.resolve_io("leaf-1").question.expect("served");
+        assert_eq!(q.questions[0].options.len(), 8);
+        assert_eq!(q.questions[0].options[7].key, "8");
+        assert!(q.answerable, "an 8-of-12 prefix keeps digit mapping and stays answerable");
+    }
+
+    #[test]
+    fn permission_request_maps_edit_write_file_path_and_abstains_for_unknown_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        // Edit → file_path summary.
+        let edit = r#"{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/home/e/app.rs","old_string":"a","new_string":"b"}}]}}"#;
+        let r = fixture(dir.path(), "leaf-edit", "sid-e", "/pe", &format!("{edit}\n"));
+        let q = r.resolve_io("leaf-edit").question.expect("pending");
+        assert_eq!(q.tool, "Edit");
+        assert_eq!(q.request.as_deref(), Some("/home/e/app.rs"));
+        // Write → file_path too.
+        let write = r#"{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"/tmp/out.txt","content":"x"}}]}}"#;
+        let r = fixture(dir.path(), "leaf-write", "sid-w", "/pw", &format!("{write}\n"));
+        assert_eq!(
+            r.resolve_io("leaf-write").question.unwrap().request.as_deref(),
+            Some("/tmp/out.txt")
+        );
+        // An unknown tool exposes its name but no synthesized summary (KTD1).
+        let webfetch = r#"{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"WebFetch","input":{"url":"https://x"}}]}}"#;
+        let r = fixture(dir.path(), "leaf-wf", "sid-f", "/pf", &format!("{webfetch}\n"));
+        let q = r.resolve_io("leaf-wf").question.expect("pending");
+        assert_eq!(q.tool, "WebFetch");
+        assert_eq!(q.request, None);
     }
 
     #[test]

@@ -101,26 +101,15 @@ impl FeedState {
         self.inner.lock().unwrap().version
     }
 
-    /// Whether `leaf_key` is in the currently-published roster — the key
-    /// authority for the per-agent endpoints (feed-agent-reply-io KTD2): a key
-    /// the feed has never served is "unknown agent" (404), and a pane that is
-    /// not an agent never becomes remotely addressable.
-    pub fn agent_exists(&self, leaf_key: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .agents
-            .iter()
-            .any(|a| a.leaf_key == leaf_key)
-    }
-
-    /// Existence **and** attention reason in one lock acquisition
-    /// (feed-pending-question U4/KTD4): `None` = unknown agent (the 404
-    /// authority, same as [`agent_exists`](Self::agent_exists)); `Some(reason)`
-    /// = published, carrying the entry's pushed `reason` (`Some("permission")`
-    /// while a permission dialog holds the pane raised, `None` otherwise). The
-    /// permission gate must read both from one roster snapshot — two separate
-    /// reads could straddle a roster swap and gate on another moment's reason.
+    /// Existence **and** attention reason in one lock acquisition — the key
+    /// authority for the per-agent endpoints (feed-agent-reply-io KTD2;
+    /// feed-pending-question U4/KTD4): `None` = unknown agent (a key the feed
+    /// has never served is a 404, and a non-agent pane never becomes remotely
+    /// addressable); `Some(reason)` = published, carrying the entry's pushed
+    /// `reason` (`Some("permission")` while a permission dialog holds the pane
+    /// raised, `None` otherwise). The permission gate must read existence and
+    /// reason from one roster snapshot — two separate reads could straddle a
+    /// roster swap and gate on another moment's reason.
     pub fn agent_reason(&self, leaf_key: &str) -> Option<Option<String>> {
         self.inner
             .lock()
@@ -211,29 +200,22 @@ mod tests {
     }
 
     #[test]
-    fn agent_reason_reports_existence_and_reason_in_one_read() {
-        // feed-pending-question U4: None = unknown (404); Some(None) =
-        // published, no reason; Some(Some(..)) = published + raised reason.
+    fn agent_reason_tracks_existence_and_reason_across_the_published_roster() {
+        // feed-pending-question U4 (the sole 404-authority + gate read): None =
+        // unknown (404); Some(None) = published, no reason; Some(Some(..)) =
+        // published + raised reason. A gone agent is unknown again.
         let s = FeedState::new();
         assert_eq!(s.agent_reason("l1"), None);
         s.publish(vec![agent("l1", "working")]);
         assert_eq!(s.agent_reason("l1"), Some(None));
+        assert_eq!(s.agent_reason("l2"), None);
         let mut raised = agent("l2", "waiting");
         raised.reason = Some("permission".into());
         s.publish(vec![raised]);
         assert_eq!(s.agent_reason("l2"), Some(Some("permission".into())));
         assert_eq!(s.agent_reason("l1"), None, "gone from the roster again");
-    }
-
-    #[test]
-    fn agent_exists_tracks_the_published_roster() {
-        let s = FeedState::new();
-        assert!(!s.agent_exists("l1"));
-        s.publish(vec![agent("l1", "working")]);
-        assert!(s.agent_exists("l1"));
-        assert!(!s.agent_exists("l2"));
         s.publish(vec![]);
-        assert!(!s.agent_exists("l1"), "a gone agent is unknown again");
+        assert_eq!(s.agent_reason("l2"), None, "empty roster → unknown");
     }
 
     #[test]

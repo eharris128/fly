@@ -48,6 +48,12 @@ export interface AgentEntry {
  * document the boundary for the external consumer.
  */
 export interface QuestionOption {
+  /**
+   * The answer primitive: the 1-based digit the on-screen picker binds this
+   * option to. To answer an `answerable` question, POST this string as
+   * `mode:"keys"` input — no need to reverse-engineer the keybinding.
+   */
+  key: string;
   label: string;
   description: string;
 }
@@ -74,6 +80,18 @@ export interface QuestionBody {
   context?: string;
   questions?: QuestionSpec[];
   request?: string;
+}
+
+/**
+ * `GET /agents/{key}/output` response body (mirrors Rust `AgentOutputBody`).
+ * Empty `text` with no `repliedAt` is the "no reply yet" state; `question` is
+ * present only while the agent is blocked on one (feed-pending-question). The
+ * frontend never populates this — it documents the boundary for the consumer.
+ */
+export interface AgentOutputBody {
+  text: string;
+  repliedAt?: number;
+  question?: QuestionBody;
 }
 
 /** One automation on the wire (mirrors Rust `AutomationEntry`). Backend-filled. */

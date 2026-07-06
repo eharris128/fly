@@ -49,6 +49,7 @@ fn fake_io() -> IoFn {
                         header: "Pick".into(),
                         multi_select: false,
                         options: vec![QuestionOption {
+                            key: "1".into(),
                             label: "Alpha".into(),
                             description: "first".into(),
                         }],
@@ -699,16 +700,23 @@ fn the_answered_latch_admits_exactly_one_guarded_delivery() {
 fn keys_answers_to_permission_dialogs_are_config_gated() {
     // Default off: a keys answer to a pending *permission* question is 403 —
     // the bearer token must not be a remote permission-approval credential
-    // unless explicitly opted in (KTD6, resolved Open Question).
+    // unless explicitly opted in (KTD6, resolved Open Question). The 403
+    // carries a JSON discriminator body so a consumer doesn't mistake this
+    // policy refusal for an auth failure (api-contract review — the game
+    // consumer blanket-maps 403→auth-error).
     let (state, server, delivered) = start();
     state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
     let body = format!(r#"{{"text":"1","mode":"keys","ifAskedAt":{ASKED_AT}}}"#);
-    let (head, _) = post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
+    let (head, resp_body) =
+        post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
     assert!(head.starts_with("HTTP/1.1 403"), "head was: {head}");
+    assert!(
+        resp_body.contains("permissionAnswersDisabled"),
+        "403 must carry the discriminator body, was: {resp_body}"
+    );
     assert!(delivered.lock().unwrap().is_empty());
 
-    // Opted in → delivers. (And the un-corroborated case: reason gone → the
-    // question is unexposed → 409 even with the opt-in.)
+    // Opted in → delivers.
     let (state, server, delivered) = start_with(true);
     state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
     let (head, _) = post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
@@ -717,17 +725,86 @@ fn keys_answers_to_permission_dialogs_are_config_gated() {
         delivered.lock().unwrap().as_slice(),
         &[("leaf-permission".to_string(), "keys:1".to_string())]
     );
-    state.publish(vec![agent("leaf-permission", "working")]); // reason cleared
+
+    // The un-corroborated case, isolated from the latch (a FRESH server so no
+    // prior reservation confounds it): with the reason not "permission" the
+    // question is unexposed, so the guard 409s BEFORE the opt-in 403 — proving
+    // the reason re-check itself gates, even fully opted in.
+    let (state, server, delivered) = start_with(true);
+    state.publish(vec![agent("leaf-permission", "working")]); // no permission reason
+    let (head, _) = post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 409"), "unexposed permission → 409: {head}");
+    assert!(delivered.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_guarded_submit_to_a_permission_dialog_is_gated_like_keys() {
+    // The review's cross-cutting finding: a guarded SUBMIT (mode omitted) whose
+    // ifAskedAt matches a permission question confirms the dialog via its
+    // trailing Enter, so it is remote permission approval and requires the same
+    // opt-in as keys. Default off → 403, nothing delivered.
+    let (state, server, delivered) = start();
+    state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
+    let body = format!(r#"{{"text":"yes","ifAskedAt":{ASKED_AT}}}"#);
+    let (head, _) = post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 403"), "guarded submit to permission: {head}");
+    assert!(delivered.lock().unwrap().is_empty());
+    // Opted in → the guarded submit delivers (paste text recorded).
+    let (state, server, delivered) = start_with(true);
+    state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
+    let (head, _) = post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[("leaf-permission".to_string(), "submit:yes".to_string())]
+    );
+}
+
+#[test]
+fn a_guarded_answer_carries_the_option_key_the_consumer_posts() {
+    // The wire hands the consumer the digit; a keys answer echoes it back
+    // through the seam verbatim (feed-pending-question, agent-native review).
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("leaf-choice", "waiting")]);
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-choice/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    let key = v["question"]["questions"][0]["options"][0]["key"].as_str().unwrap();
+    assert_eq!(key, "1");
     let (head, _) = post(
         server.local_addr(),
-        "/agents/leaf-permission/input",
+        "/agents/leaf-choice/input",
         Some(TOKEN),
-        // A different stamp would 409 on the latch anyway; same stamp exercises
-        // the gate: the latch already holds it → still 409, nothing delivered.
-        &format!(r#"{{"text":"1","mode":"keys","ifAskedAt":{}}}"#, ASKED_AT),
+        &format!(r#"{{"text":"{key}","mode":"keys","ifAskedAt":{ASKED_AT}}}"#),
     );
-    assert!(head.starts_with("HTTP/1.1 409"), "ungated after reason cleared: {head}");
-    assert_eq!(delivered.lock().unwrap().len(), 1);
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[("leaf-choice".to_string(), format!("keys:{key}"))]
+    );
+}
+
+#[test]
+fn an_explicit_submit_mode_delivers_like_the_omitted_default() {
+    // api-contract gap: an explicit "mode":"submit" is the same inject-anytime
+    // paste+Enter as the omitted-mode default.
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("l1", "waiting")]);
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/l1/input",
+        Some(TOKEN),
+        r#"{"text":"ship it","mode":"submit"}"#,
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[("l1".to_string(), "submit:ship it".to_string())]
+    );
 }
 
 #[test]
