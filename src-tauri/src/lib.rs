@@ -347,6 +347,29 @@ pub fn run() {
                     return;
                 }
 
+                // Feed settle bump for Notification (feed-pending-question
+                // U5/KTD5): a permission dialog raises attention *now*, but its
+                // `tool_use` may not have flushed to the transcript yet — the
+                // frame emitted on this roster change would carry no
+                // `questionPendingAt`, and `FeedState::publish` dedups
+                // identical rosters, so nothing would re-emit until the roster
+                // next moved. One delayed bump re-reads after the flush
+                // settles. Placed after the capture-only and
+                // automation-suppression early returns, NOT gated on
+                // `recordable` (a debounced duplicate still means a dialog is
+                // up), off-thread because Claude Code blocks on this hook.
+                // Mirrors the post-Stop bump above; AskUserQuestion fires no
+                // hook at all, so its marker rides the normal roster poll.
+                if hook.hook_event.as_deref() == Some("Notification") {
+                    if let Some(feed) = handle.try_state::<Arc<feed::FeedState>>() {
+                        let feed = feed.inner().clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            feed.bump();
+                        });
+                    }
+                }
+
                 let signal = Signal {
                     reason,
                     tier: Tier::Hook,

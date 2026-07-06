@@ -61,6 +61,15 @@ impl ConfigStore {
 /// half-written file. Creates the parent directory if it is absent (a
 /// first-ever settings write, before any config file exists). Mirrors the
 /// temp+rename discipline used by the session and resume stores.
+///
+/// The file is `0600` **on every write**, not only at token mint
+/// (feed-pending-question U5, R10): `config.json` carries the feed bearer
+/// token, and a rename replaces the inode — so a mint-time-only chmod would be
+/// clobbered by the next unrelated settings write. The mode is set on the temp
+/// file *before* the rename, so the token-bearing bytes are never readable by
+/// another local user even transiently (matches the `0600` automations store).
+/// This narrows only the cross-user threat: a same-uid process can still read
+/// the file, so the token-holder-equals-user trust model is unchanged.
 fn write_atomic(path: &Path, config: &Config) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -69,6 +78,11 @@ fn write_atomic(path: &Path, config: &Config) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &json)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -203,6 +217,30 @@ mod tests {
         // And it survives a reload from disk (persisted, not just in-memory).
         let reloaded = ConfigStore::load(path);
         assert_eq!(reloaded.get().feed.token.as_deref(), Some(first.as_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_stays_0600_after_a_second_unrelated_write() {
+        // R10's regression shape: write_atomic replaces the inode on every
+        // set(), so a mint-time-only chmod would be clobbered by the NEXT
+        // unrelated settings write. The mode must hold durably.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let store = ConfigStore::load(path.clone());
+
+        ensure_feed_token(&store).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "after mint");
+
+        // A second, unrelated settings write — the one that used to clobber.
+        let mut cfg = store.get();
+        cfg.font_size = 19;
+        store.set(cfg).unwrap();
+        assert_eq!(mode(&path), 0o600, "after an unrelated rewrite");
+        // The token itself survived the rewrite.
+        assert!(store.get().feed.token.is_some());
     }
 
     #[test]
