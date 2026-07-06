@@ -301,6 +301,25 @@ pub fn paste_payload(text: &str) -> Vec<u8> {
 /// chunk after [`SUBMIT_DELAY`] (see [`paste_payload`]).
 pub const SUBMIT: &[u8] = b"\r";
 
+/// Cap on a `mode: "keys"` answer, in chars (feed-pending-question KTD6): a
+/// picker answer is a digit or two — nothing legitimate needs more, and the
+/// route rejects an over-cap body outright (400) rather than truncating bytes
+/// into a pane in an unknown UI state.
+pub const KEYS_MAX_CHARS: usize = 16;
+
+/// Build the `mode: "keys"` payload (R9): every `char::is_control` char is
+/// dropped — a *char*-level test, so a multi-byte C1 encoding can never pass
+/// the way a byte-level check could — leaving no ESC (no forged paste
+/// markers, no raw terminal sequences), no `\r`/`\n` (no submit smuggled into
+/// an answer). No paste wrap and no trailing SUBMIT: digit keys select picker
+/// options instantly, so the payload must arrive exactly as keystrokes.
+/// `None` when nothing survives the filter — the caller delivers nothing
+/// (400), never an empty write.
+pub fn keys_payload(text: &str) -> Option<Vec<u8>> {
+    let filtered: String = text.chars().filter(|&c| !c.is_control()).collect();
+    (!filtered.is_empty()).then(|| filtered.into_bytes())
+}
+
 /// Gap between the paste write and the [`SUBMIT`] write: long enough for the
 /// composer to leave paste handling and settle (human-keypress scale), short
 /// enough to be imperceptible on the HTTP round-trip.
@@ -574,6 +593,33 @@ mod tests {
         // Empty text degrades to an empty paste + the separate Enter (typing
         // nothing and pressing Enter) — faithful to the "as if typed" contract.
         assert_eq!(paste_payload(""), b"\x1b[200~\x1b[201~".to_vec());
+    }
+
+    // ---- keys_payload (feed-pending-question U6, R9/KTD6) -------------------
+
+    #[test]
+    fn keys_payload_strips_every_control_char_and_never_wraps() {
+        // ESC (paste-marker forgery / raw sequences), \r and \n (a smuggled
+        // submit), and other controls are dropped; printable residue is
+        // delivered raw — no bracketed-paste wrap, no trailing SUBMIT.
+        assert_eq!(keys_payload("2").as_deref(), Some(b"2".as_slice()));
+        assert_eq!(
+            keys_payload("1\x1b[201~\r\n2\x07").as_deref(),
+            Some(b"1[201~2".as_slice())
+        );
+        // Empty after the filter → no write at all (the route 400s).
+        assert_eq!(keys_payload("\x1b\r\n\x07"), None);
+        assert_eq!(keys_payload(""), None);
+    }
+
+    #[test]
+    fn keys_payload_passes_multibyte_text_but_its_filter_is_char_level() {
+        // The R9 filter is a char-level is_control test, so multi-byte C1
+        // encodings (U+009B CSI, a control) are stripped even though a
+        // byte-level 0x20..=0x7E check on UTF-8 bytes could pass them.
+        assert_eq!(keys_payload("a\u{009b}b").as_deref(), Some("ab".as_bytes()));
+        // Plain multi-byte printables survive.
+        assert_eq!(keys_payload("é").as_deref(), Some("é".as_bytes()));
     }
 
     #[test]

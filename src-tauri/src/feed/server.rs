@@ -53,10 +53,31 @@ pub type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// `GET /agents/{key}/output`, the frame's `lastReplyAt`, and the frame's
 /// `questionPendingAt` all read (R3/R4).
 pub type IoFn = Arc<dyn Fn(&str) -> ResolvedIo + Send + Sync>;
-/// Delivers submitted text to a leaf's pane (feed-agent-reply-io U5) —
-/// injected because delivery needs the PTY registry + attention manager +
-/// AppHandle, none of which the server should know.
-pub type InputFn = Arc<dyn Fn(&str, &str) -> InputOutcome + Send + Sync>;
+/// Delivers one input action to a leaf's pane (feed-agent-reply-io U5;
+/// widened by feed-pending-question U6) — injected because delivery needs the
+/// PTY registry + attention manager + AppHandle, none of which the server
+/// should know. Both actions clear pane attention on delivery (the agent was
+/// just answered), which also keeps a `reason: permission` from going stale
+/// after a remote answer (KTD6/R9).
+pub type InputFn = Arc<dyn Fn(&str, InputAction) -> InputOutcome + Send + Sync>;
+
+/// Reads the live "may keys-mode answer a *permission* dialog?" opt-in
+/// (feed-pending-question KTD6, Open Question resolved as config opt-in,
+/// default off) — injected so the server needs no ConfigStore dependency and
+/// a settings change applies without a restart.
+pub type PermissionAnswersFn = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// What one `POST /agents/{key}/input` delivers (KTD6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputAction {
+    /// Today's contract: bracketed-paste the text, then Enter as its own
+    /// delayed chunk — "type a prompt and submit it".
+    Submit(String),
+    /// Answer keys: raw R9-filtered bytes (`io::keys_payload`), NO paste wrap,
+    /// NO auto-Enter — digit keys select picker options instantly, so a
+    /// wrapped or entered payload would misfire (KTD6).
+    Keys(Vec<u8>),
+}
 
 /// What became of one `POST /agents/{key}/input` delivery attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +99,15 @@ struct HandlerCtx {
     now: NowFn,
     io: IoFn,
     input: InputFn,
+    permission_answers: PermissionAnswersFn,
+    /// The per-leaf answered latch (feed-pending-question U6/R11): the
+    /// `askedAt` of the last guarded delivery per leaf. A second delivery
+    /// carrying the same `ifAskedAt` 409s until the pending question changes —
+    /// the resolver lags a terminal answer by ≥100ms, so `ifAskedAt` alone
+    /// leaves a TOCTOU window two racing consumers would both pass (AE7).
+    /// Entries go stale naturally: a new question has a new `askedAt`, which
+    /// no longer equals the latched value.
+    latch: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 /// A running feed server. Dropping it tears down cleanly: the accept loop stops
@@ -92,6 +122,7 @@ pub struct FeedServer {
 impl FeedServer {
     /// Bind `127.0.0.1:port` and start accepting. `port` 0 lets the OS choose
     /// (used by tests; read it back via [`local_addr`](Self::local_addr)).
+    #[allow(clippy::too_many_arguments)] // one injected seam per capability
     pub fn start(
         port: u16,
         token: String,
@@ -100,6 +131,7 @@ impl FeedServer {
         now: NowFn,
         io: IoFn,
         input: InputFn,
+        permission_answers: PermissionAnswersFn,
     ) -> io::Result<Self> {
         // tiny_http returns a boxed error; normalize to io::Error for the caller.
         let server = Server::http((std::net::Ipv4Addr::LOCALHOST, port))
@@ -120,6 +152,8 @@ impl FeedServer {
                 now,
                 io,
                 input,
+                permission_answers,
+                latch: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
             std::thread::Builder::new()
                 .name("fly-feed-accept".into())
@@ -288,18 +322,30 @@ fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec
     json_response(serde_json::to_string(&body).unwrap_or_else(|_| "{\"text\":\"\"}".into()))
 }
 
-/// `POST /agents/{key}/input`: parse `{"text": …}` (body capped, malformed →
-/// 400) and deliver through the injected seam. Roster membership gates the
-/// route (KTD2) and the seam re-checks the pane is live — a raced pane close
-/// between the two is a 404, not a write into nothing.
+/// `POST /agents/{key}/input`: parse `{"text", mode?, ifAskedAt?}` and deliver
+/// through the injected seam (feed-agent-reply-io U5; feed-pending-question
+/// U6/KTD6). Status precedence is pinned: 401 (upstream) → 404 (unpublished
+/// key — before any pending comparison) → 400 (bad body / unknown mode / keys
+/// without `ifAskedAt` / over-cap or empty-after-filter keys text) → 403
+/// (keys answer to a permission dialog without the config opt-in) → 409
+/// (stale-answer guard or answered latch). The seam re-checks the pane is
+/// live — a raced pane close is a 404, not a write into nothing.
+///
+/// `mode` defaults to `"submit"` (today's paste + Enter, inject-anytime when
+/// `ifAskedAt` is absent). `ifAskedAt` — mandatory for `"keys"`, optional for
+/// `"submit"` — arms the R11 guard: the value must equal the current gated
+/// pending question's `askedAt`, and the per-leaf latch admits one guarded
+/// delivery per `askedAt` (reserved *before* the PTY write, released on a
+/// failed delivery so a transient failure stays retryable).
 fn agent_input_response(
     ctx: &HandlerCtx,
     key: &str,
     req: &mut tiny_http::Request,
 ) -> Response<io::Cursor<Vec<u8>>> {
-    if !ctx.state.agent_exists(key) {
+    // One roster snapshot for existence AND the reason the guard gates on.
+    let Some(reason) = ctx.state.agent_reason(key) else {
         return empty_response(404);
-    }
+    };
     let mut body = Vec::new();
     // Read one byte past the cap so an at-cap body is distinguishable from an
     // oversized one.
@@ -313,13 +359,79 @@ fn agent_input_response(
         return empty_response(400);
     }
     #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct InputBody {
         text: String,
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        if_asked_at: Option<u64>,
     }
     let Ok(input) = serde_json::from_slice::<InputBody>(&body) else {
         return empty_response(400);
     };
-    match (ctx.input)(key, &input.text) {
+
+    let action = match input.mode.as_deref().unwrap_or("submit") {
+        "submit" => InputAction::Submit(input.text.clone()),
+        "keys" => {
+            // KTD6: a keys answer without a guard could approve whatever
+            // dialog happens to be up — ifAskedAt is mandatory, the text is
+            // hard-capped (never truncated into the pane), and the R9 filter
+            // must leave something deliverable.
+            if input.if_asked_at.is_none()
+                || input.text.chars().count() > super::io::KEYS_MAX_CHARS
+            {
+                return empty_response(400);
+            }
+            match super::io::keys_payload(&input.text) {
+                Some(bytes) => InputAction::Keys(bytes),
+                None => return empty_response(400),
+            }
+        }
+        _ => return empty_response(400),
+    };
+
+    // The stale-answer guard + answered latch (R11), armed by ifAskedAt.
+    let mut reserved = false;
+    if let Some(asked) = input.if_asked_at {
+        // Guard against the SAME gated view the read surfaces expose: an
+        // unexposed question (nothing pending, or a permission fact without
+        // the corroborating reason) is not answerable either.
+        let Some(q) = gated_question((ctx.io)(key).question, reason.as_deref()) else {
+            return empty_response(409);
+        };
+        if q.asked_at != asked {
+            return empty_response(409);
+        }
+        if matches!(action, InputAction::Keys(_)) {
+            if q.kind == "permission" && !(ctx.permission_answers)() {
+                // The resolved Open Question: remote *permission* approval is
+                // config-gated, default off — a digit can pick a durable
+                // "don't ask again". Post-auth, so the 403 leaks nothing.
+                return empty_response(403);
+            }
+            if q.kind == "choice" && !q.answerable {
+                // R7: the guard rejects the shapes v1 can't answer
+                // (multi-question, multiSelect, dropped-option mapping).
+                return empty_response(409);
+            }
+        }
+        // Reserve before delivering: of two racing same-ifAskedAt answers,
+        // exactly one proceeds (AE7).
+        let mut latch = ctx.latch.lock().unwrap();
+        if latch.get(key) == Some(&asked) {
+            return empty_response(409);
+        }
+        latch.insert(key.to_string(), asked);
+        reserved = true;
+    }
+
+    let outcome = (ctx.input)(key, action);
+    if reserved && outcome != InputOutcome::Delivered {
+        // A failed delivery must stay retryable — release the reservation.
+        ctx.latch.lock().unwrap().remove(key);
+    }
+    match outcome {
         InputOutcome::Delivered => json_response("{\"ok\":true}".into()),
         InputOutcome::UnknownPane => empty_response(404),
         InputOutcome::Failed(e) => {
