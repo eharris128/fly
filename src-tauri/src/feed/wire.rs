@@ -40,6 +40,14 @@ pub struct AgentEntry {
     pub live_task_count: u32,
     /// Stable jump number (1–9, then 0 for the tenth), or null past ten.
     pub num: Option<u32>,
+    /// Epoch ms of this agent's most recent textual reply, or null if it has
+    /// never replied (feed-agent-reply-io U1/R3). **Backend-stamped at frame
+    /// emit** from the same resolver `GET /agents/{key}/output` reads, so it
+    /// always equals that endpoint's `repliedAt` for the same reply — the
+    /// consumer's unread-dot arming depends on the two matching. The webview's
+    /// pushed roster never carries it (`default`), keeping old pushes valid.
+    #[serde(default)]
+    pub last_reply_at: Option<u64>,
 }
 
 /// One automation, projected from `automations::model::Automation` + its derived
@@ -72,6 +80,20 @@ pub struct AutomationEntry {
 #[serde(rename_all = "camelCase")]
 pub struct FeedPublishPayload {
     pub agents: Vec<AgentEntry>,
+}
+
+/// `GET /agents/{key}/output` response body (feed-agent-reply-io U4). An empty
+/// `text` with no `repliedAt` is the "no reply yet" state; the consumer reads
+/// only these two fields and ignores extras.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentOutputBody {
+    pub text: String,
+    /// Epoch ms of the reply's turn. Omitted (not null) when there is no reply
+    /// or the turn carried no parseable stamp — the consumer requires a finite
+    /// number, so absence is cleaner than null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replied_at: Option<u64>,
 }
 
 /// The full snapshot streamed on every SSE frame. `version` is the monotonic
@@ -136,6 +158,7 @@ mod tests {
                 working_for_ms: Some(4200.0),
                 live_task_count: 2,
                 num: Some(1),
+                last_reply_at: Some(1_699_999_999_000),
             }],
             automations: vec![AutomationEntry {
                 id: "a1".into(),
@@ -156,6 +179,7 @@ mod tests {
         assert_eq!(v["agents"][0]["needsAttention"], false);
         assert_eq!(v["agents"][0]["workingForMs"], 4200.0);
         assert_eq!(v["agents"][0]["liveTaskCount"], 2);
+        assert_eq!(v["agents"][0]["lastReplyAt"], 1_699_999_999_000u64);
         assert_eq!(v["automations"][0]["cron"], "*/5 * * * *");
         assert_eq!(v["automations"][0]["nextRunAt"], 1_700_000_300_000u64);
         assert_eq!(v["automations"][0]["lastStatus"], "succeeded");
@@ -250,6 +274,22 @@ mod tests {
         assert_eq!(e.next_run_at, None);
         assert_eq!(e.last_status, None);
         assert_eq!(e.last_run_at, None);
+    }
+
+    #[test]
+    fn agent_entry_without_last_reply_at_deserializes_to_null() {
+        // Back-compat both ways: an old webview push (no lastReplyAt) loads as
+        // None, and a never-replied agent serializes an explicit null (the
+        // consumer's "never unread" state), not an absent key.
+        let v = serde_json::json!({
+            "leafKey": "leaf-1", "workspace": "home", "tab": "fly",
+            "cwd": null, "status": "idle", "needsAttention": false,
+            "reason": null, "workingForMs": null, "liveTaskCount": 0, "num": null
+        });
+        let e: AgentEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(e.last_reply_at, None);
+        let out = serde_json::to_value(&e).unwrap();
+        assert!(out["lastReplyAt"].is_null());
     }
 
     #[test]

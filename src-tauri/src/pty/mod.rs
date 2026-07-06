@@ -210,6 +210,22 @@ impl PtyManager {
             .and_then(|p| p.leaf_key().map(str::to_string))
     }
 
+    /// The **live** pane currently owning `leaf_key` — the reverse of
+    /// [`leaf_key`](Self::leaf_key), for the feed's input route
+    /// (feed-agent-reply-io U5). Ids are never reused, so if a leaf ever had
+    /// two registered panes (a respawn racing a close), the highest id is the
+    /// current one; an exited-but-unreaped pane doesn't count (writing to it
+    /// would land nowhere — same `is_live` gate as the automations R7 probe).
+    pub fn pane_by_leaf(&self, leaf_key: &str) -> Option<PaneId> {
+        self.panes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p)| p.leaf_key() == Some(leaf_key) && p.lifecycle().is_live())
+            .map(|(id, _)| *id)
+            .max_by_key(|id| id.0)
+    }
+
     /// The pane's foreground pid, for `/proc`-based cwd tracking (U10).
     pub fn foreground_pid(&self, id: PaneId) -> Option<u32> {
         self.panes
@@ -463,5 +479,6 @@ mod tests {
         assert_eq!(m.agent_task_count(ghost), None); // count path: graceful, no panic
         assert_eq!(m.leaf_key(ghost), None);
         assert_eq!(m.lifecycle(ghost), None);
+        assert_eq!(m.pane_by_leaf("leaf-404"), None); // reverse lookup: graceful
     }
 }

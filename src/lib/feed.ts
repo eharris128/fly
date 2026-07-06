@@ -25,6 +25,13 @@ export interface AgentEntry {
   workingForMs: number | null;
   liveTaskCount: number;
   num: number | null;
+  /**
+   * Epoch ms of the agent's most recent reply, or null if it has never
+   * replied (feed-agent-reply-io U1). **Backend-stamped at frame emit** from
+   * the same resolver behind `GET /agents/{key}/output`, so it always matches
+   * that endpoint's `repliedAt`; the pushed roster always carries null.
+   */
+  lastReplyAt: number | null;
 }
 
 /** One automation on the wire (mirrors Rust `AutomationEntry`). Backend-filled. */
@@ -73,6 +80,7 @@ export function buildFeedPayload(model: HomeWorkspaceGroup[]): FeedPublishPayloa
           workingForMs: row.workingForMs,
           liveTaskCount: row.liveTaskCount,
           num: row.num ?? null,
+          lastReplyAt: null, // backend-stamped at emit; never pushed
         });
       }
     }

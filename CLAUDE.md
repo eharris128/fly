@@ -156,6 +156,14 @@ time/inputs as arguments so they're tested without a running app.
   `/usage` gauges via `GET /api/oauth/usage` (read-only OAuth bearer from
   `~/.claude/.credentials.json`), fetched on dashboard open only (KTD-C), never
   on a timer.
+- `feed/` — the loopback HTTP surface for an external local consumer
+  (feat-agent-state-local-feed + feed-agent-reply-io): bearer-token auth
+  (constant-time, silent 401; **the token is the whole boundary** — loopback TCP
+  has no `SO_PEERCRED`), SSE `/feed` (webview-pushed roster + backend
+  automations, `lastReplyAt` stamped at emit), `GET /agents/{key}/output`
+  (latest reply via `io.rs::ReplyResolver` — the ONE source for both reply
+  surfaces), and the single mutation route `POST /agents/{key}/input`
+  (control-stripped bracketed-paste + Enter into a *published* agent pane only).
 - `notify/`, `config/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
   reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the
