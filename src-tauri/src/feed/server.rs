@@ -31,9 +31,9 @@ use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tiny_http::{Method, Response, Server};
 
-use super::wire::{AgentOutputBody, AutomationEntry};
+use super::io::ResolvedIo;
+use super::wire::{AgentOutputBody, AutomationEntry, QuestionBody};
 use super::FeedState;
-use crate::session::transcript::LastReply;
 
 /// How long the accept loop blocks per `recv` before re-checking the shutdown
 /// flag — the max latency between teardown and the loop exiting.
@@ -47,10 +47,12 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 pub type AutomationsFn = Arc<dyn Fn() -> Vec<AutomationEntry> + Send + Sync>;
 /// Wall clock for the frame stamp — injected for deterministic tests.
 pub type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
-/// Resolves a leaf key's latest reply (feed-agent-reply-io U3) — injected so
-/// the server needs no resume-store/transcript dependency. The ONE source both
-/// `GET /agents/{key}/output` and the frame's `lastReplyAt` read (R3).
-pub type ReplyFn = Arc<dyn Fn(&str) -> Option<LastReply> + Send + Sync>;
+/// Resolves a leaf key's IO facts — latest reply + pending question
+/// (feed-agent-reply-io U3; widened by feed-pending-question U4) — injected so
+/// the server needs no resume-store/transcript dependency. The ONE source
+/// `GET /agents/{key}/output`, the frame's `lastReplyAt`, and the frame's
+/// `questionPendingAt` all read (R3/R4).
+pub type IoFn = Arc<dyn Fn(&str) -> ResolvedIo + Send + Sync>;
 /// Delivers submitted text to a leaf's pane (feed-agent-reply-io U5) —
 /// injected because delivery needs the PTY registry + attention manager +
 /// AppHandle, none of which the server should know.
@@ -74,7 +76,7 @@ struct HandlerCtx {
     token: String,
     automations: AutomationsFn,
     now: NowFn,
-    replies: ReplyFn,
+    io: IoFn,
     input: InputFn,
 }
 
@@ -96,7 +98,7 @@ impl FeedServer {
         state: Arc<FeedState>,
         automations: AutomationsFn,
         now: NowFn,
-        replies: ReplyFn,
+        io: IoFn,
         input: InputFn,
     ) -> io::Result<Self> {
         // tiny_http returns a boxed error; normalize to io::Error for the caller.
@@ -116,7 +118,7 @@ impl FeedServer {
                 token,
                 automations,
                 now,
-                replies,
+                io,
                 input,
             });
             std::thread::Builder::new()
@@ -252,24 +254,36 @@ fn empty_response(status: u16) -> Response<io::Cursor<Vec<u8>>> {
     Response::from_data(Vec::new()).with_status_code(status)
 }
 
-/// `GET /agents/{key}/output`: the latest reply, `{"text": "", …}` when the
-/// agent exists but has not replied, `404` for a key outside the published
-/// roster (KTD2).
+/// The KTD3/KTD4 exposure gate, shared verbatim by the frame stamp and the
+/// `/output` body so the two surfaces cannot apply different rules: a
+/// **choice** question is always exposed (an AskUserQuestion never "executes",
+/// so pending means waiting, from the transcript alone); a **permission**
+/// question is exposed only while the roster entry's live attention reason is
+/// `"permission"` (without that corroboration, a pending `tool_use` just means
+/// the tool is executing). The reason is read outside the resolver cache, at
+/// emit/response time — staleness degrades to "not exposed".
+fn gated_question(question: Option<QuestionBody>, reason: Option<&str>) -> Option<QuestionBody> {
+    question.filter(|q| q.kind != "permission" || reason == Some("permission"))
+}
+
+/// `GET /agents/{key}/output`: the latest reply plus the gated pending
+/// question, `{"text": "", …}` when the agent exists but has no data, `404`
+/// for a key outside the published roster (KTD2). Existence and reason come
+/// from ONE roster snapshot ([`FeedState::agent_reason`]) so the gate can't
+/// straddle a roster swap.
 fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec<u8>>> {
-    if !ctx.state.agent_exists(key) {
+    let Some(reason) = ctx.state.agent_reason(key) else {
         return empty_response(404);
-    }
-    let body = match (ctx.replies)(key) {
-        Some(reply) => AgentOutputBody {
-            text: reply.text,
-            replied_at: reply.replied_at_ms,
-            question: None,
-        },
-        None => AgentOutputBody {
-            text: String::new(),
-            replied_at: None,
-            question: None,
-        },
+    };
+    let resolved = (ctx.io)(key);
+    let (text, replied_at) = match resolved.reply {
+        Some(reply) => (reply.text, reply.replied_at_ms),
+        None => (String::new(), None),
+    };
+    let body = AgentOutputBody {
+        text,
+        replied_at,
+        question: gated_question(resolved.question, reason.as_deref()),
     };
     json_response(serde_json::to_string(&body).unwrap_or_else(|_| "{\"text\":\"\"}".into()))
 }
@@ -369,16 +383,24 @@ fn stream_sse(mut w: Box<dyn Write + Send>, ctx: &HandlerCtx) {
 }
 
 /// Build + write one `data:` frame; returns the emitted version, or `None` if
-/// the write failed (client disconnected). Each agent's `lastReplyAt` is
-/// stamped here, at emit time, through the same resolver `GET
-/// /agents/{key}/output` reads (feed-agent-reply-io U1/R3/KTD4) — the pushed
-/// roster never carries it, so the stamp can't go stale in the cache, and a
-/// version bump (a roster change, an automation mutation, or the post-Stop
-/// settle bump in `lib.rs`) is what refreshes it on the wire.
+/// the write failed (client disconnected). Each agent's `lastReplyAt` **and**
+/// `questionPendingAt` are stamped here, at emit time, through the same
+/// resolver `GET /agents/{key}/output` reads (feed-agent-reply-io U1/R3;
+/// feed-pending-question R4/KTD4) — the pushed roster never carries them, so
+/// the stamps can't go stale in the cache, and a version bump (a roster
+/// change, an automation mutation, or a settle bump in `lib.rs`) is what
+/// refreshes them on the wire. The permission gate reads the entry's own
+/// pushed `reason` — already in this snapshot — so a frame's marker and its
+/// roster status are one consistent read (a `/output` served later re-reads
+/// the reason live and may briefly disagree; R4 scopes strict equality to
+/// choice-kind for exactly this reason).
 fn emit_frame(w: &mut Box<dyn Write + Send>, ctx: &HandlerCtx) -> Option<u64> {
     let mut snap = ctx.state.snapshot((ctx.automations)(), (ctx.now)());
     for agent in &mut snap.agents {
-        agent.last_reply_at = (ctx.replies)(&agent.leaf_key).and_then(|r| r.replied_at_ms);
+        let resolved = (ctx.io)(&agent.leaf_key);
+        agent.last_reply_at = resolved.reply.and_then(|r| r.replied_at_ms);
+        agent.question_pending_at =
+            gated_question(resolved.question, agent.reason.as_deref()).map(|q| q.asked_at);
     }
     let json = serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into());
     let frame = format!("data: {json}\n\n");

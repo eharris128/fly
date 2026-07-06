@@ -661,13 +661,15 @@ pub fn run() {
                                 .collect()
                         });
                         let now_fn: feed::server::NowFn = Arc::new(notify::now_unix_ms);
-                        // Latest-reply resolver (feed-agent-reply-io U3): one
-                        // shared, cached instance behind both the /output
-                        // endpoint and the frame's lastReplyAt stamp (R3).
+                        // Per-leaf IO resolver (feed-agent-reply-io U3;
+                        // feed-pending-question U3/U4): one shared, cached
+                        // instance behind the /output endpoint and the frame's
+                        // lastReplyAt + questionPendingAt stamps (R3/R4) — one
+                        // transcript read serves every surface.
                         let resolver =
                             Arc::new(feed::io::ReplyResolver::new(session::resume::resume_path()));
-                        let reply_fn: feed::server::ReplyFn =
-                            Arc::new(move |leaf_key| resolver.resolve(leaf_key));
+                        let io_fn: feed::server::IoFn =
+                            Arc::new(move |leaf_key| resolver.resolve_io(leaf_key));
                         // Input delivery (U5): leaf → live pane → sanitized
                         // bracketed paste, then Enter as its OWN delayed write
                         // (a same-chunk \r is swallowed as pasted content —
@@ -707,7 +709,7 @@ pub fn run() {
                             Arc::clone(&feed_state),
                             automations_fn,
                             now_fn,
-                            reply_fn,
+                            io_fn,
                             input_fn,
                         ) {
                             Ok(server) => {

@@ -11,21 +11,65 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fly_lib::feed::server::{FeedServer, InputOutcome, ReplyFn};
-use fly_lib::feed::wire::AgentEntry;
+use fly_lib::feed::io::{ReplyResolver, ResolvedIo};
+use fly_lib::feed::server::{FeedServer, InputOutcome, IoFn};
+use fly_lib::feed::wire::{AgentEntry, QuestionBody, QuestionOption, QuestionSpec};
 use fly_lib::feed::FeedState;
 use fly_lib::session::transcript::LastReply;
 
 const TOKEN: &str = "test-token-abc123";
 const REPLIED_AT: u64 = 1_781_896_636_402;
+const ASKED_AT: u64 = 1_781_896_640_000;
 
-/// A reply resolver that knows one leaf: `leaf-replied` → a stamped reply.
-fn fake_replies() -> ReplyFn {
+/// An IO resolver that knows three leaves: `leaf-replied` → a stamped reply,
+/// `leaf-choice` → that reply + a pending choice question, `leaf-permission` →
+/// a pending Bash permission question (exposure of which the server must gate
+/// on the roster reason — feed-pending-question KTD3/KTD4).
+fn fake_io() -> IoFn {
     Arc::new(|leaf_key| {
-        (leaf_key == "leaf-replied").then(|| LastReply {
+        let reply = || LastReply {
             text: "All tests pass.".into(),
             replied_at_ms: Some(REPLIED_AT),
-        })
+        };
+        match leaf_key {
+            "leaf-replied" => ResolvedIo {
+                reply: Some(reply()),
+                question: None,
+            },
+            "leaf-choice" => ResolvedIo {
+                reply: Some(reply()),
+                question: Some(QuestionBody {
+                    asked_at: ASKED_AT,
+                    kind: "choice".into(),
+                    tool: "AskUserQuestion".into(),
+                    answerable: true,
+                    context: Some("Pick one.".into()),
+                    questions: vec![QuestionSpec {
+                        question: "Which?".into(),
+                        header: "Pick".into(),
+                        multi_select: false,
+                        options: vec![QuestionOption {
+                            label: "Alpha".into(),
+                            description: "first".into(),
+                        }],
+                    }],
+                    request: None,
+                }),
+            },
+            "leaf-permission" => ResolvedIo {
+                reply: None,
+                question: Some(QuestionBody {
+                    asked_at: ASKED_AT,
+                    kind: "permission".into(),
+                    tool: "Bash".into(),
+                    answerable: false,
+                    context: None,
+                    questions: vec![],
+                    request: Some("cargo build".into()),
+                }),
+            },
+            _ => ResolvedIo::default(),
+        }
     })
 }
 
@@ -42,7 +86,7 @@ fn start() -> (Arc<FeedState>, FeedServer, Arc<Mutex<Vec<(String, String)>>>) {
         Arc::clone(&state),
         Arc::new(Vec::new), // no automations in these tests
         Arc::new(|| 42),    // fixed stamp
-        fake_replies(),
+        fake_io(),
         Arc::new(move |leaf_key: &str, text: &str| {
             if leaf_key == "leaf-gone" {
                 return InputOutcome::UnknownPane;
@@ -124,6 +168,16 @@ fn agent(leaf: &str, status: &str) -> AgentEntry {
         num: None,
         last_reply_at: None,
         question_pending_at: None,
+    }
+}
+
+/// An [`agent`] whose pushed roster entry carries an attention reason — the
+/// corroboration signal the permission gate reads (feed-pending-question KTD3).
+fn agent_with_reason(leaf: &str, status: &str, reason: &str) -> AgentEntry {
+    AgentEntry {
+        reason: Some(reason.into()),
+        needs_attention: true,
+        ..agent(leaf, status)
     }
 }
 
@@ -228,6 +282,170 @@ fn feed_frames_stamp_last_reply_at_from_the_resolver() {
     assert!(body.contains("\"lastReplyAt\":null"), "body was: {body}");
 }
 
+// ---- questionPendingAt + /output question (feed-pending-question U4) --------
+
+#[test]
+fn a_pending_choice_stamps_the_frame_and_matches_output_asked_at() {
+    // R4's choice-kind invariant: the SSE marker and /output's askedAt are the
+    // same resolver-cached value, on both surfaces, regardless of reason.
+    let (state, server, _) = start();
+    state.publish(vec![agent_with_reason("leaf-choice", "waiting", "question")]);
+    let (_, sse) = get(
+        server.local_addr(),
+        "/feed",
+        Some(TOKEN),
+        Duration::from_millis(400),
+    );
+    assert!(
+        sse.contains(&format!("\"questionPendingAt\":{ASKED_AT}")),
+        "sse was: {sse}"
+    );
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-choice/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(v["question"]["askedAt"], ASKED_AT);
+    assert_eq!(v["question"]["kind"], "choice");
+    assert_eq!(v["question"]["answerable"], true);
+    assert_eq!(v["question"]["questions"][0]["options"][0]["label"], "Alpha");
+    // The reply half rides along unchanged (blessed duplication).
+    assert_eq!(v["text"], "All tests pass.");
+}
+
+#[test]
+fn a_pending_choice_on_a_working_row_is_still_exposed() {
+    // KTD5's blessed consequence: `status: "working"` with a pending question
+    // for up to ~IDLE_GAP_MS after the picker draws — not exclusive to waiting.
+    let (state, server, _) = start();
+    state.publish(vec![agent("leaf-choice", "working")]); // no reason at all
+    let (_, sse) = get(
+        server.local_addr(),
+        "/feed",
+        Some(TOKEN),
+        Duration::from_millis(400),
+    );
+    assert!(
+        sse.contains(&format!("\"questionPendingAt\":{ASKED_AT}")),
+        "sse was: {sse}"
+    );
+}
+
+#[test]
+fn a_permission_question_is_gated_on_the_permission_reason() {
+    // With the roster reason "permission" (fly backgrounded, pane raised) the
+    // question reaches both surfaces…
+    let (state, server, _) = start();
+    state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
+    let (_, sse) = get(
+        server.local_addr(),
+        "/feed",
+        Some(TOKEN),
+        Duration::from_millis(400),
+    );
+    assert!(
+        sse.contains(&format!("\"questionPendingAt\":{ASKED_AT}")),
+        "sse was: {sse}"
+    );
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-permission/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(v["question"]["kind"], "permission");
+    assert_eq!(v["question"]["tool"], "Bash");
+    assert_eq!(v["question"]["request"], "cargo build");
+
+    // …and with no (or another) reason, the same pending tool_use means
+    // "executing", so neither surface exposes it (KTD3).
+    state.publish(vec![agent("leaf-permission", "working")]);
+    let (_, sse) = get(
+        server.local_addr(),
+        "/feed",
+        Some(TOKEN),
+        Duration::from_millis(400),
+    );
+    assert!(
+        sse.contains("\"questionPendingAt\":null"),
+        "sse was: {sse}"
+    );
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-permission/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert!(v.get("question").is_none(), "body was: {body}");
+}
+
+#[test]
+fn a_delegating_tool_pending_abstains_end_to_end() {
+    // KTD3's confused-deputy rule through the REAL resolver: a sole pending
+    // `Agent` tool_use (a subagent's inner dialog is what's on screen) is not
+    // exposed even with reason "permission" — the transcript layer abstains,
+    // so no marker and no question object reach either surface.
+    let dir = tempfile::tempdir().unwrap();
+    let resume_path = dir.path().join("resume.json");
+    fly_lib::session::resume::upsert_at(
+        &resume_path,
+        "leaf-task",
+        fly_lib::session::resume::ResumePartial {
+            session_id: Some("sid-task".into()),
+            session_cwd: Some("/p".into()),
+            session_source: Some(fly_lib::session::resume::SessionSource::Hook),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let root = dir.path().join("projects");
+    let project = root.join("-p");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("sid-task.jsonl"),
+        concat!(
+            r#"{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{"prompt":"go"}}]}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let resolver = Arc::new(ReplyResolver::with_projects_root(resume_path, Some(root)));
+    let io_fn: IoFn = Arc::new(move |leaf| resolver.resolve_io(leaf));
+
+    let state = Arc::new(FeedState::new());
+    let server = FeedServer::start(
+        0,
+        TOKEN.to_string(),
+        Arc::clone(&state),
+        Arc::new(Vec::new),
+        Arc::new(|| 42),
+        io_fn,
+        Arc::new(|_: &str, _: &str| InputOutcome::Delivered),
+    )
+    .unwrap();
+    state.publish(vec![agent_with_reason("leaf-task", "waiting", "permission")]);
+
+    let (_, sse) = get(
+        server.local_addr(),
+        "/feed",
+        Some(TOKEN),
+        Duration::from_millis(400),
+    );
+    assert!(sse.contains("\"questionPendingAt\":null"), "sse was: {sse}");
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-task/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert!(v.get("question").is_none(), "body was: {body}");
+}
+
 // ---- GET /agents/{key}/output (feed-agent-reply-io U4) ----------------------
 
 #[test]
@@ -270,6 +488,9 @@ fn output_serves_the_latest_reply_with_its_stamp() {
     let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
     assert_eq!(v["text"], "All tests pass.");
     assert_eq!(v["repliedAt"], REPLIED_AT);
+    // Regression guard (feed-pending-question R5): nothing pending → the
+    // `question` key is absent, the reply shape byte-identical to before.
+    assert!(v.get("question").is_none(), "body was: {body}");
 }
 
 #[test]

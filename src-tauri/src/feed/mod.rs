@@ -114,6 +114,23 @@ impl FeedState {
             .any(|a| a.leaf_key == leaf_key)
     }
 
+    /// Existence **and** attention reason in one lock acquisition
+    /// (feed-pending-question U4/KTD4): `None` = unknown agent (the 404
+    /// authority, same as [`agent_exists`](Self::agent_exists)); `Some(reason)`
+    /// = published, carrying the entry's pushed `reason` (`Some("permission")`
+    /// while a permission dialog holds the pane raised, `None` otherwise). The
+    /// permission gate must read both from one roster snapshot — two separate
+    /// reads could straddle a roster swap and gate on another moment's reason.
+    pub fn agent_reason(&self, leaf_key: &str) -> Option<Option<String>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .iter()
+            .find(|a| a.leaf_key == leaf_key)
+            .map(|a| a.reason.clone())
+    }
+
     /// Assemble the frame to emit: the cached roster + the caller-supplied
     /// automations (read from the store at emit time, KTD4) + stamp. Kept free
     /// of any store/manager dependency so it is unit-tested in isolation.
@@ -191,6 +208,21 @@ mod tests {
             last_reply_at: None,
             question_pending_at: None,
         }
+    }
+
+    #[test]
+    fn agent_reason_reports_existence_and_reason_in_one_read() {
+        // feed-pending-question U4: None = unknown (404); Some(None) =
+        // published, no reason; Some(Some(..)) = published + raised reason.
+        let s = FeedState::new();
+        assert_eq!(s.agent_reason("l1"), None);
+        s.publish(vec![agent("l1", "working")]);
+        assert_eq!(s.agent_reason("l1"), Some(None));
+        let mut raised = agent("l2", "waiting");
+        raised.reason = Some("permission".into());
+        s.publish(vec![raised]);
+        assert_eq!(s.agent_reason("l2"), Some(Some("permission".into())));
+        assert_eq!(s.agent_reason("l1"), None, "gone from the roster again");
     }
 
     #[test]
