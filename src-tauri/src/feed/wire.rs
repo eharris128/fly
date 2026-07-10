@@ -147,6 +147,25 @@ pub struct FeedPublishPayload {
     pub agents: Vec<AgentEntry>,
 }
 
+/// One turn of the recent conversation tail riding `GET /agents/{key}/output`
+/// (feed-conversation-tail R1/R2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnEntry {
+    /// `"user"` — a prompt delivered TO the agent, from any source (terminal,
+    /// feed input, anywhere) — or `"agent"` — a reply FROM it. Exactly these
+    /// two strings (R2).
+    pub role: String,
+    /// Epoch ms of the turn's transcript entry — the same convention as
+    /// `repliedAt`. Always present and numeric: a stampless turn is dropped,
+    /// never served unstamped (R2).
+    pub at: u64,
+    /// The turn's text: control-sanitized, secret-scrubbed, then char-capped
+    /// (`io::TURN_CAP`). Truncation carries no wire marker — the same contract
+    /// as the question strings (R4).
+    pub text: String,
+}
+
 /// `GET /agents/{key}/output` response body (feed-agent-reply-io U4). An empty
 /// `text` with no `repliedAt` is the "no reply yet" state; the consumer reads
 /// only these two fields and ignores extras.
@@ -166,6 +185,14 @@ pub struct AgentOutputBody {
     /// *is* the context) — expected duplication, not suppressed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<QuestionBody>,
+    /// The recent conversation tail (feed-conversation-tail R1/R3/R5): oldest
+    /// → newest, at most `io::MAX_TURNS` turns, ending with the current reply
+    /// (the last turn's `at` equals `repliedAt` — the consumer's correlation
+    /// contract). Prompts newer than the reply surface once the next reply
+    /// closes them out (KTD2). Omitted — never an empty array — when there is
+    /// no stamped reply or no servable history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<TurnEntry>,
 }
 
 /// The full snapshot streamed on every SSE frame. `version` is the monotonic
@@ -394,6 +421,7 @@ mod tests {
                 }],
                 request: None,
             }),
+            turns: vec![],
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["question"]["askedAt"], 1_700_000_001_000u64);
@@ -431,6 +459,7 @@ mod tests {
                 questions: vec![],
                 request: Some("cargo build".into()),
             }),
+            turns: vec![],
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["question"]["kind"], "permission");
@@ -452,6 +481,7 @@ mod tests {
             text: "done".into(),
             replied_at: Some(1),
             question: None,
+            turns: vec![],
         };
         let v = serde_json::to_value(&body).unwrap();
         assert!(v.get("question").is_none());
@@ -459,6 +489,60 @@ mod tests {
         let old = serde_json::json!({"text": "done", "repliedAt": 1});
         let back: AgentOutputBody = serde_json::from_value(old).unwrap();
         assert_eq!(back.question, None);
+    }
+
+    #[test]
+    fn output_body_turns_round_trip_golden_keys() {
+        // feed-conversation-tail R1/R2/R3: the exact keys + role strings the
+        // consumer pins against, oldest → newest, ending at the reply.
+        let body = AgentOutputBody {
+            text: "All tests pass.".into(),
+            replied_at: Some(1_700_000_000_000),
+            question: None,
+            turns: vec![
+                TurnEntry {
+                    role: "user".into(),
+                    at: 1_699_999_990_000,
+                    text: "run the tests".into(),
+                },
+                TurnEntry {
+                    role: "agent".into(),
+                    at: 1_700_000_000_000,
+                    text: "All tests pass.".into(),
+                },
+            ],
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["turns"][0]["role"], "user");
+        assert_eq!(v["turns"][0]["at"], 1_699_999_990_000u64);
+        assert_eq!(v["turns"][0]["text"], "run the tests");
+        assert_eq!(v["turns"][1]["role"], "agent");
+        // R3: the final turn's `at` equals repliedAt.
+        assert_eq!(v["turns"][1]["at"], v["repliedAt"]);
+        let back: AgentOutputBody = serde_json::from_value(v).unwrap();
+        assert_eq!(back, body);
+    }
+
+    #[test]
+    fn output_body_without_turns_omits_the_key() {
+        // R5: no history → the `turns` key is absent (not an empty array),
+        // and everything else stays byte-identical to today's body.
+        let body = AgentOutputBody {
+            text: "done".into(),
+            replied_at: Some(1),
+            question: None,
+            turns: vec![],
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v.get("turns").is_none());
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"text":"done","repliedAt":1}"#
+        );
+        // And an old-style body (no turns key) still deserializes.
+        let old = serde_json::json!({"text": "done", "repliedAt": 1});
+        let back: AgentOutputBody = serde_json::from_value(old).unwrap();
+        assert!(back.turns.is_empty());
     }
 
     #[test]

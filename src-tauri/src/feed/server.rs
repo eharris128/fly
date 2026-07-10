@@ -314,10 +314,12 @@ fn gated_question(question: Option<QuestionBody>, reason: Option<&str>) -> Optio
 }
 
 /// `GET /agents/{key}/output`: the latest reply plus the gated pending
-/// question, `{"text": "", …}` when the agent exists but has no data, `404`
-/// for a key outside the published roster (KTD2). Existence and reason come
-/// from ONE roster snapshot ([`FeedState::agent_reason`]) so the gate can't
-/// straddle a roster swap.
+/// question and the conversation tail (feed-conversation-tail R1 — ungated:
+/// turns are completed history, already scrubbed/capped by the resolver),
+/// `{"text": "", …}` when the agent exists but has no data, `404` for a key
+/// outside the published roster (KTD2). Existence and reason come from ONE
+/// roster snapshot ([`FeedState::agent_reason`]) so the gate can't straddle a
+/// roster swap.
 fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec<u8>>> {
     let Some(reason) = ctx.state.agent_reason(key) else {
         return empty_response(404);
@@ -331,6 +333,7 @@ fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec
         text,
         replied_at,
         question: gated_question(resolved.question, reason.as_deref()),
+        turns: resolved.turns,
     };
     json_response(serde_json::to_string(&body).unwrap_or_else(|_| "{\"text\":\"\"}".into()))
 }

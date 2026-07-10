@@ -14,10 +14,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use super::wire::{QuestionBody, QuestionOption, QuestionSpec};
+use super::wire::{QuestionBody, QuestionOption, QuestionSpec, TurnEntry};
 use crate::automations::redact;
 use crate::session::resume;
-use crate::session::transcript::{self, LastReply, PendingInteraction, PendingKind};
+use crate::session::transcript::{self, LastReply, PendingInteraction, PendingKind, TurnRole};
 
 /// Resolve a leaf key's latest assistant reply from durable state (U3):
 /// resume record (leaf → `session_id` + `session_cwd`) → transcript path
@@ -52,15 +52,20 @@ struct CachedIo {
     io: ResolvedIo,
 }
 
-/// Both per-leaf IO facts from one transcript resolution (feed-pending-question
-/// U3): the latest completed reply and the pending question, already scrubbed /
-/// sanitized / truncated into the wire shape. Every surface reads this one
-/// source, so `/feed`'s `questionPendingAt` and `/output`'s `question.askedAt`
-/// cannot drift for a choice question (R4).
+/// The per-leaf IO facts from one transcript resolution (feed-pending-question
+/// U3; feed-conversation-tail U2): the latest completed reply, the pending
+/// question, and the recent conversation tail — question and turns already
+/// scrubbed / sanitized / truncated into the wire shape. Every surface reads
+/// this one source, so `/feed`'s `questionPendingAt` and `/output`'s
+/// `question.askedAt` cannot drift for a choice question (R4), and the tail's
+/// final turn cannot drift from the reply it correlates with.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResolvedIo {
     pub reply: Option<LastReply>,
     pub question: Option<QuestionBody>,
+    /// Wire-ready conversation tail (feed-conversation-tail R1): empty means
+    /// "no servable history" and serializes as an absent key (R5).
+    pub turns: Vec<TurnEntry>,
 }
 
 impl ReplyResolver {
@@ -92,6 +97,14 @@ impl ReplyResolver {
     /// scrubbing **before** sanitize + truncation (R8/KTD7 — see [`clean`]);
     /// the reply itself stays unscrubbed (unchanged, deferred parity — the
     /// trust model remains "token holder ≈ user at the keyboard").
+    ///
+    /// The conversation tail (feed-conversation-tail U2) is served only
+    /// alongside a *stamped* wire reply — the array must end with the current
+    /// reply, `at == repliedAt` (R3) — and every turn's text goes through the
+    /// full [`clean`] pipeline (R7). That is deliberately stricter than the
+    /// sibling `text` field's legacy no-scrub posture: turns are newly exposed
+    /// strings, so a secret-bearing final turn may read `[redacted]` where
+    /// `text` shows the raw reply.
     pub fn resolve_io(&self, leaf_key: &str) -> ResolvedIo {
         let Some(path) = self.transcript_path(leaf_key) else {
             return ResolvedIo::default();
@@ -109,15 +122,24 @@ impl ReplyResolver {
             }
         }
         let io = transcript::transcript_io(&path)
-            .map(|t| ResolvedIo {
-                reply: t.reply.and_then(|r| {
+            .map(|t| {
+                let reply = t.reply.and_then(|r| {
                     let text = crate::notify::sanitize_multiline(&r.text);
                     (!text.trim().is_empty()).then_some(LastReply {
                         text,
                         replied_at_ms: r.replied_at_ms,
                     })
-                }),
-                question: t.pending.as_ref().and_then(question_body),
+                });
+                let turns = reply
+                    .as_ref()
+                    .and_then(|r| r.replied_at_ms)
+                    .map(|at| shape_turns(&t.turns, at))
+                    .unwrap_or_default();
+                ResolvedIo {
+                    reply,
+                    question: t.pending.as_ref().and_then(question_body),
+                    turns,
+                }
             })
             .unwrap_or_default();
         cache.insert(
@@ -192,6 +214,57 @@ fn clean(raw: &str, cap: usize) -> Option<String> {
         out.push('…');
     }
     Some(out)
+}
+
+// ---- conversation-tail shaping (feed-conversation-tail U2) ------------------
+
+/// Serving ceilings for the conversation tail (R4), pinned like the question
+/// ceilings above — the consumer pins its own caps at or above these. Depth
+/// counts **served** turns (drops don't shrink the window); text is char-capped
+/// through [`clean`], so a turn is never more than 4·`TURN_CAP` bytes of UTF-8
+/// plus a 3-byte ellipsis — the same order as the 8 KiB automations output
+/// tail cap (`automations::model::OUTPUT_TAIL_CAP_BYTES`) it references.
+pub const MAX_TURNS: usize = 12;
+pub const TURN_CAP: usize = 2048;
+// The raw scan must retain at least a full serving window (KTD3).
+const _: () = assert!(MAX_TURNS <= transcript::RAW_TURN_BUFFER);
+
+/// Shape the raw conversation window into the wire `turns` (U2): walk backward
+/// from the newest agent turn — which the transcript scan guarantees is the
+/// same entry the reply came from (KTD1) — collecting up to [`MAX_TURNS`]
+/// turns whose stamp parsed and whose text survives [`clean`] (sanitize →
+/// scrub → truncate to [`TURN_CAP`], R7), then reverse to oldest → newest.
+/// Prompts newer than the reply are cut so the array ends with the current
+/// reply, `at == repliedAt` (R3/KTD2); they surface once the next reply closes
+/// them out. Empty — the caller's omit signal (R5) — when no agent turn
+/// exists in the window or when the newest one doesn't carry the reply's own
+/// stamp (defensive: serving it would break the correlation contract).
+fn shape_turns(raw: &[transcript::RawTurn], replied_at_ms: u64) -> Vec<TurnEntry> {
+    let Some(end) = raw.iter().rposition(|t| t.role == TurnRole::Agent) else {
+        return Vec::new();
+    };
+    if raw[end].at_ms != Some(replied_at_ms) {
+        return Vec::new();
+    }
+    let mut newest_first: Vec<TurnEntry> = Vec::new();
+    for t in raw[..=end].iter().rev() {
+        if newest_first.len() == MAX_TURNS {
+            break;
+        }
+        let Some(at) = t.at_ms else { continue };
+        let Some(text) = clean(&t.text, TURN_CAP) else { continue };
+        let role = match t.role {
+            TurnRole::User => "user",
+            TurnRole::Agent => "agent",
+        };
+        newest_first.push(TurnEntry {
+            role: role.to_string(),
+            at,
+            text,
+        });
+    }
+    newest_first.reverse();
+    newest_first
 }
 
 /// Shape a parsed pending interaction into the wire `QuestionBody`, applying
@@ -671,6 +744,118 @@ mod tests {
         // Transcript gone from disk → both halves None.
         std::fs::remove_dir_all(dir.path().join("projects")).unwrap();
         assert_eq!(r.resolve_io("leaf-1"), ResolvedIo::default());
+    }
+
+    // ---- conversation tail (feed-conversation-tail U2) ----------------------
+
+    /// A stamped user prompt entry. Seconds offset keeps stamps ordered.
+    fn user_line(sec: u8, text: &str) -> String {
+        format!(
+            r#"{{"type":"user","timestamp":"2026-06-19T19:17:{sec:02}.000Z","message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    }
+
+    /// A stamped assistant text entry.
+    fn agent_line(sec: u8, text: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-06-19T19:17:{sec:02}.000Z","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn turns_end_with_the_reply_and_cut_trailing_prompts() {
+        // R3/KTD2: a prompt delivered AFTER the last reply (the agent is still
+        // working on it) is cut, so the array's final turn is the current
+        // reply and its `at` equals `repliedAt`. Tool chatter in between
+        // (tool_use / tool_result entries) never becomes a turn, and the
+        // mid-run narration collapses into the run's final reply (R6).
+        let body = [
+            user_line(1, "run the tests"),
+            agent_line(5, "Running."),
+            r#"{"type":"assistant","timestamp":"2026-06-19T19:17:06.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}"#.to_string(),
+            r#"{"type":"user","timestamp":"2026-06-19T19:17:08.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#.to_string(),
+            agent_line(16, "All tests pass."),
+            user_line(30, "now the lints"),
+        ]
+        .join("\n");
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{body}\n"));
+        let io = r.resolve_io("leaf-1");
+        let reply = io.reply.expect("reply");
+        assert_eq!(reply.text, "All tests pass.");
+        let turns = &io.turns;
+        assert_eq!(
+            turns.iter().map(|t| t.role.as_str()).collect::<Vec<_>>(),
+            vec!["user", "agent"],
+            "trailing prompt cut, tool chatter absent, narration collapsed"
+        );
+        assert_eq!(turns[0].text, "run the tests");
+        assert_eq!(turns.last().unwrap().text, "All tests pass.");
+        assert_eq!(turns.last().unwrap().at, reply.replied_at_ms.unwrap());
+        // Oldest → newest.
+        assert!(turns.windows(2).all(|w| w[0].at <= w[1].at));
+    }
+
+    #[test]
+    fn turns_depth_is_capped_serving_the_newest_window_ending_at_the_reply() {
+        // R4: >MAX_TURNS of history serves exactly MAX_TURNS, the newest
+        // window, still ending at the reply.
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..20u8 {
+            lines.push(user_line(2 * i, &format!("prompt {i}")));
+            lines.push(agent_line(2 * i + 1, &format!("reply {i}")));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{}\n", lines.join("\n")));
+        let io = r.resolve_io("leaf-1");
+        assert_eq!(io.turns.len(), MAX_TURNS);
+        assert_eq!(io.turns.last().unwrap().text, "reply 19");
+        assert_eq!(
+            io.turns.last().unwrap().at,
+            io.reply.unwrap().replied_at_ms.unwrap()
+        );
+        assert_eq!(io.turns[0].text, "prompt 14", "the newest 12-turn window");
+    }
+
+    #[test]
+    fn turn_text_is_scrubbed_and_capped() {
+        // R7: every turn's text passes the full clean pipeline — a secret in a
+        // PROMPT is masked (stricter than the legacy unscrubbed reply `text`),
+        // and an oversized turn truncates to TURN_CAP chars + ellipsis.
+        let long = "x".repeat(TURN_CAP + 100);
+        let body = [
+            user_line(1, &format!("my key is sk-ant-api03-{} ok", "a".repeat(30))),
+            user_line(2, &long),
+            agent_line(5, "Noted."),
+        ]
+        .join("\n");
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{body}\n"));
+        let turns = r.resolve_io("leaf-1").turns;
+        assert_eq!(turns.len(), 3);
+        assert!(!turns[0].text.contains("sk-ant"), "was: {}", turns[0].text);
+        assert!(turns[0].text.contains("[redacted]"));
+        assert_eq!(turns[1].text.chars().count(), TURN_CAP + 1, "cap + ellipsis");
+        assert!(turns[1].text.ends_with('…'));
+    }
+
+    #[test]
+    fn turns_are_omitted_without_a_stamped_reply() {
+        // R5: no reply at all → no turns (a prompt-only tail is deferred until
+        // the next reply closes it out)…
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{}\n", user_line(1, "hi")));
+        let io = r.resolve_io("leaf-1");
+        assert_eq!(io.reply, None);
+        assert!(io.turns.is_empty());
+        // …and a reply whose entry carried no parseable stamp serves text but
+        // no turns — a turn without a numeric `at` is unservable (R2), so the
+        // array could not end with the reply.
+        let stampless = r#"{"type":"assistant","message":{"role":"assistant","content":"done"}}"#;
+        let r = fixture(dir.path(), "leaf-2", "sid-def", "/q", &format!("{stampless}\n"));
+        let io = r.resolve_io("leaf-2");
+        assert_eq!(io.reply.as_ref().unwrap().replied_at_ms, None);
+        assert!(io.turns.is_empty());
     }
 
     // ---- paste_payload / SUBMIT (U5) ----------------------------------------

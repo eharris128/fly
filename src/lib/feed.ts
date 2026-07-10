@@ -83,15 +83,32 @@ export interface QuestionBody {
 }
 
 /**
+ * One turn of the recent conversation tail on `GET /agents/{key}/output`
+ * (mirrors Rust `TurnEntry`; feed-conversation-tail). `role` is exactly
+ * `"user"` (a prompt delivered TO the agent, from any source) or `"agent"`
+ * (a reply FROM it); `at` is epoch ms, always present; `text` is scrubbed,
+ * sanitized, and char-capped (truncation carries no marker).
+ */
+export interface TurnEntry {
+  role: "user" | "agent";
+  at: number;
+  text: string;
+}
+
+/**
  * `GET /agents/{key}/output` response body (mirrors Rust `AgentOutputBody`).
  * Empty `text` with no `repliedAt` is the "no reply yet" state; `question` is
- * present only while the agent is blocked on one (feed-pending-question). The
- * frontend never populates this — it documents the boundary for the consumer.
+ * present only while the agent is blocked on one (feed-pending-question);
+ * `turns` is the recent conversation tail, oldest → newest, ending with the
+ * current reply (its `at` equals `repliedAt`) — absent, never empty, when
+ * there is no servable history (feed-conversation-tail). The frontend never
+ * populates this — it documents the boundary for the consumer.
  */
 export interface AgentOutputBody {
   text: string;
   repliedAt?: number;
   question?: QuestionBody;
+  turns?: TurnEntry[];
 }
 
 /** One automation on the wire (mirrors Rust `AutomationEntry`). Backend-filled. */

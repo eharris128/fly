@@ -701,23 +701,173 @@ pub struct PendingInteraction {
     pub input: Option<serde_json::Value>,
 }
 
-/// Both per-agent IO facts from one transcript read (U1 → U3 seam): the last
-/// *completed* assistant reply and the *pending* interaction, so the resolver
-/// caches both from a single parse instead of reading the file twice.
+/// The per-agent IO facts from one transcript read (U1 → U3 seam): the last
+/// *completed* assistant reply, the *pending* interaction, and the trailing
+/// conversation window (feed-conversation-tail U1), so the resolver caches all
+/// three from a single parse instead of reading the file multiple times.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptIo {
     pub reply: Option<LastReply>,
     pub pending: Option<PendingInteraction>,
+    /// The last [`RAW_TURN_BUFFER`] conversational turns, oldest → newest,
+    /// raw ([`RawTurn`]) — the caller shapes/cleans them for the wire.
+    pub turns: Vec<RawTurn>,
 }
 
-/// Read a transcript once and resolve both IO halves. `None` for a missing /
+/// Read a transcript once and resolve every IO fact. `None` for a missing /
 /// unreadable file (the caller's "no data" state, never an error).
 pub fn transcript_io(path: &Path) -> Option<TranscriptIo> {
     let body = std::fs::read_to_string(path).ok()?;
     Some(TranscriptIo {
         reply: last_assistant_reply_from_str(&body),
         pending: pending_interaction_from_str(&body),
+        turns: conversation_turns_from_str(&body),
     })
+}
+
+// ---- conversation-tail scan (feed-conversation-tail U1) --------------------
+
+/// One conversational turn of the transcript tail (feed-conversation-tail U1):
+/// a prompt delivered TO the agent (`User`) or a textual reply FROM it
+/// (`Agent`). `text` is **raw and untrusted** — user-/agent-authored, uncapped,
+/// unsanitized; the caller scrubs, sanitizes, and truncates before exposing it
+/// (R7, same posture as [`PendingInteraction`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawTurn {
+    pub role: TurnRole,
+    /// Epoch ms of the turn's transcript entry, when it carried a parseable
+    /// stamp. The wire requires a numeric `at` per turn (R2), so a stampless
+    /// turn is dropped at shaping time — never served unstamped.
+    pub at_ms: Option<u64>,
+    pub text: String,
+}
+
+/// Who spoke a [`RawTurn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnRole {
+    User,
+    Agent,
+}
+
+/// How many trailing raw turns the tail scan retains — 2× the wire serving
+/// depth (`feed::io::MAX_TURNS`, statically checked there — KTD3) so the
+/// shaping pass can still fill its window after cutting post-reply prompts and
+/// dropping stampless or blank-after-clean turns.
+pub(crate) const RAW_TURN_BUFFER: usize = 24;
+
+/// The conversation-tail scan: the last [`RAW_TURN_BUFFER`] conversational
+/// turns of a transcript, oldest → newest.
+///
+/// An **agent** turn is the **last** text-bearing `type == "assistant"` entry
+/// of each assistant run (a stretch uninterrupted by a user prompt): one
+/// working stretch usually flushes several text entries — narration between
+/// tool calls — and those are intermediate output, not conversation (R6), so
+/// a run collapses to its final text, exactly the entry the pane surfaced as
+/// that stretch's reply. The per-entry text predicate is
+/// [`last_assistant_reply_from_str`]'s ([`assistant_text_blocks`], no other
+/// filtering), and collapse keeps the newest, so the scan's newest agent turn
+/// IS the entry `reply`/`repliedAt` are served from (KTD1) and the wire's
+/// ends-with-the-reply correlation (R3) holds by construction.
+///
+/// A **user** turn is a `type == "user"` entry bearing real text (string body
+/// or `text` blocks, [`user_text_blocks`]) — which structurally excludes tool
+/// chatter (R6): `tool_result`-only entries (tool returns, remote
+/// `mode:"keys"` digit answers) carry no text and are transparent to the run
+/// collapse, and a permission approval writes no user entry at all.
+/// Sidechain (subagent), meta (caveats, injected notes), and compact-summary
+/// user entries are skipped (also transparently to the collapse — they are
+/// not conversation, so they don't delimit a run).
+fn conversation_turns_from_str(body: &str) -> Vec<RawTurn> {
+    let mut turns: std::collections::VecDeque<RawTurn> = std::collections::VecDeque::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue; // corrupt / unterminated line: skipped, thin-reader contract
+        };
+        let ts = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(iso8601_to_ms);
+        let turn = match v.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => assistant_text_blocks(&v).map(|text| RawTurn {
+                role: TurnRole::Agent,
+                at_ms: ts,
+                text,
+            }),
+            Some("user")
+                if v.get("isSidechain").and_then(|s| s.as_bool()) != Some(true)
+                    && v.get("isMeta").and_then(|m| m.as_bool()) != Some(true)
+                    && v.get("isCompactSummary").and_then(|c| c.as_bool()) != Some(true) =>
+            {
+                user_text_blocks(&v).map(|text| RawTurn {
+                    role: TurnRole::User,
+                    at_ms: ts,
+                    text,
+                })
+            }
+            _ => None,
+        };
+        if let Some(turn) = turn {
+            // Collapse an assistant run to its last text entry (R6): a new
+            // agent turn replaces a trailing agent turn instead of appending.
+            if turn.role == TurnRole::Agent
+                && turns.back().map(|t| t.role) == Some(TurnRole::Agent)
+            {
+                *turns.back_mut().expect("non-empty: back() was Some") = turn;
+                continue;
+            }
+            if turns.len() == RAW_TURN_BUFFER {
+                turns.pop_front();
+            }
+            turns.push_back(turn);
+        }
+    }
+    turns.into()
+}
+
+/// A user entry's prompt text: its plain-string body, or every non-blank
+/// `{"type":"text"}` block joined by blank lines (mirroring
+/// [`assistant_text_blocks`]). `None` when the entry carries no real text —
+/// e.g. `tool_result`-only — matching [`user_blocks`]'s boundary test, or
+/// when the text is harness bookkeeping ([`is_harness_bookkeeping`]).
+fn user_text_blocks(v: &serde_json::Value) -> Option<String> {
+    let content = v.get("message")?.get("content")?;
+    let text = match content {
+        serde_json::Value::String(s) if !s.trim().is_empty() => s.clone(),
+        serde_json::Value::Array(blocks) => {
+            let parts: Vec<&str> = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .filter(|t| !t.trim().is_empty())
+                .collect();
+            if parts.is_empty() {
+                return None;
+            }
+            parts.join("\n\n")
+        }
+        _ => return None,
+    };
+    (!is_harness_bookkeeping(&text)).then_some(text)
+}
+
+/// Whether a user entry's text is Claude Code harness bookkeeping rather than
+/// a prompt delivered to the agent (R6, verified on real transcripts — these
+/// carry **no** `isMeta` flag, so only the content shape identifies them): a
+/// slash-command invocation record (`<command-name>…` / `<command-message>…`)
+/// is a control signal like a `mode:"keys"` digit, and local-command output
+/// (`<local-command-stdout>`/`stderr`) is harness output *to the user*, not a
+/// prompt at all. Prefix-matched on the trimmed text — the harness writes the
+/// tag first; a real prompt starting with these exact tags is vanishingly
+/// unlikely, and exclusion is the abstain-shaped failure.
+fn is_harness_bookkeeping(text: &str) -> bool {
+    let t = text.trim_start();
+    ["<command-name>", "<command-message>", "<local-command-stdout>", "<local-command-stderr>"]
+        .iter()
+        .any(|tag| t.starts_with(tag))
 }
 
 /// Tools that delegate to a subagent whose own dialog is what's actually on
@@ -1822,7 +1972,170 @@ mod tests {
         let p = io.pending.expect("pending");
         assert_eq!(p.asked_at_ms, ASKED_AT);
         assert_eq!(p.context.as_deref(), Some("Here is the summary."));
+        // The turns window rides the same read (feed-conversation-tail U1).
+        assert_eq!(io.turns.len(), 1);
+        assert_eq!(io.turns[0].text, "Here is the summary.");
         // Missing file → None (never an error).
         assert_eq!(transcript_io(&dir.path().join("gone.jsonl")), None);
+    }
+
+    // ---- conversation-tail scan (feed-conversation-tail U1) -----------------
+
+    /// A stamped user prompt entry (string body).
+    fn user_entry(ts: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"user","timestamp":"{ts}","message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    }
+
+    /// A stamped assistant text entry.
+    fn agent_entry(ts: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn turns_scan_keeps_conversation_and_excludes_tool_chatter() {
+        // A prompt → narration → tool_use → tool_result → final reply
+        // exchange yields exactly two turns: the prompt and the run's FINAL
+        // text (R6 collapse — the mid-run narration is intermediate output,
+        // caught live on a real transcript where narration crowded out every
+        // prompt). The tool_use-only assistant entry and the tool_result-only
+        // user entry (the shape a tool return AND a remote keys-mode digit
+        // answer both take) never become turns, nor do they delimit the run.
+        let body = [
+            user_entry("2026-07-09T10:00:00.000Z", "run the tests"),
+            agent_entry("2026-07-09T10:00:05.000Z", "Running them now."),
+            r#"{"type":"assistant","timestamp":"2026-07-09T10:00:06.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}"#.to_string(),
+            r#"{"type":"user","timestamp":"2026-07-09T10:00:20.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#.to_string(),
+            agent_entry("2026-07-09T10:00:25.000Z", "All tests pass."),
+        ]
+        .join("\n");
+        let turns = conversation_turns_from_str(&body);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, TurnRole::User);
+        assert_eq!(turns[0].text, "run the tests");
+        assert!(turns[0].at_ms.is_some());
+        assert_eq!(turns[1].role, TurnRole::Agent);
+        assert_eq!(turns[1].text, "All tests pass.", "the run's final text");
+    }
+
+    #[test]
+    fn turns_scan_a_new_prompt_ends_the_collapse_run() {
+        // Collapse only spans ONE working stretch: a user prompt delimits it,
+        // so reply → prompt → reply keeps both replies.
+        let body = [
+            agent_entry("2026-07-09T10:00:00.000Z", "First reply."),
+            user_entry("2026-07-09T10:00:10.000Z", "and now?"),
+            agent_entry("2026-07-09T10:00:20.000Z", "Second reply."),
+        ]
+        .join("\n");
+        let turns = conversation_turns_from_str(&body);
+        assert_eq!(
+            turns.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(),
+            vec!["First reply.", "and now?", "Second reply."]
+        );
+    }
+
+    #[test]
+    fn turns_scan_newest_agent_turn_is_the_reply_entry() {
+        // KTD1: the scan's agent-turn predicate is last_assistant_reply's, so
+        // the newest agent turn carries the reply's exact text + stamp — the
+        // by-construction guarantee the wire's R3 correlation rests on.
+        let body = [
+            user_entry("2026-07-09T10:00:00.000Z", "status?"),
+            agent_entry("2026-07-09T10:00:05.000Z", "Checking."),
+            agent_entry("2026-07-09T10:00:25.000Z", "All green."),
+        ]
+        .join("\n");
+        let reply = last_assistant_reply_from_str(&body).expect("reply");
+        let turns = conversation_turns_from_str(&body);
+        let newest_agent = turns
+            .iter()
+            .rev()
+            .find(|t| t.role == TurnRole::Agent)
+            .expect("agent turn");
+        assert_eq!(newest_agent.text, reply.text);
+        assert_eq!(newest_agent.at_ms, reply.replied_at_ms);
+    }
+
+    #[test]
+    fn turns_scan_skips_meta_sidechain_and_summary_user_entries() {
+        // isMeta (caveats/injected notes), isSidechain (subagent traffic), and
+        // isCompactSummary user entries are not prompts delivered to THIS
+        // agent — none become turns. Thinking-only assistant entries carry no
+        // text and drop out on the text predicate.
+        let body = [
+            r#"{"type":"user","isMeta":true,"timestamp":"2026-07-09T10:00:00.000Z","message":{"role":"user","content":"Caveat: injected note"}}"#.to_string(),
+            r#"{"type":"user","isSidechain":true,"timestamp":"2026-07-09T10:00:01.000Z","message":{"role":"user","content":"subagent prompt"}}"#.to_string(),
+            r#"{"type":"user","isCompactSummary":true,"timestamp":"2026-07-09T10:00:02.000Z","message":{"role":"user","content":"compacted history"}}"#.to_string(),
+            r#"{"type":"assistant","timestamp":"2026-07-09T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"}]}}"#.to_string(),
+            user_entry("2026-07-09T10:00:04.000Z", "a real prompt"),
+        ]
+        .join("\n");
+        let turns = conversation_turns_from_str(&body);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].text, "a real prompt");
+    }
+
+    #[test]
+    fn turns_scan_excludes_harness_bookkeeping_user_entries() {
+        // Slash-command records and local-command output are harness
+        // bookkeeping, not prompts delivered to the agent — and real
+        // transcripts carry NO isMeta on them, so only the content shape (the
+        // leading tag) identifies them. None become turns, and like every
+        // non-conversation entry they are transparent to the run collapse
+        // (the two replies straddling them collapse to the final one). The
+        // match is prefix-only: a tag mentioned mid-prompt still surfaces.
+        let body = [
+            agent_entry("2026-07-09T10:00:00.000Z", "First reply."),
+            user_entry("2026-07-09T10:00:01.000Z", "<command-name>/clear</command-name>"),
+            user_entry("2026-07-09T10:00:02.000Z", "<command-message>clear</command-message>"),
+            user_entry("2026-07-09T10:00:03.000Z", "<local-command-stdout>ok</local-command-stdout>"),
+            user_entry("2026-07-09T10:00:04.000Z", "<local-command-stderr>err</local-command-stderr>"),
+            agent_entry("2026-07-09T10:00:05.000Z", "Second reply."),
+            user_entry("2026-07-09T10:00:06.000Z", "what does <command-name> mean?"),
+        ]
+        .join("\n");
+        let turns = conversation_turns_from_str(&body);
+        assert_eq!(
+            turns.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(),
+            vec!["Second reply.", "what does <command-name> mean?"],
+            "bookkeeping yields no turns and does not delimit the run"
+        );
+    }
+
+    #[test]
+    fn turns_scan_is_bounded_to_the_buffer_keeping_the_newest() {
+        // KTD3: the scan retains only the trailing RAW_TURN_BUFFER turns.
+        let body: Vec<String> = (0..RAW_TURN_BUFFER + 10)
+            .map(|i| user_entry("2026-07-09T10:00:00.000Z", &format!("prompt {i}")))
+            .collect();
+        let turns = conversation_turns_from_str(&body.join("\n"));
+        assert_eq!(turns.len(), RAW_TURN_BUFFER);
+        assert_eq!(turns[0].text, "prompt 10", "oldest retained is the 11th");
+        assert_eq!(
+            turns.last().unwrap().text,
+            format!("prompt {}", RAW_TURN_BUFFER + 9)
+        );
+    }
+
+    #[test]
+    fn turns_scan_stampless_and_blockless_shapes_degrade() {
+        // A stampless turn is kept raw with at_ms None (the shaping pass drops
+        // it); a user entry mixing tool_result + text blocks joins the text.
+        let body = [
+            r#"{"type":"user","message":{"role":"user","content":"no stamp"}}"#.to_string(),
+            r#"{"type":"user","timestamp":"2026-07-09T10:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"},{"type":"text","text":"and a"},{"type":"text","text":"real prompt"}]}}"#.to_string(),
+        ]
+        .join("\n");
+        let turns = conversation_turns_from_str(&body);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].at_ms, None);
+        assert_eq!(turns[1].text, "and a\n\nreal prompt");
+        // Empty / corrupt bodies yield no turns, never an error.
+        assert!(conversation_turns_from_str("").is_empty());
+        assert!(conversation_turns_from_str("{ not json\n").is_empty());
     }
 }
