@@ -17,7 +17,11 @@ import type {
   RunRow,
   RunStatus,
 } from "../ipc";
-import { buildMonitorPickupCommand, sanitizeTranscriptPath } from "./handoff";
+import {
+  buildMonitorPickupCommand,
+  sanitizeTranscriptPath,
+  stripControlChars,
+} from "./handoff";
 
 /** Last-run status for the row: the last run's status, or `"never run"`. */
 export type LastStatus = "never run" | RunStatus;
@@ -173,11 +177,12 @@ export function monitorStateOf(
   return "parked";
 }
 
-/** Strip control characters (C0 incl. newlines, DEL, C1) from a one-line
- *  display string — the verdict note is captured agent output, untrusted in
- *  the panel (the CLI sanitizes the same field with `sanitize_title`). */
+/** Flatten control characters (C0 incl. newlines, DEL, C1) to spaces for a
+ *  one-line display string — the verdict note is captured agent output,
+ *  untrusted in the panel (the CLI sanitizes the same field with
+ *  `sanitize_title`). Delegates to the shared sanitizer in handoff.ts. */
 function stripControl(s: string): string {
-  return s.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+  return stripControlChars(s, " ");
 }
 
 function toRow(

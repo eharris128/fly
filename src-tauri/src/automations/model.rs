@@ -176,6 +176,18 @@ pub enum VerdictOutcome {
     Fail,
 }
 
+impl VerdictOutcome {
+    /// The prompt-block spelling (`PASS`/`FAIL`) — the display form shared by
+    /// the alert line (`mod.rs`) and the CLI's verdict rendering, so the
+    /// human-facing spelling can't drift between surfaces.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VerdictOutcome::Pass => "PASS",
+            VerdictOutcome::Fail => "FAIL",
+        }
+    }
+}
+
 /// Pickup pointers captured at monitor registration (monitor-handoff U1,
 /// R11): the parent session's id, transcript path, and cwd — stored on the
 /// [`Automation`] record itself, not a run row, so they survive run-history

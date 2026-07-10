@@ -873,10 +873,7 @@ fn verdict_run(a: &Automation) -> Option<&RunRow> {
 /// [`notify::sanitize_title`] flattens control chars and caps length; the
 /// note is captured agent output, untrusted in a terminal.
 fn verdict_line(v: &Verdict) -> String {
-    let outcome = match v.outcome {
-        VerdictOutcome::Pass => "PASS",
-        VerdictOutcome::Fail => "FAIL",
-    };
+    let outcome = v.outcome.as_str();
     let note = v.note.trim();
     if note.is_empty() {
         outcome.to_string()

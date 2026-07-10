@@ -109,20 +109,27 @@ pub fn parse_verdict(text: &str) -> Option<Verdict> {
     Some(Verdict { outcome, note })
 }
 
+/// The run-identifying half of a failure bundle (R15) — grouped so the three
+/// same-typed `&str` identifiers can't be transposed at the call site (the
+/// compiler catches a swap; a positional list would not).
+pub struct BundleContext<'a> {
+    pub automation_name: &'a str,
+    pub automation_id: &'a str,
+    pub run_id: &'a str,
+    pub closed_at_ms: u64,
+}
+
 /// R15: render the durable failure bundle written for a FAIL verdict — the
 /// verdict note, the pickup pointers captured at registration (R11/R4), and
-/// the **full** captured final turn as evidence (the bundle lives outside the
-/// R8 run-output tail cap; that is its whole point). Pure string assembly;
-/// the manager writes it to disk after the close mutation releases the store
-/// lock (KTD-B), fail-tolerant.
+/// the captured final turn as evidence (the bundle lives outside the R8
+/// run-output tail cap; the caller applies its own generous evidence cap).
+/// Pure string assembly; the manager writes it to disk after the close
+/// mutation releases the store lock (KTD-B), fail-tolerant.
 pub fn render_bundle(
-    automation_name: &str,
-    automation_id: &str,
-    run_id: &str,
+    ctx: &BundleContext,
     verdict: &Verdict,
     evidence: &str,
     pointers: Option<&MonitorPointers>,
-    closed_at_ms: u64,
 ) -> String {
     let pointers_block = match pointers {
         Some(p) => format!(
@@ -132,9 +139,9 @@ pub fn render_bundle(
         None => "(none captured — pointers are stamped at monitor registration)".to_owned(),
     };
     format!(
-        "# Monitor failure bundle — {automation_name}\n\
+        "# Monitor failure bundle — {name}\n\
          \n\
-         - automation: {automation_id}\n\
+         - automation: {id}\n\
          - run: {run_id}\n\
          - verdict: FAIL\n\
          - closedAtMs: {closed_at_ms}\n\
@@ -150,6 +157,10 @@ pub fn render_bundle(
          ## Evidence — the check's full final message\n\
          \n\
          {evidence}\n",
+        name = ctx.automation_name,
+        id = ctx.automation_id,
+        run_id = ctx.run_id,
+        closed_at_ms = ctx.closed_at_ms,
         note = verdict.note,
     )
 }
@@ -292,7 +303,13 @@ mod tests {
             transcript_path: "/home/u/.claude/projects/x/sess-9.jsonl".into(),
             session_cwd: "/home/u/exp".into(),
         };
-        let b = render_bundle("train watch", "a1", "r1", &v, "full final turn here", Some(&p), 70_000);
+        let ctx = BundleContext {
+            automation_name: "train watch",
+            automation_id: "a1",
+            run_id: "r1",
+            closed_at_ms: 70_000,
+        };
+        let b = render_bundle(&ctx, &v, "full final turn here", Some(&p));
         assert!(b.contains("train watch"));
         assert!(b.contains("- automation: a1"));
         assert!(b.contains("- run: r1"));
@@ -312,7 +329,13 @@ mod tests {
             outcome: VerdictOutcome::Fail,
             note: "died".into(),
         };
-        let b = render_bundle("w", "a1", "r1", &v, "evidence", None, 1);
+        let ctx = BundleContext {
+            automation_name: "w",
+            automation_id: "a1",
+            run_id: "r1",
+            closed_at_ms: 1,
+        };
+        let b = render_bundle(&ctx, &v, "evidence", None);
         assert!(b.contains("(none captured"));
         assert!(b.contains("evidence"));
     }

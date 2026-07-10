@@ -35,7 +35,28 @@ export type GuidedHandoffByLeaf = Record<string, HandoffTarget>;
  * kind of untrusted stored paths in its prompt and its fallback display.
  */
 export function sanitizeTranscriptPath(path: string): string {
-  return path.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+  return stripControlChars(path);
+}
+
+/** C0 (incl. newlines), DEL, and C1 - the control-char class every untrusted
+ *  frontend display/embed string is stripped of (the frontend mirror of the
+ *  backend's `notify::sanitize_*` posture). */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
+
+/**
+ * Replace control characters in an untrusted string - removed by default, or
+ * swapped for `replacement` (e.g. `" "` to keep word boundaries when
+ * flattening a multi-line note). The one shared control-char sanitizer
+ * (monitor-handoff U7 reuses it for verdict notes and bundle text).
+ */
+export function stripControlChars(text: string, replacement = ""): string {
+  return text.replace(CONTROL_CHARS, replacement);
+}
+
+/** Dirname of a slash path (`"/"` for a bare filename) - the `--add-dir`
+ *  project-dir derivation shared by handoff and monitor pickup. */
+function dirnameOf(path: string): string {
+  return path.replace(/\/[^/]*$/, "") || "/";
 }
 
 /**
@@ -79,7 +100,7 @@ export function buildHandoffCommand(
   mode: HandoffMode,
 ): string[] {
   const path = sanitizeTranscriptPath(target.transcriptPath);
-  const projectDir = path.replace(/\/[^/]*$/, "") || "/";
+  const projectDir = dirnameOf(path);
   const argv = ["claude"];
   if (mode === "quick") argv.push("--dangerously-skip-permissions", handoffPrompt(path));
   argv.push("--add-dir", projectDir);
@@ -136,11 +157,10 @@ export function buildMonitorPickupCommand(
   bundlePath: string | null,
 ): string[] {
   const transcript = sanitizeTranscriptPath(transcriptPath);
-  const transcriptDir = transcript.replace(/\/[^/]*$/, "") || "/";
+  const transcriptDir = dirnameOf(transcript);
   const dirs = [transcriptDir];
   if (bundlePath != null) {
-    const bundleDir =
-      sanitizeTranscriptPath(bundlePath).replace(/\/[^/]*$/, "") || "/";
+    const bundleDir = dirnameOf(sanitizeTranscriptPath(bundlePath));
     if (bundleDir !== transcriptDir) dirs.push(bundleDir);
   }
   return [

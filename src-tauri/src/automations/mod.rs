@@ -1012,8 +1012,11 @@ impl AutomationManager {
             });
             (self.emit_changed)(id);
             // Monitor-handoff R7: a manual-run dispatch failure on a monitor
-            // is an infra failure like any other (after the lock, KTD-B).
-            self.check_monitor_escalation(id);
+            // is an infra failure like any other (after the lock, KTD-B). The
+            // fetched record is in hand — only monitors take the check.
+            if automation.monitor {
+                self.check_monitor_escalation(id);
+            }
             // Manual runs are synchronous user requests: surface the failure
             // (the row already records it) instead of reporting Started.
             return Err(format!("run could not start: {e}"));
@@ -1127,7 +1130,7 @@ impl AutomationManager {
     /// monitor whose output can never be attributed eventually rings instead
     /// of running silent.
     fn close_run_by_pane_with(&self, pane_id: u64, mut outcome: RunOutcome) -> Result<(), String> {
-        let found: Option<(Automation, String)> = {
+        let found: Option<(Automation, String, Option<u64>)> = {
             let map = self.store.snapshot();
             let mut found = None;
             'outer: for a in map.into_values() {
@@ -1137,23 +1140,19 @@ impl AutomationManager {
                         // U4b transcript read below; monitor flag / pointers /
                         // name feed the U3 verdict path.
                         let run_id = run.id.clone();
-                        found = Some((a, run_id));
+                        let started_at = run.started_at;
+                        found = Some((a, run_id, started_at));
                         break 'outer;
                     }
                 }
             }
             found
         };
-        let Some((automation, run_id)) = found else {
+        let Some((automation, run_id, started_at)) = found else {
             // No running run for this pane: idempotent no-op (second Stop, or a
             // run the deadline/other path already closed).
             return Ok(());
         };
-        let started_at = automation
-            .runs
-            .iter()
-            .find(|r| r.id == run_id)
-            .and_then(|r| r.started_at);
         // U4b (R8): capture the agent's final assistant turn into the run's
         // output, unless the caller already supplied output. The capturer reads
         // a transcript from disk (off the store lock, KTD-B) and abstains on an
@@ -1280,17 +1279,23 @@ impl AutomationManager {
         }
         // ---- lock released (KTD-B): bundle write, alert, events -------------
         // R15: write the failure bundle — verdict note + pickup pointers +
-        // the FULL captured turn (outside the R8 tail cap).
+        // the captured turn (outside the R8 8-KiB run-output tail cap; its own
+        // generous cap below keeps a pathologically verbose turn from writing
+        // an unbounded file — the tail is kept, where the verdict block and
+        // failure narrative live, matching the R8 tail convention).
         let mut bundle_note = String::new();
         if verdict.outcome == VerdictOutcome::Fail {
-            let rendered = verdict::render_bundle(
-                &automation.name,
-                &automation.id,
+            let ctx = verdict::BundleContext {
+                automation_name: &automation.name,
+                automation_id: &automation.id,
                 run_id,
+                closed_at_ms: now,
+            };
+            let rendered = verdict::render_bundle(
+                &ctx,
                 &verdict,
-                evidence,
+                tail_capped(evidence, BUNDLE_EVIDENCE_CAP_BYTES),
                 automation.pickup_pointers.as_ref(),
-                now,
             );
             bundle_note = match &bundle_path {
                 Some(p) => match write_bundle_file(std::path::Path::new(p), &rendered) {
@@ -1491,6 +1496,10 @@ impl AutomationManager {
         // U5: agent runs the sweep itself closed failed (ack-timeout / deadline),
         // to emit `automation://run-closed` in phase 3 (outside the lock).
         let mut closed_agent_runs: Vec<(String, String)> = Vec::new();
+        // Monitor-handoff R7: monitors among those closes, collected while the
+        // `.monitor` bit is in hand so the phase-3 escalation check never
+        // re-fetches (and clones) an ordinary automation just to bail.
+        let mut monitor_infra_failed: Vec<String> = Vec::new();
         let flush_result = self.store.mutate(|map| {
             for a in map.values_mut() {
                 let mut touched = false;
@@ -1500,6 +1509,9 @@ impl AutomationManager {
                 for run_id in ack_timed_out_agent_runs(a, now_ms) {
                     a.close(&run_id, failed(ERR_SPAWN_ACK), now_ms);
                     closed_agent_runs.push((a.id.clone(), run_id));
+                    if a.monitor {
+                        monitor_infra_failed.push(a.id.clone());
+                    }
                     touched = true;
                 }
 
@@ -1513,6 +1525,9 @@ impl AutomationManager {
                 for run_id in deadline_expired_agent_runs(a, now_ms) {
                     a.close(&run_id, failed(ERR_TIMED_OUT), now_ms);
                     closed_agent_runs.push((a.id.clone(), run_id));
+                    if a.monitor {
+                        monitor_infra_failed.push(a.id.clone());
+                    }
                     touched = true;
                 }
 
@@ -1615,19 +1630,21 @@ impl AutomationManager {
             to_dispatch_retry.clear();
         }
 
-        // Monitor-handoff R7: automations whose runs the sweep itself closed
-        // failed this tick (ack timeout / deadline / dispatch failure) — each
-        // is an infra failure, so the broken-monitor escalation is evaluated
-        // for them in phase 3, deduped and outside the lock.
-        let mut infra_failed: Vec<String> =
-            closed_agent_runs.iter().map(|(id, _)| id.clone()).collect();
+        // Monitor-handoff R7: monitors whose runs the sweep failed this tick
+        // (ack timeout / deadline above; dispatch failures pushed below while
+        // the claimed `Automation` — and its `.monitor` bit — is in hand, so
+        // ordinary automations never reach the escalation's store re-fetch).
+        // Evaluated in phase 3, deduped and outside the lock.
+        let mut infra_failed = monitor_infra_failed;
 
         // Phase 2: the store lock is RELEASED — dispatch (KTD-B: the
         // load-bearing discipline; a Dispatcher may safely call back into
         // list()/get() from here).
         for (automation, run_id) in to_dispatch {
             if let Err(e) = self.dispatch(&automation, &run_id) {
-                infra_failed.push(automation.id.clone());
+                if automation.monitor {
+                    infra_failed.push(automation.id.clone());
+                }
                 // R3: recompute from now — never restore the pre-claim value
                 // (it could clobber a concurrent edit). Pure math outside the
                 // lock, applied in a second short mutate. The not-before
@@ -1666,7 +1683,9 @@ impl AutomationManager {
                         a.close(&run_id, failed(&e), now_ms);
                     }
                 });
-                infra_failed.push(automation.id.clone());
+                if automation.monitor {
+                    infra_failed.push(automation.id.clone());
+                }
                 // The automation is already in `changed` (the phase-1 retry
                 // claim pushed it); only the run-closed emit is still owed so
                 // the frontend tab lifecycle reacts to a failed agent retry.
@@ -1686,7 +1705,7 @@ impl AutomationManager {
         for (automation_id, run_id) in closed_agent_runs {
             self.emit_run_closed(&automation_id, &run_id, RunStatus::Failed);
         }
-        // Monitor-handoff R7: broken-monitor escalation for every automation
+        // Monitor-handoff R7: broken-monitor escalation for every monitor
         // the sweep failed a run on this tick — deduped so one tick's
         // multiple closes on the same monitor ring at most once, and outside
         // the lock like every alert (KTD-B).
@@ -1911,10 +1930,7 @@ fn outcome_status(o: &RunOutcome) -> RunStatus {
 /// half sanitizes + caps at write time (alerts.rs R16), so only the note's
 /// first line rides here; the full note lives on the run row / bundle.
 fn verdict_alert_line(v: &Verdict, bundle_note: &str) -> String {
-    let word = match v.outcome {
-        VerdictOutcome::Pass => "PASS",
-        VerdictOutcome::Fail => "FAIL",
-    };
+    let word = v.outcome.as_str();
     let first = v.note.lines().next().unwrap_or("").trim();
     if first.is_empty() {
         format!("monitor {word}{bundle_note}")
@@ -1923,21 +1939,39 @@ fn verdict_alert_line(v: &Verdict, bundle_note: &str) -> String {
     }
 }
 
-/// Monitor-handoff R15: write a failure bundle — `0600` file in a `0700` dir
-/// via temp + rename (the alerts.rs / store.rs private-file convention),
-/// under the injected bundle dir. Called only after the close mutation
-/// releases the store lock (KTD-B); errors surface to the caller, which
-/// degrades to the "bundle could not be written" alert note (fail-tolerant).
-fn write_bundle_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+/// Monitor-handoff R15: generous byte cap on the bundle's evidence section —
+/// far above the R8 8-KiB run-output tail (a bundle's whole point is escaping
+/// it), aligned with the read path's display cap ([`BUNDLE_READ_CAP_BYTES`])
+/// so a bundle on disk stays in the size class the fallback surface assumes.
+/// Enforced at write time; without it a pathologically verbose final turn
+/// would write an unbounded file.
+const BUNDLE_EVIDENCE_CAP_BYTES: usize = 256 * 1024;
+
+/// Cap `s` to its last `cap` bytes on a char boundary (the tail survives —
+/// the verdict block and failure narrative end the message, the same
+/// convention as `model::output_tail`). Saturating arithmetic: the text is
+/// captured agent output and release builds have overflow checks off.
+fn tail_capped(s: &str, cap: usize) -> &str {
+    if s.len() <= cap {
+        return s;
     }
-    let tmp = path.with_extension("md.tmp");
-    std::fs::write(&tmp, content)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)
+    let mut start = s.len().saturating_sub(cap);
+    while start < s.len() && !s.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
+    &s[start..]
+}
+
+/// Monitor-handoff R15: write a failure bundle — `0600` file in a `0700` dir
+/// via temp + rename (reusing the store's private-file primitives), under the
+/// injected bundle dir. Called only after the close mutation releases the
+/// store lock (KTD-B); errors surface to the caller, which degrades to the
+/// "bundle could not be written" alert note (fail-tolerant).
+fn write_bundle_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        store::create_private_dir(parent)?;
+    }
+    store::write_atomic_owner_only(path, content.as_bytes())
 }
 
 /// Set the output on a terminal outcome, preserving its variant + fields (U4b).
