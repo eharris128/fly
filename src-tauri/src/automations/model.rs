@@ -530,21 +530,40 @@ impl Automation {
 
     /// Monitor-handoff R6/R7: the consecutive-infra-failure count, DERIVED
     /// from run history — never stored, so there is no counter to strand.
-    /// Walks the history newest-first: a `Failed` row with no verdict is an
-    /// infrastructure failure (timeout / crash / interruption — never a
-    /// healthcheck verdict, R6) and counts; a `Succeeded` row or any
-    /// verdict-bearing row is a concluded check and stops the walk (the R7
-    /// reset); `Skipped` rows are neutral (never ran — neither count nor
-    /// reset), and so is a still-`Running` row (it has concluded nothing
-    /// yet). The escalation threshold and its alert-once behavior live in
-    /// the close path (monitor-handoff U3), not here.
+    /// Walks the history newest-first; **any verdict-bearing row** is a
+    /// concluded, readable check and stops the walk (the R7 reset).
+    /// Otherwise:
+    ///
+    /// - a `Failed` row is an infrastructure failure (timeout / crash /
+    ///   interruption — never a healthcheck verdict, R6) and counts;
+    /// - a `Succeeded` row **with no captured output** also counts — the
+    ///   monitor-handoff **U3 refinement** of this walk's original
+    ///   "Succeeded always resets" rule: the check concluded but its output
+    ///   could not be attributed (capture abstention — a busy cwd), so its
+    ///   verdict is unreadable; without counting these, a monitor whose
+    ///   output can never be read would run silent forever (the plan's
+    ///   Risks note: escalation bounds it);
+    /// - a `Succeeded` row **with output** is a readable, concluded check —
+    ///   e.g. a healthy not-done check that reported "still running" — and
+    ///   resets the walk (a long experiment produces many of these; they
+    ///   must never escalate);
+    /// - `Skipped` rows are neutral (never ran — neither count nor reset),
+    ///   and so is a still-`Running` row (it has concluded nothing yet).
+    ///
+    /// The escalation threshold and its alert-once behavior live in the
+    /// close path (monitor-handoff U3), not here.
     pub fn consecutive_infra_failures(&self) -> usize {
         let mut n = 0;
         for row in self.runs.iter().rev() {
+            if row.verdict.is_some() {
+                break; // a concluded, readable check: reset
+            }
             match row.status {
-                RunStatus::Failed if row.verdict.is_none() => n += 1,
+                RunStatus::Failed => n += 1,
+                // U3 refinement: concluded but unreadable (abstained capture).
+                RunStatus::Succeeded if row.output.is_none() => n += 1,
+                RunStatus::Succeeded => break, // readable not-done check: reset
                 RunStatus::Skipped | RunStatus::Running => {}
-                _ => break, // Succeeded, or a verdict-bearing Failed: reset
             }
         }
         n
@@ -1216,9 +1235,12 @@ mod tests {
         assert!(!a.in_flight(), "no stranded Running row");
     }
 
-    // monitor-handoff R6/R7: the infra-failure count is DERIVED from
-    // trailing verdict-less Failed rows — Skipped (and in-flight Running)
-    // rows are neutral; a Succeeded row or any verdict-bearing row resets.
+    // monitor-handoff R6/R7 (+ the U3 refinement): the infra-failure count
+    // is DERIVED from trailing verdict-less rows that are Failed OR
+    // Succeeded-without-output (a concluded check whose capture abstained —
+    // its verdict is unreadable). Skipped (and in-flight Running) rows are
+    // neutral; a Succeeded row WITH output (a readable not-done check) or
+    // any verdict-bearing row resets.
     #[test]
     fn consecutive_infra_failures_derives_from_trailing_verdictless_failed_rows() {
         let mut a = automation(script_mode());
@@ -1254,11 +1276,32 @@ mod tests {
             "an in-flight Running row concluded nothing — neutral"
         );
 
-        a.close("live", RunOutcome::Succeeded { output: None }, 4_500);
-        assert_eq!(a.consecutive_infra_failures(), 0, "a clean check resets");
+        a.close(
+            "live",
+            RunOutcome::Succeeded {
+                output: Some("still training — no verdict yet".into()),
+            },
+            4_500,
+        );
+        assert_eq!(
+            a.consecutive_infra_failures(),
+            0,
+            "a readable not-done check (Succeeded WITH output) resets"
+        );
+
+        // U3 refinement: a Succeeded check whose output was never captured
+        // (abstention — output None) is unreadable and COUNTS, so a monitor
+        // whose output can never be attributed eventually escalates.
+        a.claim(Some(6_000), 4_600, Trigger::Schedule, "abst").unwrap();
+        a.close("abst", RunOutcome::Succeeded { output: None }, 4_700);
+        assert_eq!(
+            a.consecutive_infra_failures(),
+            1,
+            "an abstained (output-less) Succeeded check counts"
+        );
 
         fail(&mut a, "f3", 5_000);
-        assert_eq!(a.consecutive_infra_failures(), 1);
+        assert_eq!(a.consecutive_infra_failures(), 2);
 
         // A verdict-bearing row — even a Failed one — is a conclusion, not
         // an infra failure: it resets the trailing count (monitor-handoff R6).

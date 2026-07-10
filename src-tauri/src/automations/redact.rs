@@ -12,6 +12,15 @@
 //! through. It deliberately errs toward over-redaction (masking an env-style
 //! assignment's value is cheaper than leaking one). No regex dependency — a
 //! small hand-rolled scan keeps the build offline-friendly.
+//!
+//! **Call-order contract** (the `feed/io.rs::clean` convention, applied to the
+//! automations capture path by monitor-handoff U3, per the accepted residual
+//! finding in `docs/residual-review-findings/feat-feed-pending-question.md`):
+//! **sanitize → scrub → truncate**. Control-sanitize the text *before* calling
+//! [`scrub_secrets`] — this scan matches tokens by prefix/shape, which a
+//! zero-width or control character *inside* a token defeats (`sk-\u{200B}ant-…`
+//! slips past, and a later sanitize pass would re-form the cleartext). Truncate
+//! last, so the scrub always sees full, unstraddled values.
 
 /// The placeholder every match collapses to.
 const MASK: &str = "[redacted]";
@@ -236,5 +245,21 @@ mod tests {
         // Leading indentation and inner spacing are preserved on scrubbed lines.
         let text = "  summary:\n    TOKEN=abcdefghijkl ok";
         assert_eq!(scrub_secrets(text), "  summary:\n    TOKEN=[redacted] ok");
+    }
+
+    // The module-doc call-order contract (monitor-handoff U3): a zero-width
+    // char inside a token hides it from this prefix/shape scan, so callers
+    // must control-sanitize BEFORE scrubbing (sanitize → scrub → truncate).
+    #[test]
+    fn sanitize_before_scrub_catches_a_zero_width_split_token() {
+        let raw = "the token s\u{200B}k-ant-api03-abcdefghijklmnop leaked";
+        // Scrub alone misses the split token — exactly why order matters.
+        assert!(
+            scrub_secrets(raw).contains("abcdefghijklmnop"),
+            "documented hazard: the split token slips past a bare scrub"
+        );
+        // Sanitize-then-scrub re-joins the token and masks it whole.
+        let sane = crate::notify::sanitize_multiline(raw);
+        assert_eq!(scrub_secrets(&sane), "the token [redacted] leaked");
     }
 }

@@ -36,6 +36,7 @@ pub mod redact;
 pub mod schedule;
 pub mod script;
 pub mod store;
+pub mod verdict;
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,8 +48,8 @@ use tauri::Emitter;
 
 use crate::config::{AutomationDefaults, ConfigStore};
 use model::{
-    Automation, Mode, Origin, RunMode, RunOutcome, RunRow, RunStatus, Trigger, ERR_DELETED,
-    ERR_INTERRUPTED, ERR_TIMED_OUT,
+    Automation, Mode, Origin, RunMode, RunOutcome, RunRow, RunStatus, Trigger, Verdict,
+    VerdictOutcome, ERR_DELETED, ERR_INTERRUPTED, ERR_TIMED_OUT,
 };
 use store::{Store, StoreHealth};
 
@@ -229,6 +230,15 @@ impl InterruptedRun {
 /// or R17 pending-queue), the same machinery a script alert uses. Called from
 /// the post-recovery step, never under the store lock (KTD-B).
 pub type InterruptSink = Arc<dyn Fn(&InterruptedRun) + Send + Sync>;
+
+/// Monitor-handoff U3 seam (R14/R15/R7): surface a monitor verdict or a
+/// "monitor broken" escalation as `(automation name, alert line)` — the exact
+/// shape of `lib.rs`'s shared `surface_alert` path (`AlertsLog` append +
+/// `Signal { Alert, Cli }` ring or R17 pending-queue), so verdict attention
+/// rides the existing alert machinery (the plan's KTD: no new attention
+/// producer). Always invoked **after** the store lock is released (KTD-B).
+/// Default no-op; `lib.rs` injects `surface_alert` itself.
+pub type MonitorAlertSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// How claimed runs leave the manager (KTD-C/E): the sweep claims + flushes
 /// under the store lock, releases it, then calls exactly one of these.
@@ -431,6 +441,15 @@ pub struct AutomationManager {
     /// pipeline (see [`InterruptSink`]). Default no-op; `lib.rs` injects the
     /// real one.
     interrupt_sink: Mutex<InterruptSink>,
+    /// Monitor-handoff U3: verdict / broken-monitor alerts (see
+    /// [`MonitorAlertSink`]). Default no-op; `lib.rs` injects `surface_alert`.
+    monitor_alert_sink: Mutex<MonitorAlertSink>,
+    /// Monitor-handoff U3 (R15): directory the FAIL-verdict bundle files are
+    /// written under — the `FLY_APP_NAME` data root's `monitor-bundles/` in
+    /// the app (`lib.rs` injects it), a tempdir in tests. `None` (the
+    /// default) degrades to the fail-tolerant no-bundle path: the close and
+    /// retire still land and the alert notes the missing bundle.
+    bundle_dir: Mutex<Option<std::path::PathBuf>>,
     /// Interrupt-resilience U2/R2: runs that startup recovery closed
     /// `interrupted`, stashed by [`AutomationManager::new`] and drained once by
     /// [`AutomationManager::process_pending_interrupts`] on the first sweep tick
@@ -481,6 +500,8 @@ impl AutomationManager {
             output_capturer: Mutex::new(Arc::new(|_cwd: &str, _since: u64| None)),
             emit_run_closed: Mutex::new(Arc::new(|_ev: &RunClosedEvent| {})),
             interrupt_sink: Mutex::new(Arc::new(|_ir: &InterruptedRun| {})),
+            monitor_alert_sink: Mutex::new(Arc::new(|_name: &str, _line: &str| {})),
+            bundle_dir: Mutex::new(None),
             pending_interrupts: Mutex::new(Vec::new()),
             retry_queue: Mutex::new(VecDeque::new()),
             frontend_ready: AtomicBool::new(false),
@@ -595,6 +616,18 @@ impl AutomationManager {
         *self.interrupt_sink.lock().unwrap() = sink;
     }
 
+    /// Monitor-handoff U3: inject the verdict / broken-monitor alert sink
+    /// (see [`MonitorAlertSink`]).
+    pub fn set_monitor_alert_sink(&self, sink: MonitorAlertSink) {
+        *self.monitor_alert_sink.lock().unwrap() = sink;
+    }
+
+    /// Monitor-handoff U3 (R15): inject the failure-bundle directory (the
+    /// `FLY_APP_NAME` data root's `monitor-bundles/`).
+    pub fn set_bundle_dir(&self, dir: std::path::PathBuf) {
+        *self.bundle_dir.lock().unwrap() = Some(dir);
+    }
+
     /// Interrupt-resilience U2/R2/R3: drain the startup-recovery backlog exactly
     /// once — alert **every** interrupted run through the [`InterruptSink`], and
     /// enqueue the retry-eligible ones ([`InterruptedRun::is_retry_eligible`])
@@ -627,6 +660,15 @@ impl AutomationManager {
         // regardless, so this is a best-effort live refresh.
         for ir in &pending {
             (self.emit_changed)(&ir.automation_id);
+        }
+        // Monitor-handoff R7: an interrupted check is an infra failure —
+        // evaluate the broken-monitor escalation now that the alert sink is
+        // wired (this runs on the first sweep tick), deduped per automation.
+        let mut ids: Vec<String> = pending.iter().map(|ir| ir.automation_id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        for id in ids {
+            self.check_monitor_escalation(&id);
         }
     }
 
@@ -896,6 +938,9 @@ impl AutomationManager {
                 }
             });
             (self.emit_changed)(id);
+            // Monitor-handoff R7: a manual-run dispatch failure on a monitor
+            // is an infra failure like any other (after the lock, KTD-B).
+            self.check_monitor_escalation(id);
             // Manual runs are synchronous user requests: surface the failure
             // (the row already records it) instead of reporting Started.
             return Err(format!("run could not start: {e}"));
@@ -921,6 +966,10 @@ impl AutomationManager {
         outcome: RunOutcome,
     ) -> model::CloseResult {
         let now = (self.clock)();
+        // Monitor-handoff R6/R7: a failed close is an infrastructure failure
+        // (never a verdict) — evaluate the broken-monitor escalation after
+        // the mutation lands (outside the lock, below).
+        let status = outcome_status(&outcome);
         let result = flush_tolerant(
             self.store.mutate(|map| {
                 map.get_mut(automation_id)
@@ -943,6 +992,10 @@ impl AutomationManager {
             Some(res) => {
                 if res == model::CloseResult::Closed {
                     (self.emit_changed)(automation_id); // after the lock (KTD-B)
+                    if status == RunStatus::Failed {
+                        // Monitor-handoff R7 (after the lock, KTD-B).
+                        self.check_monitor_escalation(automation_id);
+                    }
                 }
                 res
             }
@@ -981,51 +1034,235 @@ impl AutomationManager {
     /// `pane_id` and close it with `outcome`. Idempotent — returns `Ok(())`
     /// whether it closed a row, found no running run, or hit an already-closed
     /// one (all benign for the Stop / pane-exit callers).
+    ///
+    /// Monitor-handoff U3 rides here: a **monitor** check that closes
+    /// `Succeeded` (a Stop) has its captured final turn parsed for the R2
+    /// verdict block **before** the R8 tail cap ever runs (the capturer
+    /// returns the full text; truncation happens inside the close mutation),
+    /// and a parsed verdict routes to the retiring close
+    /// ([`AutomationManager::close_monitor_run_retiring`]). Infra-failure
+    /// closes (pane exit here; timeout/ack/interrupt elsewhere) **never**
+    /// parse a verdict (R6) — they take the ordinary close, whose R7
+    /// escalation check lives in [`AutomationManager::close_run`]. A check
+    /// with captured output but no parseable verdict is a not-done check:
+    /// ordinary silent close, schedule untouched (R5). An **abstaining
+    /// capture** (the capturer returned `None` — busy cwd) is equally silent
+    /// but counts toward the R7 escalation (the U3 refinement: the row lands
+    /// `Succeeded` with no output, which
+    /// [`Automation::consecutive_infra_failures`] treats as an unreadable
+    /// check), so this method runs the escalation check for it below — a
+    /// monitor whose output can never be attributed eventually rings instead
+    /// of running silent.
     fn close_run_by_pane_with(&self, pane_id: u64, mut outcome: RunOutcome) -> Result<(), String> {
-        let found = {
+        let found: Option<(Automation, String)> = {
             let map = self.store.snapshot();
-            let mut found: Option<(String, String, String, Option<u64>)> = None;
-            for (auto_id, a) in map.iter() {
+            let mut found = None;
+            'outer: for a in map.into_values() {
                 for run in &a.runs {
                     if run.pane_id == Some(pane_id) && run.status == RunStatus::Running {
-                        // Also capture cwd + dispatch time for the U4b transcript
-                        // read below.
-                        found =
-                            Some((auto_id.clone(), run.id.clone(), a.cwd.clone(), run.started_at));
-                        break;
+                        // Keep the whole record: cwd + dispatch time feed the
+                        // U4b transcript read below; monitor flag / pointers /
+                        // name feed the U3 verdict path.
+                        let run_id = run.id.clone();
+                        found = Some((a, run_id));
+                        break 'outer;
                     }
-                }
-                if found.is_some() {
-                    break;
                 }
             }
             found
         };
-        let Some((automation_id, run_id, cwd, started_at)) = found else {
+        let Some((automation, run_id)) = found else {
             // No running run for this pane: idempotent no-op (second Stop, or a
             // run the deadline/other path already closed).
             return Ok(());
         };
+        let started_at = automation
+            .runs
+            .iter()
+            .find(|r| r.id == run_id)
+            .and_then(|r| r.started_at);
         // U4b (R8): capture the agent's final assistant turn into the run's
         // output, unless the caller already supplied output. The capturer reads
         // a transcript from disk (off the store lock, KTD-B) and abstains on an
         // ambiguous cwd — so this never blocks the close and never records the
-        // wrong session's content. `close_run` tail-caps the text (R8).
+        // wrong session's content. `close_run` tail-caps the text (R8);
+        // `captured` keeps the FULL pre-cap text for the verdict parse and the
+        // R15 bundle evidence.
+        let mut captured: Option<String> = None;
         if outcome_output(&outcome).is_none() {
             if let Some(started) = started_at {
                 let capturer = Arc::clone(&self.output_capturer.lock().unwrap());
-                if let Some(text) = capturer(&cwd, started) {
+                captured = capturer(&automation.cwd, started);
+                if let Some(text) = captured.clone() {
                     outcome = with_output(outcome, text);
                 }
             }
         }
+        // Monitor-handoff R2/R6: parse the verdict only for a live (not yet
+        // retired) monitor whose check concluded normally (Stop → Succeeded).
+        // Failed closes are infrastructure failures — never a verdict.
+        let parsed = if automation.monitor
+            && automation.retired_at.is_none()
+            && matches!(outcome, RunOutcome::Succeeded { .. })
+        {
+            captured.as_deref().and_then(verdict::parse_verdict)
+        } else {
+            None
+        };
+        if let Some(v) = parsed {
+            let evidence = captured.unwrap_or_default();
+            return self.close_monitor_run_retiring(&automation, &run_id, outcome, v, &evidence);
+        }
         // U5: emit `automation://run-closed` when this close actually closed the
         // row (idempotent no-op on a second Stop / already-closed run).
         let status = outcome_status(&outcome);
-        if self.close_run(&automation_id, &run_id, outcome) == model::CloseResult::Closed {
-            self.emit_run_closed(&automation_id, &run_id, status);
+        // Monitor-handoff U3 refinement: an output-less Succeeded close means
+        // the capture abstained (and no caller supplied output — derived from
+        // the outcome, so a caller-supplied-output close never reads as
+        // abstention). The row lands unreadable and counts toward R7.
+        let unreadable = outcome_output(&outcome).is_none();
+        if self.close_run(&automation.id, &run_id, outcome) == model::CloseResult::Closed {
+            self.emit_run_closed(&automation.id, &run_id, status);
+            if automation.monitor && status == RunStatus::Succeeded && unreadable {
+                // R7, after the lock (KTD-B). Failed closes are checked
+                // inside `close_run`; this covers the abstained-capture case.
+                self.check_monitor_escalation(&automation.id);
+            }
         }
         Ok(())
+    }
+
+    /// Monitor-handoff U3 (R2/R3/R4/R14/R15): the verdict close. **One store
+    /// mutation** — under a single [`store::Store::mutate`] hold — closes the
+    /// `Running` row (tail-capping its output, R8), stamps the parsed
+    /// [`Verdict`], records the bundle path, and retires the monitor
+    /// ([`Automation::retire`]: `retired_at` set, `next_run_at` cleared), so
+    /// no crash between steps can strand a verdict without its retirement or
+    /// vice versa (the plan's atomicity KTD). The bundle-file write (FAIL
+    /// only) and the alert raise happen strictly **after** the lock is
+    /// released (KTD-B), on the caller's thread (the Stop dispatch already
+    /// runs the capturer off the hook/PTY threads).
+    ///
+    /// Fail-tolerant like everything else on this path: a bundle write
+    /// failure (or an unwired bundle dir) never blocks the close/retire —
+    /// the alert line notes the missing bundle instead (mirrors
+    /// [`flush_tolerant`]'s in-memory-wins posture).
+    fn close_monitor_run_retiring(
+        &self,
+        automation: &Automation,
+        run_id: &str,
+        outcome: RunOutcome,
+        verdict: Verdict,
+        evidence: &str,
+    ) -> Result<(), String> {
+        let now = (self.clock)();
+        let status = outcome_status(&outcome);
+        // The bundle path is decided *before* the mutation so the run row can
+        // reference it atomically (R15: the row is the bundle's index); the
+        // file itself is written after the lock below. `None` when there is
+        // no FAIL bundle to write (PASS) or no bundle dir is wired.
+        let bundle_path: Option<String> = if verdict.outcome == VerdictOutcome::Fail {
+            self.bundle_dir.lock().unwrap().as_ref().map(|d| {
+                d.join(format!("{}-{}.md", automation.id, run_id))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        } else {
+            None
+        };
+        let v = verdict.clone();
+        let bp = bundle_path.clone();
+        let closed: Option<model::CloseResult> = flush_tolerant(
+            self.store.mutate(|map| {
+                map.get_mut(&automation.id).map(|a| {
+                    let res = a.close(run_id, outcome, now);
+                    if res == model::CloseResult::Closed {
+                        if let Some(row) = a.runs.iter_mut().find(|r| r.id == run_id) {
+                            row.verdict = Some(v.clone());
+                            row.bundle_path = bp.clone();
+                        }
+                        // R3: retire in the SAME mutation as the close.
+                        a.retire(now);
+                    }
+                    res
+                })
+            }),
+            // Flush failed but the mutation applied (KTD-B store contract):
+            // re-derive from the authoritative map.
+            || {
+                self.store.get(&automation.id).map(|a| {
+                    match a.runs.iter().find(|r| r.id == run_id) {
+                        Some(r) if r.status.is_terminal() => model::CloseResult::Closed,
+                        _ => model::CloseResult::NotFound,
+                    }
+                })
+            },
+        );
+        if closed != Some(model::CloseResult::Closed) {
+            // Deleted mid-close, or another path (deadline/pane-exit) closed
+            // the row first — that close carried no verdict, so nothing
+            // retires and nothing rings here (idempotent, like the plain
+            // pane-keyed close).
+            return Ok(());
+        }
+        // ---- lock released (KTD-B): bundle write, alert, events -------------
+        // R15: write the failure bundle — verdict note + pickup pointers +
+        // the FULL captured turn (outside the R8 tail cap).
+        let mut bundle_note = String::new();
+        if verdict.outcome == VerdictOutcome::Fail {
+            let rendered = verdict::render_bundle(
+                &automation.name,
+                &automation.id,
+                run_id,
+                &verdict,
+                evidence,
+                automation.pickup_pointers.as_ref(),
+                now,
+            );
+            bundle_note = match &bundle_path {
+                Some(p) => match write_bundle_file(std::path::Path::new(p), &rendered) {
+                    Ok(()) => format!(" — bundle: {p}"),
+                    Err(e) => {
+                        eprintln!(
+                            "[fly-automations] could not write monitor bundle {p} ({e}); \
+                             the run close and retirement still hold"
+                        );
+                        " — bundle could not be written".to_owned()
+                    }
+                },
+                None => " — bundle could not be written (no bundle dir)".to_owned(),
+            };
+        }
+        // R14/R15: the verdict rings through the existing alert path.
+        let line = verdict_alert_line(&verdict, &bundle_note);
+        let sink = Arc::clone(&self.monitor_alert_sink.lock().unwrap());
+        sink(&automation.name, &line);
+        (self.emit_changed)(&automation.id);
+        self.emit_run_closed(&automation.id, run_id, status);
+        Ok(())
+    }
+
+    /// Monitor-handoff R7: evaluate the broken-monitor escalation for one
+    /// automation, called after an infra-failure close **outside** the store
+    /// lock (KTD-B — it snapshots the record, then rings). The count is
+    /// derived from run history ([`Automation::consecutive_infra_failures`],
+    /// U1); [`verdict::broken_alert_due`] fires at each positive multiple of
+    /// three, which *is* the "reset after alerting" representation (see its
+    /// doc). Retired and non-monitor automations never ring.
+    fn check_monitor_escalation(&self, automation_id: &str) {
+        let Some(a) = self.store.get(automation_id) else {
+            return;
+        };
+        if !a.monitor || a.retired_at.is_some() {
+            return;
+        }
+        let n = a.consecutive_infra_failures();
+        if verdict::broken_alert_due(n) {
+            let line =
+                format!("monitor broken: {n} consecutive checks failed without a verdict");
+            let sink = Arc::clone(&self.monitor_alert_sink.lock().unwrap());
+            sink(&a.name, &line);
+        }
     }
 
     /// U7 pane-exit tap: the pane linked to an agent run has exited. Close its
@@ -1305,11 +1542,19 @@ impl AutomationManager {
             to_dispatch_retry.clear();
         }
 
+        // Monitor-handoff R7: automations whose runs the sweep itself closed
+        // failed this tick (ack timeout / deadline / dispatch failure) — each
+        // is an infra failure, so the broken-monitor escalation is evaluated
+        // for them in phase 3, deduped and outside the lock.
+        let mut infra_failed: Vec<String> =
+            closed_agent_runs.iter().map(|(id, _)| id.clone()).collect();
+
         // Phase 2: the store lock is RELEASED — dispatch (KTD-B: the
         // load-bearing discipline; a Dispatcher may safely call back into
         // list()/get() from here).
         for (automation, run_id) in to_dispatch {
             if let Err(e) = self.dispatch(&automation, &run_id) {
+                infra_failed.push(automation.id.clone());
                 // R3: recompute from now — never restore the pre-claim value
                 // (it could clobber a concurrent edit). Pure math outside the
                 // lock, applied in a second short mutate. The not-before
@@ -1348,6 +1593,7 @@ impl AutomationManager {
                         a.close(&run_id, failed(&e), now_ms);
                     }
                 });
+                infra_failed.push(automation.id.clone());
                 // The automation is already in `changed` (the phase-1 retry
                 // claim pushed it); only the run-closed emit is still owed so
                 // the frontend tab lifecycle reacts to a failed agent retry.
@@ -1366,6 +1612,15 @@ impl AutomationManager {
         // tab, U8) — also outside the lock.
         for (automation_id, run_id) in closed_agent_runs {
             self.emit_run_closed(&automation_id, &run_id, RunStatus::Failed);
+        }
+        // Monitor-handoff R7: broken-monitor escalation for every automation
+        // the sweep failed a run on this tick — deduped so one tick's
+        // multiple closes on the same monitor ring at most once, and outside
+        // the lock like every alert (KTD-B).
+        infra_failed.sort();
+        infra_failed.dedup();
+        for id in infra_failed {
+            self.check_monitor_escalation(&id);
         }
     }
 
@@ -1577,6 +1832,41 @@ fn outcome_status(o: &RunOutcome) -> RunStatus {
     }
 }
 
+/// Monitor-handoff R14/R15: the one-line alert a verdict raises —
+/// `monitor PASS: <note first line>` / `monitor FAIL: <note first line>` plus
+/// the bundle suffix (path, or the could-not-be-written note). The sink's log
+/// half sanitizes + caps at write time (alerts.rs R16), so only the note's
+/// first line rides here; the full note lives on the run row / bundle.
+fn verdict_alert_line(v: &Verdict, bundle_note: &str) -> String {
+    let word = match v.outcome {
+        VerdictOutcome::Pass => "PASS",
+        VerdictOutcome::Fail => "FAIL",
+    };
+    let first = v.note.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        format!("monitor {word}{bundle_note}")
+    } else {
+        format!("monitor {word}: {first}{bundle_note}")
+    }
+}
+
+/// Monitor-handoff R15: write a failure bundle — `0600` file in a `0700` dir
+/// via temp + rename (the alerts.rs / store.rs private-file convention),
+/// under the injected bundle dir. Called only after the close mutation
+/// releases the store lock (KTD-B); errors surface to the caller, which
+/// degrades to the "bundle could not be written" alert note (fail-tolerant).
+fn write_bundle_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let tmp = path.with_extension("md.tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, path)
+}
+
 /// Set the output on a terminal outcome, preserving its variant + fields (U4b).
 fn with_output(o: RunOutcome, text: String) -> RunOutcome {
     match o {
@@ -1778,6 +2068,11 @@ mod tests {
         dispatcher: Arc<FakeDispatcher>,
         /// U5: collected `automation://run-closed` payloads (run id + status).
         run_closed: Arc<Mutex<Vec<(String, RunStatus)>>>,
+        /// Monitor-handoff U3: collected monitor alerts as
+        /// `(automation name, alert line)` — the sink re-enters `list()` on
+        /// every call (the FakeDispatcher::reenter pattern), structurally
+        /// asserting alerts fire outside the store lock (KTD-B).
+        monitor_alerts: Arc<Mutex<Vec<(String, String)>>>,
         dir: tempfile::TempDir,
     }
 
@@ -1826,12 +2121,26 @@ mod tests {
         mgr.set_run_closed_emitter(Arc::new(move |ev: &RunClosedEvent| {
             rc.lock().unwrap().push((ev.run_id.clone(), ev.status));
         }));
+        // Monitor-handoff U3: collect verdict/broken alerts, re-entering
+        // list() from inside the sink — safe exactly because alerts fire
+        // after the store lock is released (KTD-B); a regression to
+        // under-the-lock alerting deadlocks the non-reentrant store mutex.
+        let monitor_alerts: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ma = Arc::clone(&monitor_alerts);
+        let sink_mgr = Arc::downgrade(&mgr);
+        mgr.set_monitor_alert_sink(Arc::new(move |name: &str, line: &str| {
+            if let Some(m) = sink_mgr.upgrade() {
+                let _ = m.list();
+            }
+            ma.lock().unwrap().push((name.to_owned(), line.to_owned()));
+        }));
         Harness {
             mgr,
             clock,
             events,
             dispatcher,
             run_closed,
+            monitor_alerts,
             dir,
         }
     }
@@ -2986,5 +3295,470 @@ mod tests {
         assert_eq!(alerts.lock().unwrap().len(), 1, "not re-alerted on the second tick");
         assert_eq!(h.dispatcher.count(), 1, "agent retry now dispatched");
         assert_eq!(h.runs("a1")[1].trigger, Trigger::Retry);
+    }
+
+    // ---- monitor-handoff U3: verdict close, retire, bundle, escalation ------
+
+    /// Flip a created automation into a monitor with pickup pointers. U4/U5
+    /// thread these through the create path; U3 tests stamp them directly
+    /// (this child module sees the manager's private store).
+    fn make_monitor(h: &Harness, id: &str) {
+        let _ = h.mgr.store.mutate(|map| {
+            let a = map.get_mut(id).expect("automation exists");
+            a.monitor = true;
+            a.pickup_pointers = Some(model::MonitorPointers {
+                session_id: "sess-9".into(),
+                transcript_path: "/home/u/.claude/projects/x/sess-9.jsonl".into(),
+                session_cwd: "/home/u/exp".into(),
+            });
+        });
+    }
+
+    /// Sweep-claim the due run and link it to `pane_id`; returns the run id.
+    fn claim_and_link(h: &Harness, id: &str, pane_id: u64) -> String {
+        h.sweep();
+        let run_id = h.runs(id).last().expect("a claimed row").id.clone();
+        h.mgr.set_run_pane(&run_id, pane_id).unwrap();
+        run_id
+    }
+
+    /// One full infra-failure check cycle at the current clock: claim, link,
+    /// then the pane dies before Stop (R6: an infrastructure failure).
+    fn infra_fail_cycle(h: &Harness, id: &str, pane_id: u64) {
+        let _ = claim_and_link(h, id, pane_id);
+        h.mgr.close_run_by_pane_failed(pane_id).unwrap();
+    }
+
+    // Monitor-handoff R2/R3/R14 (+ R4 verification): a Stop whose captured
+    // final turn carries a PASS block closes the row Succeeded, stamps the
+    // verdict, retires the monitor, and clears next_run_at — all observable
+    // after ONE close call — then rings the alert (after the lock: the sink
+    // re-enters list()) with the note; no bundle for a PASS. The retirement
+    // and verdict survive a store reload, and the sweep never claims again.
+    #[test]
+    fn monitor_pass_verdict_retires_in_one_close_and_alerts_r2_r3_r14() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.mgr.set_frontend_ready();
+        h.set_now(T0 + FIVE_MIN);
+        let run_id = claim_and_link(&h, &id, 42);
+        h.mgr.set_output_capturer(Arc::new(|_cwd: &str, _since: u64| {
+            Some(
+                "Checked the run as instructed.\n\n\
+                 ```verdict\nPASS\nconverged at step 800\n```\n"
+                    .to_string(),
+            )
+        }));
+
+        h.mgr.close_run_by_pane(42).unwrap();
+
+        let a = h.mgr.get(&id).unwrap();
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(row.status, RunStatus::Succeeded);
+        assert_eq!(
+            row.verdict,
+            Some(Verdict {
+                outcome: VerdictOutcome::Pass,
+                note: "converged at step 800".into(),
+            })
+        );
+        assert_eq!(row.bundle_path, None, "a PASS writes no bundle");
+        assert!(row.output.is_some(), "captured output still recorded (R8)");
+        assert_eq!(a.retired_at, Some(T0 + FIVE_MIN), "retired with the close");
+        assert_eq!(a.next_run_at, None, "scheduling stopped permanently (R3)");
+
+        // R14: exactly one alert, carrying the note.
+        assert_eq!(
+            *h.monitor_alerts.lock().unwrap(),
+            vec![(
+                "train watch".to_string(),
+                "monitor PASS: converged at step 800".to_string()
+            )]
+        );
+        // The frontend tab lifecycle still hears the close.
+        assert_eq!(
+            *h.run_closed.lock().unwrap(),
+            vec![(run_id.clone(), RunStatus::Succeeded)]
+        );
+
+        // R3: the retired monitor never claims again.
+        h.set_now(T0 + 10 * FIVE_MIN);
+        h.sweep();
+        assert_eq!(h.runs(&id).len(), 1, "no new claims after retirement");
+
+        // R4: verdict + retirement are durable across a store reload.
+        let reloaded = store_in(&h.dir).get(&id).expect("persisted");
+        assert_eq!(reloaded.retired_at, Some(T0 + FIVE_MIN));
+        assert_eq!(
+            reloaded.runs.iter().find(|r| r.id == run_id).unwrap().verdict,
+            row.verdict
+        );
+    }
+
+    // Monitor-handoff R15: a FAIL verdict writes the durable bundle — verdict
+    // note + pickup pointers + the FULL captured turn (outside the R8 tail
+    // cap) — references it from the run row, retires, and rings with the
+    // bundle path in the alert line.
+    #[test]
+    fn monitor_fail_verdict_writes_bundle_with_pointers_and_evidence_r15() {
+        let h = harness();
+        let bundles = h.dir.path().join("bundles");
+        h.mgr.set_bundle_dir(bundles.clone());
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.mgr.set_frontend_ready();
+        h.set_now(T0 + FIVE_MIN);
+        let run_id = claim_and_link(&h, &id, 42);
+        h.mgr.set_output_capturer(Arc::new(|_cwd: &str, _since: u64| {
+            Some(
+                "Traceback (most recent call last): boom at train.py:88\n\n\
+                 ```verdict\nFAIL\nloss diverged\n```"
+                    .to_string(),
+            )
+        }));
+
+        h.mgr.close_run_by_pane(42).unwrap();
+
+        let a = h.mgr.get(&id).unwrap();
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(
+            row.status,
+            RunStatus::Succeeded,
+            "the CHECK ran fine — the FAIL is the experiment's verdict"
+        );
+        assert_eq!(row.verdict.as_ref().unwrap().outcome, VerdictOutcome::Fail);
+        assert!(a.retired_at.is_some(), "a FAIL verdict retires too (R3)");
+
+        let bundle_path = row.bundle_path.clone().expect("row references the bundle");
+        assert_eq!(
+            std::path::PathBuf::from(&bundle_path),
+            bundles.join(format!("{id}-{run_id}.md"))
+        );
+        let content = std::fs::read_to_string(&bundle_path).expect("bundle file exists");
+        assert!(content.contains("loss diverged"), "verdict note: {content}");
+        assert!(content.contains("sess-9"), "pickup pointers ride the bundle");
+        assert!(content.contains("/home/u/.claude/projects/x/sess-9.jsonl"));
+        assert!(content.contains("/home/u/exp"));
+        assert!(
+            content.contains("Traceback (most recent call last): boom at train.py:88"),
+            "the full evidence text, not the tail cap"
+        );
+
+        let alerts = h.monitor_alerts.lock().unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].0, "train watch");
+        assert!(alerts[0].1.starts_with("monitor FAIL: loss diverged"));
+        assert!(
+            alerts[0].1.contains(&bundle_path),
+            "the alert carries the bundle path: {}",
+            alerts[0].1
+        );
+    }
+
+    // Monitor-handoff R5 (AE6): a check with no recognizable verdict block —
+    // or one whose capture abstains — ends silently: row Succeeded with no
+    // verdict, monitor stays parked and scheduled, nothing rings.
+    #[test]
+    fn monitor_check_without_verdict_stays_scheduled_and_silent_r5() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.mgr.set_frontend_ready();
+        h.set_now(T0 + FIVE_MIN);
+        let run_id = claim_and_link(&h, &id, 42);
+        h.mgr.set_output_capturer(Arc::new(|_cwd: &str, _since: u64| {
+            Some("still training — 3 epochs to go; nothing to report".to_string())
+        }));
+
+        h.mgr.close_run_by_pane(42).unwrap();
+
+        let a = h.mgr.get(&id).unwrap();
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(row.status, RunStatus::Succeeded);
+        assert_eq!(row.verdict, None, "a not-done check carries no verdict");
+        assert_eq!(row.bundle_path, None);
+        assert_eq!(a.retired_at, None, "monitor stays parked");
+        assert_eq!(
+            a.next_run_at,
+            Some(T0 + 2 * FIVE_MIN),
+            "the schedule continues"
+        );
+        assert!(
+            h.monitor_alerts.lock().unwrap().is_empty(),
+            "nothing rings (R5)"
+        );
+        assert_eq!(
+            a.consecutive_infra_failures(),
+            0,
+            "a readable not-done check never escalates (it resets)"
+        );
+
+        // Capture abstention (busy cwd — the capturer returns None) is
+        // equally verdict-less and equally silent here, but it COUNTS toward
+        // the R7 escalation (the U3 refinement) — one abstention is below
+        // the threshold, so still no ring.
+        h.mgr
+            .set_output_capturer(Arc::new(|_cwd: &str, _since: u64| None));
+        h.set_now(T0 + 2 * FIVE_MIN);
+        let run2 = claim_and_link(&h, &id, 43);
+        h.mgr.close_run_by_pane(43).unwrap();
+        let a = h.mgr.get(&id).unwrap();
+        assert_eq!(a.runs.iter().find(|r| r.id == run2).unwrap().verdict, None);
+        assert_eq!(a.retired_at, None);
+        assert!(h.monitor_alerts.lock().unwrap().is_empty());
+        assert_eq!(
+            a.consecutive_infra_failures(),
+            1,
+            "the abstained check counts, below the threshold"
+        );
+    }
+
+    // Monitor-handoff R7, the U3 refinement (plan Risks: "Transcript capture
+    // abstains in busy cwds … Escalation bounds it"): a monitor whose output
+    // can never be attributed — every check concludes but its capture
+    // abstains, so no verdict can ever be read — escalates like an infra
+    // failure instead of running silent forever. Three consecutive abstained
+    // checks ring "monitor broken" once; a later readable not-done check
+    // resets the count and stays silent.
+    #[test]
+    fn three_consecutive_capture_abstentions_ring_monitor_broken_r7() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.mgr.set_frontend_ready();
+        // Busy cwd: the capturer abstains on every check.
+        h.mgr
+            .set_output_capturer(Arc::new(|_cwd: &str, _since: u64| None));
+
+        for i in 1..=2u64 {
+            h.set_now(T0 + i * FIVE_MIN);
+            let _ = claim_and_link(&h, &id, 400 + i);
+            h.mgr.close_run_by_pane(400 + i).unwrap();
+        }
+        assert!(
+            h.monitor_alerts.lock().unwrap().is_empty(),
+            "two abstentions: below the threshold, still silent"
+        );
+
+        h.set_now(T0 + 3 * FIVE_MIN);
+        let _ = claim_and_link(&h, &id, 403);
+        h.mgr.close_run_by_pane(403).unwrap();
+        {
+            let alerts = h.monitor_alerts.lock().unwrap();
+            assert_eq!(alerts.len(), 1, "the third unreadable check rings");
+            assert!(
+                alerts[0].1.starts_with("monitor broken:"),
+                "{}",
+                alerts[0].1
+            );
+        }
+        let a = h.mgr.get(&id).unwrap();
+        assert_eq!(a.retired_at, None, "broken is not retired");
+        assert!(a.next_run_at.is_some(), "the schedule continues");
+
+        // A readable not-done check (capture returns text, no verdict block)
+        // resets the count and is silent — the healthy long-experiment case.
+        h.mgr.set_output_capturer(Arc::new(|_cwd: &str, _since: u64| {
+            Some("still training; nothing to report".to_string())
+        }));
+        h.set_now(T0 + 4 * FIVE_MIN);
+        let _ = claim_and_link(&h, &id, 404);
+        h.mgr.close_run_by_pane(404).unwrap();
+        assert_eq!(
+            h.monitor_alerts.lock().unwrap().len(),
+            1,
+            "a readable not-done check is silent"
+        );
+        assert_eq!(
+            h.mgr.get(&id).unwrap().consecutive_infra_failures(),
+            0,
+            "and it resets the derived count"
+        );
+    }
+
+    // Monitor-handoff R6/R7 (AE5): three consecutive verdict-less failed
+    // checks ring "monitor broken" exactly once — the fourth stays silent, a
+    // clean check resets the derived count, and a fresh streak of three
+    // rings again (the post-alert reset). The monitor is never retired and
+    // the schedule continues throughout; no bundle exists.
+    #[test]
+    fn three_consecutive_infra_failures_ring_monitor_broken_once_then_reset_r6_r7() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.mgr.set_frontend_ready();
+
+        for i in 1..=2u64 {
+            h.set_now(T0 + i * FIVE_MIN);
+            infra_fail_cycle(&h, &id, 100 + i);
+        }
+        assert!(
+            h.monitor_alerts.lock().unwrap().is_empty(),
+            "two failures: below the threshold"
+        );
+
+        h.set_now(T0 + 3 * FIVE_MIN);
+        infra_fail_cycle(&h, &id, 103);
+        assert_eq!(
+            *h.monitor_alerts.lock().unwrap(),
+            vec![(
+                "train watch".to_string(),
+                "monitor broken: 3 consecutive checks failed without a verdict".to_string()
+            )],
+            "the third consecutive failure rings exactly once"
+        );
+        let a = h.mgr.get(&id).unwrap();
+        assert_eq!(a.retired_at, None, "broken is not retired (AE5)");
+        assert!(a.next_run_at.is_some(), "the schedule continues (AE5)");
+        assert!(
+            a.runs.iter().all(|r| r.verdict.is_none()),
+            "infra failures never carry a verdict (R6)"
+        );
+        assert!(
+            a.runs.iter().all(|r| r.bundle_path.is_none()),
+            "no failure bundle exists (AE5)"
+        );
+
+        // A fourth failure does not re-ring — no per-failure alert storm.
+        h.set_now(T0 + 4 * FIVE_MIN);
+        infra_fail_cycle(&h, &id, 104);
+        assert_eq!(h.monitor_alerts.lock().unwrap().len(), 1);
+
+        // A clean check — Succeeded with CAPTURED output but no verdict (a
+        // readable not-done check) — resets the derived count…
+        h.mgr.set_output_capturer(Arc::new(|_cwd: &str, _since: u64| {
+            Some("still training — nothing to report".to_string())
+        }));
+        h.set_now(T0 + 5 * FIVE_MIN);
+        let _ = claim_and_link(&h, &id, 105);
+        h.mgr.close_run_by_pane(105).unwrap();
+        assert_eq!(
+            h.monitor_alerts.lock().unwrap().len(),
+            1,
+            "a clean check is silent (R5) and resets (R7)"
+        );
+
+        // …so a fresh streak of three rings again.
+        for i in 6..=8u64 {
+            h.set_now(T0 + i * FIVE_MIN);
+            infra_fail_cycle(&h, &id, 100 + i);
+        }
+        assert_eq!(
+            h.monitor_alerts.lock().unwrap().len(),
+            2,
+            "three NEW failures after the reset ring again"
+        );
+    }
+
+    // Monitor-handoff R6: a check that hangs to the R11 deadline closes
+    // failed(timed out) by the sweep — never a verdict — and counts toward
+    // the broken escalation, which the sweep evaluates after the lock.
+    #[test]
+    fn deadline_timed_out_check_counts_toward_broken_escalation_r6() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.mgr.set_frontend_ready();
+        // Two pane-death failures…
+        for i in 1..=2u64 {
+            h.set_now(T0 + i * FIVE_MIN);
+            infra_fail_cycle(&h, &id, 200 + i);
+        }
+        // …then a check that never Stops: the deadline sweep closes it.
+        h.set_now(T0 + 3 * FIVE_MIN);
+        let run_id = claim_and_link(&h, &id, 203);
+        h.set_now(T0 + 3 * FIVE_MIN + RUN_DEADLINE_MS);
+        h.sweep();
+
+        let a = h.mgr.get(&id).unwrap();
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(row.status, RunStatus::Failed);
+        assert_eq!(row.error.as_deref(), Some(ERR_TIMED_OUT));
+        assert_eq!(row.verdict, None, "a timeout is never a verdict (R6)");
+        let alerts = h.monitor_alerts.lock().unwrap();
+        assert_eq!(alerts.len(), 1, "third consecutive infra failure rings");
+        assert!(alerts[0].1.starts_with("monitor broken:"), "{}", alerts[0].1);
+    }
+
+    // Monitor-handoff R15 fail-tolerance (mirrors flush_tolerant): a bundle
+    // write failure never blocks the verdict — the row still closes with the
+    // verdict stamped and the monitor retires; the alert notes the missing
+    // bundle instead of carrying a path.
+    #[test]
+    fn bundle_write_failure_still_closes_and_retires_and_alert_notes_it_r15() {
+        let h = harness();
+        // A regular FILE occupies the bundle dir's parent path, so the
+        // bundle write's create_dir_all fails deterministically.
+        let blocker = h.dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a dir").unwrap();
+        h.mgr.set_bundle_dir(blocker.join("bundles"));
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.mgr.set_frontend_ready();
+        h.set_now(T0 + FIVE_MIN);
+        let run_id = claim_and_link(&h, &id, 42);
+        h.mgr.set_output_capturer(Arc::new(|_cwd: &str, _since: u64| {
+            Some("```verdict\nFAIL\ndied\n```".to_string())
+        }));
+
+        h.mgr.close_run_by_pane(42).unwrap();
+
+        let a = h.mgr.get(&id).unwrap();
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(row.verdict.as_ref().unwrap().outcome, VerdictOutcome::Fail);
+        assert!(a.retired_at.is_some(), "close and retire still land");
+        let intended = row.bundle_path.as_ref().expect("intended path recorded");
+        assert!(
+            !std::path::Path::new(intended).exists(),
+            "no file could be written"
+        );
+        let alerts = h.monitor_alerts.lock().unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert!(
+            alerts[0].1.contains("bundle could not be written"),
+            "{}",
+            alerts[0].1
+        );
+    }
+
+    // Monitor-handoff R7 × interrupt-resilience: an app restart that
+    // interrupts the third consecutive failing check still escalates — the
+    // first post-restart sweep tick (which drains startup recovery's
+    // backlog) evaluates the derived count and rings broken.
+    #[test]
+    fn restart_interrupted_third_failure_escalates_on_first_sweep_r7() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.mgr.set_frontend_ready();
+        for i in 1..=2u64 {
+            h.set_now(T0 + i * FIVE_MIN);
+            infra_fail_cycle(&h, &id, 300 + i);
+        }
+        // The third check claims and is left Running — app dies mid-check.
+        h.set_now(T0 + 3 * FIVE_MIN);
+        let _ = claim_and_link(&h, &id, 303);
+        assert!(h.mgr.get(&id).unwrap().in_flight());
+        assert!(h.monitor_alerts.lock().unwrap().is_empty());
+
+        // "Restart": a fresh manager over the same store dir. Recovery closes
+        // the orphan Running row failed(interrupted); the first sweep tick
+        // surfaces the backlog and runs the R7 check with the count at three.
+        let Harness { dir, .. } = h;
+        let h2 = harness_in(dir);
+        h2.mgr.set_frontend_ready();
+        h2.set_now(T0 + 4 * FIVE_MIN);
+        h2.sweep();
+
+        let alerts = h2.monitor_alerts.lock().unwrap();
+        assert_eq!(
+            alerts
+                .iter()
+                .filter(|(_, l)| l.starts_with("monitor broken:"))
+                .count(),
+            1,
+            "the interrupted third check rings broken post-restart: {alerts:?}"
+        );
     }
 }

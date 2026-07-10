@@ -564,6 +564,16 @@ pub fn run() {
                     interrupt_alert(&ir.name, line);
                 },
             ));
+            // Monitor verdict / broken-monitor alerts (monitor-handoff U3 —
+            // R14/R15/R7): they ride the same surface_alert path (Reason::Alert
+            // / Tier::Cli, per the plan's KTD — no new attention producer), and
+            // the KTD5 completion-raise suppression for the check pane itself
+            // stays untouched: only the sink pane rings.
+            automations_mgr.set_monitor_alert_sink(Arc::clone(&surface_alert));
+            // Monitor failure bundles (monitor-handoff U3, R15) live under the
+            // FLY_APP_NAME data root — durable, outside the run-output tail
+            // cap, isolated per dev flavor like every other store.
+            automations_mgr.set_bundle_dir(session::data_dir().join("monitor-bundles"));
             app.manage(alerts_log);
             // Composite dispatcher (U7+U5): agent dispatch routes to
             // AgentDispatcher, script dispatch routes to ScriptRunner.
@@ -614,9 +624,17 @@ pub fn run() {
                         session::transcript::CAPTURE_ATTEMPTS,
                         session::transcript::CAPTURE_RETRY_DELAY,
                     )?;
-                    let scrubbed = automations::redact::scrub_secrets(&text);
-                    let clean = notify::sanitize_multiline(&scrubbed);
-                    (!clean.trim().is_empty()).then_some(clean)
+                    // Order: sanitize → scrub → truncate (the feed io.rs::clean
+                    // order; the accepted residual finding in docs/residual-
+                    // review-findings/feat-feed-pending-question.md, applied
+                    // here by monitor-handoff U3). Sanitizing FIRST means a
+                    // control/zero-width char inside a token can't split it
+                    // past the scrub and be re-formed into cleartext later;
+                    // truncation is `close_run`'s tail cap, always last, so
+                    // the scrub (and the U3 verdict parse) see the full text.
+                    let sane = notify::sanitize_multiline(&text);
+                    let scrubbed = automations::redact::scrub_secrets(&sane);
+                    (!scrubbed.trim().is_empty()).then_some(scrubbed)
                 },
             ));
             // U5: forward agent-run closes to the frontend so the tab lifecycle
