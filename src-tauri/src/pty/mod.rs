@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::lifecycle::LifecycleState;
 use pane::Pane;
+pub use pane::ScreenTail;
 
 /// Opaque pane handle. Ids are allocated monotonically and never reused, so a
 /// stale id from a closed pane resolves to "gone" rather than aliasing a reused
@@ -224,6 +225,19 @@ impl PtyManager {
             .filter(|(_, p)| p.leaf_key() == Some(leaf_key) && p.lifecycle().is_live())
             .map(|(id, _)| *id)
             .max_by_key(|id| id.0)
+    }
+
+    /// The screen tail of the live pane owning `leaf_key`
+    /// (feed-question-screen-fallback U1): the raw output ring + grid size the
+    /// pending-question fallback parses. Same live-pane resolution as
+    /// [`pane_by_leaf`](Self::pane_by_leaf).
+    pub fn screen_tail_by_leaf(&self, leaf_key: &str) -> Option<ScreenTail> {
+        let panes = self.panes.lock().unwrap();
+        panes
+            .iter()
+            .filter(|(_, p)| p.leaf_key() == Some(leaf_key) && p.lifecycle().is_live())
+            .max_by_key(|(id, _)| id.0)
+            .map(|(_, p)| p.screen_tail())
     }
 
     /// The pane's foreground pid, for `/proc`-based cwd tracking (U10).

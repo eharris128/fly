@@ -29,6 +29,14 @@ use crate::state::lifecycle::LifecycleState;
 const READ_BUF: usize = 64 * 1024;
 /// How long to wait after SIGHUP before escalating to SIGKILL on close.
 const GRACE: Duration = Duration::from_millis(200);
+/// Capacity of the per-pane raw output tail ring
+/// (feed-question-screen-fallback U1/R7): enough to hold several full Ink
+/// dialog repaints (a few KiB each) with margin, small enough to be a
+/// negligible fixed per-pane cost. The ring is a memcpy tee on the read
+/// thread; nothing parses it until a pending-question fallback actually
+/// needs the screen.
+const TAIL_RING_CAP: usize = 64 * 1024;
+
 /// Output chunks smaller than this don't anchor or extend a work stretch (U3):
 /// a lone keystroke echo or a tiny cursor/spinner redraw is not "the agent
 /// working". Deliberately small — real agent output arrives in larger bursts —
@@ -114,6 +122,78 @@ impl ActivityCell {
     }
 }
 
+/// The bounded raw-output tail of a pane (feed-question-screen-fallback U1):
+/// the last [`TAIL_RING_CAP`] bytes the PTY produced, plus a monotonic `seq`
+/// (total bytes ever written) that identifies content versions so the screen
+/// parser can cache per snapshot — a pane waiting on a dialog produces no new
+/// output, so its `seq` is stable and the parse runs once.
+struct TailRing {
+    buf: Vec<u8>,
+    /// Next write position (wraps at capacity).
+    pos: usize,
+    /// Bytes currently held (== capacity once the ring has wrapped).
+    len: usize,
+    /// Total bytes ever written — the snapshot version.
+    seq: u64,
+}
+
+impl TailRing {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: vec![0; cap],
+            pos: 0,
+            len: 0,
+            seq: 0,
+        }
+    }
+
+    /// Append a chunk, keeping only the trailing `capacity` bytes.
+    fn write(&mut self, bytes: &[u8]) {
+        let cap = self.buf.len();
+        self.seq += bytes.len() as u64;
+        // A chunk at/over capacity replaces the whole ring with its own tail.
+        let src = if bytes.len() >= cap {
+            self.pos = 0;
+            self.len = cap;
+            self.buf.copy_from_slice(&bytes[bytes.len() - cap..]);
+            return;
+        } else {
+            bytes
+        };
+        let first = (cap - self.pos).min(src.len());
+        self.buf[self.pos..self.pos + first].copy_from_slice(&src[..first]);
+        if first < src.len() {
+            self.buf[..src.len() - first].copy_from_slice(&src[first..]);
+        }
+        self.pos = (self.pos + src.len()) % cap;
+        self.len = (self.len + src.len()).min(cap);
+    }
+
+    /// The held bytes, oldest → newest, plus the current `seq`.
+    fn snapshot(&self) -> (Vec<u8>, u64) {
+        let cap = self.buf.len();
+        let mut out = Vec::with_capacity(self.len);
+        if self.len < cap {
+            out.extend_from_slice(&self.buf[..self.len]);
+        } else {
+            out.extend_from_slice(&self.buf[self.pos..]);
+            out.extend_from_slice(&self.buf[..self.pos]);
+        }
+        (out, self.seq)
+    }
+}
+
+/// One pane's screen-state snapshot for the pending-question fallback
+/// (feed-question-screen-fallback U1): the raw output tail, its content
+/// version, and the pane's last-known grid size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenTail {
+    pub bytes: Vec<u8>,
+    pub seq: u64,
+    pub rows: u16,
+    pub cols: u16,
+}
+
 /// State shared between a pane and its read thread.
 struct PaneShared {
     /// Authoritative lifecycle. The read thread sets the terminal state after
@@ -136,6 +216,13 @@ struct PaneShared {
     /// Per-pane output-activity state (U3): the "current work stretch" the agent
     /// dashboard reads. Recorded by the read thread, queried by the poll.
     activity: ActivityCell,
+    /// Raw output tail (feed-question-screen-fallback U1). Its own lock, taken
+    /// only by the read thread (append) and the on-demand snapshot — never by
+    /// the byte path's other consumers.
+    tail: Mutex<TailRing>,
+    /// Last-known PTY grid size, set at spawn and updated on resize, so a
+    /// screen snapshot carries the width the bytes were rendered against.
+    dims: Mutex<(u16, u16)>,
 }
 
 /// A live PTY pane.
@@ -257,6 +344,8 @@ impl Pane {
             paused: Mutex::new(false),
             pause_cv: Condvar::new(),
             activity: ActivityCell::new(),
+            tail: Mutex::new(TailRing::new(TAIL_RING_CAP)),
+            dims: Mutex::new((size.rows, size.cols)),
         });
 
         let thread_shared = Arc::clone(&shared);
@@ -293,7 +382,9 @@ impl Pane {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| format!("resize failed: {e}"))
+            .map_err(|e| format!("resize failed: {e}"))?;
+        *self.shared.dims.lock().unwrap() = (rows.max(1), cols.max(1));
+        Ok(())
     }
 
     /// Pause reads (backpressure). The in-flight read drains, then the thread
@@ -340,6 +431,20 @@ impl Pane {
         super::PaneActivitySnapshot {
             working_for_ms,
             last_output_ago_ms,
+        }
+    }
+
+    /// The pane's current screen tail (feed-question-screen-fallback U1): the
+    /// raw output ring, its content version, and the grid size the bytes were
+    /// rendered against. Cheap enough for the registry lock (one bounded copy).
+    pub fn screen_tail(&self) -> ScreenTail {
+        let (bytes, seq) = self.shared.tail.lock().unwrap().snapshot();
+        let (rows, cols) = *self.shared.dims.lock().unwrap();
+        ScreenTail {
+            bytes,
+            seq,
+            rows,
+            cols,
         }
     }
 
@@ -414,6 +519,10 @@ fn read_loop(
                 // the byte path's critical work: a single Relaxed atomic update
                 // for above-threshold chunks, after the bytes are already out.
                 shared.activity.record(n);
+                // Tee into the tail ring (feed-question-screen-fallback U1) —
+                // a bounded memcpy after the bytes are already out, under a
+                // lock only the on-demand screen snapshot contends on.
+                shared.tail.lock().unwrap().write(&buf[..n]);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // On Linux the master read returns EIO (not EOF) once the child
@@ -518,5 +627,48 @@ mod tests {
     fn never_ran_is_idle() {
         let cell = ActivityCell::new();
         assert_eq!(cell.snapshot_at(1000), (None, None));
+    }
+
+    // ---- TailRing (feed-question-screen-fallback U1) ------------------------
+
+    #[test]
+    fn tail_ring_holds_everything_before_wrap() {
+        let mut r = TailRing::new(8);
+        r.write(b"abc");
+        r.write(b"de");
+        let (bytes, seq) = r.snapshot();
+        assert_eq!(bytes, b"abcde");
+        assert_eq!(seq, 5);
+    }
+
+    #[test]
+    fn tail_ring_wraps_keeping_the_newest_bytes_in_order() {
+        let mut r = TailRing::new(8);
+        r.write(b"abcdef");
+        r.write(b"ghij"); // 10 bytes total → keeps "cdefghij"
+        let (bytes, seq) = r.snapshot();
+        assert_eq!(bytes, b"cdefghij");
+        assert_eq!(seq, 10, "seq counts every byte ever written");
+    }
+
+    #[test]
+    fn tail_ring_oversized_chunk_keeps_its_own_tail() {
+        let mut r = TailRing::new(4);
+        r.write(b"xy");
+        r.write(b"abcdefgh"); // ≥ capacity → the chunk's own last 4 bytes
+        let (bytes, seq) = r.snapshot();
+        assert_eq!(bytes, b"efgh");
+        assert_eq!(seq, 10);
+        // And a later small write continues in order.
+        r.write(b"Z");
+        assert_eq!(r.snapshot().0, b"fghZ");
+    }
+
+    #[test]
+    fn tail_ring_empty_snapshot_is_empty() {
+        let r = TailRing::new(4);
+        let (bytes, seq) = r.snapshot();
+        assert!(bytes.is_empty());
+        assert_eq!(seq, 0);
     }
 }

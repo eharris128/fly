@@ -113,6 +113,15 @@ pub struct QuestionBody {
     /// (permission kind; omitted for choice).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<String>,
+    /// Provenance (feed-question-screen-fallback R5): `"screen"` when the
+    /// body was synthesized from the pane's rendered terminal grid (Claude
+    /// Code ≥ 2.1.206 no longer flushes the ask to the transcript at ask
+    /// time); omitted for a transcript-derived body. A screen-derived body's
+    /// `askedAt` is the ask-time raise stamp, never a transcript stamp — the
+    /// two never mix, so an `ifAskedAt` guard armed against one source can
+    /// never pass against the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// One automation, projected from `automations::model::Automation` + its derived
@@ -420,6 +429,7 @@ mod tests {
                     }],
                 }],
                 request: None,
+                source: None,
             }),
             turns: vec![],
         };
@@ -458,6 +468,7 @@ mod tests {
                 context: None,
                 questions: vec![],
                 request: Some("cargo build".into()),
+                source: None,
             }),
             turns: vec![],
         };

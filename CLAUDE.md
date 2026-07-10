@@ -158,7 +158,7 @@ time/inputs as arguments so they're tested without a running app.
   on a timer.
 - `feed/` — the loopback HTTP surface for an external local consumer
   (feat-agent-state-local-feed + feed-agent-reply-io + feed-pending-question +
-  feed-conversation-tail):
+  feed-conversation-tail + feed-question-screen-fallback):
   bearer-token auth (constant-time, silent 401; **the token is the whole
   boundary** — loopback TCP has no `SO_PEERCRED`), SSE `/feed` (webview-pushed
   roster + backend automations; `lastReplyAt` **and** `questionPendingAt`
@@ -166,20 +166,33 @@ time/inputs as arguments so they're tested without a running app.
   pending `question` object + the `turns` conversation tail — ≤12 turns ×
   ≤2048 chars, oldest→newest ending at the current reply with
   `at == repliedAt`, key omitted when no servable history — all via
-  `io.rs::ReplyResolver.resolve_io` — the ONE source for every per-agent
+  `fallback.rs::FallbackResolver.resolve_io` (wrapping the transcript-pure
+  `io.rs::ReplyResolver`) — the ONE source for every per-agent
   surface; question and turn strings are control-sanitized, *then*
   secret-scrubbed, *then* truncated — see `io.rs::clean` for why that order),
   and the single mutation route
   `POST /agents/{key}/input` (submit = control-stripped bracketed-paste +
   Enter; `mode:"keys"` = raw filtered answer keys with **mandatory**
   `ifAskedAt` + a per-leaf answered latch; keys-answering a *permission*
-  dialog requires `feed.allowPermissionAnswers`, default off). A pending
-  interaction is parsed from the transcript tail
+  dialog — or any *screen-derived* question while the live reason is
+  `permission` — requires `feed.allowPermissionAnswers`, default off). A
+  pending interaction is parsed from the transcript tail
   (`session/transcript.rs::pending_interaction_from_str`, backward walk,
-  abstain-on-surprise); note the live caveats: current Claude Code flushes a
-  pending *permission* `tool_use` ~0.3s after the dialog draws (exposure works
-  live) but an AskUserQuestion `tool_use` only lands **with** its result, so
-  choice questions are hindsight-only until upstream flushes at ask time.
+  abstain-on-surprise) — **primary but blind at ask time on Claude Code ≥
+  2.1.206**, which flushes the pending `tool_use` only when the turn resolves.
+  The screen fallback (feed-question-screen-fallback) covers that gap,
+  strictly behind the transcript scan: each pane tees its raw output into a
+  64 KiB tail ring (`pty/pane.rs`); when the transcript abstains but the pane
+  is corroborated waiting (roster reason `question`/`permission` **and**
+  `~/.claude/sessions/<pid>.json` says `waiting` — `session/livestate.rs`),
+  the ring is replayed through a minimal `vte` grid and matched against
+  Claude's picker shape (`feed/screen.rs`, abstain-on-surprise, digits as
+  rendered — fixtures in `tests/fixtures/screen/` are real captured renders).
+  Two-tier degrade: a body abstention still stamps `questionPendingAt`
+  (tier 1). A screen-derived body carries `source:"screen"` and its `askedAt`
+  is the ask-time raise stamp (`feed/pending.rs`, stamped by the hook
+  dispatch), never a transcript stamp — a late transcript flush takes over
+  under its own stamp and stale `ifAskedAt` answers 409.
 - `notify/`, `config/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
   reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the

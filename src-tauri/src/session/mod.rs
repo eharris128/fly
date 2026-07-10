@@ -13,6 +13,7 @@
 //! spawnable handoff target (session-handoff U1).
 
 pub mod handoff;
+pub mod livestate;
 pub mod resume;
 pub mod transcript;
 

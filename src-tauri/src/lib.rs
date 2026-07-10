@@ -206,6 +206,12 @@ pub fn run() {
         cfg.notifications_muted_default,
     ));
     let gate = Arc::new(NotificationGate::new(cfg.notification_coalesce_threshold));
+    // Ask-time raise stamps (feed-question-screen-fallback U3/KTD5): the hook
+    // dispatch stamps question/permission raises; the feed's screen fallback
+    // reads them as a screen-derived question's `askedAt`. Created
+    // unconditionally (like FeedState) so stamping never depends on the feed
+    // listener being enabled.
+    let pending_signals = Arc::new(feed::pending::PendingSignals::new());
 
     // Clones for the hook server's dispatch (the originals are managed below).
     let tokens_for_hooks = Arc::clone(&tokens);
@@ -213,6 +219,7 @@ pub fn run() {
     // The dispatch resolves PaneId → leaf_key to key resume records (U3).
     let pty_for_hooks = Arc::clone(&pty_manager);
     let config_for_hooks = cfg;
+    let signals_for_hooks = Arc::clone(&pending_signals);
 
     tauri::Builder::default()
         // single-instance must be registered first; a second launch focuses
@@ -382,6 +389,19 @@ pub fn run() {
                 // Only a fresh (non-debounced) raise surfaces; duplicates drop.
                 if !outcome.recordable {
                     return;
+                }
+
+                // Ask-time stamp (feed-question-screen-fallback U3/KTD5): a
+                // fresh question/permission raise records the wall-clock ask
+                // time, keyed by the pane's stable leaf key. This is the
+                // screen-derived question's `askedAt` — the value v2.1.206's
+                // transcript can no longer provide at ask time. Debounced
+                // duplicates were returned above, so a re-notify inside the
+                // debounce window never moves an armed guard's stamp.
+                if matches!(reason, Reason::Question | Reason::Permission) {
+                    if let Some(leaf_key) = pty.leaf_key(pane) {
+                        signals_for_hooks.stamp(&leaf_key, notify::now_unix_ms());
+                    }
                 }
 
                 let reason_effects = config.reason_effects.for_reason(reason);
@@ -688,11 +708,21 @@ pub fn run() {
                         // feed-pending-question U3/U4): one shared, cached
                         // instance behind the /output endpoint and the frame's
                         // lastReplyAt + questionPendingAt stamps (R3/R4) — one
-                        // transcript read serves every surface.
-                        let resolver =
-                            Arc::new(feed::io::ReplyResolver::new(session::resume::resume_path()));
+                        // transcript read serves every surface. Wrapped by the
+                        // screen fallback (feed-question-screen-fallback U5):
+                        // transcript primary, screen-derived question behind
+                        // it for v2.1.206's flush-at-resolve transcripts, fed
+                        // by each pane's output tail ring.
+                        let pty_for_screen = app.state::<Arc<PtyManager>>().inner().clone();
+                        let screen_fn: feed::fallback::ScreenFn =
+                            Arc::new(move |leaf_key| pty_for_screen.screen_tail_by_leaf(leaf_key));
+                        let resolver = Arc::new(feed::fallback::FallbackResolver::new(
+                            session::resume::resume_path(),
+                            Arc::clone(&pending_signals),
+                            screen_fn,
+                        ));
                         let io_fn: feed::server::IoFn =
-                            Arc::new(move |leaf_key| resolver.resolve_io(leaf_key));
+                            Arc::new(move |leaf_key, reason| resolver.resolve_io(leaf_key, reason));
                         // Input delivery (U5; feed-pending-question U6): leaf
                         // → live pane → the action's bytes. Submit is the
                         // sanitized bracketed paste, then Enter as its OWN

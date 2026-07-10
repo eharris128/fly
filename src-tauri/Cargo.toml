@@ -41,6 +41,11 @@ log = "0.4"
 # thread-per-connection HTTP server — matches fly's existing (non-async) socket
 # idiom rather than pulling in an async runtime for one read endpoint.
 tiny_http = "0.12"
+# Screen-derived pending-question fallback (feed-question-screen-fallback
+# KTD2): vte tokenizes the raw PTY byte stream (the error-prone part — UTF-8 +
+# CSI/OSC/DCS framing); the grid semantics on top are ours, deliberately
+# minimal and abstain-on-surprise.
+vte = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
