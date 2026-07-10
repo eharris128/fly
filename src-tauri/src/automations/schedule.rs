@@ -31,7 +31,7 @@
 //! in [`validate`] is best-effort — this clamp is the enforcement (R1).
 //!
 //! **Monitor not-before floor** (monitor-handoff U2, R1 of
-//! `docs/plans/2026-07-10-001-feat-monitor-handoff-plan.md`): [`advance_from`]
+//! `docs/plans/2026-07-10-002-feat-monitor-handoff-plan.md`): [`advance_from`]
 //! composes a stored epoch-ms not-before floor over [`advance`] — every
 //! recompute path (create / resume / sweep claim + skip / dispatch rollback)
 //! goes through it so a monitor is never scheduled before its floor.

@@ -28,7 +28,7 @@
 //! error strings below — no separate statuses in v1 (R5/R23).
 //!
 //! Monitor vocabulary (U1 of
-//! `docs/plans/2026-07-10-001-feat-monitor-handoff-plan.md` — IDs below that
+//! `docs/plans/2026-07-10-002-feat-monitor-handoff-plan.md` — IDs below that
 //! cite the monitor-handoff plan say so explicitly): the
 //! `monitor`/`not_before_ms`/`retired_at`/[`MonitorPointers`] fields on
 //! [`Automation`], the per-run [`Verdict`] + `bundle_path`, the

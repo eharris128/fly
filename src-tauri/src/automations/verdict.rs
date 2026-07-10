@@ -1,5 +1,5 @@
 //! Monitor verdict parsing, escalation math, and failure-bundle rendering
-//! (U3 of `docs/plans/2026-07-10-001-feat-monitor-handoff-plan.md` — all
+//! (U3 of `docs/plans/2026-07-10-002-feat-monitor-handoff-plan.md` — all
 //! R-IDs below cite that plan).
 //!
 //! Everything here is pure text/number work — no I/O, no clocks, no locks —

@@ -6,7 +6,7 @@ description: Hand a long-running experiment off to a fly monitor automation — 
 # fly monitor handoff
 
 <!-- monitor-handoff U8 (R10) of
-     docs/plans/2026-07-10-001-feat-monitor-handoff-plan.md.
+     docs/plans/2026-07-10-002-feat-monitor-handoff-plan.md.
      Install-by-copy: copy this directory to ~/.claude/skills/fly-monitor-handoff/
      (per-user) or <project>/.claude/skills/fly-monitor-handoff/ (per-project).
      No installer machinery — deliberate v1 roughness. -->

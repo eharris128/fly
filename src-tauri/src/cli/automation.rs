@@ -17,7 +17,7 @@
 //! app-side handler in `lib.rs`.
 //!
 //! Monitor surface (U5 of
-//! `docs/plans/2026-07-10-001-feat-monitor-handoff-plan.md` — monitor-handoff
+//! `docs/plans/2026-07-10-002-feat-monitor-handoff-plan.md` — monitor-handoff
 //! IDs below say so explicitly): `create` grows `--monitor` + `--not-before`
 //! (monitor-handoff R1), the R8 Sonnet-at-xhigh launch default is stamped
 //! here at create time ([`monitor_launch_defaults`]), and `list`/`show`/
