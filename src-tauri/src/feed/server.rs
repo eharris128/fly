@@ -51,8 +51,12 @@ pub type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// (feed-agent-reply-io U3; widened by feed-pending-question U4) — injected so
 /// the server needs no resume-store/transcript dependency. The ONE source
 /// `GET /agents/{key}/output`, the frame's `lastReplyAt`, and the frame's
-/// `questionPendingAt` all read (R3/R4).
-pub type IoFn = Arc<dyn Fn(&str) -> ResolvedIo + Send + Sync>;
+/// `questionPendingAt` all read (R3/R4). The second argument is the leaf's
+/// live attention reason from the caller's roster read
+/// (feed-question-screen-fallback KTD4): the screen fallback behind this seam
+/// engages only for a `question`/`permission` reason, and passing the same
+/// snapshot the caller gates on keeps the resolution and the gate coherent.
+pub type IoFn = Arc<dyn Fn(&str, Option<&str>) -> ResolvedIo + Send + Sync>;
 /// Delivers one input action to a leaf's pane (feed-agent-reply-io U5;
 /// widened by feed-pending-question U6) — injected because delivery needs the
 /// PTY registry + attention manager + AppHandle, none of which the server
@@ -324,7 +328,7 @@ fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec
     let Some(reason) = ctx.state.agent_reason(key) else {
         return empty_response(404);
     };
-    let resolved = (ctx.io)(key);
+    let resolved = (ctx.io)(key, reason.as_deref());
     let (text, replied_at) = match resolved.reply {
         Some(reply) => (reply.text, reply.replied_at_ms),
         None => (String::new(), None),
@@ -431,7 +435,8 @@ fn agent_input_response(
         // paced/chunked POST can't slip a locally-dismissed dialog's stale
         // reason past the gate. A key that vanished meanwhile → unexposed.
         let reason = ctx.state.agent_reason(key).flatten();
-        let Some(q) = gated_question((ctx.io)(key).question, reason.as_deref()) else {
+        let Some(q) = gated_question((ctx.io)(key, reason.as_deref()).question, reason.as_deref())
+        else {
             return empty_response(409);
         };
         if q.asked_at != asked {
@@ -441,7 +446,19 @@ fn agent_input_response(
         // approval (a digit or a submit's Enter both confirm it), so the
         // config opt-in gates both modes. Post-auth JSON body disambiguates
         // the policy refusal from an auth 401.
-        if q.kind == "permission" && !(ctx.permission_answers)() {
+        //
+        // Widened for screen-derived bodies (feed-question-screen-fallback
+        // KTD6, belt and braces): v2.1.206 labels an AskUserQuestion wait a
+        // "permission prompt", so a screen classification could in principle
+        // read a permission dialog as a choice picker. The opt-in therefore
+        // also gates any SCREEN-derived guarded answer delivered while the
+        // pane's live reason is `permission` — the failure direction is "an
+        // ask needs the opt-in", never "a permission bypasses it". A
+        // transcript-derived choice under a permission reason stays un-gated
+        // (its classification comes from the tool name, which is authoritative).
+        let screen_under_permission = q.source.as_deref() == Some("screen")
+            && reason.as_deref() == Some("permission");
+        if (q.kind == "permission" || screen_under_permission) && !(ctx.permission_answers)() {
             return json_status(403, "{\"error\":\"permissionAnswersDisabled\"}");
         }
         // R7: a keys answer can only complete the one v1-answerable shape;
@@ -565,10 +582,16 @@ fn stream_sse(mut w: Box<dyn Write + Send>, ctx: &HandlerCtx) {
 fn emit_frame(w: &mut Box<dyn Write + Send>, ctx: &HandlerCtx) -> Option<u64> {
     let mut snap = ctx.state.snapshot((ctx.automations)(), (ctx.now)());
     for agent in &mut snap.agents {
-        let resolved = (ctx.io)(&agent.leaf_key);
+        let resolved = (ctx.io)(&agent.leaf_key, agent.reason.as_deref());
         agent.last_reply_at = resolved.reply.and_then(|r| r.replied_at_ms);
+        // The marker: a (gated) question body's own stamp, else the tier-1
+        // pending signal (feed-question-screen-fallback R2) — the resolver
+        // sets `pending_fallback_at` only for a corroborated-waiting pane, so
+        // "question pending · body unavailable" still surfaces.
         agent.question_pending_at =
-            gated_question(resolved.question, agent.reason.as_deref()).map(|q| q.asked_at);
+            gated_question(resolved.question, agent.reason.as_deref())
+                .map(|q| q.asked_at)
+                .or(resolved.pending_fallback_at);
     }
     let json = serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into());
     let frame = format!("data: {json}\n\n");
@@ -595,6 +618,7 @@ mod tests {
             context: None,
             questions: vec![],
             request: None,
+            source: None,
         }
     }
 
@@ -607,6 +631,7 @@ mod tests {
             context: None,
             questions: vec![],
             request: Some("cargo build".into()),
+            source: None,
         }
     }
 

@@ -28,7 +28,7 @@ const PROMPTED_AT: u64 = 1_781_896_600_000;
 /// (exposure of which the server must gate on the roster reason —
 /// feed-pending-question KTD3/KTD4).
 fn fake_io() -> IoFn {
-    Arc::new(|leaf_key| {
+    Arc::new(|leaf_key, _reason| {
         let reply = || LastReply {
             text: "All tests pass.".into(),
             replied_at_ms: Some(REPLIED_AT),
@@ -53,6 +53,7 @@ fn fake_io() -> IoFn {
                 reply: Some(reply()),
                 question: None,
                 turns: turns(),
+                pending_fallback_at: None,
             },
             "leaf-choice" => ResolvedIo {
                 reply: Some(reply()),
@@ -73,8 +74,10 @@ fn fake_io() -> IoFn {
                         }],
                     }],
                     request: None,
+                    source: None,
                 }),
                 turns: Vec::new(),
+                pending_fallback_at: None,
             },
             "leaf-permission" => ResolvedIo {
                 reply: None,
@@ -86,8 +89,47 @@ fn fake_io() -> IoFn {
                     context: None,
                     questions: vec![],
                     request: Some("cargo build".into()),
+                    source: None,
                 }),
                 turns: Vec::new(),
+                pending_fallback_at: None,
+            },
+            // A screen-derived choice (feed-question-screen-fallback): the
+            // fallback resolver synthesized the body from the pane's rendered
+            // picker; askedAt is the raise stamp and the tier-1 marker rides
+            // alongside it.
+            "leaf-screen-choice" => ResolvedIo {
+                reply: None,
+                question: Some(QuestionBody {
+                    asked_at: ASKED_AT,
+                    kind: "choice".into(),
+                    tool: "AskUserQuestion".into(),
+                    answerable: true,
+                    context: None,
+                    questions: vec![QuestionSpec {
+                        question: "Which color?".into(),
+                        header: "Color".into(),
+                        multi_select: false,
+                        options: vec![QuestionOption {
+                            key: "1".into(),
+                            label: "Red".into(),
+                            description: String::new(),
+                        }],
+                    }],
+                    request: None,
+                    source: Some("screen".into()),
+                }),
+                turns: Vec::new(),
+                pending_fallback_at: Some(ASKED_AT),
+            },
+            // Tier-1 degrade (feed-question-screen-fallback R2): the pane is
+            // corroborated waiting but the screen parse abstained — pending
+            // signal only, no body.
+            "leaf-tier1" => ResolvedIo {
+                reply: None,
+                question: None,
+                turns: Vec::new(),
+                pending_fallback_at: Some(ASKED_AT),
             },
             _ => ResolvedIo::default(),
         }
@@ -447,7 +489,7 @@ fn a_delegating_tool_pending_abstains_end_to_end() {
     )
     .unwrap();
     let resolver = Arc::new(ReplyResolver::with_projects_root(resume_path, Some(root)));
-    let io_fn: IoFn = Arc::new(move |leaf| resolver.resolve_io(leaf));
+    let io_fn: IoFn = Arc::new(move |leaf, _reason| resolver.resolve_io(leaf));
 
     let state = Arc::new(FeedState::new());
     let server = FeedServer::start(
@@ -478,6 +520,189 @@ fn a_delegating_tool_pending_abstains_end_to_end() {
     );
     let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
     assert!(v.get("question").is_none(), "body was: {body}");
+}
+
+// ---- screen fallback surfaces (feed-question-screen-fallback U6) ------------
+
+#[test]
+fn tier1_pending_marker_rides_the_frame_without_a_body() {
+    // R2 two-tier degrade: the resolver stamped pending_fallback_at but
+    // synthesized no body (screen abstained) → the SSE marker still surfaces,
+    // and /output has no question key (R8).
+    let (state, server, _) = start();
+    state.publish(vec![agent_with_reason("leaf-tier1", "waiting", "question")]);
+    let (_, sse) = get(
+        server.local_addr(),
+        "/feed",
+        Some(TOKEN),
+        Duration::from_millis(400),
+    );
+    assert!(
+        sse.contains(&format!("\"questionPendingAt\":{ASKED_AT}")),
+        "sse was: {sse}"
+    );
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-tier1/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert!(v.get("question").is_none(), "body was: {body}");
+}
+
+#[test]
+fn a_screen_choice_serves_with_provenance_and_answers_without_the_opt_in() {
+    // Under a `question` reason a screen-derived choice behaves like any
+    // choice: exposed with its provenance tag, keys-answerable un-gated.
+    let (state, server, delivered) = start(); // opt-in OFF
+    state.publish(vec![agent_with_reason("leaf-screen-choice", "waiting", "question")]);
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-screen-choice/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(v["question"]["source"], "screen");
+    assert_eq!(v["question"]["askedAt"], ASKED_AT);
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-screen-choice/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"1","mode":"keys","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[("leaf-screen-choice".to_string(), "keys:1".to_string())]
+    );
+}
+
+#[test]
+fn a_screen_choice_under_a_permission_reason_requires_the_opt_in() {
+    // KTD6 belt-and-braces: v2.1.206 labels an ask's wait a "permission
+    // prompt", so a screen body answered while the live reason is
+    // `permission` is treated as remote permission approval — the config
+    // opt-in gates it even though the body classified as a choice.
+    let (state, server, delivered) = start(); // opt-in OFF
+    state.publish(vec![agent_with_reason(
+        "leaf-screen-choice",
+        "waiting",
+        "permission",
+    )]);
+    let (head, body) = post(
+        server.local_addr(),
+        "/agents/leaf-screen-choice/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"1","mode":"keys","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 403"), "head was: {head}");
+    assert!(body.contains("permissionAnswersDisabled"), "body was: {body}");
+    assert!(delivered.lock().unwrap().is_empty(), "nothing delivered");
+
+    // With the opt-in ON the same answer delivers.
+    let (state, server, delivered) = start_with(true);
+    state.publish(vec![agent_with_reason(
+        "leaf-screen-choice",
+        "waiting",
+        "permission",
+    )]);
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-screen-choice/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"1","mode":"keys","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_transcript_takeover_makes_a_screen_stamped_answer_409() {
+    // R5 timestamp discipline end-to-end: the consumer read a screen-derived
+    // body (askedAt = raise stamp), then the transcript flushed — the
+    // transcript body takes over under its own stamp, so the in-flight
+    // screen-stamped guard must 409, never deliver against the new question.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let flipped = Arc::new(AtomicBool::new(false));
+    let flipped_io = Arc::clone(&flipped);
+    const SCREEN_AT: u64 = 1_000;
+    const TRANSCRIPT_AT: u64 = 2_000;
+    let io_fn: IoFn = Arc::new(move |_leaf, _reason| {
+        let (asked_at, source, pending) = if flipped_io.load(Ordering::SeqCst) {
+            (TRANSCRIPT_AT, None, None)
+        } else {
+            (SCREEN_AT, Some("screen".to_string()), Some(SCREEN_AT))
+        };
+        ResolvedIo {
+            reply: None,
+            question: Some(QuestionBody {
+                asked_at,
+                kind: "choice".into(),
+                tool: "AskUserQuestion".into(),
+                answerable: true,
+                context: None,
+                questions: vec![QuestionSpec {
+                    question: "Which?".into(),
+                    header: String::new(),
+                    multi_select: false,
+                    options: vec![QuestionOption {
+                        key: "1".into(),
+                        label: "Alpha".into(),
+                        description: String::new(),
+                    }],
+                }],
+                request: None,
+                source,
+            }),
+            turns: Vec::new(),
+            pending_fallback_at: pending,
+        }
+    });
+    let state = Arc::new(FeedState::new());
+    let server = FeedServer::start(
+        0,
+        TOKEN.to_string(),
+        Arc::clone(&state),
+        Arc::new(Vec::new),
+        Arc::new(|| 42),
+        io_fn,
+        Arc::new(|_: &str, _: InputAction| InputOutcome::Delivered),
+        Arc::new(|| true),
+    )
+    .unwrap();
+    state.publish(vec![agent_with_reason("leaf-x", "waiting", "question")]);
+
+    // The consumer reads the screen-derived question…
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-x/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(v["question"]["askedAt"], SCREEN_AT);
+
+    // …the transcript flushes (takeover) before the answer arrives…
+    flipped.store(true, Ordering::SeqCst);
+
+    // …so the screen-stamped guard is stale: 409, nothing delivered.
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-x/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"1","mode":"keys","ifAskedAt":{SCREEN_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 409"), "head was: {head}");
+    // Re-armed against the transcript stamp, the answer goes through.
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-x/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"1","mode":"keys","ifAskedAt":{TRANSCRIPT_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
 }
 
 // ---- GET /agents/{key}/output (feed-agent-reply-io U4) ----------------------

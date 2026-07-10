@@ -905,10 +905,20 @@ enum WalkItem {
 /// `tool_result` appended *after* all the `tool_use` lines — resolves
 /// correctly, and stops at the first text-bearing `user` entry (real
 /// conversation resuming, which clears pending). Verified live shapes this
-/// rests on (2026-07-06): the ask's `tool_use` flushes at ask time with its
-/// own timestamp; an Esc/reject writes an `is_error` `tool_result` for the
-/// same id (consumed like any other), often followed by a text user entry
-/// (the boundary).
+/// rests on (2026-07-06, Claude Code 2.1.200): the ask's `tool_use` flushes at
+/// ask time with its own timestamp; an Esc/reject writes an `is_error`
+/// `tool_result` for the same id (consumed like any other), often followed by
+/// a text user entry (the boundary).
+///
+/// **Upstream regression (verified live 2026-07-10, Claude Code 2.1.206):**
+/// the ask-time flush no longer happens — the assistant entry carrying the
+/// pending `tool_use` is written only when the turn *resolves*, so while a
+/// dialog is open this walk finds nothing and correctly abstains. This scan
+/// stays primary regardless (a future Claude Code that resumes flushing at
+/// ask time restores full fidelity here automatically); the live gap is
+/// covered by the screen-derived fallback layered strictly behind it
+/// (`feed/fallback.rs` + `feed/screen.rs`,
+/// docs/plans/2026-07-10-001-feat-feed-question-screen-fallback-plan.md).
 pub(crate) fn pending_interaction_from_str(body: &str) -> Option<PendingInteraction> {
     use std::collections::HashSet;
 

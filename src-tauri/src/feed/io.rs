@@ -66,6 +66,13 @@ pub struct ResolvedIo {
     /// Wire-ready conversation tail (feed-conversation-tail R1): empty means
     /// "no servable history" and serializes as an absent key (R5).
     pub turns: Vec<TurnEntry>,
+    /// The tier-1 pending signal (feed-question-screen-fallback R2): the
+    /// ask-time stamp of a corroborated-waiting pane whose transcript yielded
+    /// no question. Set ONLY by the fallback layer (`fallback.rs`) — the
+    /// transcript resolver itself always leaves it `None`. The frame's
+    /// `questionPendingAt` falls back to it when no (gated) question body
+    /// exists, so "pending, body unavailable" still surfaces.
+    pub pending_fallback_at: Option<u64>,
 }
 
 impl ReplyResolver {
@@ -139,6 +146,7 @@ impl ReplyResolver {
                     reply,
                     question: t.pending.as_ref().and_then(question_body),
                     turns,
+                    pending_fallback_at: None,
                 }
             })
             .unwrap_or_default();
@@ -174,14 +182,14 @@ impl ReplyResolver {
 /// contract is that they are pinned and oversized content is
 /// **truncated-and-served, never abstained** — an oversized injected question
 /// must not suppress exposure).
-const MAX_QUESTIONS: usize = 4;
-const MAX_OPTIONS: usize = 8;
-const QUESTION_CAP: usize = 512;
-const HEADER_CAP: usize = 512;
-const LABEL_CAP: usize = 128;
-const DESCRIPTION_CAP: usize = 1024;
-const CONTEXT_CAP: usize = 2048;
-const REQUEST_CAP: usize = 512;
+pub(crate) const MAX_QUESTIONS: usize = 4;
+pub(crate) const MAX_OPTIONS: usize = 8;
+pub(crate) const QUESTION_CAP: usize = 512;
+pub(crate) const HEADER_CAP: usize = 512;
+pub(crate) const LABEL_CAP: usize = 128;
+pub(crate) const DESCRIPTION_CAP: usize = 1024;
+pub(crate) const CONTEXT_CAP: usize = 2048;
+pub(crate) const REQUEST_CAP: usize = 512;
 
 /// The one string pipeline for every newly exposed question string (R8):
 /// control-sanitize the **full, untruncated** value first (R16 posture,
@@ -203,7 +211,7 @@ const REQUEST_CAP: usize = 512;
 ///
 /// `None` when the result is blank (a blank string is absent, never served
 /// empty).
-fn clean(raw: &str, cap: usize) -> Option<String> {
+pub(crate) fn clean(raw: &str, cap: usize) -> Option<String> {
     let sane = crate::notify::sanitize_multiline(raw);
     let scrubbed = redact::scrub_secrets(&sane);
     if scrubbed.trim().is_empty() {
@@ -332,6 +340,7 @@ fn question_body(p: &PendingInteraction) -> Option<QuestionBody> {
                 context: p.context.as_deref().and_then(|c| clean(c, CONTEXT_CAP)),
                 questions,
                 request: None,
+                source: None,
             })
         }
         PendingKind::Permission => Some(QuestionBody {
@@ -342,6 +351,7 @@ fn question_body(p: &PendingInteraction) -> Option<QuestionBody> {
             context: p.context.as_deref().and_then(|c| clean(c, CONTEXT_CAP)),
             questions: Vec::new(),
             request: p.input.as_ref().and_then(|i| permission_request(&p.tool, i)),
+            source: None,
         }),
     }
 }
