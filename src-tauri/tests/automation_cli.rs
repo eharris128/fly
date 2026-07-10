@@ -458,6 +458,121 @@ fn monitor_create_rejects_script_mode_r1() {
     assert!(mgr.list().is_empty(), "nothing stored");
 }
 
+// ---- CLI create surface (monitor-handoff U5) ----------------------------------
+
+/// String-vec sugar for driving the real CLI arg loop.
+fn argv(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+// monitor-handoff U5 + R1: the monitor flag combinations the plan rejects are
+// all refused CLI-side (exit 2) — before pane env resolution, so no socket
+// (and no FLY_PANE_TOKEN) is ever needed: `--monitor` with `--script`;
+// `--not-before` without `--monitor` (the floor stays monitor-only); a
+// malformed `--not-before` timestamp.
+#[test]
+fn cli_create_rejects_monitor_flag_misuse_before_the_socket_u5_r1() {
+    assert_eq!(
+        fly_lib::cli::automation::run(&argv(&[
+            "create", "--name", "w", "--cron", "*/30 * * * *", "--script", "echo hi",
+            "--monitor",
+        ])),
+        2,
+        "--monitor with --script is rejected CLI-side"
+    );
+    assert_eq!(
+        fly_lib::cli::automation::run(&argv(&[
+            "create", "--name", "w", "--cron", "*/30 * * * *", "--prompt", "check",
+            "--not-before", "2099-01-01T00:00:00Z",
+        ])),
+        2,
+        "--not-before without --monitor is rejected (monitor-only floor)"
+    );
+    assert_eq!(
+        fly_lib::cli::automation::run(&argv(&[
+            "create", "--name", "w", "--cron", "*/30 * * * *", "--prompt", "check",
+            "--monitor", "--not-before", "next tuesday",
+        ])),
+        2,
+        "a malformed --not-before timestamp is rejected CLI-side"
+    );
+    assert_eq!(
+        fly_lib::cli::automation::run(&argv(&[
+            "create", "--name", "w", "--cron", "*/30 * * * *", "--prompt", "check",
+            "--monitor", "--not-before",
+        ])),
+        2,
+        "--not-before with no value is rejected"
+    );
+}
+
+// monitor-handoff U5 round-trip (R1/R8/R9/R10): the REAL CLI create path —
+// arg loop → validation → R8 defaults → request → hook socket — carries
+// `--monitor`/`--not-before`. The stored monitor gets Sonnet-at-xhigh stamped
+// into its own model/effort slot when unspecified (R8), keeps an explicit
+// `--model`/`--effort` verbatim, holds the parsed not-before floor (first
+// next_run_at at/after it, R1), defaults retry-on-interrupt on (R9), and
+// carries the server-resolved pointers.
+#[test]
+fn cli_create_monitor_over_socket_stamps_r8_defaults_and_floor() {
+    use fly_lib::automations::model::Mode;
+    let (mgr, _d) = manager();
+    let tokens = Arc::new(TokenRegistry::new());
+    let server = server_over(&mgr, &tokens);
+    let tok = tokens.issue(PaneId(11));
+    // The mutating CLI path resolves the pane env; only this test sets these.
+    std::env::set_var("FLY_PANE_TOKEN", &tok);
+    std::env::set_var("FLY_SOCKET_PATH", server.socket_path());
+
+    // 2026-07-12T00:00:00Z — after the harness clock T0 (2026-01-06).
+    let nb_ms: u64 = 1_783_814_400_000;
+    let code = fly_lib::cli::automation::run(&argv(&[
+        "create", "--name", "training watch", "--cron", "0 */6 * * *", "--tz", "UTC",
+        "--cwd", "/tmp", "--prompt", "check the training run", "--monitor",
+        "--not-before", "2026-07-12T00:00:00Z",
+    ]));
+    assert_eq!(code, 0, "monitor create succeeds through the real CLI");
+
+    let list = mgr.list();
+    let a = list
+        .iter()
+        .find(|a| a.name == "training watch")
+        .expect("persisted");
+    assert!(a.monitor, "the CLI set the monitor flag");
+    assert_eq!(a.not_before_ms, Some(nb_ms), "the parsed floor crossed the wire");
+    assert!(
+        a.next_run_at.expect("scheduled") >= nb_ms,
+        "parked: the first occurrence is clamped at/after the floor (R1)"
+    );
+    assert!(a.retry_on_interrupt, "R9: monitor default rides the CLI path too");
+    assert_eq!(a.pickup_pointers, Some(sock_pointers()), "pointers captured");
+    match &a.mode {
+        Mode::Agent { model, effort, .. } => {
+            assert_eq!(model.as_deref(), Some("sonnet"), "R8 default model stamped");
+            assert_eq!(effort.as_deref(), Some("xhigh"), "R8 default effort stamped");
+        }
+        other => panic!("expected agent mode, got {other:?}"),
+    }
+
+    // Explicit --model/--effort win over the R8 default, per-field.
+    let code = fly_lib::cli::automation::run(&argv(&[
+        "create", "--name", "pinned watch", "--cron", "0 */6 * * *", "--tz", "UTC",
+        "--cwd", "/tmp", "--prompt", "check", "--monitor", "--model", "opus",
+        "--effort", "high",
+    ]));
+    assert_eq!(code, 0);
+    let list = mgr.list();
+    let a = list.iter().find(|a| a.name == "pinned watch").expect("persisted");
+    match &a.mode {
+        Mode::Agent { model, effort, .. } => {
+            assert_eq!(model.as_deref(), Some("opus"), "explicit model wins");
+            assert_eq!(effort.as_deref(), Some("high"), "explicit effort wins");
+        }
+        other => panic!("expected agent mode, got {other:?}"),
+    }
+    assert_eq!(a.not_before_ms, None, "no floor unless --not-before was passed");
+}
+
 // R11 over the wire: the `monitor` + `not_before_ms` request fields cross the
 // socket (serde round-trip through the real server) and the created monitor
 // carries the harness-resolved pointers — i.e. pointers come from the
