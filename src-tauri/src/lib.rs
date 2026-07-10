@@ -758,8 +758,10 @@ pub fn run() {
                         // delayed write (a same-chunk \r is swallowed as
                         // pasted content — see `io::paste_payload`); Keys is
                         // the raw R9-filtered answer bytes, no wrap, no Enter
-                        // (KTD6 — a digit selects a picker option instantly).
-                        // BOTH end in the same attention clear local typing
+                        // (KTD6 — a digit selects a picker option instantly);
+                        // Other (feed-other-answer) is the three-chunk picker
+                        // free-text choreography below. ALL end in the same
+                        // attention clear local typing
                         // performs (`pty::pty_write`) — the agent was just
                         // answered, so its ring must drop, and a remote keys
                         // answer must not leave `reason: permission` stale
@@ -783,6 +785,25 @@ pub fn run() {
                                     feed::server::InputAction::Keys(bytes) => {
                                         pty.write(pane, bytes)
                                     }
+                                    // Other answer (feed-other-answer KTD1):
+                                    // digit → text → Enter as three separate,
+                                    // delay-spaced chunks. The boundaries are
+                                    // load-bearing — a digit coalesced with
+                                    // the text is dropped by the picker and
+                                    // the Enter would then select the
+                                    // highlighted default (probed live) — and
+                                    // no chunk carries an ESC byte, so nothing
+                                    // can read as a picker cancel.
+                                    feed::server::InputAction::Other { select, text } => pty
+                                        .write(pane, select)
+                                        .and_then(|()| {
+                                            std::thread::sleep(feed::io::SUBMIT_DELAY);
+                                            pty.write(pane, text)
+                                        })
+                                        .and_then(|()| {
+                                            std::thread::sleep(feed::io::SUBMIT_DELAY);
+                                            pty.write(pane, feed::io::SUBMIT)
+                                        }),
                                 };
                                 match delivered {
                                     Ok(()) => {

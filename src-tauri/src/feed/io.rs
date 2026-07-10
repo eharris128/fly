@@ -321,6 +321,7 @@ fn question_body(p: &PendingInteraction) -> Option<QuestionBody> {
                     header: clean(&q.header, HEADER_CAP).unwrap_or_default(),
                     multi_select: q.multi_select,
                     options,
+                    other_key: None,
                 });
             }
             if questions.is_empty() {
@@ -332,6 +333,16 @@ fn question_body(p: &PendingInteraction) -> Option<QuestionBody> {
                 && questions.len() == 1
                 && !questions[0].multi_select
                 && !questions[0].options.is_empty();
+            // The free-text row's digit (feed-other-answer R2), only on the one
+            // answerable shape: the picker appends "Type something." directly
+            // after the authored options, so its digit is the SOURCE option
+            // count + 1 (pre-truncation — a truncated >9 tail would need a
+            // two-keystroke digit, which `None`s out here). Verified live on
+            // 2.1.206; a transcript body cannot see the rendered row, so this
+            // rests on that appended-row contract (KTD2 of the plan).
+            if answerable {
+                questions[0].other_key = other_digit_after(p.questions[0].options.len());
+            }
             Some(QuestionBody {
                 asked_at: p.asked_at_ms,
                 kind: "choice".into(),
@@ -422,8 +433,44 @@ pub fn keys_payload(text: &str) -> Option<Vec<u8>> {
 
 /// Gap between the paste write and the [`SUBMIT`] write: long enough for the
 /// composer to leave paste handling and settle (human-keypress scale), short
-/// enough to be imperceptible on the HTTP round-trip.
+/// enough to be imperceptible on the HTTP round-trip. Also the gap between the
+/// three chunks of a `mode:"other"` delivery (digit → text → Enter): the live
+/// probe (2026-07-10, 2.1.206) showed the picker drops a digit that arrives
+/// coalesced with the text — chunk boundaries plus a human-scale gap are what
+/// make the choreography deterministic (feed-other-answer KTD1).
 pub const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Cap on a `mode:"other"` free-text answer, in chars (feed-other-answer R6):
+/// sentence scale — far above a picker digit, far below the 64 KiB body cap.
+/// The route rejects an over-cap body outright (400) rather than truncating
+/// bytes into the pane, same posture as [`KEYS_MAX_CHARS`].
+pub const OTHER_MAX_CHARS: usize = 512;
+
+/// The digit that focuses the picker's own "Type something." free-text row
+/// for a transcript-derived question: the picker appends that row directly
+/// after the authored options, so its digit is source option count + 1
+/// (feed-other-answer R2, verified live on 2.1.206). `None` past 9 — a
+/// two-char digit is not a single keystroke, so it is undeliverable.
+pub(crate) fn other_digit_after(source_options: usize) -> Option<String> {
+    let digit = source_options + 1;
+    (digit <= 9).then(|| digit.to_string())
+}
+
+/// Build the text chunk of a `mode:"other"` answer (feed-other-answer R5): the
+/// bytes typed into the picker's focused "Type something." input. Newlines
+/// collapse to single spaces first (the inline input is one line; a kept `\r`
+/// would submit early, a dropped one would join words), then every remaining
+/// control char is dropped exactly like [`keys_payload`] — no ESC, so nothing
+/// the picker could read as a cancel (the failure `paste_payload`'s leading
+/// paste marker causes at an unfocused picker, the whole reason this mode
+/// exists), and no smuggled submit (the Enter is the caller's own delayed
+/// chunk). `None` when nothing printable survives — the route 400s, never an
+/// empty write.
+pub fn other_payload(text: &str) -> Option<Vec<u8>> {
+    let one_line = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    let filtered: String = one_line.chars().filter(|&c| !c.is_control()).collect();
+    (!filtered.trim().is_empty()).then(|| filtered.into_bytes())
+}
 
 #[cfg(test)]
 mod tests {
@@ -897,6 +944,76 @@ mod tests {
         // Empty after the filter → no write at all (the route 400s).
         assert_eq!(keys_payload("\x1b\r\n\x07"), None);
         assert_eq!(keys_payload(""), None);
+    }
+
+    // ---- other_payload / other_digit_after (feed-other-answer R2/R5/R6) -----
+
+    #[test]
+    fn other_payload_collapses_newlines_strips_controls_and_never_wraps() {
+        // A sentence passes through raw — no paste markers, no trailing Enter.
+        assert_eq!(
+            other_payload("Use the staging bucket instead").as_deref(),
+            Some(b"Use the staging bucket instead".as_slice())
+        );
+        // Newlines (any flavor) become single spaces: the inline input is one
+        // line, and a raw \r would submit mid-answer.
+        assert_eq!(
+            other_payload("line one\r\nline two\nline three\rend").as_deref(),
+            Some(b"line one line two line three end".as_slice())
+        );
+        // ESC and other controls are dropped — the payload can never carry a
+        // paste marker or a cancel.
+        assert_eq!(
+            other_payload("a\x1b[201~b\x07c").as_deref(),
+            Some(b"a[201~bc".as_slice())
+        );
+        // Nothing printable left → no write at all (the route 400s). A
+        // newline-only text collapses to blank spaces and counts as empty too.
+        assert_eq!(other_payload("\x1b\x07"), None);
+        assert_eq!(other_payload("\n\r\n"), None);
+        assert_eq!(other_payload(""), None);
+    }
+
+    #[test]
+    fn other_digit_is_source_count_plus_one_single_keystroke_only() {
+        assert_eq!(other_digit_after(2).as_deref(), Some("3"));
+        assert_eq!(other_digit_after(8).as_deref(), Some("9"));
+        // 9+ authored options put the row past a one-keystroke digit — and a
+        // >MAX_OPTIONS batch was truncated on the wire besides — undeliverable.
+        assert_eq!(other_digit_after(9), None);
+        assert_eq!(other_digit_after(12), None);
+    }
+
+    #[test]
+    fn an_answerable_choice_carries_the_other_row_digit() {
+        // feed-other-answer R2: the wire hands the consumer the digit that
+        // focuses "Type something." — authored count + 1 (here 2 + 1).
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", PENDING_ASK);
+        let q = r.resolve_io("leaf-1").question.expect("pending");
+        assert!(q.answerable);
+        assert_eq!(q.questions[0].other_key.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn unanswerable_shapes_carry_no_other_key() {
+        // A multi-question batch is read-only — no otherKey anywhere.
+        let questions: Vec<String> = (0..2)
+            .map(|i| {
+                format!(
+                    r#"{{"question":"Q{i}?","multiSelect":false,"options":[{{"label":"A"}},{{"label":"B"}}]}}"#
+                )
+            })
+            .collect();
+        let entry = format!(
+            r#"{{"type":"assistant","timestamp":"2026-06-19T19:17:20.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{{"questions":[{}]}}}}]}}}}"#,
+            questions.join(",")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{entry}\n"));
+        let q = r.resolve_io("leaf-1").question.expect("served");
+        assert!(!q.answerable);
+        assert!(q.questions.iter().all(|s| s.other_key.is_none()));
     }
 
     #[test]

@@ -11,9 +11,10 @@
 //! authenticates before it routes, so an unauthenticated caller can't even map
 //! the surface. One deliberate mutation route exists (feed-agent-reply-io
 //! KTD3): `POST /agents/{key}/input` writes to a published agent's PTY exactly
-//! as local typing would — the payload is control-stripped and bracketed-paste
-//! wrapped (`io::input_payload`), so a token holder can send *text*, never raw
-//! terminal control sequences. Everything else stays read-only.
+//! as local typing would — every mode's payload is control-stripped
+//! (`io::{paste_payload,keys_payload,other_payload}`), so a token holder can
+//! send *text* and answer keys, never raw terminal control sequences.
+//! Everything else stays read-only.
 //!
 //! Routes: `GET /healthz` (unauthenticated liveness), `GET /feed` (SSE),
 //! `GET /agents/{key}/output` (latest reply), `POST /agents/{key}/input`
@@ -81,6 +82,16 @@ pub enum InputAction {
     /// NO auto-Enter — digit keys select picker options instantly, so a
     /// wrapped or entered payload would misfire (KTD6).
     Keys(Vec<u8>),
+    /// A free-text answer typed into the pending picker's own
+    /// "Type something." row (feed-other-answer KTD1): fly owns the keystroke
+    /// choreography — `select` (the row's digit, from the guarded question's
+    /// `otherKey`), then `text` (`io::other_payload` bytes), then Enter, each
+    /// as its OWN delay-spaced PTY chunk. The live probe (2.1.206) pinned all
+    /// three boundaries: a digit coalesced with the text is dropped, text at
+    /// an unfocused picker is ignored, and a bracketed paste's leading ESC
+    /// cancels the picker outright — so no chunk here ever contains an ESC
+    /// byte, and the gaps are mandatory, not a nicety.
+    Other { select: Vec<u8>, text: Vec<u8> },
 }
 
 /// What became of one `POST /agents/{key}/input` delivery attempt.
@@ -344,27 +355,33 @@ fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec
 
 /// `POST /agents/{key}/input`: parse `{"text", mode?, ifAskedAt?}` and deliver
 /// through the injected seam (feed-agent-reply-io U5; feed-pending-question
-/// U6/KTD6). Status precedence is pinned, in the order the code checks it:
-/// 401 (upstream auth) → 404 (unpublished key, before any pending comparison)
-/// → 400 (bad body / unknown mode / keys without `ifAskedAt` / over-cap or
-/// empty-after-filter keys text) → **409** (the guarded question is not
-/// exposed — nothing pending, reason gone, or `ifAskedAt` mismatch) → **403**
-/// (a guarded answer to a *permission* dialog without the config opt-in) →
-/// **409** (a keys answer to an unanswerable choice shape, or the answered
-/// latch already holds this `askedAt`). The 403 carries a JSON discriminator
-/// body (`{"error":"permissionAnswersDisabled"}`) so a consumer does not
-/// mistake this policy refusal for an auth failure — auth failures in this
-/// feed are always a bare 401, never a 403.
+/// U6/KTD6; feed-other-answer U2). Status precedence is pinned, in the order
+/// the code checks it: 401 (upstream auth) → 404 (unpublished key, before any
+/// pending comparison) → 400 (bad body / unknown mode / keys or other without
+/// `ifAskedAt` / over-cap or empty-after-filter answer text) → **409** (the
+/// guarded question is not exposed — nothing pending, reason gone, or
+/// `ifAskedAt` mismatch) → **403** (a guarded answer to a *permission* dialog
+/// without the config opt-in) → **409** (a keys/other answer to a shape it
+/// cannot complete, or the answered latch already holds this `askedAt`). The
+/// 403 carries a JSON discriminator body
+/// (`{"error":"permissionAnswersDisabled"}`) so a consumer does not mistake
+/// this policy refusal for an auth failure — auth failures in this feed are
+/// always a bare 401, never a 403.
 ///
 /// `mode` defaults to `"submit"` (today's paste + Enter, inject-anytime when
-/// `ifAskedAt` is absent). `ifAskedAt` — mandatory for `"keys"`, optional for
-/// `"submit"` — arms the R11 guard against the freshly re-read reason (not the
-/// entry snapshot, so a slow body read can't gate on a stale dialog state):
-/// the value must equal the current gated pending question's `askedAt`, and
-/// the per-leaf latch admits one guarded delivery per `askedAt` (reserved
-/// *before* the PTY write, released on a failed delivery — but only if this
-/// request's own reservation is still the one held, so a concurrent newer
-/// answer's reservation is never clobbered).
+/// `ifAskedAt` is absent); `"keys"` sends raw answer keys; `"other"`
+/// (feed-other-answer) types `text` into the pending picker's own
+/// "Type something." free-text row and submits it — fly resolves the row's
+/// digit from the guarded question's `otherKey` and owns the three-chunk
+/// choreography, so the payload never contains an ESC byte the picker could
+/// read as cancel. `ifAskedAt` — mandatory for `"keys"` and `"other"`,
+/// optional for `"submit"` — arms the R11 guard against the freshly re-read
+/// reason (not the entry snapshot, so a slow body read can't gate on a stale
+/// dialog state): the value must equal the current gated pending question's
+/// `askedAt`, and the per-leaf latch admits one guarded delivery per `askedAt`
+/// (reserved *before* the PTY write, released on a failed delivery — but only
+/// if this request's own reservation is still the one held, so a concurrent
+/// newer answer's reservation is never clobbered).
 ///
 /// The permission opt-in gate covers **any** guarded delivery whose gated
 /// question is `permission`-kind, not only `mode:"keys"` — a guarded submit's
@@ -407,7 +424,7 @@ fn agent_input_response(
         return empty_response(400);
     };
 
-    let action = match input.mode.as_deref().unwrap_or("submit") {
+    let mut action = match input.mode.as_deref().unwrap_or("submit") {
         "submit" => InputAction::Submit(input.text.clone()),
         "keys" => {
             // KTD6: a keys answer without a guard could approve whatever
@@ -421,6 +438,27 @@ fn agent_input_response(
             }
             match super::io::keys_payload(&input.text) {
                 Some(bytes) => InputAction::Keys(bytes),
+                None => return empty_response(400),
+            }
+        }
+        "other" => {
+            // feed-other-answer R1/R6: same mandatory-guard posture as keys —
+            // an unguarded Other answer could type into whatever dialog is up
+            // — with the sentence-scale cap instead of the digit cap. The
+            // select digit is resolved from the guarded question below; only
+            // the text half is built here.
+            if input.if_asked_at.is_none()
+                || input.text.chars().count() > super::io::OTHER_MAX_CHARS
+            {
+                return empty_response(400);
+            }
+            match super::io::other_payload(&input.text) {
+                // A placeholder select — the guard block below either fills
+                // it from the question's otherKey or 409s.
+                Some(bytes) => InputAction::Other {
+                    select: Vec::new(),
+                    text: bytes,
+                },
                 None => return empty_response(400),
             }
         }
@@ -466,6 +504,22 @@ fn agent_input_response(
         // rather than fire a mis-mapped digit into the picker.
         if matches!(action, InputAction::Keys(_)) && q.kind == "choice" && !q.answerable {
             return empty_response(409);
+        }
+        // feed-other-answer R4: an Other answer additionally needs a known
+        // free-text-row digit (`otherKey`), which only an answerable choice
+        // body carries — a permission dialog has no Other row, and an
+        // unanswerable shape's digits can't be trusted. Anything else 409s
+        // rather than type into an unknown UI state (where the trailing Enter
+        // would select whatever option is highlighted — the live-probed
+        // failure this guard exists to prevent).
+        if let InputAction::Other { select, .. } = &mut action {
+            match (q.kind == "choice" && q.answerable)
+                .then(|| q.questions.first().and_then(|s| s.other_key.clone()))
+                .flatten()
+            {
+                Some(digit) => *select = digit.into_bytes(),
+                None => return empty_response(409),
+            }
         }
         // Reserve before delivering: of two racing same-ifAskedAt answers,
         // exactly one proceeds (AE7).

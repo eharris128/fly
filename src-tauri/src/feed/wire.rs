@@ -82,6 +82,17 @@ pub struct QuestionSpec {
     pub header: String,
     pub multi_select: bool,
     pub options: Vec<QuestionOption>,
+    /// The free-text answer primitive (feed-other-answer R2): the digit that
+    /// focuses the picker's own "Type something." row — the row Claude Code
+    /// appends after the authored options. Present only when a `mode:"other"`
+    /// answer can be delivered against this question (answerable shape AND
+    /// the digit is known: source-count+1 for a transcript body, the rendered
+    /// row's digit for a screen body). `options` never contains this row for
+    /// a transcript body but does for a screen body (digit fidelity, R4 of
+    /// the screen-fallback plan) — `otherKey` is the one place a consumer
+    /// should read it from either way. Omitted, not null, when unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_key: Option<String>,
 }
 
 /// The pending question riding `GET /agents/{key}/output` while an agent is
@@ -437,6 +448,7 @@ mod tests {
                         label: "Snappy".into(),
                         description: "Fast and tight".into(),
                     }],
+                    other_key: Some("2".into()),
                 }],
                 request: None,
                 source: None,
@@ -458,11 +470,34 @@ mod tests {
             v["question"]["questions"][0]["options"][0]["description"],
             "Fast and tight"
         );
+        // The free-text row's digit rides as camelCase otherKey
+        // (feed-other-answer R2).
+        assert_eq!(v["question"]["questions"][0]["otherKey"], "2");
         // Permission-only key absent on a choice.
         assert!(v["question"].get("request").is_none());
         // And it round-trips back byte-equal.
         let back: AgentOutputBody = serde_json::from_value(v).unwrap();
         assert_eq!(back, body);
+    }
+
+    #[test]
+    fn a_spec_without_other_key_omits_it_and_old_bodies_deserialize() {
+        // Back-compat both ways (feed-other-answer R2): no otherKey → the key
+        // is absent (not null), and a pre-otherKey body still loads as None.
+        let spec = QuestionSpec {
+            question: "Which?".into(),
+            header: String::new(),
+            multi_select: false,
+            options: vec![],
+            other_key: None,
+        };
+        let v = serde_json::to_value(&spec).unwrap();
+        assert!(v.get("otherKey").is_none());
+        let old = serde_json::json!({
+            "question": "Which?", "header": "", "multiSelect": false, "options": []
+        });
+        let back: QuestionSpec = serde_json::from_value(old).unwrap();
+        assert_eq!(back.other_key, None);
     }
 
     #[test]
