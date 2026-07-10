@@ -645,6 +645,17 @@ pub fn run() {
                     let _ = run_closed_handle.emit("automation://run-closed", ev);
                 },
             ));
+            // monitor-handoff U4 (R13's backend half): after a successful
+            // monitor create's store flush, tell the frontend which pane
+            // registered it so the parent tab can close (U6 maps pane → leaf
+            // → tab; an already-closed pane is a no-op there).
+            let monitor_registered_handle = app.handle().clone();
+            automations_mgr.set_monitor_registered_emitter(Arc::new(
+                move |ev: &automations::MonitorRegisteredEvent| {
+                    let _ =
+                        monitor_registered_handle.emit(automations::MONITOR_REGISTERED_EVENT, ev);
+                },
+            ));
             let killer_runner = Arc::clone(&script_runner);
             automations_mgr
                 .set_script_killer(Arc::new(move |run_id: &str| killer_runner.kill_run(run_id)));
@@ -870,20 +881,73 @@ fn handle_automation_request(
         .try_state::<Arc<AttentionManager>>()
         .and_then(|a| a.pane_workspace(pane))
         .unwrap_or_default();
-    dispatch_automation_op(&mgr, pane.0, &workspace_id, is_recursion, req)
+    // monitor-handoff U4 (R11): the pickup-pointer resolver for a monitor
+    // create. Pane-precise by construction — it starts from the *validated
+    // socket caller's* leaf key (the wire can never self-declare pointers)
+    // and runs the exact handoff qualification (plausibility gate,
+    // record-cwd-wins, ≥1 real transcript turn) via the shared
+    // [`session::handoff::resolve_target_now`]. The request's `cwd` (the
+    // CLI's own cwd, i.e. the pane's) is only the derivation fallback for a
+    // record that never captured its cwd — the record's cwd wins. Invoked by
+    // the dispatch core only for monitor creates, so ordinary ops never pay
+    // the store/transcript read.
+    let pty = app.try_state::<Arc<PtyManager>>().map(|s| s.inner().clone());
+    let live_cwd = req.cwd.clone();
+    let resolve_pointers = move || -> Option<automations::model::MonitorPointers> {
+        let leaf_key = pty.as_ref()?.leaf_key(pane)?;
+        monitor_pointers_from_target(
+            session::handoff::resolve_target_now(&leaf_key, live_cwd.as_deref()),
+            live_cwd.as_deref(),
+        )
+    };
+    dispatch_automation_op(
+        &mgr,
+        pane.0,
+        &workspace_id,
+        is_recursion,
+        req,
+        &resolve_pointers,
+    )
+}
+
+/// monitor-handoff U4 (R11): flatten a qualified [`session::handoff::HandoffTarget`]
+/// into the [`automations::model::MonitorPointers`] stored on a monitor. The
+/// pointer cwd is the **record's** captured cwd when it has one (the same
+/// R12-precedence the transcript path was derived under), else the live-cwd
+/// fallback the derivation actually used — so the stored cwd and transcript
+/// path always cohere. No target, or no cwd from anywhere, abstains to `None`
+/// (→ the R12 refusal). Pure, so it is unit-tested below without an app.
+fn monitor_pointers_from_target(
+    target: Option<session::handoff::HandoffTarget>,
+    live_cwd: Option<&str>,
+) -> Option<automations::model::MonitorPointers> {
+    let t = target?;
+    let session_cwd = t
+        .session_cwd
+        .clone()
+        .or_else(|| live_cwd.map(str::to_string))?;
+    Some(automations::model::MonitorPointers {
+        session_id: t.session_id,
+        transcript_path: t.transcript_path,
+        session_cwd,
+    })
 }
 
 /// Route a parsed `automation/*` request to the manager (U9). AppHandle-free so
 /// it is directly testable: the caller supplies the validated `pane_id`, the
-/// pane's `workspace_id` (for origin stamping, R9), and whether the pane is
-/// itself automation-spawned (`is_recursion`, the R22 gate). Enforces the gate
-/// first, then routes create/pause/resume/run/delete to the manager.
+/// pane's `workspace_id` (for origin stamping, R9), whether the pane is
+/// itself automation-spawned (`is_recursion`, the R22 gate), and the
+/// pickup-pointer resolver for monitor creates (monitor-handoff U4, R11 —
+/// the wrapper above wires the pane-precise attribution/handoff resolution;
+/// tests wire a stub). Enforces the gate first, then routes
+/// create/pause/resume/run/delete to the manager.
 pub fn dispatch_automation_op(
     mgr: &automations::AutomationManager,
     pane_id: u64,
     workspace_id: &str,
     is_recursion: bool,
     req: cli::automation::AutomationRequest,
+    resolve_pointers: &dyn Fn() -> Option<automations::model::MonitorPointers>,
 ) -> cli::automation::AutomationResponse {
     use automations::{CreateMode, CreateSpec, ManualRun};
     use cli::automation::AutomationResponse;
@@ -891,6 +955,8 @@ pub fn dispatch_automation_op(
     // R22 recursion gate: a pane spawned by an automation may not create or
     // manage automations (the registry entry outlives a delete, cleared only on
     // the pane's exit, so create→delete can't un-gate a still-live pane).
+    // Checked before any monitor pointer resolution (monitor-handoff U4): a
+    // gated pane's create never touches the resume store or a transcript.
     if is_recursion {
         return AutomationResponse::err(
             "automations cannot be managed from an automation-spawned pane",
@@ -904,6 +970,10 @@ pub fn dispatch_automation_op(
             else {
                 return AutomationResponse::err("create requires name, cron, timezone, and cwd");
             };
+            // monitor-handoff R1: a monitor is an *agent-mode* automation.
+            // The CLI rejects `--monitor --script` too (U5), but the socket
+            // payload is untrusted — enforce it here as well.
+            let monitor = req.monitor;
             let mode = if let Some(prompt) = req.prompt {
                 CreateMode::Agent {
                     prompt,
@@ -911,6 +981,11 @@ pub fn dispatch_automation_op(
                     effort: req.effort,
                 }
             } else if let Some(content) = req.script {
+                if monitor {
+                    return AutomationResponse::err(
+                        "a monitor must be agent-mode (a prompt, not a script)",
+                    );
+                }
                 CreateMode::Script {
                     content,
                     interpreter: req.interpreter.unwrap_or_else(|| "bash".to_string()),
@@ -918,6 +993,19 @@ pub fn dispatch_automation_op(
                 }
             } else {
                 return AutomationResponse::err("create requires a prompt or a script");
+            };
+            // monitor-handoff U4 (R11/R12): a monitor create captures its
+            // pickup pointers from the registering pane NOW — the parent tab
+            // is about to close — or refuses with the distinct error and
+            // stores NOTHING. Resolution is attempted only for monitor
+            // creates; the non-monitor path is untouched.
+            let pickup_pointers = if monitor {
+                match resolve_pointers() {
+                    Some(p) => Some(p),
+                    None => return AutomationResponse::err(automations::ERR_MONITOR_POINTERS),
+                }
+            } else {
+                None
             };
             let origin = automations::model::Origin {
                 pane_id,
@@ -930,13 +1018,29 @@ pub fn dispatch_automation_op(
                 timezone,
                 cwd,
                 mode,
-                retry_on_interrupt: req.retry_on_interrupt,
-                // monitor-handoff U2: U5 threads `--not-before` through the
-                // socket request; until then plain creates carry no floor.
-                not_before_ms: None,
+                // monitor-handoff R9: monitors default retry-on-interrupt ON
+                // (an app-restart-interrupted check re-runs once); an explicit
+                // opt-in still wins for ordinary automations.
+                retry_on_interrupt: req.retry_on_interrupt
+                    || automations::model::default_retry_on_interrupt(monitor),
+                // monitor-handoff U2/U4: the not-before floor rides the wire
+                // (untrusted epoch-ms; schedule math saturates) and clamps
+                // the initial next_run_at inside `create`.
+                not_before_ms: req.not_before_ms,
+                monitor,
+                pickup_pointers,
                 origin,
             }) {
-                Ok(created) => AutomationResponse::ok(Some(created.automation.id), created.warning),
+                Ok(created) => {
+                    // monitor-handoff U4 (R13's backend half): signal the
+                    // frontend to close the registering pane's tab — after
+                    // `create` returned, i.e. after the store flush and off
+                    // the store lock (KTD-B). Non-monitor creates never emit.
+                    if monitor {
+                        mgr.emit_monitor_registered(pane_id, &created.automation.id);
+                    }
+                    AutomationResponse::ok(Some(created.automation.id), created.warning)
+                }
                 Err(e) => AutomationResponse::err(e),
             }
         }
@@ -1018,5 +1122,48 @@ mod tests {
         assert!(cli::is_cli_subcommand("-h"));
         // The overview names the discovery target that motivated this.
         assert!(cli::top_level_help().contains("automation"));
+    }
+
+    // ---- monitor pickup pointers (monitor-handoff U4, R11) -------------------
+
+    fn target(session_cwd: Option<&str>) -> session::handoff::HandoffTarget {
+        session::handoff::HandoffTarget {
+            session_id: "sess-1".into(),
+            transcript_path: "/root/-proj-app/sess-1.jsonl".into(),
+            session_cwd: session_cwd.map(str::to_string),
+            last_turn_ms: 5,
+            session_source: session::resume::SessionSource::Hook,
+            divergence_pending: false,
+        }
+    }
+
+    // R11: a qualified target flattens verbatim — and the record's captured
+    // cwd wins over the live fallback (the same R12-precedence the transcript
+    // path was derived under, so path and cwd cohere).
+    #[test]
+    fn monitor_pointers_flatten_the_target_with_the_records_cwd_winning() {
+        let p = monitor_pointers_from_target(Some(target(Some("/proj/recorded"))), Some("/live"))
+            .expect("a qualified target yields pointers");
+        assert_eq!(p.session_id, "sess-1");
+        assert_eq!(p.transcript_path, "/root/-proj-app/sess-1.jsonl");
+        assert_eq!(p.session_cwd, "/proj/recorded", "record cwd wins");
+    }
+
+    // R11: a record that never captured its cwd falls back to the live cwd —
+    // the directory the transcript was actually derived under.
+    #[test]
+    fn monitor_pointers_fall_back_to_the_live_cwd_when_the_record_has_none() {
+        let p = monitor_pointers_from_target(Some(target(None)), Some("/proj/live"))
+            .expect("live-cwd fallback qualifies");
+        assert_eq!(p.session_cwd, "/proj/live");
+    }
+
+    // R12: no target (unresolvable/unqualified session) or no cwd from
+    // anywhere abstains to None — the create arm turns that into the
+    // distinct refusal and stores nothing.
+    #[test]
+    fn monitor_pointers_abstain_without_a_target_or_any_cwd() {
+        assert_eq!(monitor_pointers_from_target(None, Some("/live")), None);
+        assert_eq!(monitor_pointers_from_target(Some(target(None)), None), None);
     }
 }

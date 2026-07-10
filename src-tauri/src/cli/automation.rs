@@ -100,6 +100,20 @@ pub struct AutomationRequest {
     /// clients and every other op.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub retry_on_interrupt: bool,
+    /// Monitor flavor (monitor-handoff U4, R1/R11): create-only, agent-mode
+    /// only (the app rejects `monitor` + `script`). A monitor create makes
+    /// the app capture pickup pointers from the **validated calling pane** —
+    /// the wire can never self-declare them — or refuse (R12). U5 sets this
+    /// from `--monitor`. `#[serde(default)]`/`skip_serializing_if` keep old
+    /// CLI binaries and new servers mutually intelligible (back-compat).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub monitor: bool,
+    /// Monitor not-before floor, epoch ms (monitor-handoff U2/U4, R1):
+    /// create-only; clamps every `next_run_at` recompute. Untrusted numeric
+    /// input — schedule math is saturating/checked. U5 parses `--not-before`
+    /// into it; same back-compat pattern as `monitor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before_ms: Option<u64>,
 }
 
 /// The app's response to an `automation/*` request.

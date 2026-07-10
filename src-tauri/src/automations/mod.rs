@@ -135,6 +135,23 @@ pub const SKIP_CAPACITY: &str = "capacity";
 /// The dashboard (U10) refetches on it.
 pub const AUTOMATION_CHANGED_EVENT: &str = "automation://changed";
 
+/// The Tauri event emitted after a successful **monitor** create's store
+/// flush (monitor-handoff U4 — the backend half of R13). Payload:
+/// [`MonitorRegisteredEvent`] `{ paneId, automationId }`. The frontend (U6)
+/// maps the registering pane → leaf → tab and closes it — the parent session
+/// handed its watch off, so its tab is residue.
+pub const MONITOR_REGISTERED_EVENT: &str = "automation://monitor-registered";
+
+/// Monitor-handoff R12: the distinct refusal returned over the socket when a
+/// monitor create cannot capture qualified pickup pointers from the
+/// registering pane — no resume record, an implausible session id, a missing
+/// transcript, or a metadata-only transcript (no real turn) all abstain into
+/// this one string, and NOTHING is stored. Shared with the integration tests
+/// so the contract can't drift silently.
+pub const ERR_MONITOR_POINTERS: &str = "monitor create refused: could not capture pickup \
+     pointers — this pane has no qualified session (a transcript with at least one real \
+     turn); nothing was created";
+
 /// Length of minted automation/run ids (short random alphanumerics).
 const ID_LEN: usize = 10;
 
@@ -195,6 +212,23 @@ pub struct RunClosedEvent {
 /// mutation returns (lock released, KTD-B). Default no-op; `lib.rs` wires the
 /// Tauri emit, tests wire a collector.
 pub type RunClosedEmitter = Arc<dyn Fn(&RunClosedEvent) + Send + Sync>;
+
+/// Monitor-handoff U4 event payload (the backend half of R13): a monitor was
+/// registered from `pane_id` and persisted as `automation_id`. Serde
+/// camelCase (`paneId`/`automationId`), the file-wide wire convention.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorRegisteredEvent {
+    pub pane_id: u64,
+    pub automation_id: String,
+}
+
+/// Monitor-handoff U4 seam (R13): emit [`MONITOR_REGISTERED_EVENT`] after a
+/// successful monitor create — invoked by the socket create arm
+/// (`lib.rs::dispatch_automation_op`) strictly **after** [`AutomationManager::create`]
+/// returned, i.e. after the store flush and off the store lock (KTD-B).
+/// Default no-op; `lib.rs` wires the Tauri emit, tests wire a collector.
+pub type MonitorRegisteredEmitter = Arc<dyn Fn(&MonitorRegisteredEvent) + Send + Sync>;
 
 /// One run that a prior app instance's crash/restart left `Running`, closed
 /// `failed("interrupted")` by startup recovery (interrupt-resilience U2/R2).
@@ -369,6 +403,17 @@ pub struct CreateSpec {
     /// `None` for plain recurring automations; U4/U5 thread the real value
     /// through from `create --monitor --not-before`.
     pub not_before_ms: Option<u64>,
+    /// Monitor flavor (monitor-handoff U4, R1): stamped as-is. The create
+    /// arm in `lib.rs` is the enforcement point pairing this with
+    /// `pickup_pointers` (R11/R12) and agent mode — the manager only stamps.
+    pub monitor: bool,
+    /// Pickup pointers captured from the registering pane at create time
+    /// (monitor-handoff U4, R11) — resolved by the caller against the pane's
+    /// own attribution (never self-declared over the wire); `None` for every
+    /// non-monitor create. A monitor create with no qualified pointers never
+    /// reaches this spec: it is refused upstream with
+    /// [`ERR_MONITOR_POINTERS`] (R12).
+    pub pickup_pointers: Option<crate::automations::model::MonitorPointers>,
     /// Resolved by the caller at create time (R22/R9: pane id + workspace
     /// identity + label); the manager only stamps it.
     pub origin: Origin,
@@ -437,6 +482,10 @@ pub struct AutomationManager {
     /// U5: emit `automation://run-closed` on agent-run close (see
     /// [`RunClosedEmitter`]). Default no-op; `lib.rs` injects the Tauri emit.
     emit_run_closed: Mutex<RunClosedEmitter>,
+    /// Monitor-handoff U4 (R13): emit `automation://monitor-registered` after
+    /// a successful monitor create (see [`MonitorRegisteredEmitter`]).
+    /// Default no-op; `lib.rs` injects the Tauri emit.
+    emit_monitor_registered: Mutex<MonitorRegisteredEmitter>,
     /// Interrupt-resilience U2: surface an interrupted run through the alert
     /// pipeline (see [`InterruptSink`]). Default no-op; `lib.rs` injects the
     /// real one.
@@ -499,6 +548,7 @@ impl AutomationManager {
             ))),
             output_capturer: Mutex::new(Arc::new(|_cwd: &str, _since: u64| None)),
             emit_run_closed: Mutex::new(Arc::new(|_ev: &RunClosedEvent| {})),
+            emit_monitor_registered: Mutex::new(Arc::new(|_ev: &MonitorRegisteredEvent| {})),
             interrupt_sink: Mutex::new(Arc::new(|_ir: &InterruptedRun| {})),
             monitor_alert_sink: Mutex::new(Arc::new(|_name: &str, _line: &str| {})),
             bundle_dir: Mutex::new(None),
@@ -606,6 +656,27 @@ impl AutomationManager {
     /// U5: inject the `automation://run-closed` emitter (see [`RunClosedEmitter`]).
     pub fn set_run_closed_emitter(&self, e: RunClosedEmitter) {
         *self.emit_run_closed.lock().unwrap() = e;
+    }
+
+    /// Monitor-handoff U4: inject the `automation://monitor-registered`
+    /// emitter (see [`MonitorRegisteredEmitter`]).
+    pub fn set_monitor_registered_emitter(&self, e: MonitorRegisteredEmitter) {
+        *self.emit_monitor_registered.lock().unwrap() = e;
+    }
+
+    /// Monitor-handoff U4 (R13's backend half): fire
+    /// [`MONITOR_REGISTERED_EVENT`] for a monitor `automation_id` just
+    /// registered from `pane_id`. Called by the socket create arm strictly
+    /// after [`AutomationManager::create`] returned — the store is flushed
+    /// and its lock released (KTD-B) — so the frontend's tab close (U6) can
+    /// never observe a registration the store might still lose.
+    pub fn emit_monitor_registered(&self, pane_id: u64, automation_id: &str) {
+        let ev = MonitorRegisteredEvent {
+            pane_id,
+            automation_id: automation_id.to_string(),
+        };
+        let emitter = Arc::clone(&self.emit_monitor_registered.lock().unwrap());
+        emitter(&ev);
     }
 
     /// Interrupt-resilience U2: inject the interrupted-run alert sink (see
@@ -759,14 +830,16 @@ impl AutomationManager {
             timezone: spec.timezone,
             enabled: true,
             retry_on_interrupt: spec.retry_on_interrupt,
-            // Monitor fields (monitor-handoff plan U1/U2): the not-before
+            // Monitor fields (monitor-handoff plan U1/U2/U4): the not-before
             // floor is stamped from the spec — already clamped into
             // `next_run_at` above (R1) — so every later recompute keeps
-            // clamping; U4/U5 thread `monitor` + pointers through the spec.
-            monitor: false,
+            // clamping; the flag and the registration-time pickup pointers
+            // (R11) arrive pre-qualified from the create arm in `lib.rs`
+            // (a pointer-less monitor create was refused there, R12).
+            monitor: spec.monitor,
             not_before_ms: spec.not_before_ms,
             retired_at: None,
-            pickup_pointers: None,
+            pickup_pointers: spec.pickup_pointers,
             cwd: spec.cwd,
             mode,
             origin: spec.origin,
@@ -2170,6 +2243,8 @@ mod tests {
             },
             retry_on_interrupt: false,
             not_before_ms: None,
+            monitor: false,
+            pickup_pointers: None,
             origin: origin(),
         }
     }

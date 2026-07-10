@@ -96,6 +96,20 @@ pub fn resolve_in_root(
     })
 }
 
+/// Resolve `leaf_key`'s current session against the **real** resume store and
+/// transcript root — the environment-reading entry over [`resolve_in_root`],
+/// shared by the handoff command below and the monitor-registration pointer
+/// capture (monitor-handoff U4, R11: `lib.rs`'s create arm resolves the
+/// registering pane's leaf through this exact qualification — plausibility
+/// gate, record-cwd-wins, ≥1 real transcript turn — so the two surfaces can
+/// never drift on what "qualified" means). Reads the store at call time,
+/// never from a snapshot (session ids rotate on `/clear`, KTD1).
+pub fn resolve_target_now(leaf_key: &str, live_cwd: Option<&str>) -> Option<HandoffTarget> {
+    let records = super::resume::load_resume_records();
+    let root = transcript::claude_projects_root()?;
+    resolve_in_root(&records, leaf_key, live_cwd, &root)
+}
+
 /// Command: resolve the focused leaf's previous session into a spawnable
 /// handoff target, or `None` when nothing qualifies — no record, no transcript
 /// file, or no real conversation turn (R4/R5; the `None` feeds the R6 notice).
@@ -106,9 +120,7 @@ pub fn resolve_handoff_target(
     leaf_key: String,
     live_cwd: Option<String>,
 ) -> Option<HandoffTarget> {
-    let records = super::resume::load_resume_records();
-    let root = transcript::claude_projects_root()?;
-    resolve_in_root(&records, &leaf_key, live_cwd.as_deref(), &root)
+    resolve_target_now(&leaf_key, live_cwd.as_deref())
 }
 
 // ---- pick-list candidates (fix-session-pane-attribution U5) -----------------
