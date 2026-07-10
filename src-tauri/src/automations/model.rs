@@ -555,10 +555,20 @@ impl Automation {
     ///   verdict is unreadable; without counting these, a monitor whose
     ///   output can never be read would run silent forever (the plan's
     ///   Risks note: escalation bounds it);
-    /// - a `Succeeded` row **with output** is a readable, concluded check —
-    ///   e.g. a healthy not-done check that reported "still running" — and
-    ///   resets the walk (a long experiment produces many of these; they
-    ///   must never escalate);
+    /// - a verdict-less `Succeeded` row whose output **contains a
+    ///   verdict-fence opener** also counts (fix(review) #5): the check
+    ///   OPENED a block but it never parsed — a near-miss (decorated or
+    ///   lowercase outcome, unclosed fence, two blocks), i.e. persistent
+    ///   non-compliance, which must escalate to a visible "monitor broken"
+    ///   rather than resetting forever. Detection is
+    ///   [`super::verdict::contains_verdict_opener`] — the parser's own
+    ///   opener rule, so the two cannot drift. Accepted miss: the stored
+    ///   output is the R8 tail ([`output_tail`]) — a cap that cut the opener
+    ///   off leaves the row reading as a plain not-done check;
+    /// - any other `Succeeded` row **with output** is a readable, concluded
+    ///   check — e.g. a healthy not-done check that reported "still
+    ///   running" — and resets the walk (a long experiment produces many of
+    ///   these; they must never escalate);
     /// - `Skipped` rows are neutral (never ran — neither count nor reset),
     ///   and so is a still-`Running` row (it has concluded nothing yet).
     ///
@@ -574,6 +584,16 @@ impl Automation {
                 RunStatus::Failed => n += 1,
                 // U3 refinement: concluded but unreadable (abstained capture).
                 RunStatus::Succeeded if row.output.is_none() => n += 1,
+                // fix(review) #5: an opened-but-unparseable block is a
+                // near-miss, not a healthy not-done check.
+                RunStatus::Succeeded
+                    if row
+                        .output
+                        .as_deref()
+                        .is_some_and(super::verdict::contains_verdict_opener) =>
+                {
+                    n += 1
+                }
                 RunStatus::Succeeded => break, // readable not-done check: reset
                 RunStatus::Skipped | RunStatus::Running => {}
             }
@@ -1327,6 +1347,66 @@ mod tests {
 
         fail(&mut a, "f4", 7_000);
         assert_eq!(a.consecutive_infra_failures(), 1, "count restarts after");
+
+        // fix(review) #5: a near-miss block — an opened ```verdict fence that
+        // never parsed — counts like an unreadable check, extending the
+        // trailing streak instead of resetting it.
+        a.claim(Some(9_000), 8_000, Trigger::Schedule, "m1").unwrap();
+        a.close(
+            "m1",
+            RunOutcome::Succeeded {
+                output: Some("```verdict\nPASS: all good\n```".into()),
+            },
+            8_100,
+        );
+        assert_eq!(
+            a.consecutive_infra_failures(),
+            2,
+            "an opened-but-unparseable block counts (near-miss)"
+        );
+    }
+
+    // fix(review) #5 (monitor-handoff R7 — the plan's Risks promise:
+    // escalation converts persistent non-compliance into a visible broken
+    // signal): a Succeeded verdict-less row whose output contains a
+    // verdict-fence OPENER that never parsed (decorated outcome, lowercase,
+    // unclosed fence) counts as unreadable in the walk; plain not-done text
+    // (no opener) still resets. Opener detection is the parser's own rule
+    // (`verdict::contains_verdict_opener`), so the two cannot drift. Accepted
+    // miss (documented on the walk): the stored output is the R8 tail — a
+    // cap that cut the opener off reads as a plain not-done check.
+    #[test]
+    fn near_miss_verdict_blocks_count_as_unreadable_in_the_walk() {
+        let mut a = automation(script_mode());
+        a.monitor = true;
+
+        let succeed_with = |a: &mut Automation, id: &str, t: u64, out: &str| {
+            a.claim(Some(t + 1000), t, Trigger::Schedule, id).unwrap();
+            a.close(
+                id,
+                RunOutcome::Succeeded {
+                    output: Some(out.into()),
+                },
+                t + 1,
+            );
+        };
+
+        // Decorated outcome line: the opener is there, the block never parses.
+        succeed_with(&mut a, "m1", 1_000, "checked.\n```verdict\nPASS: all good\n```");
+        assert_eq!(a.consecutive_infra_failures(), 1, "near-miss counts");
+
+        // Lowercase outcome behind an unclosed fence: still a near-miss.
+        succeed_with(&mut a, "m2", 2_000, "```verdict\npass\nprobably fine");
+        assert_eq!(a.consecutive_infra_failures(), 2, "the streak grows");
+
+        // Plain not-done text without an opener resets — the healthy
+        // long-experiment case must never escalate.
+        succeed_with(&mut a, "ok", 3_000, "still training — nothing to report");
+        assert_eq!(
+            a.consecutive_infra_failures(),
+            0,
+            "a readable not-done check resets"
+        );
     }
 
     // monitor-handoff R4 + R8/U7: the history cap never evicts a

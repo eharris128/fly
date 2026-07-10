@@ -396,6 +396,64 @@ fn monitor_create_refuses_without_qualified_pointers_r12() {
     assert!(events.lock().unwrap().is_empty(), "no registered event");
 }
 
+// fix(review) #14 (monitor-handoff R12/R13): a monitor create whose store
+// flush FAILED still answers ok + warning — the record is live in memory
+// (KTD-B), and the CLI prints the warning in the still-open parent tab —
+// but emits NO monitor-registered event: closing that tab on a registration
+// that dies at restart would discard the very session the monitor is
+// supposed to hand back to (refuse-rather-than-lose).
+#[test]
+fn flush_failed_monitor_create_warns_but_never_emits_registered_r12() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let store = Store::load_at(
+        data.join("automations.json"),
+        data.join("automation-scripts"),
+    );
+    let mgr = Arc::new(AutomationManager::new(
+        store,
+        Arc::new(UnwiredDispatcher) as Arc<dyn Dispatcher>,
+        Box::new(|| T0),
+        Box::new(|_id: &str| {}),
+    ));
+    let events = collect_registered(&mgr);
+
+    // Failure injection (the store.rs pattern): remove the store dir (the
+    // construction-time recovery flush created it) and make its parent
+    // read-only, so the create's flush fails at create_dir_all.
+    let _ = std::fs::remove_dir_all(&data);
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::create_dir(dir.path().join("probe")).is_ok() {
+        // Running as root (or an ACL overrides the mode): the injection
+        // cannot work — skip gracefully, like the store.rs tests.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!("skipping flush-failure test: read-only dir is still writable");
+        return;
+    }
+
+    let mut req = create_req("tok");
+    req.monitor = true;
+    let resp = dispatch_automation_op(&mgr, 9, "ws", false, req, &|| Some(sock_pointers()));
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(resp.ok, "the create still succeeds in memory (KTD-B): {resp:?}");
+    assert!(
+        resp.warning
+            .as_deref()
+            .unwrap_or("")
+            .contains("store flush failed"),
+        "the flush warning rides the response for the CLI to print: {:?}",
+        resp.warning
+    );
+    let id = resp.id.expect("the new id is returned");
+    assert!(mgr.get(&id).is_some(), "live in memory");
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "NO monitor-registered event — the parent tab must stay open (R12)"
+    );
+}
+
 // The non-monitor path is untouched by U4: no pointer resolution is even
 // attempted, nothing rides the new fields, and no registered event fires.
 #[test]
@@ -577,8 +635,14 @@ fn cli_create_monitor_over_socket_stamps_r8_defaults_and_floor() {
 // socket (serde round-trip through the real server) and the created monitor
 // carries the harness-resolved pointers — i.e. pointers come from the
 // server-side resolver keyed on the validated pane, never from the payload.
+// R8 backstop (fix(review) #12): a raw-socket monitor create that BYPASSES
+// the CLI (no model/effort in the payload) still lands sonnet/xhigh —
+// stamped by the socket create arm, never left to ride
+// config.automation_defaults; explicit values still win per-field.
 #[test]
 fn monitor_create_over_socket_round_trips_flags_and_stores_pointers_r11() {
+    use fly_lib::automations::model::Mode;
+    use fly_lib::cli::automation::{MONITOR_DEFAULT_EFFORT, MONITOR_DEFAULT_MODEL};
     let (mgr, _d) = manager();
     let tokens = Arc::new(TokenRegistry::new());
     let server = server_over(&mgr, &tokens);
@@ -603,4 +667,39 @@ fn monitor_create_over_socket_round_trips_flags_and_stores_pointers_r11() {
         "pointers are the server-resolved set for the validated pane"
     );
     assert_eq!(a.origin.pane_id, 8, "origin still stamps the caller");
+    match &a.mode {
+        Mode::Agent { model, effort, .. } => {
+            assert_eq!(
+                model.as_deref(),
+                Some(MONITOR_DEFAULT_MODEL),
+                "R8 default model backstopped socket-side (fix(review) #12)"
+            );
+            assert_eq!(
+                effort.as_deref(),
+                Some(MONITOR_DEFAULT_EFFORT),
+                "R8 default effort backstopped socket-side"
+            );
+        }
+        other => panic!("expected agent mode, got {other:?}"),
+    }
+
+    // Explicit payload values still win per-field over the backstop.
+    let mut pinned = create_req(&tok);
+    pinned.name = Some("pinned".to_string());
+    pinned.monitor = true;
+    pinned.model = Some("opus".to_string());
+    let resp = send_request(server.socket_path(), &pinned).unwrap();
+    assert!(resp.ok, "{resp:?}");
+    let a = mgr.get(&resp.id.unwrap()).expect("persisted");
+    match &a.mode {
+        Mode::Agent { model, effort, .. } => {
+            assert_eq!(model.as_deref(), Some("opus"), "explicit model wins");
+            assert_eq!(
+                effort.as_deref(),
+                Some(MONITOR_DEFAULT_EFFORT),
+                "unspecified effort still backstopped per-field"
+            );
+        }
+        other => panic!("expected agent mode, got {other:?}"),
+    }
 }

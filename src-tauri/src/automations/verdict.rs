@@ -23,8 +23,11 @@ use super::model::{MonitorPointers, Verdict, VerdictOutcome};
 
 /// The prompt-side verdict-block contract (R2). Quoted **verbatim** by the U8
 /// skill file — edit here and there together, nowhere else. The example block
-/// inside it is itself parseable by [`parse_verdict`] (tested below), so the
-/// spec cannot drift from the parser.
+/// inside it deliberately does **not** parse: its note is
+/// [`SPEC_NOTE_PLACEHOLDER`], which [`parse_verdict`] treats as an echo of the
+/// spec, not a verdict (fix(review) #3) — a check that merely quotes these
+/// instructions back must never read as a spurious PASS and retire the
+/// monitor. The abstention is tested below, so spec and parser cannot drift.
 pub const VERDICT_BLOCK_SPEC: &str = r#"End your final message with exactly one fenced verdict block:
 
 ```verdict
@@ -36,6 +39,13 @@ The first line inside the fence must be exactly PASS or FAIL — uppercase,
 alone on its line. Every line after it up to the closing fence is the
 free-text result note. Emit exactly one such block. If the experiment is not
 finished yet, emit NO verdict block at all — say it is still running and stop."#;
+
+/// The example note line inside [`VERDICT_BLOCK_SPEC`], verbatim — defined
+/// once here so the spec text and the echo guard in [`parse_verdict`] cannot
+/// drift (a test asserts the spec contains this exact line). A parsed block
+/// whose note equals it is the spec quoted back, not a real verdict —
+/// abstain (fix(review) #3).
+const SPEC_NOTE_PLACEHOLDER: &str = "<free-text note — one or more lines>";
 
 /// R7: the consecutive verdict-less-failed-check threshold that flags a
 /// monitor as broken.
@@ -57,7 +67,13 @@ pub const MONITOR_BROKEN_THRESHOLD: usize = 3;
 ///   again, matching R7's "resets after alerting";
 /// - self-healing when a close goes unevaluated (e.g. a shutdown-interrupted
 ///   check closes while the app is exiting): the streak still rings at the
-///   next multiple instead of never.
+///   next multiple — **until the run-history cap saturates the derived
+///   count** (fix(review) #13). With the 20-row cap (`model::RUN_HISTORY_CAP`,
+///   R8) the count can never exceed 20, so an unbroken streak rings six
+///   times (3, 6, 9, 12, 15, 18) and then goes silent: the cap pins the
+///   count at 20, which is not a multiple of three. Deliberate honesty, not
+///   a to-fix: the user has been rung six times, and a monitor stuck that
+///   long is loudly broken already.
 ///
 /// A clean check or a verdict-bearing row zeroes the derived count itself
 /// (the R7 reset — see the U1 walk), so this predicate needs no memory.
@@ -76,7 +92,10 @@ pub fn broken_alert_due(consecutive_infra_failures: usize) -> bool {
 /// - note: every line after the outcome up to the closing fence (a line whose
 ///   trimmed content is exactly ```` ``` ````), inner newlines preserved,
 ///   outer whitespace trimmed; may be empty;
-/// - zero openers, two-plus openers, or a missing closing fence ⇒ `None`.
+/// - zero openers, two-plus openers, or a missing closing fence ⇒ `None`;
+/// - a note equal to [`SPEC_NOTE_PLACEHOLDER`] ⇒ `None` — the block is
+///   [`VERDICT_BLOCK_SPEC`]'s own example quoted back (a check echoing its
+///   instructions), never a real verdict (fix(review) #3).
 ///
 /// Surrounding prose is fine — fences are matched per-line, so a block
 /// embedded in a longer message parses. Callers hand this the **full**
@@ -87,7 +106,7 @@ pub fn parse_verdict(text: &str) -> Option<Verdict> {
     let openers: Vec<usize> = lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.trim() == "```verdict")
+        .filter(|(_, l)| is_verdict_opener(l))
         .map(|(i, _)| i)
         .collect();
     // Exactly one block or nothing (abstain-on-surprise: two blocks could
@@ -106,7 +125,31 @@ pub fn parse_verdict(text: &str) -> Option<Verdict> {
         _ => return None, // decorated/lowercase outcome line ⇒ abstain
     };
     let note = inner[first.saturating_add(1)..].join("\n").trim().to_owned();
+    if note == SPEC_NOTE_PLACEHOLDER {
+        // Echo guard (fix(review) #3): this is the spec's own example block —
+        // a check quoting its instructions back, not a delivered verdict.
+        return None;
+    }
     Some(Verdict { outcome, note })
+}
+
+/// The one verdict-fence opener detection (a line whose trimmed content is
+/// exactly ```` ```verdict ````), shared by [`parse_verdict`] and
+/// [`contains_verdict_opener`] so the two cannot drift.
+fn is_verdict_opener(line: &str) -> bool {
+    line.trim() == "```verdict"
+}
+
+/// Whether `text` contains a verdict-fence **opener** line — the same
+/// per-line detection [`parse_verdict`] uses (fix(review) #5). The escalation
+/// walk ([`super::model::Automation::consecutive_infra_failures`]) treats a
+/// concluded check that OPENED a verdict block yet yielded no parseable
+/// verdict (decorated/lowercase outcome, unclosed fence, two blocks) as an
+/// unreadable check rather than a healthy not-done one: persistent
+/// near-misses must escalate to a visible "monitor broken", never run silent
+/// forever (the plan's Risks promise).
+pub fn contains_verdict_opener(text: &str) -> bool {
+    text.lines().any(is_verdict_opener)
 }
 
 /// The run-identifying half of a failure bundle (R15) — grouped so the three
@@ -265,14 +308,35 @@ mod tests {
         );
     }
 
-    // The one-place spec (R2, quoted verbatim by the U8 skill) contains an
-    // example block that this parser accepts — the contract cannot drift
-    // from its own documentation.
+    // The echo guard (fix(review) #3): the one-place spec (R2, quoted
+    // verbatim by the U8 skill) contains an example block whose note is the
+    // placeholder — a check that merely quotes the spec back must abstain,
+    // never retire the monitor on a spurious PASS. The containment assertion
+    // pins the placeholder const to the spec text so they cannot drift.
     #[test]
-    fn the_spec_texts_own_example_parses() {
-        let v = parse_verdict(VERDICT_BLOCK_SPEC).expect("the spec's example block parses");
-        assert_eq!(v.outcome, VerdictOutcome::Pass);
-        assert_eq!(v.note, "<free-text note — one or more lines>");
+    fn the_spec_texts_own_example_abstains_as_an_echo_guard() {
+        assert!(
+            VERDICT_BLOCK_SPEC.contains(SPEC_NOTE_PLACEHOLDER),
+            "the guard's placeholder is the spec's example note line, verbatim"
+        );
+        assert_eq!(
+            parse_verdict(VERDICT_BLOCK_SPEC),
+            None,
+            "the spec's own example is an echo, not a verdict"
+        );
+    }
+
+    // The echo guard is exact-match only: a PASS block with a REAL note —
+    // even one that merely resembles or mentions the placeholder — parses.
+    #[test]
+    fn a_pass_block_with_a_real_note_still_parses_past_the_echo_guard() {
+        assert_eq!(
+            parse_verdict("```verdict\nPASS\nfree-text note: run converged\n```"),
+            Some(Verdict {
+                outcome: VerdictOutcome::Pass,
+                note: "free-text note: run converged".into(),
+            })
+        );
     }
 
     // R7: the derived "reset after alerting" — the alert fires at each

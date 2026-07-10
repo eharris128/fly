@@ -52,7 +52,7 @@
     findAutomationsWorkspace,
     buildAgentArgv,
     shouldAutoCloseRun,
-    tabForPane,
+    monitorCloseTarget,
   } from "./lib/automation-panes";
   import {
     automationsToRows,
@@ -713,6 +713,29 @@
     setActiveTree(tree, leaves(tree)[0]?.key);
     pruneNotifications(); // the removed pane's leaf is gone
   }
+  // Leaf-targeted close for a pane in ANY workspace/tab (vs closePane, which
+  // only removes the ACTIVE tab's focused leaf). Splices the leaf out of its
+  // tab's tree; when it was that tab's focused leaf, focus hands to the first
+  // remaining leaf — closePane's post-removal rule — WITHOUT touching
+  // activeWorkspaceId/activeTabId, so closing a background leaf never steals
+  // the user's view. A sole-leaf tab is the caller's job (route through
+  // closeTab); a null removeLeaf here leaves the tab untouched.
+  function closeLeafInTab(tabId: string, leafKey: string) {
+    workspaces = workspaces.map((w) => ({
+      ...w,
+      tabs: w.tabs.map((t) => {
+        if (t.id !== tabId) return t;
+        const tree = removeLeaf(t.tree, leafKey);
+        if (tree === null) return t; // sole leaf — whole-tab close, not ours
+        const focusedLeafKey =
+          t.focusedLeafKey === leafKey
+            ? (leaves(tree)[0]?.key ?? t.focusedLeafKey)
+            : t.focusedLeafKey;
+        return { ...t, tree, focusedLeafKey };
+      }),
+    }));
+    pruneNotifications(); // the removed pane's leaf is gone
+  }
   function focusDir(dir: "left" | "right" | "up" | "down") {
     if (!activeTab) return;
     const n = neighbor(rects, activeTab.focusedLeafKey, dir);
@@ -896,17 +919,26 @@
     setTimeout(() => closeTab(tabId), AGENT_RUN_CLOSE_LINGER_MS);
   }
   // Monitor-handoff U6 (R13): a monitor was registered from this pane — its
-  // session handed the watch off to the automation, so its tab is residue.
-  // Map paneId → leaf → tab (the handleRunClosed pattern, via the pure
-  // tabForPane) and close it through the ordinary closeTab path, which hands
-  // focus/activeTabId per existing close behavior. NO linger, deliberately
-  // unlike handleRunClosed: the event fires strictly after the store flush, so
-  // registration confirmed means residue-free (origin decision). An unknown
-  // pane or an already-closed tab is a no-op.
+  // session handed the watch off to the automation, so residue-free close
+  // means the REGISTERING PANE's leaf, resolved via the pure
+  // monitorCloseTarget (the handleRunClosed paneId→leaf mapping pattern).
+  // Only a sole-leaf tab closes whole, through the ordinary closeTab path,
+  // which hands focus/activeTabId per existing close behavior; in a split tab
+  // only the registering leaf is removed (closeLeafInTab) — sibling panes are
+  // unrelated live sessions and survive, since killing them here would bypass
+  // the destructive confirm every user-initiated multi-pane close gets
+  // (requestCloseTab). NO linger, deliberately unlike handleRunClosed: the
+  // event fires strictly after the store flush, so registration confirmed
+  // means residue-free (origin decision). An unknown pane or an
+  // already-closed tab is a no-op.
   function handleMonitorRegistered(ev: MonitorRegisteredEvent) {
-    const tabId = tabForPane(workspaces, leafByPaneId, ev.paneId);
-    if (!tabId) return;
-    closeTab(tabId);
+    const target = monitorCloseTarget(workspaces, leafByPaneId, ev.paneId);
+    if (!target) return;
+    if (target.kind === "tab") {
+      closeTab(target.tabId);
+      return;
+    }
+    closeLeafInTab(target.tabId, target.leafKey);
   }
   function newWorkspace() {
     const ws = makeWorkspace(`workspace ${workspaces.length + 1}`);
@@ -1699,7 +1731,17 @@
             void frontendLog(`monitor bundle read failed: ${String(e)}`);
           }
         }
-        pickupFallback = { automationId: row.id, explanation: plan.explanation, bundleText };
+        // HomeView renders the fallback block row-anchored, so if the
+        // automation was deleted while we awaited (the automation://changed
+        // refetch dropped its row), it would have nowhere to render — surface
+        // the outcome as the transient notice instead of a silent dead click.
+        if (automationRows.some((r) => r.id === row.id)) {
+          pickupFallback = { automationId: row.id, explanation: plan.explanation, bundleText };
+        } else {
+          showNotice(
+            `Monitor “${sanitizeTranscriptPath(row.name)}” was deleted while checking pickup — its failure details can't be shown.`,
+          );
+        }
         return;
       }
       // Spawn: seed cwd + command BEFORE appending the tab (Terminal reads
@@ -1862,9 +1904,12 @@
     paletteOpen = false;
     settingsOpen = false;
     if (notificationPanelOpen) setNotificationPanel(false);
-    // A stale R17 fallback block from the previous open would be confusing —
-    // each dashboard open starts clean (monitor-handoff U7).
-    pickupFallback = null;
+    // pickupFallback is deliberately NOT cleared on open (monitor-handoff U7,
+    // R17): staleness is already handled where it matters — handleMonitorPickup
+    // nulls it at the start of every attempt, and the block has its own dismiss
+    // control — whereas a clear here would silently wipe a fallback that
+    // resolved while the dashboard was closed (Escape mid-await) before the
+    // user ever saw it.
     homeViewOpen = true;
   }
   // Jump from a dashboard row to its pane, closing the view (R4).
@@ -2279,7 +2324,8 @@
     let unlistenRunClosed: (() => void) | undefined;
     void onRunClosed(handleRunClosed).then((un) => (unlistenRunClosed = un));
     // Monitor-handoff U6 (R13): a monitor registered → close the registering
-    // pane's tab immediately (no linger — see handleMonitorRegistered).
+    // pane's leaf immediately (whole tab only when it's the sole leaf; no
+    // linger — see handleMonitorRegistered).
     let unlistenMonitorRegistered: (() => void) | undefined;
     void onMonitorRegistered(handleMonitorRegistered).then(
       (un) => (unlistenMonitorRegistered = un),

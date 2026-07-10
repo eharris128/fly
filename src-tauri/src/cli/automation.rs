@@ -110,6 +110,12 @@ pub fn validate_monitor_flags(
 /// `config.automation_defaults` — a sparse healthcheck must not silently
 /// ride a user's expensive default model. No new config surface (the plan's
 /// constraint). Pure, unit-tested below.
+///
+/// The socket create arm (`lib.rs::dispatch_automation_op`) now **backstops**
+/// this same default (fix(review) #12): a raw-socket monitor create that
+/// bypasses the CLI still lands sonnet/xhigh. The CLI stamp stays anyway —
+/// it makes the `--json` output and the local echo self-describing before
+/// the socket round-trip; the redundancy is deliberate defense in depth.
 pub fn monitor_launch_defaults(
     monitor: bool,
     model: Option<String>,

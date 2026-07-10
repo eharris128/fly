@@ -48,8 +48,8 @@ use tauri::Emitter;
 
 use crate::config::{AutomationDefaults, ConfigStore};
 use model::{
-    Automation, Mode, Origin, RunMode, RunOutcome, RunRow, RunStatus, Trigger, Verdict,
-    VerdictOutcome, ERR_DELETED, ERR_INTERRUPTED, ERR_TIMED_OUT,
+    Automation, ClaimError, Mode, Origin, RunMode, RunOutcome, RunRow, RunStatus, Trigger,
+    Verdict, VerdictOutcome, ERR_DELETED, ERR_INTERRUPTED, ERR_TIMED_OUT,
 };
 use store::{Store, StoreHealth};
 
@@ -151,6 +151,19 @@ pub const MONITOR_REGISTERED_EVENT: &str = "automation://monitor-registered";
 pub const ERR_MONITOR_POINTERS: &str = "monitor create refused: could not capture pickup \
      pointers — this pane has no qualified session (a transcript with at least one real \
      turn); nothing was created";
+
+/// Monitor-handoff R3 (fix(review) #2): the refusal [`AutomationManager::resume`]
+/// returns for a retired monitor. Retirement is permanent — re-arming
+/// `next_run_at` would set the sweep re-claiming (and being refused) every
+/// tick forever.
+const ERR_RESUME_RETIRED: &str =
+    "monitor is retired — it delivered its verdict and cannot be resumed";
+
+/// Monitor-handoff R3 (fix(review) #8): the refusal
+/// [`AutomationManager::manual_run`] returns for a retired monitor — distinct
+/// from the (resumable) disabled refusal.
+const ERR_RUN_RETIRED: &str =
+    "monitor is retired — it delivered its verdict and will never run again";
 
 /// Length of minted automation/run ids (short random alphanumerics).
 const ID_LEN: usize = 10;
@@ -446,6 +459,15 @@ pub enum CreateMode {
 pub struct Created {
     pub automation: Automation,
     pub warning: Option<String>,
+    /// Whether the create's store flush reached disk (fix(review) #14).
+    /// `false` only in the KTD-B degraded arm: the record is live in memory
+    /// (and `warning` says so) but would not survive a restart. `warning` is
+    /// **overloaded** (the R1 min-gap advisory rides it too), so callers that
+    /// must know the flush outcome read this flag, never the string — the
+    /// monitor-registered emit (monitor-handoff R13) is gated on it in
+    /// `lib.rs`: R12's refuse-rather-than-lose posture means never closing
+    /// the parent tab on a registration that may die with the app.
+    pub flush_ok: bool,
 }
 
 /// What a manual run did (R23/R7).
@@ -858,12 +880,17 @@ impl AutomationManager {
         });
         // A flush failure keeps the in-memory record live (the store is the
         // authority, KTD-B) — surface it as a warning, not a failed create,
-        // so a CLI retry doesn't mint a duplicate schedule.
+        // so a CLI retry doesn't mint a duplicate schedule. `flush_ok`
+        // carries the outcome as a typed flag (fix(review) #14): the warning
+        // string is overloaded with the R1 min-gap advisory, so callers must
+        // never string-match it.
         let mut warning = validation.min_gap_warning;
+        let mut flush_ok = true;
         match inserted {
             Ok(true) => {}
             Ok(false) => return Err("id collision while creating automation; retry".into()),
             Err(e) => {
+                flush_ok = false;
                 warning = Some(match warning {
                     Some(w) => format!("{w}; store flush failed: {e} (automation is live in memory)"),
                     None => format!("store flush failed: {e} (automation is live in memory)"),
@@ -874,6 +901,7 @@ impl AutomationManager {
         Ok(Created {
             automation: record,
             warning,
+            flush_ok,
         })
     }
 
@@ -895,17 +923,48 @@ impl AutomationManager {
     /// future), and the not-before floor rides the same recompute
     /// (monitor-handoff U2, R1): resuming a parked monitor before its floor
     /// never schedules early.
+    ///
+    /// A **retired** monitor refuses (monitor-handoff R3: scheduling stopped
+    /// permanently — re-arming `next_run_at` would set the sweep re-claiming,
+    /// and being refused, every tick forever). The gate runs inside the
+    /// mutation, before any write, so no re-arm can slip between check and
+    /// write (fix(review) #2).
     pub fn resume(&self, id: &str) -> Result<Automation, String> {
         let now = (self.clock)();
-        let updated = self.with_automation(id, |a| {
-            // Pure cron math inside the lock is fine (KTD-B bans dispatch/
-            // emit/IO, not computation). Unparseable stored state degrades
-            // to paused rather than firing at a bogus instant.
-            a.next_run_at = schedule::advance_from(&a.cron, &a.timezone, now, a.not_before_ms)
-                .ok()
-                .flatten();
-            a.updated_at = now;
-        })?;
+        // Not `with_automation`: that helper cannot express a refusal, so the
+        // retirement gate runs the same flush-tolerant mutate inline.
+        let updated: Option<Result<Automation, String>> = flush_tolerant(
+            self.store.mutate(|map| {
+                map.get_mut(id).map(|a| {
+                    if a.retired_at.is_some() {
+                        return Err(ERR_RESUME_RETIRED.to_string());
+                    }
+                    // Pure cron math inside the lock is fine (KTD-B bans
+                    // dispatch/emit/IO, not computation). Unparseable stored
+                    // state degrades to paused rather than firing at a bogus
+                    // instant.
+                    a.next_run_at =
+                        schedule::advance_from(&a.cron, &a.timezone, now, a.not_before_ms)
+                            .ok()
+                            .flatten();
+                    a.updated_at = now;
+                    Ok(a.clone())
+                })
+            }),
+            // Flush failed but the mutation applied (KTD-B store contract):
+            // re-derive from the authoritative record — the retirement gate
+            // re-checks identically, so the refetch reports the same outcome.
+            || {
+                self.store.get(id).map(|a| {
+                    if a.retired_at.is_some() {
+                        Err(ERR_RESUME_RETIRED.to_string())
+                    } else {
+                        Ok(a)
+                    }
+                })
+            },
+        );
+        let updated = updated.ok_or_else(|| format!("no such automation: {id}"))??;
         (self.emit_changed)(id);
         Ok(updated)
     }
@@ -975,7 +1034,13 @@ impl AutomationManager {
                         .map(|()| ManualRun::Started {
                             run_id: run_id.clone(),
                         })
-                        .map_err(|_| "automation is disabled".to_string()),
+                        // fix(review) #8: report the variant — a retired
+                        // monitor (R3, permanent) must not read as merely
+                        // disabled (resumable).
+                        .map_err(|e| match e {
+                            ClaimError::Retired => ERR_RUN_RETIRED.to_string(),
+                            ClaimError::Disabled => "automation is disabled".to_string(),
+                        }),
                 )
             }),
             // Flush failed but the in-memory mutation applied (KTD-B store
@@ -989,6 +1054,12 @@ impl AutomationManager {
                         Some(_) => Ok(ManualRun::Started {
                             run_id: run_id.clone(),
                         }),
+                        // No row recorded ⇒ the claim was refused. The
+                        // [`ClaimError`] variant is lost here (this branch
+                        // re-derives from the map), so re-check retirement on
+                        // the fetched record for the right message
+                        // (fix(review) #8).
+                        None if a.retired_at.is_some() => Err(ERR_RUN_RETIRED.to_string()),
                         None => Err("automation is disabled".to_string()),
                     }
                 })
@@ -1126,8 +1197,11 @@ impl AutomationManager {
     /// but counts toward the R7 escalation (the U3 refinement: the row lands
     /// `Succeeded` with no output, which
     /// [`Automation::consecutive_infra_failures`] treats as an unreadable
-    /// check), so this method runs the escalation check for it below — a
-    /// monitor whose output can never be attributed eventually rings instead
+    /// check) — as does a **near-miss block** (output that opened a
+    /// ```` ```verdict ```` fence yet never parsed, fix(review) #5). So this
+    /// method runs the escalation check for every verdict-less Succeeded
+    /// monitor close below — a monitor whose output can never be attributed,
+    /// or whose blocks are persistently malformed, eventually rings instead
     /// of running silent.
     fn close_run_by_pane_with(&self, pane_id: u64, mut outcome: RunOutcome) -> Result<(), String> {
         let found: Option<(Automation, String, Option<u64>)> = {
@@ -1188,16 +1262,17 @@ impl AutomationManager {
         // U5: emit `automation://run-closed` when this close actually closed the
         // row (idempotent no-op on a second Stop / already-closed run).
         let status = outcome_status(&outcome);
-        // Monitor-handoff U3 refinement: an output-less Succeeded close means
-        // the capture abstained (and no caller supplied output — derived from
-        // the outcome, so a caller-supplied-output close never reads as
-        // abstention). The row lands unreadable and counts toward R7.
-        let unreadable = outcome_output(&outcome).is_none();
         if self.close_run(&automation.id, &run_id, outcome) == model::CloseResult::Closed {
             self.emit_run_closed(&automation.id, &run_id, status);
-            if automation.monitor && status == RunStatus::Succeeded && unreadable {
+            if automation.monitor && status == RunStatus::Succeeded {
                 // R7, after the lock (KTD-B). Failed closes are checked
-                // inside `close_run`; this covers the abstained-capture case.
+                // inside `close_run`; every Succeeded close on this path is
+                // verdict-less by construction (a parsed verdict routed to
+                // the retiring close above), so evaluate the escalation and
+                // let the derived walk decide: an abstained capture (the U3
+                // refinement) and a near-miss block (an opener that never
+                // parsed, fix(review) #5) count toward R7, while a readable
+                // not-done check derives zero and stays silent.
                 self.check_monitor_escalation(&automation.id);
             }
         }
@@ -1242,7 +1317,15 @@ impl AutomationManager {
         } else {
             None
         };
-        let v = verdict.clone();
+        // R8 cap discipline (fix(review) #11): the note is untrusted agent
+        // output riding every flush and DTO fetch — stamp a HEAD-capped copy
+        // on the row (the head carries the verdict summary; contrast the R8
+        // output tail, where the verdict trails). The FULL note still rides
+        // the FAIL bundle below, and the alert line takes only its first line.
+        let v = Verdict {
+            outcome: verdict.outcome,
+            note: head_capped(&verdict.note, model::OUTPUT_TAIL_CAP_BYTES).to_owned(),
+        };
         let bp = bundle_path.clone();
         let closed: Option<model::CloseResult> = flush_tolerant(
             self.store.mutate(|map| {
@@ -1285,8 +1368,12 @@ impl AutomationManager {
         // failure narrative live, matching the R8 tail convention).
         let mut bundle_note = String::new();
         if verdict.outcome == VerdictOutcome::Fail {
+            // The automation name is untrusted creator input embedded into a
+            // rendered document — flatten control chars at write time, the
+            // alerts-log posture (R16; fix(review) #11).
+            let safe_name = crate::notify::sanitize_title(&automation.name);
             let ctx = verdict::BundleContext {
-                automation_name: &automation.name,
+                automation_name: &safe_name,
                 automation_id: &automation.id,
                 run_id,
                 closed_at_ms: now,
@@ -1557,9 +1644,26 @@ impl AutomationManager {
                         // returning: persist-before-dispatch.
                         let advanced = advance_or_pause(a, now_ms);
                         let run_id = mint_id();
-                        if a.claim(advanced, now_ms, Trigger::Schedule, &run_id).is_ok() {
-                            to_dispatch.push((a.clone(), run_id));
-                            touched = true;
+                        match a.claim(advanced, now_ms, Trigger::Schedule, &run_id) {
+                            Ok(()) => {
+                                to_dispatch.push((a.clone(), run_id));
+                                touched = true;
+                            }
+                            // Monitor-handoff R3 defense in depth (fix(review)
+                            // #2): a due-but-RETIRED record is degraded state
+                            // (retire() nulls the schedule in the same
+                            // mutation that stamps `retired_at`; only an
+                            // on-disk edit or a historic re-arm bug pairs
+                            // them). Null the schedule so the record
+                            // self-heals instead of being re-claimed and
+                            // refused every tick forever.
+                            Err(ClaimError::Retired) => {
+                                a.rollback_recompute(None);
+                                touched = true;
+                            }
+                            // `due` requires `enabled`, so a Disabled refusal
+                            // is unreachable here; leave the record alone.
+                            Err(ClaimError::Disabled) => {}
                         }
                     }
                 }
@@ -1946,6 +2050,22 @@ fn verdict_alert_line(v: &Verdict, bundle_note: &str) -> String {
 /// Enforced at write time; without it a pathologically verbose final turn
 /// would write an unbounded file.
 const BUNDLE_EVIDENCE_CAP_BYTES: usize = 256 * 1024;
+
+/// Cap `s` to its first `cap` bytes on a char boundary — the **head**
+/// survives (fix(review) #11: a verdict note leads with its summary line,
+/// unlike captured run output, whose verdict trails — see [`tail_capped`]).
+/// Bounded arithmetic on in-range indices: the text is untrusted agent
+/// output and release builds have overflow checks off.
+fn head_capped(s: &str, cap: usize) -> &str {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 /// Cap `s` to its last `cap` bytes on a char boundary (the tail survives —
 /// the verdict block and failure narrative end the message, the same
@@ -3542,6 +3662,93 @@ mod tests {
         h.mgr.close_run_by_pane_failed(pane_id).unwrap();
     }
 
+    /// Retire a monitor through the real verdict path: one due check whose
+    /// captured turn carries a PASS block. Assumes a fresh harness clock
+    /// (moves it to the first occurrence) and `make_monitor` already ran.
+    fn retire_via_pass_verdict(h: &Harness, id: &str, pane_id: u64) {
+        h.mgr.set_frontend_ready();
+        h.set_now(T0 + FIVE_MIN);
+        let _ = claim_and_link(h, id, pane_id);
+        h.mgr.set_output_capturer(Arc::new(|_cwd: &str, _since: u64| {
+            Some("```verdict\nPASS\ndone\n```".to_string())
+        }));
+        h.mgr.close_run_by_pane(pane_id).unwrap();
+        assert!(h.mgr.get(id).unwrap().retired_at.is_some(), "retired");
+    }
+
+    // Monitor-handoff R3 (fix(review) #2): resume() refuses a retired
+    // monitor — retirement is permanent, so the schedule is never re-armed
+    // (a re-arm would set the sweep re-claiming, and being refused, every
+    // tick forever).
+    #[test]
+    fn resume_refuses_a_retired_monitor_and_never_rearms_r3() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        retire_via_pass_verdict(&h, &id, 42);
+
+        let err = h
+            .mgr
+            .resume(&id)
+            .expect_err("resume on a retired monitor refuses");
+        assert!(err.contains("retired"), "the refusal names retirement: {err}");
+        assert_eq!(h.next_run_at(&id), None, "schedule NOT re-armed (R3)");
+
+        // And the sweep keeps finding nothing due — no grinding claims.
+        h.set_now(T0 + 10 * FIVE_MIN);
+        h.sweep();
+        assert_eq!(h.runs(&id).len(), 1, "no new rows after the refused resume");
+    }
+
+    // Monitor-handoff R3 defense in depth (fix(review) #2): a degraded
+    // due-but-retired record (retire() forbids the pair — an on-disk edit or
+    // a historic re-arm produced it) self-heals: the sweep's refused claim
+    // nulls the schedule instead of re-claiming and being refused every tick
+    // forever.
+    #[test]
+    fn sweep_self_heals_a_due_but_retired_record_r3() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.mgr.set_frontend_ready();
+        // Degrade: retired yet still scheduled, stamped directly the way a
+        // hand-edited store file would present it.
+        let _ = h.mgr.store.mutate(|map| {
+            map.get_mut(&id).unwrap().retired_at = Some(T0);
+        });
+        h.set_now(T0 + FIVE_MIN); // the stale next_run_at is now due
+        h.sweep();
+
+        assert_eq!(h.dispatcher.count(), 0, "a retired monitor never dispatches");
+        assert_eq!(h.next_run_at(&id), None, "the sweep nulled the degraded schedule");
+        assert!(h.runs(&id).is_empty(), "no row appended — the claim was refused");
+
+        // Healed: the next tick has nothing due and touches nothing.
+        h.set_now(T0 + 2 * FIVE_MIN);
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 0);
+    }
+
+    // Monitor-handoff R3 (fix(review) #8): manual_run on a retired monitor
+    // reports the retirement — permanent, never-runs-again — not the generic
+    // (resumable) "disabled" refusal. The manager-layer mirror of the model's
+    // claim_rejects_a_retired_monitor_for_schedule_and_manual_triggers.
+    #[test]
+    fn manual_run_on_a_retired_monitor_reports_retirement_r3() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        retire_via_pass_verdict(&h, &id, 42);
+
+        let err = h.mgr.manual_run(&id).expect_err("refused");
+        assert_eq!(err, ERR_RUN_RETIRED, "the retirement-specific message");
+        assert_eq!(
+            h.runs(&id).len(),
+            1,
+            "nothing appended by the refused manual claim"
+        );
+    }
+
     // Monitor-handoff R2/R3/R14 (+ R4 verification): a Stop whose captured
     // final turn carries a PASS block closes the row Succeeded, stamps the
     // verdict, retires the monitor, and clears next_run_at — all observable
@@ -3666,6 +3873,62 @@ mod tests {
             alerts[0].1.contains(&bundle_path),
             "the alert carries the bundle path: {}",
             alerts[0].1
+        );
+    }
+
+    // fix(review) #11 (R8 cap discipline × R15): the verdict note is
+    // untrusted agent output — a multi-megabyte note is HEAD-capped at stamp
+    // time on the run row (the head carries the summary line), while the
+    // FAIL bundle still records the full note (the bundle's whole point is
+    // escaping the row caps). The name embedded in the bundle is sanitized
+    // like the alerts log (R16).
+    #[test]
+    fn huge_verdict_note_is_head_capped_on_the_row_but_full_in_the_bundle_r8_r15() {
+        let h = harness();
+        let bundles = h.dir.path().join("bundles");
+        h.mgr.set_bundle_dir(bundles.clone());
+        // A control char in the name must not reach the rendered bundle.
+        let id = h
+            .mgr
+            .create(agent_spec("train \u{1b}[2Jwatch"))
+            .unwrap()
+            .automation
+            .id;
+        make_monitor(&h, &id);
+        h.mgr.set_frontend_ready();
+        h.set_now(T0 + FIVE_MIN);
+        let run_id = claim_and_link(&h, &id, 42);
+        // ~3 MiB note behind a one-line summary.
+        let big_note = format!("loss diverged\n{}", "x".repeat(3 * 1024 * 1024));
+        let note_in = big_note.clone();
+        h.mgr.set_output_capturer(Arc::new(move |_cwd: &str, _since: u64| {
+            Some(format!("```verdict\nFAIL\n{note_in}\n```"))
+        }));
+
+        h.mgr.close_run_by_pane(42).unwrap();
+
+        let a = h.mgr.get(&id).unwrap();
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        let stamped = &row.verdict.as_ref().expect("verdict stamped").note;
+        assert_eq!(
+            stamped.len(),
+            model::OUTPUT_TAIL_CAP_BYTES,
+            "row note capped to the R8 size class"
+        );
+        assert!(
+            big_note.starts_with(stamped.as_str()),
+            "the HEAD survives — the summary line leads the note"
+        );
+
+        let content =
+            std::fs::read_to_string(row.bundle_path.as_ref().expect("bundle written")).unwrap();
+        assert!(
+            content.contains(&big_note),
+            "the bundle records the FULL note (R15)"
+        );
+        assert!(
+            !content.contains('\u{1b}'),
+            "control chars in the name never reach the bundle (R16)"
         );
     }
 
@@ -3862,6 +4125,142 @@ mod tests {
             2,
             "three NEW failures after the reset ring again"
         );
+    }
+
+    // fix(review) #14 (KTD-B × monitor-handoff R12): a create whose store
+    // flush fails still succeeds — the record is live in memory — but
+    // reports the outcome via the TYPED `flush_ok` flag: the warning string
+    // is overloaded with the R1 min-gap advisory, so callers (the socket
+    // create arm's monitor-registered gate) must never string-match it.
+    #[test]
+    fn create_under_a_failing_flush_returns_ok_with_flush_ok_false_r12() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = harness();
+        let ok = h.mgr.create(agent_spec("healthy")).unwrap();
+        assert!(ok.flush_ok, "a flushed create reports flush_ok");
+
+        // Failure injection (the store.rs pattern): remove the store dir and
+        // make its parent read-only, so the flush's create_dir_all fails.
+        let data = h.dir.path().join("data");
+        std::fs::remove_dir_all(&data).unwrap();
+        std::fs::set_permissions(h.dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::create_dir(h.dir.path().join("probe")).is_ok() {
+            // Running as root (or an ACL overrides the mode): the injection
+            // cannot work — skip gracefully, like the store.rs tests.
+            std::fs::set_permissions(h.dir.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            eprintln!("skipping flush-failure test: read-only dir is still writable");
+            return;
+        }
+        let created = h.mgr.create(agent_spec("degraded")).expect("create still succeeds");
+        std::fs::set_permissions(h.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!created.flush_ok, "the failed flush reads as a typed flag");
+        assert!(
+            created
+                .warning
+                .as_deref()
+                .unwrap_or("")
+                .contains("store flush failed"),
+            "the CLI-facing warning still rides: {:?}",
+            created.warning
+        );
+        assert!(
+            h.mgr.get(&created.automation.id).is_some(),
+            "the record is live in memory (KTD-B)"
+        );
+    }
+
+    // Review testing gap (delete racing the verdict close): a monitor check
+    // is claimed + linked, the automation is deleted mid-check, then the
+    // Stop lands with a verdict-bearing capturer. Both the pane-keyed close
+    // (the snapshot finds nothing) and the retiring close's own mutation
+    // (simulating the snapshot winning the race — the record fetched before
+    // the delete) take the documented benign branch: Ok(()), no panic, no
+    // alert, no bundle, nothing resurrected.
+    #[test]
+    fn delete_racing_a_verdict_close_is_a_benign_no_op() {
+        let h = harness();
+        let bundles = h.dir.path().join("bundles");
+        h.mgr.set_bundle_dir(bundles.clone());
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.mgr.set_frontend_ready();
+        h.set_now(T0 + FIVE_MIN);
+        let run_id = claim_and_link(&h, &id, 42);
+        h.mgr.set_output_capturer(Arc::new(|_cwd: &str, _since: u64| {
+            Some("```verdict\nFAIL\ndied\n```".to_string())
+        }));
+        let pre_delete = h.mgr.get(&id).expect("fetched before the delete");
+
+        let removed = h.mgr.delete(&id).expect("delete succeeds");
+        assert_eq!(
+            removed.runs.last().unwrap().status,
+            RunStatus::Failed,
+            "delete closed the in-flight row on the removed record (R23)"
+        );
+
+        // The Stop lands after the delete: the snapshot finds no running run.
+        assert_eq!(h.mgr.close_run_by_pane(42), Ok(()));
+        // And the tighter interleaving — snapshot before the delete, close
+        // mutation after it — hits close_monitor_run_retiring's NotFound arm.
+        assert_eq!(
+            h.mgr.close_monitor_run_retiring(
+                &pre_delete,
+                &run_id,
+                RunOutcome::Succeeded {
+                    output: Some("```verdict\nFAIL\ndied\n```".into()),
+                },
+                Verdict {
+                    outcome: VerdictOutcome::Fail,
+                    note: "died".into(),
+                },
+                "evidence",
+            ),
+            Ok(())
+        );
+
+        assert!(h.mgr.get(&id).is_none(), "nothing resurrected");
+        assert!(h.monitor_alerts.lock().unwrap().is_empty(), "no alert rings");
+        assert!(!bundles.exists(), "no bundle file was written");
+    }
+
+    // Monitor-handoff R7 (fix(review) #5 — the plan's Risks promise:
+    // escalation converts persistent non-compliance into a visible broken
+    // signal): a check that keeps emitting a NEAR-MISS verdict block — an
+    // opened ```verdict fence that never parses (decorated outcome here) —
+    // neither retires (abstain-on-surprise, R2) nor resets the derived
+    // count: three in a row ring "monitor broken" exactly like infra
+    // failures, evaluated at the close that produced the third.
+    #[test]
+    fn three_consecutive_near_miss_verdict_blocks_ring_monitor_broken_r7() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.mgr.set_frontend_ready();
+        h.mgr.set_output_capturer(Arc::new(|_cwd: &str, _since: u64| {
+            Some("checked it.\n```verdict\nPASS: all good\n```".to_string())
+        }));
+
+        for i in 1..=2u64 {
+            h.set_now(T0 + i * FIVE_MIN);
+            let _ = claim_and_link(&h, &id, 500 + i);
+            h.mgr.close_run_by_pane(500 + i).unwrap();
+        }
+        assert!(
+            h.monitor_alerts.lock().unwrap().is_empty(),
+            "two near-misses: below the threshold, still silent"
+        );
+        let a = h.mgr.get(&id).unwrap();
+        assert_eq!(a.retired_at, None, "a near-miss never retires (R2 abstention)");
+        assert!(a.runs.iter().all(|r| r.verdict.is_none()));
+
+        h.set_now(T0 + 3 * FIVE_MIN);
+        let _ = claim_and_link(&h, &id, 503);
+        h.mgr.close_run_by_pane(503).unwrap();
+        let alerts = h.monitor_alerts.lock().unwrap();
+        assert_eq!(alerts.len(), 1, "the third consecutive near-miss rings");
+        assert!(alerts[0].1.starts_with("monitor broken:"), "{}", alerts[0].1);
     }
 
     // Monitor-handoff R6: a check that hangs to the R11 deadline closes

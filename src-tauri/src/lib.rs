@@ -977,10 +977,23 @@ pub fn dispatch_automation_op(
             // payload is untrusted — enforce it here as well.
             let monitor = req.monitor;
             let mode = if let Some(prompt) = req.prompt {
+                // monitor-handoff R8 (fix(review) #12): the sonnet/xhigh
+                // monitor default is stamped CLI-side
+                // (`cli::automation::monitor_launch_defaults`) so `--json`
+                // output and the local echo self-describe before the
+                // round-trip — but the socket payload is the untrusted
+                // boundary, and a raw-socket monitor create must not
+                // silently ride `config.automation_defaults`. Backstop the
+                // same per-field default here (explicit values still win);
+                // the double stamp is deliberate defense in depth, mirroring
+                // the R9 retry-on-interrupt default below. Non-monitor
+                // creates pass through untouched.
+                let (model, effort) =
+                    cli::automation::monitor_launch_defaults(monitor, req.model, req.effort);
                 CreateMode::Agent {
                     prompt,
-                    model: req.model,
-                    effort: req.effort,
+                    model,
+                    effort,
                 }
             } else if let Some(content) = req.script {
                 if monitor {
@@ -1037,8 +1050,15 @@ pub fn dispatch_automation_op(
                     // monitor-handoff U4 (R13's backend half): signal the
                     // frontend to close the registering pane's tab — after
                     // `create` returned, i.e. after the store flush and off
-                    // the store lock (KTD-B). Non-monitor creates never emit.
-                    if monitor {
+                    // the store lock (KTD-B). Non-monitor creates never emit,
+                    // and neither does a create whose flush FAILED
+                    // (fix(review) #14, R12 refuse-rather-than-lose): the
+                    // registration is live in memory but dies at restart, so
+                    // closing the parent tab would discard the session the
+                    // monitor is supposed to hand back to. The response path
+                    // is unchanged — the CLI still prints the flush warning,
+                    // and the still-open tab is where the user sees it.
+                    if monitor && created.flush_ok {
                         mgr.emit_monitor_registered(pane_id, &created.automation.id);
                     }
                     AutomationResponse::ok(Some(created.automation.id), created.warning)

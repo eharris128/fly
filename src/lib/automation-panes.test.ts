@@ -3,7 +3,7 @@ import {
   findAutomationsWorkspace,
   buildAgentArgv,
   shouldAutoCloseRun,
-  tabForPane,
+  monitorCloseTarget,
 } from "./automation-panes";
 import type { Node } from "./layout";
 import type { Workspace, Tab } from "./workspaces";
@@ -92,20 +92,23 @@ describe("shouldAutoCloseRun (U8, R6/R7)", () => {
   });
 });
 
-describe("tabForPane (monitor-handoff U6, R13)", () => {
-  it("resolves a known pane to its enclosing tab across workspaces", () => {
+describe("monitorCloseTarget (monitor-handoff U6, R13)", () => {
+  it("resolves a sole-leaf pane to a whole-tab close across workspaces", () => {
     const workspaces: Workspace[] = [
       { ...ws("ws-1"), tabs: [tab("tab-1", leafNode("leaf-1"))] },
       { ...ws("ws-2"), tabs: [tab("tab-2", leafNode("leaf-2"))] },
     ];
-    expect(tabForPane(workspaces, { 7: "leaf-2" }, 7)).toBe("tab-2");
+    expect(monitorCloseTarget(workspaces, { 7: "leaf-2" }, 7)).toEqual({
+      kind: "tab",
+      tabId: "tab-2",
+    });
   });
 
   it("returns null for a pane id absent from the reverse index", () => {
     const workspaces: Workspace[] = [
       { ...ws("ws-1"), tabs: [tab("tab-1", leafNode("leaf-1"))] },
     ];
-    expect(tabForPane(workspaces, {}, 7)).toBeNull();
+    expect(monitorCloseTarget(workspaces, {}, 7)).toBeNull();
   });
 
   it("returns null when the mapped leaf no longer resolves (tab closed manually)", () => {
@@ -113,10 +116,10 @@ describe("tabForPane (monitor-handoff U6, R13)", () => {
       { ...ws("ws-1"), tabs: [tab("tab-1", leafNode("leaf-1"))] },
     ];
     // Stale reverse-index entry: the pane exited and its tab is gone.
-    expect(tabForPane(workspaces, { 7: "leaf-gone" }, 7)).toBeNull();
+    expect(monitorCloseTarget(workspaces, { 7: "leaf-gone" }, 7)).toBeNull();
   });
 
-  it("resolves a pane in a split to the WHOLE enclosing tab (R13 closes the tab)", () => {
+  it("resolves a pane in a split to ONLY its own leaf (R13 — siblings survive)", () => {
     const split: Node = {
       kind: "split",
       key: "split-1",
@@ -128,7 +131,13 @@ describe("tabForPane (monitor-handoff U6, R13)", () => {
     const workspaces: Workspace[] = [
       { ...ws("ws-1"), tabs: [tab("tab-1", split)] },
     ];
-    // Closing this tab also closes the sibling leaf — the documented R13 edge.
-    expect(tabForPane(workspaces, { 7: "leaf-2" }, 7)).toBe("tab-1");
+    // A whole-tab close would kill the sibling leaf's process without the
+    // destructive confirm the user-initiated path gets — so a multi-leaf tab
+    // resolves to a leaf-scoped close.
+    expect(monitorCloseTarget(workspaces, { 7: "leaf-2" }, 7)).toEqual({
+      kind: "leaf",
+      tabId: "tab-1",
+      leafKey: "leaf-2",
+    });
   });
 });
