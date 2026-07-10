@@ -1,6 +1,20 @@
 import { describe, it, expect } from "vitest";
-import { automationsToRows, humanSchedule, relativeTime } from "./automations";
-import type { Automation, AutomationSpec, RunRow, RunStatus } from "../ipc";
+import {
+  automationsToRows,
+  humanSchedule,
+  monitorStateOf,
+  planPickup,
+  relativeTime,
+  sanitizeBundleText,
+  type MonitorDerivation,
+} from "./automations";
+import type {
+  Automation,
+  AutomationSpec,
+  MonitorPointers,
+  RunRow,
+  RunStatus,
+} from "../ipc";
 
 // A minute in ms, and a fixed "now" far enough from 0 that past deltas never
 // underflow (matches the CLI rel_label test's stance).
@@ -16,6 +30,8 @@ function run(status: RunStatus, over: Partial<RunRow> = {}): RunRow {
     paneId: null,
     model: null,
     effort: null,
+    verdict: null,
+    bundlePath: null,
     output: null,
     exitCode: null,
     error: null,
@@ -40,6 +56,10 @@ function automation(over: Partial<Automation> = {}): Automation {
     timezone: "America/New_York",
     enabled: true,
     retryOnInterrupt: false,
+    monitor: false,
+    notBeforeMs: null,
+    retiredAt: null,
+    pickupPointers: null,
     cwd: "/tmp",
     origin: { paneId: 7, workspaceId: "ws-1", label: "cli" },
     createdAt: 1_000,
@@ -49,6 +69,26 @@ function automation(over: Partial<Automation> = {}): Automation {
     ...over,
     mode,
   };
+}
+
+// A parked monitor with pointers, ready for per-test overrides
+// (monitor-handoff U7 fixtures).
+const POINTERS: MonitorPointers = {
+  sessionId: "sess-1",
+  transcriptPath: "/home/u/.claude/projects/x/sess-1.jsonl",
+  sessionCwd: "/home/u/exp",
+};
+function monitorAutomation(over: Partial<Automation> = {}): Automation {
+  return automation({
+    mode: { kind: "agent", prompt: "check it", model: null, effort: null },
+    monitor: true,
+    pickupPointers: POINTERS,
+    ...over,
+  });
+}
+// The DTO-derived broken inputs, empty by default (no broken monitors).
+function derivation(over: Partial<MonitorDerivation> = {}): MonitorDerivation {
+  return { infraFailures: {}, brokenThreshold: 3, ...over };
 }
 
 describe("automationsToRows", () => {
@@ -179,6 +219,223 @@ describe("automationsToRows", () => {
 
   it("is empty for an empty list", () => {
     expect(automationsToRows([], NOW)).toEqual([]);
+  });
+
+  it("leaves recurring automations unaffected by the monitor fields (R18)", () => {
+    const [row] = automationsToRows([automation()], NOW, derivation());
+    expect(row.monitor).toBe(false);
+    expect(row.monitorState).toBeNull();
+    expect(row.verdictOutcome).toBeNull();
+    expect(row.bundlePath).toBeNull();
+    expect(row.pickupPointers).toBeNull();
+  });
+});
+
+// ---- monitor rows (monitor-handoff U7, R18) ---------------------------------
+
+describe("monitor state derivation", () => {
+  it("maps each monitor state to the CLI's exact label", () => {
+    // Parked: scheduled, no verdict, count under threshold.
+    expect(monitorStateOf(monitorAutomation(), derivation())).toBe("parked");
+    // Paused: nextRunAt null, not retired.
+    expect(
+      monitorStateOf(monitorAutomation({ nextRunAt: null }), derivation()),
+    ).toBe("paused");
+    // Broken: derived count at the threshold outranks paused/parked.
+    expect(
+      monitorStateOf(
+        monitorAutomation(),
+        derivation({ infraFailures: { a1: 3 } }),
+      ),
+    ).toBe("broken");
+    // Retired pass/fail: split by the newest verdict-bearing run row.
+    expect(
+      monitorStateOf(
+        monitorAutomation({
+          retiredAt: NOW,
+          nextRunAt: null,
+          runs: [run("succeeded", { verdict: { outcome: "pass", note: "done" } })],
+        }),
+        derivation(),
+      ),
+    ).toBe("retired pass");
+    expect(
+      monitorStateOf(
+        monitorAutomation({
+          retiredAt: NOW,
+          nextRunAt: null,
+          runs: [run("succeeded", { verdict: { outcome: "fail", note: "died" } })],
+        }),
+        derivation(),
+      ),
+    ).toBe("retired fail");
+    // Defensive: retirement without a surviving verdict row.
+    expect(
+      monitorStateOf(
+        monitorAutomation({ retiredAt: NOW, nextRunAt: null }),
+        derivation(),
+      ),
+    ).toBe("retired");
+    // Non-monitor: never a state.
+    expect(monitorStateOf(automation(), derivation())).toBeNull();
+  });
+
+  it("retired outranks broken; broken outranks paused (CLI precedence)", () => {
+    const broken = derivation({ infraFailures: { a1: 5 } });
+    expect(
+      monitorStateOf(
+        monitorAutomation({
+          retiredAt: NOW,
+          nextRunAt: null,
+          runs: [run("succeeded", { verdict: { outcome: "pass", note: "" } })],
+        }),
+        broken,
+      ),
+    ).toBe("retired pass");
+    expect(monitorStateOf(monitorAutomation({ nextRunAt: null }), broken)).toBe(
+      "broken",
+    );
+  });
+
+  it("sorts parked with recurring by next-run, retired after paused (R18)", () => {
+    const rows = automationsToRows(
+      [
+        monitorAutomation({
+          id: "ret",
+          name: "aaa-retired",
+          retiredAt: NOW,
+          nextRunAt: null,
+          runs: [run("succeeded", { verdict: { outcome: "fail", note: "x" } })],
+        }),
+        automation({ id: "pau", name: "bbb-paused", nextRunAt: null }),
+        monitorAutomation({ id: "park", name: "zzz-parked", nextRunAt: NOW + MIN }),
+        automation({ id: "rec", name: "recurring", nextRunAt: NOW + 2 * MIN }),
+      ],
+      NOW,
+      derivation(),
+    );
+    // Parked monitor rides with recurring by next-run (1 min < 2 min), then
+    // paused, then retired last — despite the retired row's first-place name.
+    expect(rows.map((r) => r.id)).toEqual(["park", "rec", "pau", "ret"]);
+  });
+
+  it("carries the verdict, bundle path, and pointers on the row; sanitizes the note", () => {
+    const [row] = automationsToRows(
+      [
+        monitorAutomation({
+          retiredAt: NOW,
+          nextRunAt: null,
+          runs: [
+            run("succeeded", {
+              verdict: { outcome: "fail", note: "line1\nline2\u0007" },
+              bundlePath: "/data/monitor-bundles/a1-r1.md",
+            }),
+          ],
+        }),
+      ],
+      NOW,
+      derivation(),
+    );
+    expect(row.monitorState).toBe("retired fail");
+    expect(row.verdictOutcome).toBe("fail");
+    expect(row.verdictNote).toBe("line1 line2 "); // control chars flattened
+    expect(row.bundlePath).toBe("/data/monitor-bundles/a1-r1.md");
+    expect(row.pickupPointers).toEqual(POINTERS);
+  });
+
+  it("reads the newest verdict-bearing run, not the last row", () => {
+    const [row] = automationsToRows(
+      [
+        monitorAutomation({
+          retiredAt: NOW,
+          nextRunAt: null,
+          runs: [
+            run("succeeded", {
+              id: "v",
+              verdict: { outcome: "fail", note: "died" },
+              bundlePath: "/b/a1-v.md",
+            }),
+            run("skipped", { id: "later" }), // e.g. a refused post-retire claim
+          ],
+        }),
+      ],
+      NOW,
+      derivation(),
+    );
+    expect(row.verdictOutcome).toBe("fail");
+    expect(row.bundlePath).toBe("/b/a1-v.md");
+  });
+
+  it("derives no broken state without the DTO inputs (legacy caller)", () => {
+    expect(monitorStateOf(monitorAutomation())).toBe("parked");
+  });
+});
+
+// ---- pickup planning (monitor-handoff U7, R16/R17) --------------------------
+
+describe("planPickup", () => {
+  const row = { pickupPointers: POINTERS, bundlePath: "/data/monitor-bundles/a1-r1.md" };
+  const ok = { transcriptExists: true, cwdExists: true };
+
+  it("spawns exactly one recovery session when everything resolves (AE4/R16)", () => {
+    const plan = planPickup(row, ok);
+    expect(plan.kind).toBe("spawn");
+    if (plan.kind !== "spawn") return;
+    expect(plan.cwd).toBe("/home/u/exp");
+    // The argv: prompt positional BEFORE the variadic --add-dir, no bypass flag.
+    expect(plan.argv[0]).toBe("claude");
+    expect(plan.argv[1]).toContain("/data/monitor-bundles/a1-r1.md");
+    expect(plan.argv[1]).toContain(POINTERS.transcriptPath);
+    expect(plan.argv.indexOf("--add-dir")).toBeGreaterThan(
+      plan.argv.findIndex((a) => a.includes("failure bundle")),
+    );
+    expect(plan.argv).not.toContain("--dangerously-skip-permissions");
+  });
+
+  it("falls back when the transcript is gone, naming the path (R17)", () => {
+    const plan = planPickup(row, { transcriptExists: false, cwdExists: true });
+    expect(plan.kind).toBe("fallback");
+    if (plan.kind !== "fallback") return;
+    expect(plan.explanation).toContain("transcript no longer exists");
+    expect(plan.explanation).toContain(POINTERS.transcriptPath);
+  });
+
+  it("falls back when the cwd is gone, and when both are gone (R17)", () => {
+    const cwdGone = planPickup(row, { transcriptExists: true, cwdExists: false });
+    expect(cwdGone.kind).toBe("fallback");
+    if (cwdGone.kind === "fallback")
+      expect(cwdGone.explanation).toContain("directory no longer exists");
+    const bothGone = planPickup(row, { transcriptExists: false, cwdExists: false });
+    expect(bothGone.kind).toBe("fallback");
+    if (bothGone.kind === "fallback")
+      expect(bothGone.explanation).toContain(" and ");
+  });
+
+  it("falls back when there are no pointers or the check itself failed", () => {
+    expect(planPickup({ pickupPointers: null, bundlePath: null }, ok).kind).toBe(
+      "fallback",
+    );
+    expect(planPickup(row, null).kind).toBe("fallback");
+  });
+
+  it("sanitizes control characters out of paths embedded in explanations", () => {
+    const evil = {
+      pickupPointers: {
+        ...POINTERS,
+        transcriptPath: "/tmp/x\u001b[31m.jsonl",
+      },
+      bundlePath: null,
+    };
+    const plan = planPickup(evil, { transcriptExists: false, cwdExists: true });
+    if (plan.kind === "fallback") expect(plan.explanation).not.toContain("\u001b");
+  });
+});
+
+describe("sanitizeBundleText", () => {
+  it("strips control characters but keeps newlines and tabs", () => {
+    expect(sanitizeBundleText("a\u0007b\u001b[31mc\nd\te\u009f")).toBe(
+      "ab[31mc\nd\te",
+    );
   });
 });
 

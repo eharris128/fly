@@ -387,8 +387,11 @@ fn write_map(path: &Path, map: &BTreeMap<String, Automation>) -> io::Result<()> 
 }
 
 /// Temp + chmod-0600 + rename in `path`'s own dir (same filesystem, so the
-/// rename is atomic).
-fn write_atomic_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// rename is atomic). `pub(crate)`: the monitor bundle write (monitor-handoff
+/// U3, `mod.rs::write_bundle_file`) shares these two primitives rather than
+/// keeping a third copy of the dance (alerts.rs keeps its own documented
+/// local pair; this was the tie-breaker toward sharing).
+pub(crate) fn write_atomic_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
@@ -396,7 +399,7 @@ fn write_atomic_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// `create_dir_all` + explicit `0700` (never left to umask).
-fn create_private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
@@ -425,6 +428,10 @@ mod tests {
             timezone: "America/New_York".into(),
             enabled: true,
             retry_on_interrupt: false,
+            monitor: false,
+            not_before_ms: None,
+            retired_at: None,
+            pickup_pointers: None,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "script".into(),

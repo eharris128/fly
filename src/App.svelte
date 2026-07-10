@@ -52,8 +52,15 @@
     findAutomationsWorkspace,
     buildAgentArgv,
     shouldAutoCloseRun,
+    monitorCloseTarget,
   } from "./lib/automation-panes";
-  import { automationsToRows, type AutomationRow } from "./lib/automations";
+  import {
+    automationsToRows,
+    planPickup,
+    sanitizeBundleText,
+    type AutomationRow,
+    type PickupCheckResult,
+  } from "./lib/automations";
   import {
     shouldShowNudge,
     deriveBusyIdle,
@@ -102,9 +109,12 @@
     onAgentRun,
     automationsFrontendReady,
     listAutomations,
+    monitorPickupCheck,
+    readMonitorBundle,
     onAutomationChanged,
     onAlertPending,
     onRunClosed,
+    onMonitorRegistered,
     registerAlertSink,
     type PaneId,
     type PaneActivity,
@@ -114,12 +124,14 @@
     type AgentRunEvent,
     type AlertPendingEvent,
     type RunClosedEvent,
+    type MonitorRegisteredEvent,
     type HandoffTarget,
     type HandoffCandidate,
   } from "./ipc";
   import {
     buildHandoffCommand,
     handoffPrompt,
+    sanitizeTranscriptPath,
     type HandoffMode,
     type GuidedHandoffByLeaf,
   } from "./lib/handoff";
@@ -252,7 +264,10 @@
   // registry, no deadline (R11 by construction). Quick mode launches
   // bypass-permissions (it runs the prompt unattended) and carries the stock
   // pickup prompt as trailing argv (R7); guided stays default-permission and
-  // omits the prompt (U3 pre-types it). Read once at mount.
+  // omits the prompt (U3 pre-types it). Read once at mount. Monitor pickup
+  // panes (monitor-handoff U7, R16) ride this same map — the identical
+  // ordinary-pane shape: a `claude` argv with a prompt positional, default
+  // permission mode, no automation linkage.
   let handoffCommandByLeaf = $state<Record<string, string[]>>({});
   // leaf key → resolved target for a GUIDED handoff pane (session-handoff U2,
   // the seam for U3): the injection controller reads which leaf awaits the
@@ -288,6 +303,16 @@
   let automationRows = $state<AutomationRow[]>([]);
   let automationsDegraded = $state(false);
   let automationsCorruptBak = $state<string | null>(null);
+  // Monitor pickup (monitor-handoff U7, R16/R17): the R17 fallback block the
+  // matching retired-fail row expands with (null = none showing), and the
+  // in-flight guard that keeps the pickup one-action (AE4) — $state so the
+  // buttons disable while a pickup resolves.
+  let pickupFallback = $state<{
+    automationId: string;
+    explanation: string;
+    bundleText: string | null;
+  } | null>(null);
+  let pickupInFlight = $state(false);
   let paletteOpen = $state(false);
   let notificationPanelOpen = $state(false);
   // Settings menu (`leader ,`, the ⚙ control-bar button, or the command
@@ -688,6 +713,29 @@
     setActiveTree(tree, leaves(tree)[0]?.key);
     pruneNotifications(); // the removed pane's leaf is gone
   }
+  // Leaf-targeted close for a pane in ANY workspace/tab (vs closePane, which
+  // only removes the ACTIVE tab's focused leaf). Splices the leaf out of its
+  // tab's tree; when it was that tab's focused leaf, focus hands to the first
+  // remaining leaf — closePane's post-removal rule — WITHOUT touching
+  // activeWorkspaceId/activeTabId, so closing a background leaf never steals
+  // the user's view. A sole-leaf tab is the caller's job (route through
+  // closeTab); a null removeLeaf here leaves the tab untouched.
+  function closeLeafInTab(tabId: string, leafKey: string) {
+    workspaces = workspaces.map((w) => ({
+      ...w,
+      tabs: w.tabs.map((t) => {
+        if (t.id !== tabId) return t;
+        const tree = removeLeaf(t.tree, leafKey);
+        if (tree === null) return t; // sole leaf — whole-tab close, not ours
+        const focusedLeafKey =
+          t.focusedLeafKey === leafKey
+            ? (leaves(tree)[0]?.key ?? t.focusedLeafKey)
+            : t.focusedLeafKey;
+        return { ...t, tree, focusedLeafKey };
+      }),
+    }));
+    pruneNotifications(); // the removed pane's leaf is gone
+  }
   function focusDir(dir: "left" | "right" | "up" | "down") {
     if (!activeTab) return;
     const n = neighbor(rects, activeTab.focusedLeafKey, dir);
@@ -869,6 +917,28 @@
     if (!shouldAutoCloseRun(ev.status, raised)) return;
     const { tabId } = loc;
     setTimeout(() => closeTab(tabId), AGENT_RUN_CLOSE_LINGER_MS);
+  }
+  // Monitor-handoff U6 (R13): a monitor was registered from this pane — its
+  // session handed the watch off to the automation, so residue-free close
+  // means the REGISTERING PANE's leaf, resolved via the pure
+  // monitorCloseTarget (the handleRunClosed paneId→leaf mapping pattern).
+  // Only a sole-leaf tab closes whole, through the ordinary closeTab path,
+  // which hands focus/activeTabId per existing close behavior; in a split tab
+  // only the registering leaf is removed (closeLeafInTab) — sibling panes are
+  // unrelated live sessions and survive, since killing them here would bypass
+  // the destructive confirm every user-initiated multi-pane close gets
+  // (requestCloseTab). NO linger, deliberately unlike handleRunClosed: the
+  // event fires strictly after the store flush, so registration confirmed
+  // means residue-free (origin decision). An unknown pane or an
+  // already-closed tab is a no-op.
+  function handleMonitorRegistered(ev: MonitorRegisteredEvent) {
+    const target = monitorCloseTarget(workspaces, leafByPaneId, ev.paneId);
+    if (!target) return;
+    if (target.kind === "tab") {
+      closeTab(target.tabId);
+      return;
+    }
+    closeLeafInTab(target.tabId, target.leafKey);
   }
   function newWorkspace() {
     const ws = makeWorkspace(`workspace ${workspaces.length + 1}`);
@@ -1604,7 +1674,13 @@
   async function refreshAutomations() {
     try {
       const dash = await listAutomations();
-      automationRows = automationsToRows(dash.automations, Date.now());
+      // Monitor-handoff U7: the broken-monitor inputs (derived infra-failure
+      // counts + the one Rust threshold) ride the DTO — the view-model never
+      // re-derives run-history walks or hardcodes the number.
+      automationRows = automationsToRows(dash.automations, Date.now(), {
+        infraFailures: dash.infraFailures,
+        brokenThreshold: dash.monitorBrokenThreshold,
+      });
       automationsDegraded = dash.degraded;
       automationsCorruptBak = dash.corruptBak;
     } catch (e) {
@@ -1615,6 +1691,75 @@
     if (!homeViewOpen) return;
     void refreshAutomations();
   });
+  // Monitor-handoff U7 (R16/R17): the retired-fail row's one-action pickup.
+  // Validate the stored pointers still resolve (R17, over the read-only
+  // monitor_pickup_check command), then either spawn ONE recovery session —
+  // a normal, non-ephemeral tab in the CURRENT workspace running `claude`
+  // with the stock pickup prompt in default permission mode (the user is
+  // present; contrast the automations workspace + bypass flag of agent runs)
+  // — or expand the row with the raw bundle + explanation instead of a broken
+  // spawn. The in-flight guard + disabled buttons keep it exactly one spawn
+  // per click (AE4); pickup panes are ordinary panes (no run id, no recursion
+  // registry, no deadline), riding handoffCommandByLeaf like handoff panes.
+  async function handleMonitorPickup(row: AutomationRow) {
+    if (pickupInFlight) return;
+    pickupInFlight = true;
+    pickupFallback = null;
+    try {
+      // R17 first: check existence only when there are pointers to check —
+      // planPickup routes a missing/failed check to the fallback branch.
+      let check: PickupCheckResult | null = null;
+      if (row.pickupPointers != null) {
+        try {
+          check = await monitorPickupCheck(
+            row.pickupPointers.transcriptPath,
+            row.pickupPointers.sessionCwd,
+          );
+        } catch (e) {
+          void frontendLog(`monitor pickup check failed: ${String(e)}`);
+        }
+      }
+      const plan = planPickup(row, check);
+      if (plan.kind === "fallback") {
+        // Best-effort bundle read (scoped + capped backend-side); a failed
+        // read still shows the explanation — never a silent no-op.
+        let bundleText: string | null = null;
+        if (row.bundlePath != null) {
+          try {
+            bundleText = sanitizeBundleText(await readMonitorBundle(row.bundlePath));
+          } catch (e) {
+            void frontendLog(`monitor bundle read failed: ${String(e)}`);
+          }
+        }
+        // HomeView renders the fallback block row-anchored, so if the
+        // automation was deleted while we awaited (the automation://changed
+        // refetch dropped its row), it would have nowhere to render — surface
+        // the outcome as the transient notice instead of a silent dead click.
+        if (automationRows.some((r) => r.id === row.id)) {
+          pickupFallback = { automationId: row.id, explanation: plan.explanation, bundleText };
+        } else {
+          showNotice(
+            `Monitor “${sanitizeTranscriptPath(row.name)}” was deleted while checking pickup — its failure details can't be shown.`,
+          );
+        }
+        return;
+      }
+      // Spawn: seed cwd + command BEFORE appending the tab (Terminal reads
+      // both once at mount), then activate it in the current workspace and
+      // close the dashboard so the user lands in the recovery session.
+      const t = makeTab();
+      t.title = `pickup: ${sanitizeTranscriptPath(row.name)}`;
+      const newKey = leaves(t.tree)[0].key;
+      cwdByLeaf = { ...cwdByLeaf, [newKey]: plan.cwd };
+      handoffCommandByLeaf = { ...handoffCommandByLeaf, [newKey]: plan.argv };
+      workspaces = workspaces.map((w) =>
+        w.id === activeWorkspaceId ? { ...w, tabs: [...w.tabs, t], activeTabId: t.id } : w,
+      );
+      homeViewOpen = false;
+    } finally {
+      pickupInFlight = false;
+    }
+  }
 
   // ---- attention-triage nudge trigger (U5) ---------------------------------
   // Watch the focused pane while the dashboard is closed and decide whether the
@@ -1759,6 +1904,12 @@
     paletteOpen = false;
     settingsOpen = false;
     if (notificationPanelOpen) setNotificationPanel(false);
+    // pickupFallback is deliberately NOT cleared on open (monitor-handoff U7,
+    // R17): staleness is already handled where it matters — handleMonitorPickup
+    // nulls it at the start of every attempt, and the block has its own dismiss
+    // control — whereas a clear here would silently wipe a fallback that
+    // resolved while the dashboard was closed (Escape mid-await) before the
+    // user ever saw it.
     homeViewOpen = true;
   }
   // Jump from a dashboard row to its pane, closing the view (R4).
@@ -2172,6 +2323,13 @@
     // succeeded run's background tab (or keep a failed / attention one).
     let unlistenRunClosed: (() => void) | undefined;
     void onRunClosed(handleRunClosed).then((un) => (unlistenRunClosed = un));
+    // Monitor-handoff U6 (R13): a monitor registered → close the registering
+    // pane's leaf immediately (whole tab only when it's the sole leaf; no
+    // linger — see handleMonitorRegistered).
+    let unlistenMonitorRegistered: (() => void) | undefined;
+    void onMonitorRegistered(handleMonitorRegistered).then(
+      (un) => (unlistenMonitorRegistered = un),
+    );
     const cwdTimer = setInterval(() => void refreshCwds(), 1500);
     return () => {
       window.removeEventListener("focus", reportForeground);
@@ -2183,6 +2341,7 @@
       unlistenAutomationChanged?.();
       unlistenAlertPending?.();
       unlistenRunClosed?.();
+      unlistenMonitorRegistered?.();
     };
   });
 </script>
@@ -2290,6 +2449,10 @@
         automations={automationRows}
         automationsDegraded={automationsDegraded}
         automationsCorruptBak={automationsCorruptBak}
+        pickupFallback={pickupFallback}
+        pickupBusy={pickupInFlight}
+        onPickup={(row) => void handleMonitorPickup(row)}
+        onDismissPickupFallback={() => (pickupFallback = null)}
         onRefresh={() => void refreshUsage()}
         onJump={jumpFromHome}
         onClose={toggleHome}

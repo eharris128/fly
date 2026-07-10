@@ -10,10 +10,50 @@
 // for a later pass. `linkedPaneId` is derived here so that affordance can be
 // wired without touching the view-model.
 
-import type { Automation, AutomationMode, RunStatus } from "../ipc";
+import type {
+  Automation,
+  AutomationMode,
+  MonitorPointers,
+  RunRow,
+  RunStatus,
+} from "../ipc";
+import {
+  buildMonitorPickupCommand,
+  sanitizeTranscriptPath,
+  stripControlChars,
+} from "./handoff";
 
 /** Last-run status for the row: the last run's status, or `"never run"`. */
 export type LastStatus = "never run" | RunStatus;
+
+/**
+ * The monitor state badge (monitor-handoff U7, R18) — the CLI's
+ * `monitor_state_label` spellings verbatim, so `fly automation list` and the
+ * dashboard can never disagree. Precedence retired (split pass/fail by the
+ * durable verdict row; plain `"retired"` is the defensive
+ * retirement-without-a-verdict-row fallback) > broken (derived infra-failure
+ * count at/past the R7 threshold) > paused (`nextRunAt` null) > parked.
+ */
+export type MonitorState =
+  | "parked"
+  | "paused"
+  | "broken"
+  | "retired pass"
+  | "retired fail"
+  | "retired";
+
+/**
+ * The backend-derived broken-monitor inputs (monitor-handoff U7): the
+ * per-monitor consecutive-infra-failure counts and the one Rust threshold
+ * constant, both riding the `AutomationsDashboard` DTO so nothing here
+ * re-derives run-history walks or hardcodes the number.
+ */
+export interface MonitorDerivation {
+  /** Monitor id → consecutive infra-failure count (`infraFailures` on the DTO). */
+  infraFailures: Record<string, number>;
+  /** `monitorBrokenThreshold` on the DTO (verdict.rs::MONITOR_BROKEN_THRESHOLD). */
+  brokenThreshold: number;
+}
 
 export interface AutomationRow {
   id: string;
@@ -47,30 +87,109 @@ export interface AutomationRow {
   lastRunModel: string | null;
   /** The effort the last run actually launched with, or null. */
   lastRunEffort: string | null;
+  /** Monitor flavor bit (monitor-handoff U7); false for ordinary automations. */
+  monitor: boolean;
+  /** Derived monitor state (R18); null for non-monitors (they render mode tags). */
+  monitorState: MonitorState | null;
+  /** The durable verdict's outcome/note (monitor-handoff R4), from the newest
+   * verdict-bearing run row; note is control-char-sanitized for display.
+   * Null until a verdict lands (and always for non-monitors). */
+  verdictOutcome: "pass" | "fail" | null;
+  verdictNote: string | null;
+  /** The verdict run's failure-bundle path (R15), or null (incl. PASS and a
+   * failed bundle write). */
+  bundlePath: string | null;
+  /** Registration-time pickup pointers (R11); what the R16 pickup spawns from. */
+  pickupPointers: MonitorPointers | null;
 }
 
 /**
  * Build the sorted, humanized dashboard rows from the raw automation list.
- * Sort mirrors the CLI's `load_store_at` (U9): next-run ascending, paused
- * (`nextRunAt == null`) last, ties broken by name — so the dashboard and
- * `fly automation list` agree. Pure over `nowMs` (injected for tests).
+ * Sort mirrors the CLI's `load_store_at` (U9, extended by monitor-handoff
+ * U5/U7 — R18): bucket first (scheduled 0 — parked monitors ride with
+ * recurring automations by next-run — then paused 1, then retired 2, the
+ * CLI's `sort_bucket`), next-run ascending inside a bucket, ties broken by
+ * name — so the dashboard and `fly automation list` agree. Pure over `nowMs`
+ * (injected for tests). `monitor` carries the DTO's backend-derived
+ * broken-monitor inputs; omitting it (legacy callers/tests) just means no
+ * broken state can derive — every other monitor state still does.
  */
 export function automationsToRows(
   automations: Automation[],
   nowMs: number,
+  monitor?: MonitorDerivation,
 ): AutomationRow[] {
-  const sorted = [...automations].sort((a, b) => {
-    const an = a.nextRunAt;
-    const bn = b.nextRunAt;
-    if (an != null && bn != null) return an - bn || a.name.localeCompare(b.name);
-    if (an != null) return -1; // a is scheduled, b paused → a first
-    if (bn != null) return 1; // b is scheduled, a paused → b first
-    return a.name.localeCompare(b.name); // both paused → by name
-  });
-  return sorted.map((a) => toRow(a, nowMs));
+  const sorted = [...automations].sort(
+    (a, b) =>
+      sortBucket(a) - sortBucket(b) ||
+      (a.nextRunAt ?? 0) - (b.nextRunAt ?? 0) ||
+      a.name.localeCompare(b.name),
+  );
+  return sorted.map((a) => toRow(a, nowMs, monitor));
 }
 
-function toRow(a: Automation, nowMs: number): AutomationRow {
+/**
+ * The CLI's `sort_bucket` mirrored exactly (monitor-handoff U5/U7, R18):
+ * 0 = scheduled (incl. parked monitors), 1 = paused, 2 = retired last.
+ * Retirement is checked first — retire also clears `nextRunAt`, and a
+ * retired row must never read as merely paused. Within a bucket `nextRunAt`
+ * is either uniformly set (0) or uniformly null (1 and 2), so the next-run
+ * comparison above only ever bites inside the scheduled bucket.
+ */
+function sortBucket(a: Automation): number {
+  if (a.retiredAt != null) return 2;
+  if (a.nextRunAt == null) return 1;
+  return 0;
+}
+
+/**
+ * The newest verdict-bearing run row (monitor-handoff R4) — the CLI's
+ * `verdict_run` mirrored. A monitor retires on its first verdict so at most
+ * one exists; newest-first keeps the read honest if that ever loosens.
+ */
+function verdictRun(a: Automation): RunRow | null {
+  for (let i = a.runs.length - 1; i >= 0; i--) {
+    if (a.runs[i].verdict != null) return a.runs[i];
+  }
+  return null;
+}
+
+/**
+ * Derive a monitor's dashboard state (monitor-handoff U7, R18) — the CLI's
+ * `monitor_state_label` mirrored exactly: null for non-monitors; otherwise
+ * retired (pass/fail split by the durable verdict row, plain `"retired"` as
+ * the defensive no-verdict-row fallback) > broken (derived count at/past the
+ * threshold) > paused > parked. Exported for tests.
+ */
+export function monitorStateOf(
+  a: Automation,
+  monitor?: MonitorDerivation,
+): MonitorState | null {
+  if (!a.monitor) return null;
+  if (a.retiredAt != null) {
+    const v = verdictRun(a)?.verdict ?? null;
+    if (v == null) return "retired";
+    return v.outcome === "pass" ? "retired pass" : "retired fail";
+  }
+  const count = monitor?.infraFailures[a.id] ?? 0;
+  if (monitor != null && count >= monitor.brokenThreshold) return "broken";
+  if (a.nextRunAt == null) return "paused";
+  return "parked";
+}
+
+/** Flatten control characters (C0 incl. newlines, DEL, C1) to spaces for a
+ *  one-line display string — the verdict note is captured agent output,
+ *  untrusted in the panel (the CLI sanitizes the same field with
+ *  `sanitize_title`). Delegates to the shared sanitizer in handoff.ts. */
+function stripControl(s: string): string {
+  return stripControlChars(s, " ");
+}
+
+function toRow(
+  a: Automation,
+  nowMs: number,
+  monitor?: MonitorDerivation,
+): AutomationRow {
   // Last-run state is *derived* from the history's last row (R25) — no separate
   // mirror to drift, matching the Rust model's `last_run()`.
   const last = a.runs.length > 0 ? a.runs[a.runs.length - 1] : null;
@@ -79,6 +198,9 @@ function toRow(a: Automation, nowMs: number): AutomationRow {
   // (U9, R13). The last run's *actual* model/effort come from its RunRow.
   const model = a.mode.kind === "agent" ? a.mode.model : null;
   const effort = a.mode.kind === "agent" ? a.mode.effort : null;
+  // The durable verdict record (monitor-handoff R4): outcome/note/bundle come
+  // from the newest verdict-bearing row, not necessarily the last run.
+  const vRun = a.monitor ? verdictRun(a) : null;
   return {
     id: a.id,
     name: a.name,
@@ -95,6 +217,12 @@ function toRow(a: Automation, nowMs: number): AutomationRow {
     effort,
     lastRunModel: last?.model ?? null,
     lastRunEffort: last?.effort ?? null,
+    monitor: a.monitor,
+    monitorState: monitorStateOf(a, monitor),
+    verdictOutcome: vRun?.verdict?.outcome ?? null,
+    verdictNote: vRun?.verdict ? stripControl(vRun.verdict.note) : null,
+    bundlePath: vRun?.bundlePath ?? null,
+    pickupPointers: a.pickupPointers,
   };
 }
 
@@ -170,4 +298,95 @@ export function relativeTime(targetMs: number, nowMs: number): string {
     }
   }
   return future ? `in ${body}` : `${body} ago`;
+}
+
+// ---- monitor pickup planning (monitor-handoff U7, R16/R17) -------------------
+// The pure spawn-vs-fallback decision behind the retired-fail row's pickup
+// button. App.svelte performs the two IPCs (the R17 existence check, the
+// fallback bundle read) and the tab mutation; everything decidable without an
+// app lives here so AE4's one-action guarantee is unit-tested.
+
+/** The R17 existence check's result (ipc `PickupCheck`), or null when the
+ *  check IPC itself failed — planPickup treats that as unverifiable and falls
+ *  back rather than risking a broken spawn. */
+export interface PickupCheckResult {
+  transcriptExists: boolean;
+  cwdExists: boolean;
+}
+
+/**
+ * What the pickup button does: exactly one recovery spawn (AE4) — the argv
+ * (prompt positional before the variadic `--add-dir`, built by
+ * `handoff.ts::buildMonitorPickupCommand`) plus the cwd to spawn it in — or
+ * the R17 fallback with a display-ready explanation of why spawning would
+ * break. Explanations embed the stored paths control-char-sanitized.
+ */
+export type PickupPlan =
+  | { kind: "spawn"; argv: string[]; cwd: string }
+  | { kind: "fallback"; explanation: string };
+
+/**
+ * Decide spawn vs fallback for a retired-fail row (R16/R17). Fallback when:
+ * no pickup pointers were stored (a legacy or hand-edited record), the
+ * existence check couldn't run (`check == null`), or the transcript/cwd no
+ * longer exist. Otherwise one spawn plan: the recovery session launches in
+ * the parent's cwd with the stock pickup prompt pointing at the bundle and
+ * the transcript tail.
+ */
+export function planPickup(
+  row: Pick<AutomationRow, "pickupPointers" | "bundlePath">,
+  check: PickupCheckResult | null,
+): PickupPlan {
+  const ptr = row.pickupPointers;
+  if (ptr == null) {
+    return {
+      kind: "fallback",
+      explanation:
+        "No pickup pointers were stored for this monitor, so a recovery " +
+        "session can't be spawned. The raw failure bundle is shown instead.",
+    };
+  }
+  if (check == null) {
+    return {
+      kind: "fallback",
+      explanation:
+        "Couldn't verify the parent session's transcript and directory still " +
+        "exist, so no recovery session was spawned. The raw failure bundle " +
+        "is shown instead.",
+    };
+  }
+  const missing: string[] = [];
+  if (!check.transcriptExists) {
+    missing.push(
+      `the parent transcript no longer exists (${sanitizeTranscriptPath(ptr.transcriptPath)})`,
+    );
+  }
+  if (!check.cwdExists) {
+    missing.push(
+      `the session directory no longer exists (${sanitizeTranscriptPath(ptr.sessionCwd)})`,
+    );
+  }
+  if (missing.length > 0) {
+    return {
+      kind: "fallback",
+      explanation:
+        `Can't spawn a recovery session: ${missing.join(" and ")}. ` +
+        "The raw failure bundle is shown instead.",
+    };
+  }
+  return {
+    kind: "spawn",
+    argv: buildMonitorPickupCommand(ptr.transcriptPath, row.bundlePath),
+    cwd: ptr.sessionCwd,
+  };
+}
+
+/**
+ * Sanitize bundle text for the fallback `<pre>` (R17): strip control
+ * characters except newline and tab — the bundle is captured agent output
+ * rendered verbatim in the panel, the same untrusted-display posture as the
+ * verdict note (multi-line, so newlines survive unlike `stripControl`).
+ */
+export function sanitizeBundleText(text: string): string {
+  return text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 }

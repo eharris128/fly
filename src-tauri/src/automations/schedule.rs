@@ -29,6 +29,12 @@
 //! (`next >= now + MIN_CADENCE_MS - SNAP_EPSILON_MS`); only genuinely
 //! too-fast schedules get the `now + 5min` floor. The advisory min-gap check
 //! in [`validate`] is best-effort — this clamp is the enforcement (R1).
+//!
+//! **Monitor not-before floor** (monitor-handoff U2, R1 of
+//! `docs/plans/2026-07-10-001-feat-monitor-handoff-plan.md`): [`advance_from`]
+//! composes a stored epoch-ms not-before floor over [`advance`] — every
+//! recompute path (create / resume / sweep claim + skip / dispatch rollback)
+//! goes through it so a monitor is never scheduled before its floor.
 
 use std::str::FromStr;
 
@@ -148,6 +154,31 @@ pub fn advance(cron: &str, tz: &str, now_ms: u64) -> Result<Option<u64>, String>
             floor // R1: the 5-minute minimum-cadence floor
         }
     }))
+}
+
+/// [`advance`] with a not-before floor (monitor-handoff U2, R1): a monitor
+/// never runs before its stored `not_before_ms`, so the schedule advances
+/// from `effective now = max(now, not_before)` and delegates — the R1
+/// minimum-cadence floor and the [`SNAP_EPSILON_MS`] boundary-snap apply
+/// unchanged relative to that instant, so boundary-aligned schedules stay on
+/// their boundaries (no reintroduced drift). Because the floor composes with
+/// a *recurring* cron (never a one-shot), a not-before moment that already
+/// passed — fly closed across it, or plain automations passing `None` — is a
+/// pure no-op: identical to [`advance`], the next occurrence from now.
+///
+/// The stored value is UNTRUSTED input (release builds have overflow-checks
+/// off): `max` involves no arithmetic, [`advance`] saturates internally, and
+/// an absurdly-far instant (e.g. `u64::MAX`) fails [`zoned`]'s range check
+/// as a hard `Err` rather than wrapping — callers degrade it like any other
+/// unadvanceable schedule.
+pub fn advance_from(
+    cron: &str,
+    tz: &str,
+    now_ms: u64,
+    not_before_ms: Option<u64>,
+) -> Result<Option<u64>, String> {
+    let effective_now = not_before_ms.map_or(now_ms, |nb| now_ms.max(nb));
+    advance(cron, tz, effective_now)
 }
 
 /// Shared parse gate for all three entry points, in R1's order: field count
@@ -372,6 +403,101 @@ mod tests {
         let now = local_ms(&utc, 2026, 1, 6, 9, 29, 30);
         let advanced = advance("30 9 * * *", UTC, now).unwrap();
         assert_eq!(advanced, Some(now + MIN_CADENCE_MS));
+    }
+
+    // monitor-handoff U2, R1: an absent or already-passed not-before is a
+    // pure no-op — advance_from matches plain advance exactly, so ordinary
+    // recurring automations (None) and a not-before moment missed while fly
+    // was closed both yield the next occurrence from now.
+    #[test]
+    fn advance_from_with_absent_or_past_not_before_matches_plain_advance_monitor_r1() {
+        let utc = zone(UTC);
+        let now = local_ms(&utc, 2026, 1, 6, 9, 0, 7);
+        let plain = advance("*/5 * * * *", UTC, now).unwrap();
+        assert_eq!(
+            advance_from("*/5 * * * *", UTC, now, None).unwrap(),
+            plain,
+            "None floor: identical schedule"
+        );
+
+        let missed = local_ms(&utc, 2026, 1, 5, 12, 0, 0); // passed while fly was closed
+        assert_eq!(
+            advance_from("*/5 * * * *", UTC, now, Some(missed)).unwrap(),
+            plain,
+            "a passed floor still yields the next occurrence from now"
+        );
+        assert_eq!(plain, Some(local_ms(&utc, 2026, 1, 6, 9, 5, 0)));
+    }
+
+    // monitor-handoff U2, R1: a future not-before floors the schedule — the
+    // first fire is the first cron occurrence at/after the floor (a sparse
+    // 6-hourly monitor cadence here), never an occurrence between now and
+    // the floor.
+    #[test]
+    fn advance_from_with_future_not_before_lands_on_first_occurrence_after_the_floor_monitor_r1() {
+        let utc = zone(UTC);
+        let now = local_ms(&utc, 2026, 1, 6, 9, 0, 7);
+        let nb = local_ms(&utc, 2026, 1, 7, 2, 30, 0); // tomorrow 02:30
+
+        let got = advance_from("0 */6 * * *", UTC, now, Some(nb)).unwrap();
+        assert_eq!(
+            got,
+            Some(local_ms(&utc, 2026, 1, 7, 6, 0, 0)),
+            "first 6-hourly occurrence after the floor — not today's 12:00"
+        );
+        assert!(got.unwrap() >= nb, "never before the floor");
+        assert_eq!(
+            got,
+            next_occurrence_ms("0 */6 * * *", UTC, nb).unwrap(),
+            "on a real cron occurrence, exactly as if queried from the floor"
+        );
+    }
+
+    // monitor-handoff U2, R1: the SNAP_EPSILON_MS boundary-snap survives the
+    // composition — a floor landing seconds after a `*/5` boundary snaps to
+    // the NEXT boundary (not floor + 5min), and once the floor is in the
+    // past subsequent advances are byte-identical to the plain schedule: no
+    // reintroduced drift across occurrences.
+    #[test]
+    fn advance_from_preserves_the_boundary_snap_and_reintroduces_no_drift_monitor_r1() {
+        let utc = zone(UTC);
+        let now = local_ms(&utc, 2026, 1, 6, 9, 0, 7);
+        let nb = local_ms(&utc, 2026, 1, 6, 10, 5, 10); // 10s past a boundary
+
+        let first = advance_from("*/5 * * * *", UTC, now, Some(nb)).unwrap();
+        assert_eq!(
+            first,
+            Some(local_ms(&utc, 2026, 1, 6, 10, 10, 0)),
+            "snapped to the boundary, not floored to 10:10:10"
+        );
+
+        // The next claim lands sweep-latency after the boundary; the floor is
+        // now in the past, so the step matches the plain schedule exactly.
+        let claim = first.unwrap() + 7_000;
+        let second = advance_from("*/5 * * * *", UTC, claim, Some(nb)).unwrap();
+        assert_eq!(second, advance("*/5 * * * *", UTC, claim).unwrap());
+        assert_eq!(
+            second,
+            Some(local_ms(&utc, 2026, 1, 6, 10, 15, 0)),
+            "still boundary-aligned — no drift"
+        );
+    }
+
+    // monitor-handoff U2, R1: the stored floor is untrusted input and release
+    // builds have overflow-checks off — a near-max epoch-ms floor must fail
+    // closed as a hard error (zoned()'s range check), never wrap into a
+    // bogus past instant or panic.
+    #[test]
+    fn advance_from_near_max_not_before_fails_closed_without_overflow_monitor_r1() {
+        let utc = zone(UTC);
+        let now = local_ms(&utc, 2026, 1, 6, 9, 0, 7);
+        for nb in [u64::MAX, u64::MAX - 1, i64::MAX as u64] {
+            let err = advance_from("*/5 * * * *", UTC, now, Some(nb)).unwrap_err();
+            assert!(
+                err.contains("out of range"),
+                "hard error, never a wrapped instant: {err}"
+            );
+        }
     }
 
     // R1: fly is 5-field-only — a 6-field (seconds-bearing) expression is

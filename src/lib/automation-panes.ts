@@ -3,6 +3,7 @@
 // `$state`, the leaf/tab id minting, and the maps read at mount; this module
 // only decides *where* an incoming agent run's tab should land.
 
+import { leaves } from "./layout";
 import type { Workspace } from "./workspaces";
 import type { RunStatus } from "../ipc";
 
@@ -58,4 +59,41 @@ export function shouldAutoCloseRun(
   isRaised: boolean,
 ): boolean {
   return status === "succeeded" && !isRaised;
+}
+
+/** What the monitor-registered close should remove (monitor-handoff U6, R13):
+ *  the whole tab when the registering pane is its sole leaf, else ONLY that
+ *  pane's leaf — sibling split panes are unrelated live sessions and survive. */
+export type MonitorCloseTarget =
+  | { kind: "tab"; tabId: string }
+  | { kind: "leaf"; tabId: string; leafKey: string };
+
+/**
+ * Resolve a registering pane id to its monitor-registered close target
+ * (monitor-handoff U6, R13): paneId → leaf key (via the caller's reverse
+ * index) → the enclosing tab, scanning every workspace — the monitor parent is
+ * an ORDINARY pane, so it lives in normal workspaces/tabs, not the Automations
+ * workspace. A sole-leaf tab closes whole (`kind: "tab"`); in a split tab the
+ * residue is only the registering pane's leaf (`kind: "leaf"`) — closing the
+ * whole tab would silently kill sibling panes' processes, the exact case the
+ * user-initiated path gates behind the destructive confirm (requestCloseTab).
+ * `null` when the pane id is unknown or its leaf no longer resolves (the tab
+ * was already closed manually) — the caller no-ops. Note the reverse index may
+ * hold a stale entry for an exited pane; the workspace scan is what makes the
+ * lookup safe (a gone leaf → `null`, never a wrong target).
+ */
+export function monitorCloseTarget(
+  workspaces: Workspace[],
+  leafByPaneId: Record<number, string>,
+  paneId: number,
+): MonitorCloseTarget | null {
+  const leafKey = leafByPaneId[paneId];
+  if (!leafKey) return null;
+  for (const ws of workspaces)
+    for (const tab of ws.tabs)
+      if (leaves(tab.tree).some((l) => l.key === leafKey))
+        return leaves(tab.tree).length === 1
+          ? { kind: "tab", tabId: tab.id }
+          : { kind: "leaf", tabId: tab.id, leafKey };
+  return null;
 }

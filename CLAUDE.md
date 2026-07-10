@@ -280,6 +280,33 @@ named `fly-automation-sweep` thread ticks every 10s; a due automation is
   raise for automation-linked panes** (`is_automation_pane` + `Reason::Finished`) —
   else `succeeded && !isRaised` would never fire.
 
+**Monitors** (`docs/plans/2026-07-10-001-feat-monitor-handoff-plan.md` — its own
+U1–U8/R1–R18). A monitor is an agent-mode automation flavor for parked
+experiments: a not-before floor (`schedule.rs` clamps every `next_run_at`
+recompute) + a sparse recurring cron; each check's captured final turn is
+parsed for one fenced ` ```verdict ` block (`automations/verdict.rs` — the
+contract text is `VERDICT_BLOCK_SPEC`, quoted verbatim by
+`skills/fly-monitor-handoff/SKILL.md`, edited only together; abstain-on-surprise,
+so no block = "not done" = silent). A parsed verdict **retires** the monitor in
+the same store mutation that closes the row (`retiredAt` set, `next_run_at`
+cleared; claims/manual runs refused thereafter); FAIL also writes a durable
+bundle file under `<data root>/monitor-bundles/` (outside the run-output tail
+cap) and every verdict rings via the existing Alert path. Three consecutive
+*unreadable* checks (Failed closes, or Succeeded closes whose capture abstained
+— `Automation::consecutive_infra_failures`, derived not stored) ring "monitor
+broken"; readable not-done checks reset. `create --monitor` captures pickup
+pointers from the registering pane via the shared handoff qualification
+(`session/handoff.rs::resolve_target_now`) or **refuses** (nothing stored), then
+emits `automation://monitor-registered` and the frontend closes the parent tab
+(no linger — `tabForPane` in `lib/automation-panes.ts`). The dashboard derives
+monitor states (parked/paused/broken/retired-pass/retired-fail) mirroring the
+CLI's derivation, and a retired-fail row offers the one-action **pickup**:
+validate transcript+cwd (`monitor_pickup_check`), spawn a default-permission
+recovery session in the current workspace (`lib/handoff.ts::
+buildMonitorPickupCommand`, prompt before `--add-dir`), or fall back to showing
+the bundle inline (`read_monitor_bundle`, bundle-dir-scoped). Checks fire only
+while fly runs; missed ticks are never caught up.
+
 ### Session, resume & handoff (`session/` + `lib/{resume,handoff}.ts`)
 Durable, backend-owned stores kept **separate** from the debounced layout blob
 (`session/mod.rs`), all under the `FLY_APP_NAME` root so a dev flavor stays
