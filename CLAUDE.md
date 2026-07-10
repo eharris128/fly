@@ -157,14 +157,19 @@ time/inputs as arguments so they're tested without a running app.
   `~/.claude/.credentials.json`), fetched on dashboard open only (KTD-C), never
   on a timer.
 - `feed/` — the loopback HTTP surface for an external local consumer
-  (feat-agent-state-local-feed + feed-agent-reply-io + feed-pending-question):
+  (feat-agent-state-local-feed + feed-agent-reply-io + feed-pending-question +
+  feed-conversation-tail):
   bearer-token auth (constant-time, silent 401; **the token is the whole
   boundary** — loopback TCP has no `SO_PEERCRED`), SSE `/feed` (webview-pushed
   roster + backend automations; `lastReplyAt` **and** `questionPendingAt`
   stamped at emit), `GET /agents/{key}/output` (latest reply + the gated
-  pending `question` object via `io.rs::ReplyResolver.resolve_io` — the ONE
-  source for every per-agent surface; question strings are secret-scrubbed
-  *then* sanitized/truncated), and the single mutation route
+  pending `question` object + the `turns` conversation tail — ≤12 turns ×
+  ≤2048 chars, oldest→newest ending at the current reply with
+  `at == repliedAt`, key omitted when no servable history — all via
+  `io.rs::ReplyResolver.resolve_io` — the ONE source for every per-agent
+  surface; question and turn strings are control-sanitized, *then*
+  secret-scrubbed, *then* truncated — see `io.rs::clean` for why that order),
+  and the single mutation route
   `POST /agents/{key}/input` (submit = control-stripped bracketed-paste +
   Enter; `mode:"keys"` = raw filtered answer keys with **mandatory**
   `ifAskedAt` + a per-leaf answered latch; keys-answering a *permission*

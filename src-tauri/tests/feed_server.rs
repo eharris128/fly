@@ -13,28 +13,46 @@ use std::time::Duration;
 
 use fly_lib::feed::io::{ReplyResolver, ResolvedIo};
 use fly_lib::feed::server::{FeedServer, InputAction, InputOutcome, IoFn};
-use fly_lib::feed::wire::{AgentEntry, QuestionBody, QuestionOption, QuestionSpec};
+use fly_lib::feed::wire::{AgentEntry, QuestionBody, QuestionOption, QuestionSpec, TurnEntry};
 use fly_lib::feed::FeedState;
 use fly_lib::session::transcript::LastReply;
 
 const TOKEN: &str = "test-token-abc123";
 const REPLIED_AT: u64 = 1_781_896_636_402;
 const ASKED_AT: u64 = 1_781_896_640_000;
+const PROMPTED_AT: u64 = 1_781_896_600_000;
 
-/// An IO resolver that knows three leaves: `leaf-replied` → a stamped reply,
-/// `leaf-choice` → that reply + a pending choice question, `leaf-permission` →
-/// a pending Bash permission question (exposure of which the server must gate
-/// on the roster reason — feed-pending-question KTD3/KTD4).
+/// An IO resolver that knows three leaves: `leaf-replied` → a stamped reply
+/// with a two-turn conversation tail, `leaf-choice` → that reply + a pending
+/// choice question, `leaf-permission` → a pending Bash permission question
+/// (exposure of which the server must gate on the roster reason —
+/// feed-pending-question KTD3/KTD4).
 fn fake_io() -> IoFn {
     Arc::new(|leaf_key| {
         let reply = || LastReply {
             text: "All tests pass.".into(),
             replied_at_ms: Some(REPLIED_AT),
         };
+        // The tail ends with the reply's own turn (feed-conversation-tail R3).
+        let turns = || {
+            vec![
+                TurnEntry {
+                    role: "user".into(),
+                    at: PROMPTED_AT,
+                    text: "run the tests".into(),
+                },
+                TurnEntry {
+                    role: "agent".into(),
+                    at: REPLIED_AT,
+                    text: "All tests pass.".into(),
+                },
+            ]
+        };
         match leaf_key {
             "leaf-replied" => ResolvedIo {
                 reply: Some(reply()),
                 question: None,
+                turns: turns(),
             },
             "leaf-choice" => ResolvedIo {
                 reply: Some(reply()),
@@ -56,6 +74,7 @@ fn fake_io() -> IoFn {
                     }],
                     request: None,
                 }),
+                turns: Vec::new(),
             },
             "leaf-permission" => ResolvedIo {
                 reply: None,
@@ -68,6 +87,7 @@ fn fake_io() -> IoFn {
                     questions: vec![],
                     request: Some("cargo build".into()),
                 }),
+                turns: Vec::new(),
             },
             _ => ResolvedIo::default(),
         }
@@ -503,7 +523,7 @@ fn output_serves_the_latest_reply_with_its_stamp() {
     assert_eq!(v["text"], "All tests pass.");
     assert_eq!(v["repliedAt"], REPLIED_AT);
     // Regression guard (feed-pending-question R5): nothing pending → the
-    // `question` key is absent, the reply shape byte-identical to before.
+    // `question` key is absent.
     assert!(v.get("question").is_none(), "body was: {body}");
 }
 
@@ -522,6 +542,33 @@ fn output_for_a_never_replied_agent_is_empty_text_200() {
     assert_eq!(v["text"], "");
     // No stamp at all — the consumer requires a finite number when present.
     assert!(v.get("repliedAt").is_none(), "body was: {body}");
+    // And no history → the `turns` key is absent, never an empty array
+    // (feed-conversation-tail R5).
+    assert!(v.get("turns").is_none(), "body was: {body}");
+}
+
+// ---- turns on /output (feed-conversation-tail R1/R3/R5) ---------------------
+
+#[test]
+fn output_serves_the_conversation_tail_ending_at_the_reply() {
+    let (state, server, _) = start();
+    state.publish(vec![agent("leaf-replied", "waiting")]);
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-replied/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    let turns = v["turns"].as_array().expect("turns array");
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["role"], "user");
+    assert_eq!(turns[0]["at"], PROMPTED_AT);
+    assert_eq!(turns[0]["text"], "run the tests");
+    assert_eq!(turns[1]["role"], "agent");
+    // R3: the final turn IS the current reply — `at` equals `repliedAt`.
+    assert_eq!(turns[1]["at"], v["repliedAt"]);
+    assert_eq!(turns[1]["text"], "All tests pass.");
 }
 
 // ---- POST /agents/{key}/input (feed-agent-reply-io U4/U5) -------------------
