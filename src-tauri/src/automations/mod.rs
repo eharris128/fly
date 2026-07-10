@@ -709,6 +709,12 @@ impl AutomationManager {
             timezone: spec.timezone,
             enabled: true,
             retry_on_interrupt: spec.retry_on_interrupt,
+            // Monitor fields (monitor-handoff plan U1): plain creates are
+            // never monitors; U4/U5 thread the real values through the spec.
+            monitor: false,
+            not_before_ms: None,
+            retired_at: None,
+            pickup_pointers: None,
             cwd: spec.cwd,
             mode,
             origin: spec.origin,
@@ -2697,6 +2703,10 @@ mod tests {
             timezone: "UTC".into(),
             enabled: true,
             retry_on_interrupt: false,
+            monitor: false,
+            not_before_ms: None,
+            retired_at: None,
+            pickup_pointers: None,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "script".into(),

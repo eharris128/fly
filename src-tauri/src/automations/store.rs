@@ -425,6 +425,10 @@ mod tests {
             timezone: "America/New_York".into(),
             enabled: true,
             retry_on_interrupt: false,
+            monitor: false,
+            not_before_ms: None,
+            retired_at: None,
+            pickup_pointers: None,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "script".into(),

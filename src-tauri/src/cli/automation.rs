@@ -787,6 +787,10 @@ mod tests {
             timezone: "UTC".into(),
             enabled: true,
             retry_on_interrupt: false,
+            monitor: false,
+            not_before_ms: None,
+            retired_at: None,
+            pickup_pointers: None,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "s".into(),
