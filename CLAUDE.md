@@ -175,7 +175,13 @@ time/inputs as arguments so they're tested without a running app.
   and the single mutation route
   `POST /agents/{key}/input` (submit = control-stripped bracketed-paste +
   Enter; `mode:"keys"` = raw filtered answer keys with **mandatory**
-  `ifAskedAt` + a per-leaf answered latch; keys-answering a *permission*
+  `ifAskedAt` + a per-leaf answered latch; `mode:"other"` =
+  feed-other-answer's free-text answer into the picker's own
+  "Type something." row — fly resolves the row's digit from the question's
+  `otherKey` and delivers digit → filtered text → Enter as three
+  delay-spaced PTY chunks, never a bracketed paste, whose leading ESC would
+  cancel an unfocused picker; guarded exactly like keys and refused (409)
+  when `otherKey` is unknown; answering a *permission*
   dialog — or any *screen-derived* question while the live reason is
   `permission` — requires `feed.allowPermissionAnswers`, default off). A
   pending interaction is parsed from the transcript tail

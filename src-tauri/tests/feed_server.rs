@@ -72,6 +72,36 @@ fn fake_io() -> IoFn {
                             label: "Alpha".into(),
                             description: "first".into(),
                         }],
+                        // The free-text row's digit: 1 authored option + 1.
+                        other_key: Some("2".into()),
+                    }],
+                    request: None,
+                    source: None,
+                }),
+                turns: Vec::new(),
+                pending_fallback_at: None,
+            },
+            // An answerable choice whose free-text digit is unknown (an older
+            // render, or a >9-option ask): keys-answerable, never
+            // other-answerable (feed-other-answer R4).
+            "leaf-choice-no-other" => ResolvedIo {
+                reply: None,
+                question: Some(QuestionBody {
+                    asked_at: ASKED_AT,
+                    kind: "choice".into(),
+                    tool: "AskUserQuestion".into(),
+                    answerable: true,
+                    context: None,
+                    questions: vec![QuestionSpec {
+                        question: "Which?".into(),
+                        header: String::new(),
+                        multi_select: false,
+                        options: vec![QuestionOption {
+                            key: "1".into(),
+                            label: "Alpha".into(),
+                            description: String::new(),
+                        }],
+                        other_key: None,
                     }],
                     request: None,
                     source: None,
@@ -115,6 +145,9 @@ fn fake_io() -> IoFn {
                             label: "Red".into(),
                             description: String::new(),
                         }],
+                        // Screen bodies read the digit off the rendered
+                        // "Type something." row (feed-other-answer R3).
+                        other_key: Some("3".into()),
                     }],
                     request: None,
                     source: Some("screen".into()),
@@ -162,6 +195,11 @@ fn start_with(
                 InputAction::Keys(bytes) => {
                     format!("keys:{}", String::from_utf8_lossy(bytes))
                 }
+                InputAction::Other { select, text } => format!(
+                    "other:{}+{}",
+                    String::from_utf8_lossy(select),
+                    String::from_utf8_lossy(text)
+                ),
             };
             log.lock().unwrap().push((leaf_key.to_string(), describe));
             InputOutcome::Delivered
@@ -652,6 +690,7 @@ fn a_transcript_takeover_makes_a_screen_stamped_answer_409() {
                         label: "Alpha".into(),
                         description: String::new(),
                     }],
+                    other_key: None,
                 }],
                 request: None,
                 source,
@@ -966,6 +1005,163 @@ fn the_answered_latch_admits_exactly_one_guarded_delivery() {
         &format!(r#"{{"text":"Alpha please","ifAskedAt":{ASKED_AT}}}"#),
     );
     assert!(head.starts_with("HTTP/1.1 409"), "guarded submit after latch: {head}");
+}
+
+// ---- POST /agents/{key}/input mode:other (feed-other-answer U2/R1/R4/R6) ----
+
+#[test]
+fn other_mode_types_the_free_text_row_with_the_questions_own_digit() {
+    // The happy path: the consumer reads otherKey off /output and posts the
+    // free text; the seam receives the digit + filtered text as ONE action
+    // (fly owns the chunk choreography, not the consumer).
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("leaf-choice", "waiting")]);
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-choice/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(v["question"]["questions"][0]["otherKey"], "2");
+    let (head, resp) = post(
+        server.local_addr(),
+        "/agents/leaf-choice/input",
+        Some(TOKEN),
+        &format!(
+            r#"{{"text":"use the staging bucket\ninstead","mode":"other","ifAskedAt":{ASKED_AT}}}"#
+        ),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    let v: serde_json::Value = serde_json::from_str(&resp).expect("json body");
+    assert_eq!(v["ok"], true);
+    // Digit from the question (never the consumer), newline collapsed to a
+    // space, no paste markers, no inline Enter.
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[(
+            "leaf-choice".to_string(),
+            "other:2+use the staging bucket instead".to_string()
+        )]
+    );
+}
+
+#[test]
+fn other_mode_requires_the_guard_and_a_sane_body() {
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("leaf-choice", "waiting")]);
+    let over_cap = "a".repeat(513);
+    for bad in [
+        // ifAskedAt is mandatory (R1) — an unguarded Other could type into
+        // whatever dialog happens to be up.
+        r#"{"text":"free text","mode":"other"}"#.to_string(),
+        // Over the sentence cap → rejected outright, never truncated (R6).
+        format!(r#"{{"text":"{over_cap}","mode":"other","ifAskedAt":{ASKED_AT}}}"#),
+        // Nothing printable survives the filter → nothing to type.
+        format!(r#"{{"text":"\r\n","mode":"other","ifAskedAt":{ASKED_AT}}}"#),
+    ] {
+        let (head, _) = post(server.local_addr(), "/agents/leaf-choice/input", Some(TOKEN), &bad);
+        assert!(head.starts_with("HTTP/1.1 400"), "body {bad:?} → head: {head}");
+    }
+    // A stale stamp 409s like any guarded answer.
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-choice/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"free text","mode":"other","ifAskedAt":{}}}"#, ASKED_AT - 5_000),
+    );
+    assert!(head.starts_with("HTTP/1.1 409"), "head was: {head}");
+    assert!(delivered.lock().unwrap().is_empty());
+}
+
+#[test]
+fn other_mode_without_a_known_digit_409s() {
+    // R4: an answerable choice whose otherKey is absent (older render, >9
+    // options) — typing would end with Enter selecting the highlighted
+    // default, so the route refuses instead. Keys answers stay available.
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("leaf-choice-no-other", "waiting")]);
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-choice-no-other/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"free text","mode":"other","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 409"), "head was: {head}");
+    assert!(delivered.lock().unwrap().is_empty());
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-choice-no-other/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"1","mode":"keys","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "keys still works: {head}");
+}
+
+#[test]
+fn other_mode_never_answers_a_permission_dialog() {
+    // A permission dialog has no free-text row. Opt-in off → the pinned
+    // precedence surfaces the 403 first; opt-in ON → still 409 (no otherKey,
+    // kind != choice) — the mode is structurally impossible against it.
+    let (state, server, delivered) = start();
+    state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
+    let body = format!(r#"{{"text":"free text","mode":"other","ifAskedAt":{ASKED_AT}}}"#);
+    let (head, _) = post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 403"), "head was: {head}");
+    let (state, server, delivered2) = start_with(true);
+    state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
+    let (head, _) = post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 409"), "head was: {head}");
+    assert!(delivered.lock().unwrap().is_empty());
+    assert!(delivered2.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_screen_choice_other_answer_follows_the_keys_gating() {
+    // Under a question reason a screen body Other-answers un-gated; under a
+    // permission reason the KTD6 widened opt-in applies exactly as for keys.
+    let (state, server, delivered) = start(); // opt-in OFF
+    state.publish(vec![agent_with_reason("leaf-screen-choice", "waiting", "question")]);
+    let body = format!(r#"{{"text":"neither, make it green","mode":"other","ifAskedAt":{ASKED_AT}}}"#);
+    let (head, _) = post(server.local_addr(), "/agents/leaf-screen-choice/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[(
+            "leaf-screen-choice".to_string(),
+            "other:3+neither, make it green".to_string()
+        )]
+    );
+    // Same answer under a live permission reason: opt-in required.
+    let (state, server, delivered) = start(); // opt-in OFF
+    state.publish(vec![agent_with_reason("leaf-screen-choice", "waiting", "permission")]);
+    let (head, resp) = post(server.local_addr(), "/agents/leaf-screen-choice/input", Some(TOKEN), &body);
+    assert!(head.starts_with("HTTP/1.1 403"), "head was: {head}");
+    assert!(resp.contains("permissionAnswersDisabled"), "body was: {resp}");
+    assert!(delivered.lock().unwrap().is_empty());
+}
+
+#[test]
+fn the_answered_latch_spans_keys_and_other() {
+    // One question, one answer — whichever mode lands first wins; the other
+    // 409s against the same askedAt (R11 is mode-agnostic).
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("leaf-choice", "waiting")]);
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-choice/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"1","mode":"keys","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-choice/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"free text","mode":"other","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 409"), "other after keys: {head}");
+    assert_eq!(delivered.lock().unwrap().len(), 1, "exactly one delivery");
 }
 
 #[test]

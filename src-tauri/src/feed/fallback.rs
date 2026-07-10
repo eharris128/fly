@@ -140,6 +140,12 @@ impl FallbackResolver {
     }
 }
 
+/// The exact label the picker renders on its appended free-text row (2.1.206,
+/// pinned by the real `tests/fixtures/screen/ask-80.raw` render). A renamed
+/// row in a future version makes `otherKey` silently absent — degrading to
+/// "not Other-answerable", never to a wrong digit.
+const OTHER_ROW_LABEL: &str = "Type something.";
+
 /// Shape a parsed screen interaction into the wire `QuestionBody`, running
 /// every string through the R8/KTD7 [`io::clean`] pipeline (sanitize → scrub →
 /// truncate) and the pinned count ceilings (R6 of this plan).
@@ -169,18 +175,37 @@ fn screen_question_body(p: &ScreenInteraction, asked_at: u64) -> Option<Question
         return None;
     }
     let question = io::clean(&p.question, io::QUESTION_CAP)?;
+    let answerable = !dropped;
+    // The free-text row's digit (feed-other-answer R3): unlike a transcript
+    // body, the rendered options already CONTAIN the picker's appended
+    // "Type something." row, so its digit is read straight off the screen —
+    // no appended-row arithmetic, no version assumption. Exactly-one match,
+    // single keystroke, answerable parse only; anything else abstains (the
+    // module's whole posture).
+    let other_key = (p.kind == ScreenKind::Choice && answerable)
+        .then(|| {
+            let mut hits = options
+                .iter()
+                .filter(|o| o.label == OTHER_ROW_LABEL && o.key.len() == 1);
+            match (hits.next(), hits.next()) {
+                (Some(row), None) => Some(row.key.clone()),
+                _ => None,
+            }
+        })
+        .flatten();
     let spec = QuestionSpec {
         question,
         header: io::clean(&p.header, io::HEADER_CAP).unwrap_or_default(),
         multi_select: false,
         options,
+        other_key,
     };
     match p.kind {
         ScreenKind::Choice => Some(QuestionBody {
             asked_at,
             kind: "choice".into(),
             tool: "AskUserQuestion".into(),
-            answerable: !dropped,
+            answerable,
             context: None,
             questions: vec![spec],
             request: None,
@@ -242,6 +267,31 @@ mod tests {
             "\u{276f} 1. Red",
             "     Warm and bold",
             "  2. Blue",
+            "",
+            "Enter to select \u{b7} Esc to cancel",
+        ] {
+            out.extend_from_slice(l.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+
+    /// A rendered picker including the extras the real 2.1.206 render appends
+    /// (mirrors `tests/fixtures/screen/ask-80.raw`): the authored options,
+    /// then "Type something." and — past a rule — "Chat about this".
+    fn picker_bytes_with_extras() -> Vec<u8> {
+        let mut out: Vec<u8> = b"\x1b[H\x1b[2J".to_vec();
+        for l in [
+            " \u{2610} Color preference",
+            "",
+            "Which color do you prefer?",
+            "",
+            "\u{276f} 1. Red",
+            "     Warm and bold",
+            "  2. Blue",
+            "  3. Type something.",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "  4. Chat about this",
             "",
             "Enter to select \u{b7} Esc to cancel",
         ] {
@@ -342,6 +392,26 @@ mod tests {
         assert_eq!(q.questions[0].options[0].label, "Red");
         assert_eq!(q.questions[0].options[0].description, "Warm and bold");
         assert_eq!(q.questions[0].options[1].key, "2");
+    }
+
+    #[test]
+    fn a_screen_body_reads_other_key_off_the_rendered_row() {
+        // feed-other-answer R3: the rendered "Type something." row's own digit
+        // becomes otherKey — no count arithmetic, no version assumption.
+        let f = Fixture::new();
+        f.signals.stamp("leaf-1", 7_777);
+        let r = f.resolver(REPLY_ONLY, "waiting", Some(picker_bytes_with_extras()));
+        let q = r.resolve_io("leaf-1", Some("question")).question.expect("question");
+        assert!(q.answerable);
+        assert_eq!(q.questions[0].other_key.as_deref(), Some("3"));
+        // The row itself still rides `options` as rendered (digit fidelity).
+        assert_eq!(q.questions[0].options[2].label, "Type something.");
+
+        // A render without the row (older picker, or any other dialog) simply
+        // has no otherKey — absent, never a guessed digit.
+        let r = f.resolver(REPLY_ONLY, "waiting", Some(picker_bytes()));
+        let q = r.resolve_io("leaf-1", Some("question")).question.expect("question");
+        assert_eq!(q.questions[0].other_key, None);
     }
 
     #[test]

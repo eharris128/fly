@@ -64,6 +64,15 @@ export interface QuestionSpec {
   header: string;
   multiSelect: boolean;
   options: QuestionOption[];
+  /**
+   * The free-text answer primitive (feed-other-answer R2): the digit that
+   * focuses the picker's own "Type something." row. Present only when a
+   * `mode:"other"` answer — `POST {text, mode:"other", ifAskedAt}` — can be
+   * delivered against this question; fly owns the digit → text → Enter
+   * keystroke choreography. Absent when unavailable (unanswerable shape,
+   * digit unknown) — consumers must not offer free-text answer UX then.
+   */
+  otherKey?: string;
 }
 
 /**
