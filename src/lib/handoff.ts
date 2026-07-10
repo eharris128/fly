@@ -31,8 +31,10 @@ export type GuidedHandoffByLeaf = Record<string, HandoffTarget>;
  * character means corruption or forgery — same write-time-sanitization posture
  * as the alerts log (automations R16). Stripping (not rejecting) keeps the
  * chord total: a mangled path at worst fails the agent's read, visibly.
+ * Exported for monitor pickup (monitor-handoff U7), which embeds the same
+ * kind of untrusted stored paths in its prompt and its fallback display.
  */
-function sanitizeTranscriptPath(path: string): string {
+export function sanitizeTranscriptPath(path: string): string {
   return path.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
 }
 
@@ -82,6 +84,71 @@ export function buildHandoffCommand(
   if (mode === "quick") argv.push("--dangerously-skip-permissions", handoffPrompt(path));
   argv.push("--add-dir", projectDir);
   return argv;
+}
+
+// ---- monitor pickup (monitor-handoff U7, R16) -------------------------------
+// A failed monitor's one-action pickup mirrors the handoff prompt/argv shape:
+// same sanitization, same "prompt positional BEFORE the variadic --add-dir"
+// ordering lesson, same tail-not-whole-file transcript guidance. Unlike quick
+// handoff it stays in the user's DEFAULT permission mode — the user is present
+// at pickup (they clicked the button), so no --dangerously-skip-permissions.
+
+/**
+ * The stock pickup prompt for a failed monitor's recovery session (R16):
+ * points the fresh agent at the failure bundle (verdict + evidence + pointers)
+ * and the parent transcript's RECENT portion — the tail, never the whole
+ * file — then directs diagnosing and continuing. Both paths are stored
+ * strings, control-char-sanitized before embedding. `bundlePath` may be null
+ * (a failed bundle write, U3's fail-tolerance): the prompt then leans on the
+ * transcript alone.
+ */
+export function monitorPickupPrompt(
+  bundlePath: string | null,
+  transcriptPath: string,
+): string {
+  const transcript = sanitizeTranscriptPath(transcriptPath);
+  const bundle =
+    bundlePath != null ? sanitizeTranscriptPath(bundlePath) : null;
+  const bundleLead = bundle
+    ? `Its failure bundle is at ${bundle} — read that file first: it carries the ` +
+      `verdict, the failure evidence, and pointers to the original session. `
+    : `Its failure bundle could not be written, so start from the transcript. `;
+  return (
+    `You are picking up a failed experiment that a monitor automation was ` +
+    `watching. ${bundleLead}` +
+    `The original session's transcript is at ${transcript}. Read the RECENT ` +
+    `portion of that file (tail it — do not read the whole file) to see what ` +
+    `the experiment was doing, then diagnose the failure and continue the work.`
+  );
+}
+
+/**
+ * Build the pickup pane's argv (monitor-handoff U7, R16). The prompt is the
+ * positional and MUST precede `--add-dir` (the flag is variadic — a trailing
+ * positional would be swallowed as another directory, the buildHandoffCommand
+ * lesson). `--add-dir` grants the transcript's project dir and — when a
+ * bundle exists outside it — the bundle's dir, so the first reads need no
+ * approval. Default permission mode: the user is present at pickup, so no
+ * bypass flag, ever.
+ */
+export function buildMonitorPickupCommand(
+  transcriptPath: string,
+  bundlePath: string | null,
+): string[] {
+  const transcript = sanitizeTranscriptPath(transcriptPath);
+  const transcriptDir = transcript.replace(/\/[^/]*$/, "") || "/";
+  const dirs = [transcriptDir];
+  if (bundlePath != null) {
+    const bundleDir =
+      sanitizeTranscriptPath(bundlePath).replace(/\/[^/]*$/, "") || "/";
+    if (bundleDir !== transcriptDir) dirs.push(bundleDir);
+  }
+  return [
+    "claude",
+    monitorPickupPrompt(bundlePath, transcript),
+    "--add-dir",
+    ...dirs,
+  ];
 }
 
 // ---- U3: guided injection controller ----------------------------------------

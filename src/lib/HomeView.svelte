@@ -24,6 +24,10 @@
     automations,
     automationsDegraded,
     automationsCorruptBak,
+    pickupFallback,
+    pickupBusy,
+    onPickup,
+    onDismissPickupFallback,
     onRefresh,
     onJump,
     onClose,
@@ -47,6 +51,22 @@
     /** Where corrupt store bytes were preserved, for the R6 warning hint; null
      *  when degraded only by a failing flush. */
     automationsCorruptBak: string | null;
+    /** The R17 fallback surface (monitor-handoff U7): when a pickup couldn't
+     *  spawn, App resolves the explanation + (best-effort) bundle text and the
+     *  matching row renders them inline. Null when no fallback is showing. */
+    pickupFallback: {
+      automationId: string;
+      explanation: string;
+      bundleText: string | null;
+    } | null;
+    /** True while a pickup is resolving/spawning — disables every pickup
+     *  button so the one-action guarantee (AE4) holds against double-clicks. */
+    pickupBusy: boolean;
+    /** Spawn a failed monitor's recovery session (monitor-handoff R16) — the
+     *  automations panel's first interactive control. */
+    onPickup: (row: AutomationRow) => void;
+    /** Dismiss the R17 fallback block. */
+    onDismissPickupFallback: () => void;
     /** Re-fetch the usage gauges on demand (the panel's refresh button). */
     onRefresh: () => void;
     onJump: (wsId: string, tabId: string, leafKey: string) => void;
@@ -66,6 +86,21 @@
     if (a.mode !== "agent") return "—";
     const model = a.model ?? "Claude default";
     return a.effort ? `${model} · ${a.effort}` : model;
+  }
+
+  // Monitor state → its badge CSS class (monitor-handoff U7, R18): the state
+  // words are the CLI's spellings ("retired fail"), the class is the same word
+  // kebab-cased so styles key on it ("m-retired-fail").
+  function monitorClass(state: string): string {
+    return `m-${state.replace(/\s+/g, "-")}`;
+  }
+
+  // The next-run column (monitor-handoff R3, mirroring the CLI's next_label):
+  // a retired monitor never runs again — "—", not "paused"; everything else
+  // keeps the existing paused/relative labels.
+  function nextLabel(a: AutomationRow): string {
+    if (a.monitorState?.startsWith("retired")) return "—";
+    return a.paused ? "paused" : `next ${a.nextRun}`;
   }
 
   // Selection is tracked by leaf key (stable across live updates), never index.
@@ -214,12 +249,14 @@
     </div>
   {/if}
 
-  <!-- Automations panel (U10, R25): read-only, stacked below the agent list in
-       the same left column. Static rows — no keyboard selection or jump. -->
+  <!-- Automations panel (U10, R25; monitor-handoff U7): stacked below the
+       agent list in the same left column. Rows are static — no keyboard
+       selection or jump — with one exception: a retired-fail monitor row
+       carries the R16 pickup button (the panel's first interactive control). -->
   <section class="automations" aria-label="Automations">
     <header class="auto-head">
       <h2>Automations</h2>
-      <span class="hint">read-only · manage with <code>fly automation</code></span>
+      <span class="hint">manage with <code>fly automation</code></span>
     </header>
 
     {#if automationsDegraded}
@@ -238,14 +275,43 @@
         {#each automations as a (a.id)}
           <li class="auto-row" class:paused={a.paused} title={a.lastError ?? ""}>
             <span class="a-status s-{statusWord(a.lastStatus)}">{statusWord(a.lastStatus)}</span>
-            <span class="a-name">{a.name}<span class="a-mode">{a.mode}</span>{#if a.retryOnInterrupt}<span class="a-retry" title="re-runs once if an app crash/restart interrupts it">retry</span>{/if}</span>
+            <span class="a-name">{a.name}{#if a.monitorState}<span class="a-mode a-monitor {monitorClass(a.monitorState)}" title={a.verdictNote ?? ""}>monitor · {a.monitorState}</span>{:else}<span class="a-mode">{a.mode}</span>{/if}{#if a.retryOnInterrupt}<span class="a-retry" title="re-runs once if an app crash/restart interrupts it">retry</span>{/if}</span>
             <span class="a-meta">
               <span class="a-sched">{a.schedule}</span>
               <span class="a-model" title="launch model · effort">{modelLabel(a)}</span>
-              <span class="a-next">{a.paused ? "paused" : `next ${a.nextRun}`}</span>
+              <span class="a-next">{nextLabel(a)}</span>
               {#if a.lastRun}<span class="a-last">· last {a.lastRun}</span>{/if}
+              {#if a.monitorState === "retired fail"}
+                <!-- The one-action pickup (monitor-handoff U7, R16): spawns a
+                     recovery session against the stored pointers — the panel's
+                     first interactive control. Disabled while one resolves so
+                     exactly one session spawns per click (AE4). -->
+                <button
+                  type="button"
+                  class="a-pickup"
+                  disabled={pickupBusy}
+                  onclick={() => onPickup(a)}
+                  title="Spawn a recovery session pointed at the failure bundle and the parent transcript"
+                >pick up</button>
+              {/if}
             </span>
           </li>
+          {#if pickupFallback?.automationId === a.id}
+            <!-- R17 fallback: the transcript/cwd no longer exist (or couldn't
+                 be verified), so instead of a broken spawn the row expands with
+                 the explanation and the raw bundle text (sanitized by App). -->
+            <li class="pickup-fallback">
+              <div class="pf-head">
+                <span class="pf-explain">{pickupFallback.explanation}</span>
+                <button type="button" class="pf-dismiss" onclick={onDismissPickupFallback}>dismiss</button>
+              </div>
+              {#if pickupFallback.bundleText != null}
+                <pre class="pf-bundle">{pickupFallback.bundleText}</pre>
+              {:else}
+                <p class="pf-none">The bundle file could not be read either.</p>
+              {/if}
+            </li>
+          {/if}
         {/each}
       </ul>
     {/if}
@@ -736,6 +802,105 @@
     background: #1f3350;
     border-radius: 4px;
     padding: 1px 5px;
+  }
+  /* Monitor state badges (monitor-handoff U7, R18): same chip shape as the
+     mode tag, tinted per state so parked / paused / broken / retired-pass /
+     retired-fail read apart at a glance — the label word still carries the
+     meaning (never color-only). */
+  .a-monitor.m-parked {
+    color: #7dd3fc;
+    background: #16324a;
+  }
+  .a-monitor.m-paused {
+    color: #aeb6d4;
+    background: #2a3350;
+  }
+  .a-monitor.m-broken {
+    color: #fca5a5;
+    background: #4a1d24;
+  }
+  .a-monitor.m-retired-pass {
+    color: #86efac;
+    background: #163a28;
+  }
+  .a-monitor.m-retired-fail {
+    color: #fda4af;
+    background: #45182b;
+  }
+  .a-monitor.m-retired {
+    color: #8b93b2;
+    background: #262d44;
+  }
+  /* The R16 pickup action — the panel's one interactive control. */
+  .a-pickup {
+    font: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    color: #fda4af;
+    background: #45182b;
+    border: 1px solid #6b2440;
+    border-radius: 4px;
+    padding: 1px 8px;
+    cursor: pointer;
+  }
+  .a-pickup:hover:not(:disabled) {
+    background: #58203a;
+    color: #ffd3da;
+  }
+  .a-pickup:disabled {
+    cursor: default;
+    opacity: 0.6;
+  }
+  /* R17 fallback block: the explanation + raw bundle text shown under the
+     retired-fail row when a recovery spawn would break. Modest — an inline
+     list item, not a new overlay archetype. */
+  .pickup-fallback {
+    background: #171c2d;
+    border: 1px solid #45182b;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 12px;
+    color: #cdd3ea;
+  }
+  .pf-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .pf-explain {
+    color: #f0a8a8;
+  }
+  .pf-dismiss {
+    flex: none;
+    font: inherit;
+    font-size: 11px;
+    color: #aeb6d4;
+    background: #1d2336;
+    border: 1px solid #2a3350;
+    border-radius: 4px;
+    padding: 1px 8px;
+    cursor: pointer;
+  }
+  .pf-dismiss:hover {
+    background: #232a40;
+    color: #e6e9f2;
+  }
+  .pf-bundle {
+    margin: 8px 0 0;
+    max-height: 240px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 11px;
+    color: #aeb6d4;
+    background: #12172480;
+    border-radius: 4px;
+    padding: 8px 10px;
+  }
+  .pf-none {
+    margin: 8px 0 0;
+    color: #7b84a3;
   }
   .a-meta {
     display: flex;

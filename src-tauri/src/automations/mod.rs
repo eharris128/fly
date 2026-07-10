@@ -2047,13 +2047,40 @@ pub fn automations_frontend_ready(manager: tauri::State<'_, Arc<AutomationManage
 /// can point the user at them), and `flush_error` carries a failing-flush
 /// detail. Sticky across successful flushes for the app session (see
 /// [`store::StoreHealth`]).
+///
+/// The two monitor fields (monitor-handoff U7, R18) carry the *derived*
+/// broken-monitor inputs the raw list can't: `infra_failures` is the
+/// per-monitor consecutive-infra-failure count
+/// ([`Automation::consecutive_infra_failures`] — a method, so it never rides
+/// the model's serialization) precomputed backend-side so the frontend
+/// needn't re-derive the walk from run history, and
+/// `monitor_broken_threshold` is [`verdict::MONITOR_BROKEN_THRESHOLD`]
+/// carried on the wire so the frontend comparison can't drift from the one
+/// Rust constant. Still a read-only projection.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutomationsDashboard {
     pub automations: Vec<Automation>,
+    /// Monitor id → derived consecutive-infra-failure count (monitors only).
+    pub infra_failures: std::collections::HashMap<String, usize>,
+    /// The R7 broken threshold, mirrored from [`verdict::MONITOR_BROKEN_THRESHOLD`].
+    pub monitor_broken_threshold: usize,
     pub degraded: bool,
     pub corrupt_bak: Option<String>,
     pub flush_error: Option<String>,
+}
+
+/// Precompute each monitor's derived consecutive-infra-failure count
+/// (monitor-handoff U7): the frontend gets the number, not the walk. Only
+/// monitors appear — an ordinary automation has no broken state to derive.
+fn monitor_infra_failures(
+    automations: &[Automation],
+) -> std::collections::HashMap<String, usize> {
+    automations
+        .iter()
+        .filter(|a| a.monitor)
+        .map(|a| (a.id.clone(), a.consecutive_infra_failures()))
+        .collect()
 }
 
 /// List every automation plus store health for the dashboard panel (U10). A
@@ -2065,12 +2092,89 @@ pub fn list_automations(
     manager: tauri::State<'_, Arc<AutomationManager>>,
 ) -> AutomationsDashboard {
     let health = manager.store_health();
+    let automations = manager.list();
+    let infra_failures = monitor_infra_failures(&automations);
     AutomationsDashboard {
-        automations: manager.list(),
+        automations,
+        infra_failures,
+        monitor_broken_threshold: verdict::MONITOR_BROKEN_THRESHOLD,
         degraded: !health.is_ok(),
         corrupt_bak: health.corrupt_bak.map(|p| p.display().to_string()),
         flush_error: health.flush_error,
     }
+}
+
+/// R17 pickup validation (monitor-handoff U7): whether a failed monitor's
+/// stored pickup pointers still resolve on disk — the transcript file and
+/// the session cwd. A pure, read-only metadata check (two `stat`s, no file
+/// contents), so the pickup button can decide spawn-vs-fallback without a
+/// broken `claude` launch. Serde camelCase like every dashboard shape.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickupCheck {
+    pub transcript_exists: bool,
+    pub cwd_exists: bool,
+}
+
+/// Check a pickup target's transcript + cwd existence (monitor-handoff U7,
+/// R17). Read-only by construction: `Path::is_file` / `Path::is_dir` only.
+#[tauri::command]
+pub fn monitor_pickup_check(transcript_path: String, cwd: String) -> PickupCheck {
+    PickupCheck {
+        transcript_exists: std::path::Path::new(&transcript_path).is_file(),
+        cwd_exists: std::path::Path::new(&cwd).is_dir(),
+    }
+}
+
+/// Display cap for the R17 fallback surface: a bundle is the verdict note +
+/// pickup pointers + one full captured turn, so 256 KiB covers any real one;
+/// the head (verdict + pointers) is the useful part, so oversize truncates
+/// the tail.
+const BUNDLE_READ_CAP_BYTES: usize = 256 * 1024;
+
+/// Read a monitor failure bundle's text for the dashboard's R17 fallback
+/// (monitor-handoff U7): when pickup can't spawn (transcript/cwd gone), the
+/// panel shows the raw bundle instead. Read-only, and **scoped**: the path
+/// must canonicalize to a file inside the app's monitor-bundles dir — the
+/// webview only ever echoes back a `bundlePath` the backend stamped on a run
+/// row, so anything outside the bundle dir is a forged or corrupted path and
+/// is refused, never read. Errors are one-line strings for the panel.
+#[tauri::command]
+pub fn read_monitor_bundle(
+    manager: tauri::State<'_, Arc<AutomationManager>>,
+    path: String,
+) -> Result<String, String> {
+    let dir = manager.bundle_dir.lock().unwrap().clone();
+    read_bundle_scoped(dir.as_deref(), &path)
+}
+
+/// The scoped bundle read behind [`read_monitor_bundle`], split out so the
+/// scope check is testable without Tauri state. Canonicalizes both sides so
+/// `..` traversal and symlinks out of the bundle dir are refused.
+fn read_bundle_scoped(
+    bundle_dir: Option<&std::path::Path>,
+    path: &str,
+) -> Result<String, String> {
+    let Some(dir) = bundle_dir else {
+        return Err("no bundle directory is configured".to_string());
+    };
+    let dir = std::fs::canonicalize(dir).map_err(|e| format!("bundle dir unavailable: {e}"))?;
+    let file = std::fs::canonicalize(path).map_err(|e| format!("bundle unreadable: {e}"))?;
+    if !file.starts_with(&dir) {
+        return Err("not a monitor bundle path".to_string());
+    }
+    let text =
+        std::fs::read_to_string(&file).map_err(|e| format!("bundle unreadable: {e}"))?;
+    if text.len() <= BUNDLE_READ_CAP_BYTES {
+        return Ok(text);
+    }
+    // Truncate on a char boundary (the repo's release-overflow posture: all
+    // arithmetic here is on in-range usizes).
+    let mut end = BUNDLE_READ_CAP_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(format!("{}\n… (truncated)", &text[..end]))
 }
 
 #[cfg(test)]
@@ -3835,5 +3939,107 @@ mod tests {
             1,
             "the interrupted third check rings broken post-restart: {alerts:?}"
         );
+    }
+
+    // Monitor-handoff U7 (R18): the dashboard DTO's precomputed infra-failure
+    // map covers monitors only and mirrors the model's derived walk, so the
+    // frontend never re-derives it from run history.
+    #[test]
+    fn monitor_infra_failures_maps_monitors_only_u7() {
+        fn bare(id: &str, monitor: bool) -> Automation {
+            Automation {
+                id: id.into(),
+                name: id.into(),
+                cron: "*/5 * * * *".into(),
+                timezone: "UTC".into(),
+                enabled: true,
+                retry_on_interrupt: false,
+                monitor,
+                not_before_ms: None,
+                retired_at: None,
+                pickup_pointers: None,
+                cwd: "/tmp".into(),
+                mode: Mode::Agent { prompt: "p".into(), model: None, effort: None },
+                origin: Origin {
+                    pane_id: 1,
+                    workspace_id: "ws-1".into(),
+                    label: "cli".into(),
+                },
+                created_at: T0,
+                updated_at: T0,
+                next_run_at: Some(T0),
+                runs: Vec::new(),
+            }
+        }
+        // Both carry one verdict-less Failed row — an infra failure for the
+        // monitor's derived walk, meaningless for the plain automation.
+        let fail = || RunOutcome::Failed {
+            error: "x".into(),
+            exit_code: None,
+            output: None,
+        };
+        let mut plain = bare("a1", false);
+        plain.claim(Some(T0), T0, Trigger::Schedule, "r1").unwrap();
+        plain.close("r1", fail(), T0);
+        let mut mon = bare("a2", true);
+        mon.claim(Some(T0), T0, Trigger::Schedule, "r1").unwrap();
+        mon.close("r1", fail(), T0);
+
+        let map = monitor_infra_failures(&[plain, mon.clone()]);
+        assert_eq!(map.len(), 1, "non-monitors never appear");
+        assert_eq!(map.get("a2"), Some(&mon.consecutive_infra_failures()));
+        assert_eq!(map.get("a2"), Some(&1));
+    }
+
+    // Monitor-handoff U7 (R17): the fallback bundle read is scoped to the
+    // bundle dir — inside reads, everything else (outside paths, `..`
+    // traversal, missing files, unwired dir) refuses without touching disk
+    // contents.
+    #[test]
+    fn read_bundle_scoped_reads_inside_and_refuses_outside_u7() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = dir.path().join("monitor-bundles");
+        std::fs::create_dir_all(&bundles).unwrap();
+        let inside = bundles.join("a1-r1.md");
+        std::fs::write(&inside, "verdict: FAIL\nevidence").unwrap();
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, "nope").unwrap();
+
+        // Inside the dir: reads.
+        assert_eq!(
+            read_bundle_scoped(Some(&bundles), inside.to_str().unwrap()).unwrap(),
+            "verdict: FAIL\nevidence"
+        );
+        // Outside the dir: refused.
+        assert!(read_bundle_scoped(Some(&bundles), outside.to_str().unwrap())
+            .unwrap_err()
+            .contains("not a monitor bundle path"));
+        // `..` traversal out of the dir: canonicalization catches it.
+        let sneaky = bundles.join("../secret.txt");
+        assert!(read_bundle_scoped(Some(&bundles), sneaky.to_str().unwrap())
+            .unwrap_err()
+            .contains("not a monitor bundle path"));
+        // Missing file / unwired dir: one-line errors, never a panic.
+        let gone = bundles.join("missing.md");
+        assert!(read_bundle_scoped(Some(&bundles), gone.to_str().unwrap()).is_err());
+        assert!(read_bundle_scoped(None, inside.to_str().unwrap()).is_err());
+    }
+
+    // Oversize bundles truncate at the display cap on a char boundary, keeping
+    // the head (verdict + pointers — the useful part).
+    #[test]
+    fn read_bundle_scoped_truncates_oversize_at_cap_u7() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundles = dir.path().join("monitor-bundles");
+        std::fs::create_dir_all(&bundles).unwrap();
+        let big = bundles.join("big.md");
+        // Multibyte content so the char-boundary walk is exercised.
+        let content = "é".repeat(BUNDLE_READ_CAP_BYTES); // 2 bytes each → 2× the cap
+        std::fs::write(&big, &content).unwrap();
+
+        let text = read_bundle_scoped(Some(&bundles), big.to_str().unwrap()).unwrap();
+        assert!(text.ends_with("… (truncated)"));
+        assert!(text.len() <= BUNDLE_READ_CAP_BYTES + 32);
+        assert!(text.starts_with('é'), "head kept");
     }
 }

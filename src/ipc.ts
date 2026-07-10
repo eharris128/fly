@@ -224,6 +224,29 @@ export type RunStatus = "running" | "succeeded" | "failed" | "skipped";
  * run an app crash/restart interrupted (interrupt-resilience U1). */
 export type RunTrigger = "schedule" | "manual" | "retry";
 
+/**
+ * The machine-readable monitor verdict (mirrors Rust `Verdict`,
+ * monitor-handoff U1/R2): the pass/fail outcome plus the free-text note the
+ * backend parsed from the check's final assistant turn. The note is captured
+ * agent output — untrusted for display (sanitize before rendering).
+ */
+export interface Verdict {
+  outcome: "pass" | "fail";
+  note: string;
+}
+
+/**
+ * Pickup pointers captured at monitor registration (mirrors Rust
+ * `MonitorPointers`, monitor-handoff U1/R11): the parent session's id,
+ * transcript path, and cwd — what the U7 pickup action spawns against (R16),
+ * after validating the transcript/cwd still exist (R17).
+ */
+export interface MonitorPointers {
+  sessionId: string;
+  transcriptPath: string;
+  sessionCwd: string;
+}
+
 /** One bounded run-history row (mirrors Rust `RunRow`, R8). */
 export interface RunRow {
   id: string;
@@ -237,6 +260,12 @@ export interface RunRow {
    * Claude's own default. */
   model: string | null;
   effort: string | null;
+  /** Parsed monitor verdict (monitor-handoff U1/R2); null for every
+   * non-monitor run and for checks that parsed no verdict (R5). */
+  verdict: Verdict | null;
+  /** Durable failure-bundle path for a FAIL verdict (monitor-handoff R15);
+   * null otherwise (including a PASS, or a failed bundle write). */
+  bundlePath: string | null;
   output: string | null;
   exitCode: number | null;
   /** Failure detail for `failed` rows; the skip reason for `skipped` rows. */
@@ -275,6 +304,18 @@ export interface Automation {
   /** Opt-in interrupt resilience (interrupt-resilience U1/R1): re-run once on the
    * next launch if an app crash/restart interrupts a run. Default false. */
   retryOnInterrupt: boolean;
+  /** Monitor flavor (monitor-handoff U1/R1): an agent-mode automation with a
+   * not-before time that delivers one machine-readable verdict and retires. */
+  monitor: boolean;
+  /** Epoch-ms floor below which a monitor never runs (monitor-handoff R1);
+   * null for non-monitors and floor-less monitors. */
+  notBeforeMs: number | null;
+  /** Set (epoch ms) when a parsed verdict retired this monitor (monitor-handoff
+   * R3/R4): scheduling stopped permanently, record and history kept. */
+  retiredAt: number | null;
+  /** Pickup pointers captured at registration (monitor-handoff R11); null for
+   * every non-monitor automation. */
+  pickupPointers: MonitorPointers | null;
   cwd: string;
   mode: AutomationSpec;
   origin: AutomationOrigin;
@@ -290,9 +331,17 @@ export interface Automation {
  * plus flattened store health for the R6 warning row. `degraded` is the
  * at-a-glance bit; `corruptBak` names where corrupt store bytes were preserved;
  * `flushError` carries a failing-flush detail. Both null when healthy.
+ * `infraFailures` / `monitorBrokenThreshold` (monitor-handoff U7, R18) are the
+ * backend-derived broken-monitor inputs: the per-monitor consecutive
+ * infra-failure count and the one Rust threshold constant, so the frontend
+ * never re-derives the walk or hardcodes the number.
  */
 export interface AutomationsDashboard {
   automations: Automation[];
+  /** Monitor id → derived consecutive-infra-failure count (monitors only). */
+  infraFailures: Record<string, number>;
+  /** Mirrors Rust `verdict::MONITOR_BROKEN_THRESHOLD`. */
+  monitorBrokenThreshold: number;
   degraded: boolean;
   corruptBak: string | null;
   flushError: string | null;
@@ -301,6 +350,35 @@ export interface AutomationsDashboard {
 /** Fetch the automations + store health for the dashboard panel (U10). */
 export function listAutomations(): Promise<AutomationsDashboard> {
   return invoke<AutomationsDashboard>("list_automations");
+}
+
+/**
+ * R17 pickup validation (monitor-handoff U7, mirrors Rust `PickupCheck`):
+ * whether a failed monitor's stored transcript path and session cwd still
+ * exist on disk. Read-only metadata check — the pickup button decides
+ * spawn-vs-fallback on this, never on a broken `claude` launch.
+ */
+export interface PickupCheck {
+  transcriptExists: boolean;
+  cwdExists: boolean;
+}
+
+/** Check a pickup target's transcript + cwd existence (monitor-handoff R17). */
+export function monitorPickupCheck(
+  transcriptPath: string,
+  cwd: string,
+): Promise<PickupCheck> {
+  return invoke<PickupCheck>("monitor_pickup_check", { transcriptPath, cwd });
+}
+
+/**
+ * Read a monitor failure bundle's text for the R17 fallback surface
+ * (monitor-handoff U7). Backend-scoped to the monitor-bundles dir (anything
+ * else rejects) and display-capped; rejects with a one-line reason. The text
+ * is captured agent output — sanitize before rendering.
+ */
+export function readMonitorBundle(path: string): Promise<string> {
+  return invoke<string>("read_monitor_bundle", { path });
 }
 
 /**
