@@ -913,6 +913,9 @@ pub fn dispatch_automation_op(
                 cwd,
                 mode,
                 retry_on_interrupt: req.retry_on_interrupt,
+                // monitor-handoff U2: U5 threads `--not-before` through the
+                // socket request; until then plain creates carry no floor.
+                not_before_ms: None,
                 origin,
             }) {
                 Ok(created) => AutomationResponse::ok(Some(created.automation.id), created.warning),

@@ -353,6 +353,12 @@ pub struct CreateSpec {
     /// Opt-in interrupt resilience (interrupt-resilience U1/R1). Default `false`
     /// at the CLI/socket boundary; stamped onto the [`Automation`] as-is.
     pub retry_on_interrupt: bool,
+    /// Monitor not-before floor, epoch ms (monitor-handoff U2, R1): clamps
+    /// the initial `next_run_at` via [`schedule::advance_from`] and is
+    /// stamped onto the record so every later recompute keeps clamping.
+    /// `None` for plain recurring automations; U4/U5 thread the real value
+    /// through from `create --monitor --not-before`.
+    pub not_before_ms: Option<u64>,
     /// Resolved by the caller at create time (R22/R9: pane id + workspace
     /// identity + label); the manager only stamps it.
     pub origin: Origin,
@@ -649,12 +655,14 @@ impl AutomationManager {
     /// script content to the store's script dir first (a crash between the
     /// two steps leaves at worst an orphan script dir, never an entry
     /// pointing at a missing script), stamp origin + timestamps, compute the
-    /// initial `next_run_at` via [`schedule::advance`], persist, and emit
+    /// initial `next_run_at` via [`schedule::advance_from`] (the not-before
+    /// floor clamps it, monitor-handoff U2/R1), persist, and emit
     /// `automation://changed`.
     pub fn create(&self, spec: CreateSpec) -> Result<Created, String> {
         let validation = schedule::validate(&spec.cron, &spec.timezone)?;
         let now = (self.clock)();
-        let next_run_at = schedule::advance(&spec.cron, &spec.timezone, now)?;
+        let next_run_at =
+            schedule::advance_from(&spec.cron, &spec.timezone, now, spec.not_before_ms)?;
 
         // Mint a unique id (bounded retry; a collision in a 36^10 space at
         // desktop scale is astronomically unlikely).
@@ -709,10 +717,12 @@ impl AutomationManager {
             timezone: spec.timezone,
             enabled: true,
             retry_on_interrupt: spec.retry_on_interrupt,
-            // Monitor fields (monitor-handoff plan U1): plain creates are
-            // never monitors; U4/U5 thread the real values through the spec.
+            // Monitor fields (monitor-handoff plan U1/U2): the not-before
+            // floor is stamped from the spec — already clamped into
+            // `next_run_at` above (R1) — so every later recompute keeps
+            // clamping; U4/U5 thread `monitor` + pointers through the spec.
             monitor: false,
-            not_before_ms: None,
+            not_before_ms: spec.not_before_ms,
             retired_at: None,
             pickup_pointers: None,
             cwd: spec.cwd,
@@ -765,15 +775,20 @@ impl AutomationManager {
     }
 
     /// R23: resume recomputes `next_run_at` **from now** via
-    /// [`schedule::advance`] — a stale past value must never fire instantly
-    /// (AE7: an automation paused for a week resumes into the future).
+    /// [`schedule::advance_from`] — a stale past value must never fire
+    /// instantly (AE7: an automation paused for a week resumes into the
+    /// future), and the not-before floor rides the same recompute
+    /// (monitor-handoff U2, R1): resuming a parked monitor before its floor
+    /// never schedules early.
     pub fn resume(&self, id: &str) -> Result<Automation, String> {
         let now = (self.clock)();
         let updated = self.with_automation(id, |a| {
             // Pure cron math inside the lock is fine (KTD-B bans dispatch/
             // emit/IO, not computation). Unparseable stored state degrades
             // to paused rather than firing at a bogus instant.
-            a.next_run_at = schedule::advance(&a.cron, &a.timezone, now).ok().flatten();
+            a.next_run_at = schedule::advance_from(&a.cron, &a.timezone, now, a.not_before_ms)
+                .ok()
+                .flatten();
             a.updated_at = now;
         })?;
         (self.emit_changed)(id);
@@ -1297,10 +1312,16 @@ impl AutomationManager {
             if let Err(e) = self.dispatch(&automation, &run_id) {
                 // R3: recompute from now — never restore the pre-claim value
                 // (it could clobber a concurrent edit). Pure math outside the
-                // lock, applied in a second short mutate.
-                let recomputed = schedule::advance(&automation.cron, &automation.timezone, now_ms)
-                    .ok()
-                    .flatten();
+                // lock, applied in a second short mutate. The not-before
+                // floor clamps here too (monitor-handoff U2, R1).
+                let recomputed = schedule::advance_from(
+                    &automation.cron,
+                    &automation.timezone,
+                    now_ms,
+                    automation.not_before_ms,
+                )
+                .ok()
+                .flatten();
                 let _ = self.store.mutate(|map| {
                     if let Some(a) = map.get_mut(&automation.id) {
                         a.close(&run_id, failed(&e), now_ms);
@@ -1509,11 +1530,14 @@ fn in_flight_widened(a: &Automation, alive: &PaneAliveProbe) -> bool {
             .any(|r| r.status == RunStatus::Failed && r.pane_id.is_some() && alive(r))
 }
 
-/// [`schedule::advance`] with degraded fallbacks: an unparseable stored
+/// [`schedule::advance_from`] with degraded fallbacks: an unparseable stored
 /// cron/tz (same-UID file edits) or an exhausted schedule pauses the
-/// automation (`None`) instead of wedging the sweep.
+/// automation (`None`) instead of wedging the sweep. The record's not-before
+/// floor (monitor-handoff U2, R1) clamps every sweep-side recompute — claim,
+/// pre-claim overlap skip, and capacity skip alike — so no path schedules
+/// early.
 fn advance_or_pause(a: &Automation, now_ms: u64) -> Option<u64> {
-    match schedule::advance(&a.cron, &a.timezone, now_ms) {
+    match schedule::advance_from(&a.cron, &a.timezone, now_ms, a.not_before_ms) {
         Ok(next) => next,
         Err(e) => {
             eprintln!(
@@ -1836,6 +1860,7 @@ mod tests {
                 timeout_ms: 120_000,
             },
             retry_on_interrupt: false,
+            not_before_ms: None,
             origin: origin(),
         }
     }
@@ -2026,6 +2051,97 @@ mod tests {
         h.sweep();
         assert_eq!(h.dispatcher.count(), 0, "nothing due right after resume");
         assert!(h.runs(&id).is_empty());
+    }
+
+    // monitor-handoff U2, R1: a create carrying a future not-before floor
+    // never schedules before it — the initial next_run_at is the first cron
+    // occurrence at/after the floor (not the first from now), the floor is
+    // persisted on the record, and the sweep stays quiet until it passes.
+    #[test]
+    fn create_with_future_not_before_clamps_initial_next_run_at_monitor_r1() {
+        let h = harness();
+        let nb = T0 + 3 * 24 * 60 * 60 * 1000; // three days out, boundary-aligned
+        let created = h
+            .mgr
+            .create(CreateSpec {
+                not_before_ms: Some(nb),
+                ..script_spec("parked")
+            })
+            .unwrap();
+
+        assert_eq!(
+            created.automation.next_run_at,
+            Some(nb + FIVE_MIN),
+            "first */5 occurrence strictly after the floor, days past 'now'"
+        );
+        assert_eq!(
+            created.automation.not_before_ms,
+            Some(nb),
+            "floor persisted on the record for every later recompute"
+        );
+
+        h.set_now(T0 + FIVE_MIN); // would be due without the floor
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 0, "parked — nothing fires before the floor");
+        assert!(h.runs(&created.automation.id).is_empty());
+    }
+
+    // monitor-handoff U2, R1 (plan scenario 3): resuming a paused monitor
+    // BEFORE its not-before must not schedule early — the resume recompute
+    // clamps to the floor, not to now.
+    #[test]
+    fn resume_before_not_before_does_not_schedule_early_monitor_r1() {
+        let h = harness();
+        let nb = T0 + 24 * 60 * 60 * 1000; // tomorrow, boundary-aligned
+        let id = h
+            .mgr
+            .create(CreateSpec {
+                not_before_ms: Some(nb),
+                ..script_spec("parked monitor")
+            })
+            .unwrap()
+            .automation
+            .id;
+        h.mgr.pause(&id).unwrap();
+        assert_eq!(h.next_run_at(&id), None, "paused = next_run_at nulled");
+
+        h.set_now(T0 + FIVE_MIN); // still well before the floor
+        let resumed = h.mgr.resume(&id).unwrap();
+        assert_eq!(
+            resumed.next_run_at,
+            Some(nb + FIVE_MIN),
+            "recomputed from the floor, not from now"
+        );
+    }
+
+    // monitor-handoff U2, R1: the sweep-side claim recompute clamps too —
+    // even a next_run_at forced BELOW the floor (degraded same-UID store
+    // edit) re-arms at the first occurrence after the floor once it fires,
+    // so no recompute path schedules early.
+    #[test]
+    fn sweep_claim_recompute_clamps_to_not_before_monitor_r1() {
+        let h = harness();
+        let nb = T0 + 24 * 60 * 60 * 1000;
+        let id = h
+            .mgr
+            .create(CreateSpec {
+                not_before_ms: Some(nb),
+                ..script_spec("edited early")
+            })
+            .unwrap()
+            .automation
+            .id;
+        // Force the degraded shape: due now despite the future floor.
+        let _ = h.mgr.store.mutate(|map| {
+            map.get_mut(&id).map(|a| a.next_run_at = Some(T0));
+        });
+
+        h.sweep(); // due → claim → advance_from clamps the re-arm
+        assert_eq!(
+            h.next_run_at(&id),
+            Some(nb + FIVE_MIN),
+            "re-armed at the first occurrence after the floor, never earlier"
+        );
     }
 
     // R23: a manual run is allowed on a paused automation, never consumes an
