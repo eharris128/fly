@@ -3,6 +3,7 @@
 // `$state`, the leaf/tab id minting, and the maps read at mount; this module
 // only decides *where* an incoming agent run's tab should land.
 
+import { leaves } from "./layout";
 import type { Workspace } from "./workspaces";
 import type { RunStatus } from "../ipc";
 
@@ -58,4 +59,27 @@ export function shouldAutoCloseRun(
   isRaised: boolean,
 ): boolean {
   return status === "succeeded" && !isRaised;
+}
+
+/**
+ * Resolve a pane id to the id of the tab that contains its leaf (monitor-
+ * handoff U6, R13): paneId → leaf key (via the caller's reverse index) → the
+ * enclosing tab, scanning every workspace — the monitor parent is an ORDINARY
+ * pane, so it lives in normal workspaces/tabs, not the Automations workspace.
+ * `null` when the pane id is unknown or its leaf no longer resolves (the tab
+ * was already closed manually) — the caller no-ops. Note the reverse index may
+ * hold a stale entry for an exited pane; the workspace scan is what makes the
+ * lookup safe (a gone leaf → `null`, never a wrong tab).
+ */
+export function tabForPane(
+  workspaces: Workspace[],
+  leafByPaneId: Record<number, string>,
+  paneId: number,
+): string | null {
+  const leafKey = leafByPaneId[paneId];
+  if (!leafKey) return null;
+  for (const ws of workspaces)
+    for (const tab of ws.tabs)
+      if (leaves(tab.tree).some((l) => l.key === leafKey)) return tab.id;
+  return null;
 }

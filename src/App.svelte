@@ -52,6 +52,7 @@
     findAutomationsWorkspace,
     buildAgentArgv,
     shouldAutoCloseRun,
+    tabForPane,
   } from "./lib/automation-panes";
   import { automationsToRows, type AutomationRow } from "./lib/automations";
   import {
@@ -105,6 +106,7 @@
     onAutomationChanged,
     onAlertPending,
     onRunClosed,
+    onMonitorRegistered,
     registerAlertSink,
     type PaneId,
     type PaneActivity,
@@ -114,6 +116,7 @@
     type AgentRunEvent,
     type AlertPendingEvent,
     type RunClosedEvent,
+    type MonitorRegisteredEvent,
     type HandoffTarget,
     type HandoffCandidate,
   } from "./ipc";
@@ -869,6 +872,19 @@
     if (!shouldAutoCloseRun(ev.status, raised)) return;
     const { tabId } = loc;
     setTimeout(() => closeTab(tabId), AGENT_RUN_CLOSE_LINGER_MS);
+  }
+  // Monitor-handoff U6 (R13): a monitor was registered from this pane — its
+  // session handed the watch off to the automation, so its tab is residue.
+  // Map paneId → leaf → tab (the handleRunClosed pattern, via the pure
+  // tabForPane) and close it through the ordinary closeTab path, which hands
+  // focus/activeTabId per existing close behavior. NO linger, deliberately
+  // unlike handleRunClosed: the event fires strictly after the store flush, so
+  // registration confirmed means residue-free (origin decision). An unknown
+  // pane or an already-closed tab is a no-op.
+  function handleMonitorRegistered(ev: MonitorRegisteredEvent) {
+    const tabId = tabForPane(workspaces, leafByPaneId, ev.paneId);
+    if (!tabId) return;
+    closeTab(tabId);
   }
   function newWorkspace() {
     const ws = makeWorkspace(`workspace ${workspaces.length + 1}`);
@@ -2172,6 +2188,12 @@
     // succeeded run's background tab (or keep a failed / attention one).
     let unlistenRunClosed: (() => void) | undefined;
     void onRunClosed(handleRunClosed).then((un) => (unlistenRunClosed = un));
+    // Monitor-handoff U6 (R13): a monitor registered → close the registering
+    // pane's tab immediately (no linger — see handleMonitorRegistered).
+    let unlistenMonitorRegistered: (() => void) | undefined;
+    void onMonitorRegistered(handleMonitorRegistered).then(
+      (un) => (unlistenMonitorRegistered = un),
+    );
     const cwdTimer = setInterval(() => void refreshCwds(), 1500);
     return () => {
       window.removeEventListener("focus", reportForeground);
@@ -2183,6 +2205,7 @@
       unlistenAutomationChanged?.();
       unlistenAlertPending?.();
       unlistenRunClosed?.();
+      unlistenMonitorRegistered?.();
     };
   });
 </script>

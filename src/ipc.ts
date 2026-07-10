@@ -154,6 +154,30 @@ export function onRunClosed(
 }
 
 /**
+ * A monitor automation was registered from inside pane `paneId` and persisted
+ * as `automationId` (monitor-handoff U4, mirrors Rust `MonitorRegisteredEvent`).
+ * Emitted strictly after the store flush, so by the time this arrives the
+ * handoff is durable — the registering pane's tab is residue and the frontend
+ * (U6, R13) closes it immediately, no linger.
+ */
+export interface MonitorRegisteredEvent {
+  paneId: number;
+  automationId: string;
+}
+
+/**
+ * Subscribe to monitor registrations (`automation://monitor-registered`).
+ * Returns an unlisten fn — the caller (App.svelte) tears it down on unmount.
+ */
+export function onMonitorRegistered(
+  handler: (ev: MonitorRegisteredEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<MonitorRegisteredEvent>("automation://monitor-registered", (e) =>
+    handler(e.payload),
+  );
+}
+
+/**
  * An automation alert with no sink pane yet (automations U6/R17). Emitted by the
  * backend when an alert-classified script run concludes and the "Automations"
  * sink pane isn't registered. The frontend single-flights a background ephemeral
