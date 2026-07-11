@@ -16,6 +16,7 @@
 //! boundary shape, mirrored by `src/lib/feed.ts`. The `io` module resolves a
 //! leaf's latest reply and builds the injected input payload.
 
+pub mod ask;
 pub mod fallback;
 pub mod io;
 pub mod pending;

@@ -41,6 +41,36 @@ fn setup_writes_hooks_idempotently_with_absolute_path() {
 }
 
 #[test]
+fn setup_installs_the_permission_request_hook_with_catch_all_matcher() {
+    // hook-ask-channel U5/R1: PermissionRequest matches on tool names, so the
+    // fly group needs the explicit "*" (verified live: fires for Bash and
+    // AskUserQuestion alike); teardown removes it like every fly group.
+    let dir = tempfile::tempdir().unwrap();
+    let settings = dir.path().join("settings.json");
+    apply(&settings, Path::new(BIN)).unwrap();
+    apply(&settings, Path::new(BIN)).unwrap(); // idempotent
+
+    let v = read(&settings);
+    let perm = v["hooks"]["PermissionRequest"].as_array().unwrap();
+    assert_eq!(perm.len(), 1, "re-run duplicated the group");
+    assert_eq!(perm[0]["matcher"], "*");
+    let cmd = perm[0]["hooks"][0]["command"].as_str().unwrap();
+    assert!(cmd.contains(BIN));
+    assert!(cmd.contains("notify --claude --permission-request"));
+    // The other fly events stay matcher-less (fires for every value).
+    assert!(v["hooks"]["Stop"][0].get("matcher").is_none());
+
+    teardown(&settings).unwrap();
+    let v = read(&settings);
+    assert!(
+        v.get("hooks")
+            .and_then(|h| h.get("PermissionRequest"))
+            .is_none(),
+        "teardown must remove the fly PermissionRequest group"
+    );
+}
+
+#[test]
 fn setup_preserves_other_keys_and_user_hooks_and_backs_up() {
     let dir = tempfile::tempdir().unwrap();
     let settings = dir.path().join("settings.json");

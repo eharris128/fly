@@ -13,12 +13,15 @@ use serde_json::{json, Map, Value};
 use crate::state::attention::Reason;
 
 /// What a fly hook on a Claude Code event does (fix-session-pane-attribution
-/// U7): raise attention with a CLI-arg fallback reason, or capture-only —
-/// `fly notify --claude --capture`, the `SessionStart` path that updates the
-/// pane's resume record and must never ring (KTD1/R2).
+/// U7; hook-ask-channel U5): raise attention with a CLI-arg fallback reason,
+/// capture-only — `fly notify --claude --capture`, the `SessionStart` path
+/// that updates the pane's resume record and must never ring (KTD1/R2) — or
+/// a held permission ask (`fly notify --claude --permission-request`, the
+/// `PermissionRequest` path that feeds the ask registry and never rings).
 enum HookKind {
     Attention(Reason),
     Capture,
+    Ask,
 }
 
 impl HookKind {
@@ -30,6 +33,20 @@ impl HookKind {
                 format!("\"{}\" notify {} --claude", fly_bin.display(), reason.as_str())
             }
             HookKind::Capture => format!("\"{}\" notify --claude --capture", fly_bin.display()),
+            HookKind::Ask => {
+                format!("\"{}\" notify --claude --permission-request", fly_bin.display())
+            }
+        }
+    }
+
+    /// The matcher the event's fly group installs, if any. `PermissionRequest`
+    /// matches on tool names, so it needs the explicit catch-all (verified on
+    /// 2.1.207: `"*"` fires for `Bash` and `AskUserQuestion` alike); the other
+    /// events install matcher-less, which fires for every value.
+    fn matcher(&self) -> Option<&'static str> {
+        match self {
+            HookKind::Ask => Some("*"),
+            _ => None,
         }
     }
 }
@@ -39,10 +56,16 @@ impl HookKind {
 /// with **no matcher**, so it fires for every source — `startup`, `resume`,
 /// `clear`, `compact` — keeping the captured id current across `/clear`
 /// rotation (fix-attribution KTD5; all three key sources verified live in U1).
+/// `PermissionRequest` (hook-ask-channel U5/R1) fires at ask time for every
+/// dialog — including AskUserQuestion, including under bypassPermissions
+/// (live-verified 2.1.207) — and holds until the ask resolves; on a Claude too
+/// old for the event it simply never fires (detection degrades to the
+/// transcript/screen chain).
 const CLAUDE_HOOK_EVENTS: &[(&str, HookKind)] = &[
     ("Notification", HookKind::Attention(Reason::Permission)),
     ("Stop", HookKind::Attention(Reason::Finished)),
     ("SessionStart", HookKind::Capture),
+    ("PermissionRequest", HookKind::Ask),
 ];
 
 /// CLI: `fly hooks setup [--agent claude]`.
@@ -110,11 +133,16 @@ pub fn apply(settings_path: &Path, fly_bin: &Path) -> std::io::Result<()> {
         // Replace any prior fly group in place (idempotent across re-runs and
         // schema changes); leave the user's own hooks untouched. The fly-group
         // marker keys on the first two command tokens (`fly notify`), so the
-        // --capture variant is recognized unchanged (KTD5).
+        // --capture and --permission-request variants are recognized unchanged
+        // (KTD5; hook-ask-channel U5).
         groups.retain(|group| !group_is_fly(group));
-        groups.push(json!({
+        let mut group = json!({
             "hooks": [ { "type": "command", "command": command } ]
-        }));
+        });
+        if let Some(matcher) = kind.matcher() {
+            group["matcher"] = json!(matcher);
+        }
+        groups.push(group);
     }
 
     write_pretty(settings_path, &root)

@@ -294,7 +294,11 @@ fn shape_turns(raw: &[transcript::RawTurn], replied_at_ms: u64) -> Vec<TurnEntry
 /// the pre-drop enumeration index so a blank-dropped option leaves a gap rather
 /// than renumbering its successors (a renumber would silently mis-map a digit);
 /// for an answerable question no drops occur, so keys are contiguous `1..N`.
-fn question_body(p: &PendingInteraction) -> Option<QuestionBody> {
+///
+/// `pub(crate)` for the hook-ask-channel (U6): the hook leg shapes its
+/// `PendingInteraction` through this same function, so choice-body rules
+/// (caps, drops, answerability, `otherKey`) cannot drift between sources.
+pub(crate) fn question_body(p: &PendingInteraction) -> Option<QuestionBody> {
     match p.kind {
         PendingKind::Choice => {
             let mut dropped_any = false;

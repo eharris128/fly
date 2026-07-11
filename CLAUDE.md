@@ -108,8 +108,10 @@ socket). See the Automations module map below.
 ### The attention pipeline (the core feature, spans many files)
 This is the data flow that makes an agent's "I need you" reach the UI:
 
-1. `fly hooks setup` installs a Claude Code `command` hook in
-   `~/.claude/settings.json` (backed up first) that runs `fly notify`.
+1. `fly hooks setup` installs Claude Code `command` hooks in
+   `~/.claude/settings.json` (backed up first) that run `fly notify`:
+   `Notification`/`Stop` (attention), `SessionStart` (capture-only), and
+   `PermissionRequest` (matcher `*` — the held ask channel, see `feed/` below).
    `fly hooks teardown` removes only fly's hooks.
 2. When a pane spawns (`stream::spawn_pane`), the backend mints a per-pane
    CSPRNG token and injects `FLY_PANE_TOKEN` + `FLY_SOCKET_PATH` into the child
@@ -147,8 +149,9 @@ time/inputs as arguments so they're tested without a running app.
 - `state/` — the pure state machines (`lifecycle`, `attention`) + the output
   `activity` tracker + suppression policy (`policy.rs`) + per-pane `manager`.
 - `hooks/` — the authenticated socket **(the security boundary)**: `token`,
-  `protocol` (the notify path + the `automation/*` request envelope, U9),
-  `server`. Has its own scoped `CLAUDE.md` — read it before changing anything here.
+  `protocol` (the notify path + the `automation/*` request envelope, U9, + the
+  newline-framed held `ask/hold` op, hook-ask-channel), `server`. Has its own
+  scoped `CLAUDE.md` — read it before changing anything here.
 - `cli/` — `fly notify`, `fly hooks setup|teardown`, `fly automation …` (U9).
 - `automations/` — cron-scheduled agent/script runs (see the module map below).
 - `session/` — layout persistence (`mod.rs`) **plus the resume/handoff
@@ -160,7 +163,7 @@ time/inputs as arguments so they're tested without a running app.
   on a timer.
 - `feed/` — the loopback HTTP surface for an external local consumer
   (feat-agent-state-local-feed + feed-agent-reply-io + feed-pending-question +
-  feed-conversation-tail + feed-question-screen-fallback):
+  feed-conversation-tail + feed-question-screen-fallback + hook-ask-channel):
   bearer-token auth (constant-time, silent 401; **the token is the whole
   boundary** — loopback TCP has no `SO_PEERCRED`), SSE `/feed` (webview-pushed
   roster + backend automations; `lastReplyAt` **and** `questionPendingAt`
@@ -181,15 +184,30 @@ time/inputs as arguments so they're tested without a running app.
   `otherKey` and delivers digit → filtered text → Enter as three
   delay-spaced PTY chunks, never a bracketed paste, whose leading ESC would
   cancel an unfocused picker; guarded exactly like keys and refused (409)
-  when `otherKey` is unknown; answering a *permission*
-  dialog — or any *screen-derived* question while the live reason is
-  `permission` — requires `feed.allowPermissionAnswers`, default off). A
-  pending interaction is parsed from the transcript tail
+  when `otherKey` is unknown; `mode:"decision"` = hook-ask-channel's
+  `{"decision":"allow"|"deny"}` against a HOOK-sourced permission ask,
+  resolved through the held connection — never PTY bytes; answering a
+  *permission* dialog (any mode incl. decision) — or any *screen-derived*
+  question while the live reason is `permission` — requires
+  `feed.allowPermissionAnswers`, default off).
+  **Pending-question detection is now event-first** (hook-ask-channel): the
+  `PermissionRequest` hook fires at ask time for every dialog — incl.
+  AskUserQuestion, incl. bypassPermissions (live-verified 2.1.207) — and
+  `fly notify --permission-request` forwards a bounded typed subset over the
+  socket as a **held** `ask/hold` request whose connection lifetime IS the
+  ask's lifetime (Claude kills the hook when the dialog resolves locally →
+  drop clears `feed/ask.rs::AskRegistry`; leaf-keyed, last-write-wins,
+  capped). A held ask is the resolver's primary leg (`source:"hook"`,
+  `askedAt` = fly's receipt stamp, exposed with NO attention-reason
+  corroboration — the held connection is the proof), ahead of the transcript
+  walk, and its register/clear both `FeedState::bump` so frames move without
+  a roster change. Everything below is the fallback chain, unchanged when no
+  ask is held: a pending interaction is parsed from the transcript tail
   (`session/transcript.rs::pending_interaction_from_str`, backward walk,
-  abstain-on-surprise) — **primary but blind at ask time on Claude Code ≥
-  2.1.206**, which flushes the pending `tool_use` only when the turn resolves.
-  The screen fallback (feed-question-screen-fallback, gate widened by
-  fix-feed-question-detection-gaps) covers that gap, strictly behind the
+  abstain-on-surprise) — **primary-after-hook but blind at ask time on Claude
+  Code ≥ 2.1.206**, which flushes the pending `tool_use` only when the turn
+  resolves. The screen fallback (feed-question-screen-fallback, gate widened
+  by fix-feed-question-detection-gaps) covers that gap, strictly behind the
   transcript scan: each pane tees its raw output into a 64 KiB tail ring
   (`pty/pane.rs`); when the transcript abstains, the gate is
   `~/.claude/sessions/<pid>.json` (`session/livestate.rs`), three-valued —

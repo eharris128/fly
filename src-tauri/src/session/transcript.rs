@@ -992,10 +992,7 @@ pub(crate) fn pending_interaction_from_str(body: &str) -> Option<PendingInteract
     {
         let asked_at_ms = ts?; // stampless → unguardable → abstain
         let (questions, dropped) = parse_questions(input)?;
-        let answerable = !dropped
-            && questions.len() == 1
-            && !questions[0].multi_select
-            && !questions[0].options.is_empty();
+        let answerable = answerable_shape(&questions, dropped);
         return Some(PendingInteraction {
             kind: PendingKind::Choice,
             asked_at_ms,
@@ -1120,7 +1117,22 @@ fn context_for(items: &[WalkItem], idx: usize) -> Option<String> {
 /// `answerable` so such an ask is never marked remotely answerable (the
 /// display-layer `question_body` catches blank-after-sanitize drops; this
 /// catches the earlier parse-layer drops it can't see).
-fn parse_questions(input: &serde_json::Value) -> Option<(Vec<QuestionSpec>, bool)> {
+/// The one R7 answerability rule, shared by the transcript walk and the
+/// hook-ask leg (hook-ask-channel U6): remotely answerable means a clean
+/// parse (`!dropped` — a drop shifts wire indices off the on-screen digits)
+/// of exactly one single-select question with at least one option.
+pub(crate) fn answerable_shape(questions: &[QuestionSpec], dropped: bool) -> bool {
+    !dropped
+        && questions.len() == 1
+        && !questions[0].multi_select
+        && !questions[0].options.is_empty()
+}
+
+/// `pub(crate)` for the hook-ask-channel (U6): a `PermissionRequest` hook's
+/// `tool_input` is the same `{"questions":[…]}` object a transcript's pending
+/// `tool_use` carries, so the feed's hook leg parses it with this exact
+/// function rather than a drifting copy.
+pub(crate) fn parse_questions(input: &serde_json::Value) -> Option<(Vec<QuestionSpec>, bool)> {
     let questions = input.get("questions")?.as_array()?;
     let mut dropped = false;
     let mut parsed: Vec<QuestionSpec> = Vec::new();

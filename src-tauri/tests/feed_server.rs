@@ -164,6 +164,54 @@ fn fake_io() -> IoFn {
                 turns: Vec::new(),
                 pending_fallback_at: Some(ASKED_AT),
             },
+            // A HOOK-sourced permission ask (hook-ask-channel KTD3/KTD5): the
+            // held PermissionRequest connection is the corroborator, so the
+            // body serves with no attention reason at all, and mode:"decision"
+            // can answer it. `leaf-hook-conflict` is the same shape whose held
+            // ask resolves locally between guard and delivery (the input seam
+            // reports Conflict).
+            "leaf-hook-permission" | "leaf-hook-conflict" => ResolvedIo {
+                reply: None,
+                question: Some(QuestionBody {
+                    asked_at: ASKED_AT,
+                    kind: "permission".into(),
+                    tool: "Bash".into(),
+                    answerable: false,
+                    context: None,
+                    questions: vec![],
+                    request: Some("touch /tmp/x".into()),
+                    source: Some("hook".into()),
+                }),
+                turns: Vec::new(),
+                pending_fallback_at: None,
+            },
+            // A HOOK-sourced choice: keys-answerable like any choice body, but
+            // never decision-answerable (an allow cannot skip the picker).
+            "leaf-hook-choice" => ResolvedIo {
+                reply: None,
+                question: Some(QuestionBody {
+                    asked_at: ASKED_AT,
+                    kind: "choice".into(),
+                    tool: "AskUserQuestion".into(),
+                    answerable: true,
+                    context: None,
+                    questions: vec![QuestionSpec {
+                        question: "Which?".into(),
+                        header: String::new(),
+                        multi_select: false,
+                        options: vec![QuestionOption {
+                            key: "1".into(),
+                            label: "Alpha".into(),
+                            description: String::new(),
+                        }],
+                        other_key: Some("2".into()),
+                    }],
+                    request: None,
+                    source: Some("hook".into()),
+                }),
+                turns: Vec::new(),
+                pending_fallback_at: None,
+            },
             _ => ResolvedIo::default(),
         }
     })
@@ -190,6 +238,11 @@ fn start_with(
             if leaf_key == "leaf-gone" {
                 return InputOutcome::UnknownPane;
             }
+            // The local-answer race (hook-ask-channel R7): the held ask
+            // vanished between the route's guard and the delivery.
+            if leaf_key == "leaf-hook-conflict" {
+                return InputOutcome::Conflict;
+            }
             let describe = match &action {
                 InputAction::Submit(text) => format!("submit:{text}"),
                 InputAction::Keys(bytes) => {
@@ -200,6 +253,9 @@ fn start_with(
                     String::from_utf8_lossy(select),
                     String::from_utf8_lossy(text)
                 ),
+                InputAction::Decision { allow, if_asked_at } => {
+                    format!("decision:{allow}@{if_asked_at}")
+                }
             };
             log.lock().unwrap().push((leaf_key.to_string(), describe));
             InputOutcome::Delivered
@@ -1162,6 +1218,166 @@ fn the_answered_latch_spans_keys_and_other() {
     );
     assert!(head.starts_with("HTTP/1.1 409"), "other after keys: {head}");
     assert_eq!(delivered.lock().unwrap().len(), 1, "exactly one delivery");
+}
+
+// ---- hook-sourced asks + mode:decision (hook-ask-channel U7, KTD3/KTD5) ----
+
+#[test]
+fn a_hook_permission_body_serves_and_stamps_without_any_reason() {
+    // KTD3: the held connection is the corroboration — no attention reason
+    // anywhere, yet /output serves the body and the frame carries the marker,
+    // while a transcript-sourced permission body (leaf-permission) stays
+    // hidden without its reason (the pre-existing gate, unchanged).
+    let (state, server, _) = start();
+    state.publish(vec![
+        agent("leaf-hook-permission", "waiting"),
+        agent("leaf-permission", "waiting"),
+    ]);
+    let (_, body) = get(
+        server.local_addr(),
+        "/agents/leaf-hook-permission/output",
+        Some(TOKEN),
+        Duration::from_millis(300),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(v["question"]["kind"], "permission");
+    assert_eq!(v["question"]["source"], "hook");
+    assert_eq!(v["question"]["request"], "touch /tmp/x");
+    let (_, frame) = get(server.local_addr(), "/feed", Some(TOKEN), Duration::from_millis(400));
+    assert!(
+        frame.contains(&format!(
+            r#""leafKey":"leaf-hook-permission","#
+        )),
+        "frame was: {frame}"
+    );
+    let snap: serde_json::Value = serde_json::from_str(
+        frame.lines().find(|l| l.starts_with("data:")).unwrap().trim_start_matches("data:"),
+    )
+    .expect("frame json");
+    let agents = snap["agents"].as_array().unwrap();
+    let hook = agents.iter().find(|a| a["leafKey"] == "leaf-hook-permission").unwrap();
+    assert_eq!(hook["questionPendingAt"], ASKED_AT);
+    let transcript = agents.iter().find(|a| a["leafKey"] == "leaf-permission").unwrap();
+    assert!(transcript["questionPendingAt"].is_null(), "no reason → hidden");
+}
+
+#[test]
+fn decision_mode_answers_a_hook_permission_ask() {
+    // KTD5 happy path (opt-in ON): the decision reaches the seam as a
+    // Decision action — never PTY bytes — carrying the guard stamp.
+    let (state, server, delivered) = start_with(true);
+    state.publish(vec![agent("leaf-hook-permission", "waiting")]);
+    let (head, resp) = post(
+        server.local_addr(),
+        "/agents/leaf-hook-permission/input",
+        Some(TOKEN),
+        &format!(r#"{{"mode":"decision","decision":"allow","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "head was: {head}");
+    let v: serde_json::Value = serde_json::from_str(&resp).expect("json body");
+    assert_eq!(v["ok"], true);
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[(
+            "leaf-hook-permission".to_string(),
+            format!("decision:true@{ASKED_AT}")
+        )]
+    );
+}
+
+#[test]
+fn decision_mode_is_config_gated_like_every_permission_answer() {
+    // R6: a decision IS a remote permission answer — default-off opt-in, same
+    // discriminator body as keys (a consumer must not read policy as auth).
+    let (state, server, delivered) = start(); // opt-in OFF
+    state.publish(vec![agent("leaf-hook-permission", "waiting")]);
+    let (head, resp) = post(
+        server.local_addr(),
+        "/agents/leaf-hook-permission/input",
+        Some(TOKEN),
+        &format!(r#"{{"mode":"decision","decision":"deny","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 403"), "head was: {head}");
+    assert!(resp.contains("permissionAnswersDisabled"), "body was: {resp}");
+    assert!(delivered.lock().unwrap().is_empty());
+}
+
+#[test]
+fn decision_mode_requires_a_sane_guarded_body() {
+    let (state, server, delivered) = start_with(true);
+    state.publish(vec![agent("leaf-hook-permission", "waiting")]);
+    for bad in [
+        // ifAskedAt is mandatory (same posture as keys/other).
+        r#"{"mode":"decision","decision":"allow"}"#.to_string(),
+        // The verdict must be exactly allow|deny.
+        format!(r#"{{"mode":"decision","decision":"maybe","ifAskedAt":{ASKED_AT}}}"#),
+        format!(r#"{{"mode":"decision","ifAskedAt":{ASKED_AT}}}"#),
+    ] {
+        let (head, _) =
+            post(server.local_addr(), "/agents/leaf-hook-permission/input", Some(TOKEN), &bad);
+        assert!(head.starts_with("HTTP/1.1 400"), "body {bad:?} → head: {head}");
+    }
+    // A stale stamp 409s like any guarded answer.
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-hook-permission/input",
+        Some(TOKEN),
+        &format!(r#"{{"mode":"decision","decision":"allow","ifAskedAt":{}}}"#, ASKED_AT - 1),
+    );
+    assert!(head.starts_with("HTTP/1.1 409"), "head was: {head}");
+    assert!(delivered.lock().unwrap().is_empty());
+}
+
+#[test]
+fn decision_mode_409s_for_every_non_hook_shape() {
+    // R6: only a hook-sourced permission body has a live response channel.
+    let (state, server, delivered) = start_with(true);
+    state.publish(vec![
+        agent_with_reason("leaf-permission", "waiting", "permission"),
+        agent("leaf-hook-choice", "waiting"),
+    ]);
+    // A transcript-sourced permission body (exposed via its reason): no held
+    // connection → 409.
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-permission/input",
+        Some(TOKEN),
+        &format!(r#"{{"mode":"decision","decision":"allow","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 409"), "transcript permission: {head}");
+    // A hook-sourced CHOICE: an allow cannot skip the picker (live-verified) →
+    // 409; keys still answers it (the picker path is untouched).
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-hook-choice/input",
+        Some(TOKEN),
+        &format!(r#"{{"mode":"decision","decision":"allow","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 409"), "hook choice: {head}");
+    assert!(delivered.lock().unwrap().is_empty());
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-hook-choice/input",
+        Some(TOKEN),
+        &format!(r#"{{"text":"1","mode":"keys","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "keys on a hook choice: {head}");
+}
+
+#[test]
+fn a_locally_resolved_ask_conflicts_with_409() {
+    // R7: the held ask vanished between guard and delivery (local answer won)
+    // — the seam's Conflict maps to 409, and the latch releases so a fresh
+    // ask's answer isn't blocked by this request's reservation.
+    let (state, server, _) = start_with(true);
+    state.publish(vec![agent("leaf-hook-conflict", "waiting")]);
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-hook-conflict/input",
+        Some(TOKEN),
+        &format!(r#"{{"mode":"decision","decision":"allow","ifAskedAt":{ASKED_AT}}}"#),
+    );
+    assert!(head.starts_with("HTTP/1.1 409"), "head was: {head}");
 }
 
 #[test]

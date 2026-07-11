@@ -255,6 +255,15 @@ pub fn run() {
             let gate = gate;
             let config = config_for_hooks;
             let pty = pty_for_hooks;
+            // Held permission asks (hook-ask-channel U8): the registry is
+            // managed unconditionally (like FeedState) — registration works
+            // whether or not the feed listener is enabled, and lifecycle
+            // shutdown releases every held hook (R9). A second Arc feeds the
+            // ask handler below; the feed wiring further down clones from the
+            // managed state.
+            let ask_registry = Arc::new(feed::ask::AskRegistry::new());
+            app.manage(Arc::clone(&ask_registry));
+            let pty_for_ask = Arc::clone(&pty);
             // The per-effect dispatch (U18): decouple the in-app ring, the
             // history record, the desktop banner, and the chime — each decided
             // independently by the policy (KTD14), not fused behind one boolean.
@@ -481,11 +490,55 @@ pub fn run() {
             let automation_handler: hooks::RequestHandler = Arc::new(move |pane, buf: &[u8]| {
                 handle_automation_request(&automation_handle, pane, buf).to_bytes()
             });
-            let server = HookServer::start_with_handler(
+            // Held-ask registration (hook-ask-channel U8): resolve the pane to
+            // its leaf, upsert the resume record at Hook rank (KTD6 — the ask
+            // payload carries session_id/cwd exactly like a raising hook), and
+            // register. Register and clear both bump the feed so a frame moves
+            // without any roster change (R3); FeedState is resolved lazily via
+            // try_state (managed later in this setup, same pattern as the
+            // automation handler). Runs on the socket's per-connection thread;
+            // touches only the registry lock and the resume file.
+            let ask_handle = app.handle().clone();
+            let ask_registry_for_hooks = Arc::clone(&ask_registry);
+            let ask_handler: hooks::AskHandler = Arc::new(move |pane, payload| {
+                let leaf_key = pty_for_ask.leaf_key(pane)?;
+                if let Some(session_id) = payload.session_id.clone() {
+                    let _ = session::resume::upsert_at(
+                        &session::resume::resume_path(),
+                        &leaf_key,
+                        session::resume::ResumePartial {
+                            session_id: Some(session_id),
+                            session_cwd: payload.cwd.clone(),
+                            session_source: Some(session::resume::SessionSource::Hook),
+                            ..Default::default()
+                        },
+                    );
+                }
+                let (gen, rx) =
+                    ask_registry_for_hooks.register(&leaf_key, payload, notify::now_unix_ms())?;
+                if let Some(feed) = ask_handle.try_state::<Arc<feed::FeedState>>() {
+                    feed.bump();
+                }
+                let drop_handle = ask_handle.clone();
+                let drop_registry = Arc::clone(&ask_registry_for_hooks);
+                let on_drop = Box::new(move || {
+                    if drop_registry.clear_if(&leaf_key, gen) {
+                        if let Some(feed) = drop_handle.try_state::<Arc<feed::FeedState>>() {
+                            feed.bump();
+                        }
+                    }
+                });
+                Some(hooks::AskTicket {
+                    decision_rx: rx,
+                    on_drop,
+                })
+            });
+            let server = HookServer::start_full(
                 hook_socket_path(),
                 tokens_for_hooks,
                 dispatch,
                 Some(automation_handler),
+                Some(ask_handler),
             )
             .map_err(|e| format!("failed to start hook server: {e}"))?;
             app.manage(server);
@@ -745,10 +798,17 @@ pub fn run() {
                         let pty_for_screen = app.state::<Arc<PtyManager>>().inner().clone();
                         let screen_fn: feed::fallback::ScreenFn =
                             Arc::new(move |leaf_key| pty_for_screen.screen_tail_by_leaf(leaf_key));
+                        // Held asks feed the resolver's primary leg
+                        // (hook-ask-channel U6/KTD3).
+                        let ask_registry_for_io =
+                            app.state::<Arc<feed::ask::AskRegistry>>().inner().clone();
+                        let ask_fn: feed::fallback::AskFn =
+                            Arc::new(move |leaf_key| ask_registry_for_io.get(leaf_key));
                         let resolver = Arc::new(feed::fallback::FallbackResolver::new(
                             session::resume::resume_path(),
                             Arc::clone(&pending_signals),
                             screen_fn,
+                            ask_fn,
                         ));
                         let io_fn: feed::server::IoFn = Arc::new(move |leaf_key, reason, status| {
                             resolver.resolve_io(leaf_key, reason, status)
@@ -772,10 +832,49 @@ pub fn run() {
                             let pty = app.state::<Arc<PtyManager>>().inner().clone();
                             let attention = app.state::<Arc<AttentionManager>>().inner().clone();
                             let input_handle = app.handle().clone();
+                            let asks_for_input =
+                                app.state::<Arc<feed::ask::AskRegistry>>().inner().clone();
                             Arc::new(move |leaf_key, action| {
                                 let Some(pane) = pty.pane_by_leaf(leaf_key) else {
                                     return feed::server::InputOutcome::UnknownPane;
                                 };
+                                // Decision delivery (hook-ask-channel U8/KTD5):
+                                // resolved through the held connection, never
+                                // the PTY. The registry's atomic stamp check is
+                                // the last line against the local-answer race —
+                                // Gone maps to 409, the "already resolved"
+                                // outcome. A delivered decision clears pane
+                                // attention exactly like a typed answer, and
+                                // the ask's removal bumps the feed so the
+                                // pending marker drops on the next frame.
+                                if let feed::server::InputAction::Decision { allow, if_asked_at } =
+                                    &action
+                                {
+                                    return match asks_for_input.answer(
+                                        leaf_key,
+                                        *if_asked_at,
+                                        *allow,
+                                    ) {
+                                        feed::ask::AnswerOutcome::Delivered => {
+                                            if let Some(outcome) = attention.on_input(pane) {
+                                                stream::emit_attention(
+                                                    &input_handle,
+                                                    pane,
+                                                    &outcome,
+                                                );
+                                            }
+                                            if let Some(feed) =
+                                                input_handle.try_state::<Arc<feed::FeedState>>()
+                                            {
+                                                feed.bump();
+                                            }
+                                            feed::server::InputOutcome::Delivered
+                                        }
+                                        feed::ask::AnswerOutcome::Gone => {
+                                            feed::server::InputOutcome::Conflict
+                                        }
+                                    };
+                                }
                                 let delivered = match &action {
                                     feed::server::InputAction::Submit(text) => pty
                                         .write(pane, &feed::io::paste_payload(text))
@@ -805,6 +904,8 @@ pub fn run() {
                                             std::thread::sleep(feed::io::SUBMIT_DELAY);
                                             pty.write(pane, feed::io::SUBMIT)
                                         }),
+                                    // Returned early above — never a PTY write.
+                                    feed::server::InputAction::Decision { .. } => unreachable!(),
                                 };
                                 match delivered {
                                     Ok(()) => {
