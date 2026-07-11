@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::lifecycle::LifecycleState;
 use pane::Pane;
+pub(crate) use pane::CLAUDE_SESSION_MARKERS;
 pub use pane::ScreenTail;
 
 /// Opaque pane handle. Ids are allocated monotonically and never reused, so a

@@ -108,11 +108,12 @@ finished yet, emit NO verdict block at all — say it is still running and stop.
   missed ticks. The not-before floor composes with the recurring cron, so a
   floor that passes while fly is closed still yields a check at the next
   tick after launch.
-- **Busy directories blur the check's output.** fly attributes a check's
-  final message by cwd; a second fresh Claude session in the same cwd during
-  a check makes that tick's verdict unreadable. For noisy directories,
-  recommend a dedicated cwd for the experiment. Three consecutive unreadable
-  checks ring a "monitor broken" alert instead of failing silently.
+- **Checks run invisibly.** A check is a backend-owned headless `claude -p`
+  child — no pane or tab appears while it runs; the dashboard's automation
+  row is the only live surface. Its verdict is read from the check's own
+  final message, so nothing else running in the cwd can blur it. Three
+  consecutive unreadable checks (crashes, timeouts, malformed verdict
+  blocks) ring a "monitor broken" alert instead of failing silently.
 - On PASS the user gets a notification with your note. On FAIL they also get
   a durable failure bundle (verdict, evidence, pointers back to this
   session) and a one-click pickup on the fly dashboard.

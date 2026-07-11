@@ -74,9 +74,12 @@ pub fn read_proc_table() -> Vec<ProcEntry> {
 /// the **last** `')'` — `comm` is everything between the first `'('` and that last
 /// `')'`; the `pid` is the token before the first `'('`; and the space-separated
 /// remainder after the last `')'` is `state` (field 0), `ppid` (1), `pgrp` (2),
-/// per `proc(5)`. Any missing/non-numeric field yields `None` (a truncated read or
-/// a line we don't understand is skipped, never a panic).
-fn parse_stat_line(line: &str) -> Option<ProcEntry> {
+/// and — sixteen fields on — `starttime` (19; overall field 22), per `proc(5)`.
+/// Any missing/non-numeric field yields `None` (a truncated read or a line we
+/// don't understand is skipped, never a panic). `pub(crate)`: the headless
+/// check runner's kill discipline shares this one parser
+/// (headless-monitor-checks U3) rather than growing a second copy of the trap.
+pub(crate) fn parse_stat_line(line: &str) -> Option<ProcEntry> {
     let lparen = line.find('(')?;
     let rparen = line.rfind(')')?;
     if rparen < lparen {
@@ -88,7 +91,44 @@ fn parse_stat_line(line: &str) -> Option<ProcEntry> {
     let state = rest.next()?.chars().next()?;
     let ppid: u32 = rest.next()?.parse().ok()?;
     let pgid: u32 = rest.next()?.parse().ok()?;
-    Some(ProcEntry { pid, ppid, pgid, state, comm })
+    let start_time: u64 = rest.nth(16)?.parse().ok()?;
+    Some(ProcEntry { pid, ppid, pgid, state, start_time, comm })
+}
+
+/// Read + parse one pid's `stat`. `None` when the process is gone/unreadable —
+/// the same tolerance as [`read_proc_table`]. Shared with the headless check
+/// runner's liveness pin (headless-monitor-checks U3).
+pub(crate) fn read_stat(pid: u32) -> Option<ProcEntry> {
+    let line = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat_line(&line)
+}
+
+/// The transitive descendants of `root_pid` in `table` (root excluded):
+/// `ppid`-edge BFS with a visited set, so a malformed table (self-parent,
+/// cycle, duplicate pid) cannot loop. Shared by the task count below and the
+/// headless check runner's pre-kill descendant snapshot
+/// (headless-monitor-checks U3/R5 — orphans reparent post-mortem, so the
+/// snapshot must be taken while the tree is intact).
+pub(crate) fn descendants_in_table(table: &[ProcEntry], root_pid: u32) -> Vec<&ProcEntry> {
+    use std::collections::{HashMap, HashSet};
+    let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (i, e) in table.iter().enumerate() {
+        children.entry(e.ppid).or_default().push(i);
+    }
+    let mut visited: HashSet<u32> = HashSet::from([root_pid]);
+    let mut out: Vec<&ProcEntry> = Vec::new();
+    let mut frontier = vec![root_pid];
+    while let Some(parent) = frontier.pop() {
+        let Some(kids) = children.get(&parent) else { continue };
+        for &i in kids {
+            let e = &table[i];
+            if visited.insert(e.pid) {
+                out.push(e);
+                frontier.push(e.pid);
+            }
+        }
+    }
+    out
 }
 
 /// The basename of a `/`-separated path (the part after the last `/`).
@@ -143,6 +183,11 @@ pub struct ProcEntry {
     pub pgid: u32,
     /// The single-char run state from `stat` (`R`/`S`/`D`/`Z`/`X`/…).
     pub state: char,
+    /// `starttime` (`proc(5)` field 22): clock ticks since boot at process
+    /// start — the pid-reuse pin the headless check runner's kill discipline
+    /// verifies before signaling (headless-monitor-checks U3/R5). Unused by
+    /// the task count.
+    pub start_time: u64,
     pub comm: String,
 }
 
@@ -176,31 +221,11 @@ pub struct ProcEntry {
 /// carries a visited set, so a malformed table (self-parent,
 /// `ppid` cycle, duplicate pid) cannot infinite-loop.
 pub fn count_background_task_groups(table: &[ProcEntry], root_pid: u32) -> u32 {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
-    // `ppid -> child pids` and `pid -> entry`, each one pass. Duplicate/malformed
-    // entries fold in without special-casing (the visited set bounds the walk).
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    for e in table {
-        children.entry(e.ppid).or_default().push(e.pid);
-    }
     let by_pid: HashMap<u32, &ProcEntry> = table.iter().map(|e| (e.pid, e)).collect();
-
-    // Transitive descendants of the agent root. `visited.insert` both guards the
-    // cycle/self-parent/duplicate cases and records membership in one step; the
-    // root is pre-seeded so it can never re-enqueue itself or count as its own job.
-    let mut visited: HashSet<u32> = HashSet::from([root_pid]);
-    let mut descendants: HashSet<u32> = HashSet::new();
-    let mut frontier = vec![root_pid];
-    while let Some(parent) = frontier.pop() {
-        let Some(kids) = children.get(&parent) else { continue };
-        for &kid in kids {
-            if visited.insert(kid) {
-                descendants.insert(kid);
-                frontier.push(kid);
-            }
-        }
-    }
+    // Transitive descendants of the agent root (the shared, cycle-safe walk).
+    let descendants = descendants_in_table(table, root_pid);
 
     // Distinct *top-level* background groups among the live descendants. A live,
     // backgrounded descendant counts its group as a real task only when it is
@@ -216,13 +241,10 @@ pub fn count_background_task_groups(table: &[ProcEntry], root_pid: u32) -> u32 {
     let anchored_to_agent = |ppid: u32| {
         ppid == root_pid || by_pid.get(&ppid).is_some_and(|e| e.pgid == root_pid)
     };
-    let mut groups: HashSet<u32> = HashSet::new();
-    for pid in &descendants {
-        if let Some(e) = by_pid.get(pid) {
-            if e.state != 'Z' && e.state != 'X' && e.pgid != root_pid && anchored_to_agent(e.ppid)
-            {
-                groups.insert(e.pgid);
-            }
+    let mut groups: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for e in &descendants {
+        if e.state != 'Z' && e.state != 'X' && e.pgid != root_pid && anchored_to_agent(e.ppid) {
+            groups.insert(e.pgid);
         }
     }
     groups.len() as u32
@@ -306,7 +328,7 @@ mod tests {
     /// Build a `ProcEntry`; `comm` is irrelevant to the v1 count (carried only for
     /// the KTD6 fallback), so a placeholder keeps the cases readable.
     fn proc(pid: u32, ppid: u32, pgid: u32, state: char) -> ProcEntry {
-        ProcEntry { pid, ppid, pgid, state, comm: "x".into() }
+        ProcEntry { pid, ppid, pgid, state, start_time: 0, comm: "x".into() }
     }
 
     #[test]
@@ -481,25 +503,35 @@ mod tests {
 
     #[test]
     fn parse_stat_line_parses_a_plain_line() {
-        let e = parse_stat_line("1 (systemd) S 0 1 1 0 -1 4194560 1234").unwrap();
+        let e = parse_stat_line(
+            "1 (systemd) S 0 1 1 0 -1 4194560 1234 0 0 0 5 3 0 0 20 0 1 0 42 12345 67",
+        )
+        .unwrap();
         assert_eq!(e.pid, 1);
         assert_eq!(e.comm, "systemd");
         assert_eq!(e.state, 'S');
         assert_eq!(e.ppid, 0);
         assert_eq!(e.pgid, 1);
+        assert_eq!(e.start_time, 42);
     }
 
     #[test]
     fn parse_stat_line_handles_spaces_and_parens_in_comm() {
-        // The real risk: comm with spaces AND nested parens. Splitting on the last
-        // ')' keeps state/ppid/pgrp correct where a naive first-')' split would not.
-        let e = parse_stat_line("4242 (weird (proc) name) R 4200 4242 4242 0 -1 0")
-            .expect("parses despite parens in comm");
+        // The real risk: comm with spaces AND nested parens. Splitting on the
+        // last ')' keeps state/ppid/pgrp — and starttime, sixteen fields on —
+        // correct where a naive first-')' split would not. Field layout after
+        // the comm: state ppid pgrp session tty tpgid flags minflt cminflt
+        // majflt cmajflt utime stime cutime cstime priority nice threads
+        // itrealvalue STARTTIME …
+        let line = "4242 (weird (proc) name) R 4200 4242 4242 0 -1 4194560 \
+                    10 0 0 0 1 2 0 0 20 0 1 0 987654321 12345 67";
+        let e = parse_stat_line(line).expect("parses despite parens in comm");
         assert_eq!(e.pid, 4242);
         assert_eq!(e.comm, "weird (proc) name");
         assert_eq!(e.state, 'R');
         assert_eq!(e.ppid, 4200);
         assert_eq!(e.pgid, 4242);
+        assert_eq!(e.start_time, 987_654_321);
     }
 
     #[test]
@@ -510,5 +542,19 @@ mod tests {
         assert!(parse_stat_line("123 (c) S 456").is_none()); // missing pgrp
         assert!(parse_stat_line("abc (c) S 1 1").is_none()); // non-numeric pid
         assert!(parse_stat_line("123 (c) S xx 1").is_none()); // non-numeric ppid
+        // Enough fields for ppid/pgrp but truncated before starttime (19).
+        assert!(parse_stat_line("1 (init) S 0 1 1 0 -1 4194560 10").is_none());
+    }
+
+    // The single-pid reader the headless kill discipline pins liveness on
+    // (headless-monitor-checks U3): our own stat is always readable and
+    // carries a plausible starttime.
+    #[test]
+    fn read_stat_sees_our_own_process() {
+        let me = std::process::id();
+        let s = read_stat(me).expect("own /proc stat is readable");
+        assert_eq!(s.pid, me);
+        assert!(s.start_time > 0);
+        assert!(!matches!(s.state, 'Z' | 'X'));
     }
 }

@@ -350,9 +350,12 @@ impl TailBuf {
     }
 }
 
-/// Drain a pipe to EOF into a tail-capped string (runs on a reader thread).
-fn drain_reader(mut r: impl Read) -> String {
-    let mut tail = TailBuf::new(CAPTURE_CAP_BYTES);
+/// Drain a pipe to EOF into a string keeping only the trailing `cap` bytes
+/// (runs on a reader thread). Shared with the headless check runner
+/// (headless-monitor-checks U3 — its bounded stderr tail), which passes its
+/// own, much smaller cap.
+pub(crate) fn drain_reader(mut r: impl Read, cap: usize) -> String {
+    let mut tail = TailBuf::new(cap);
     let mut buf = [0u8; 8192];
     loop {
         match r.read(&mut buf) {
@@ -368,12 +371,13 @@ fn drain_reader(mut r: impl Read) -> String {
 /// Start a reader thread; its final capture arrives on the returned channel.
 /// If the thread cannot start (rare), the sender drops and the reaper's
 /// bounded recv treats the stream as empty — degraded, never wedged.
-fn spawn_reader(name: &str, r: impl Read + Send + 'static) -> Receiver<String> {
+/// Shared with the headless check runner (see [`drain_reader`]).
+pub(crate) fn spawn_reader(name: &str, r: impl Read + Send + 'static, cap: usize) -> Receiver<String> {
     let (tx, rx) = mpsc::channel();
     let _ = std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
-            let _ = tx.send(drain_reader(r));
+            let _ = tx.send(drain_reader(r, cap));
         });
     rx
 }
@@ -573,10 +577,12 @@ impl ScriptRunner {
         let rx_out = spawn_reader(
             "fly-automation-script-out",
             child.stdout.take().expect("stdout piped"),
+            CAPTURE_CAP_BYTES,
         );
         let rx_err = spawn_reader(
             "fly-automation-script-err",
             child.stderr.take().expect("stderr piped"),
+            CAPTURE_CAP_BYTES,
         );
 
         let job = ReapJob {

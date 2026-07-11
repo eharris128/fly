@@ -577,6 +577,27 @@ pub fn run() {
                     }
                 },
             )));
+            // Headless monitor-check runner (headless-monitor-checks U3/U5):
+            // owns every monitor check's `claude -p` child — spawn, stream,
+            // deadline, kill. Same Weak-manager closer pattern as the
+            // ScriptRunner above; the closer routes into the manager's
+            // run-id-keyed close (`close_headless_run`: sanitize → scrub via
+            // the shared redact helpers, then the one shared verdict-close
+            // tail), so a headless verdict retires through exactly the
+            // mutation a pane verdict does (R9). `run()` itself never errors:
+            // every failure, spawn included, closes through this closer as an
+            // infra Failed row (a post-shutdown close simply drops with the
+            // Weak, like the script reaper's).
+            let headless_closer_mgr = Arc::downgrade(&automations_mgr);
+            let headless_runner = Arc::new(automations::headless::HeadlessRunner::new(Arc::new(
+                move |automation_id: &str,
+                      run_id: &str,
+                      outcome: automations::headless::CheckOutcome| {
+                    if let Some(mgr) = headless_closer_mgr.upgrade() {
+                        mgr.close_headless_run(automation_id, run_id, outcome);
+                    }
+                },
+            )));
 
             // U6 alert surfacing (R16/R17/R18): the alerts log + sink registry.
             // `surface_alert` is the one shared path — append the sanitized
@@ -648,32 +669,10 @@ pub fn run() {
             // cap, isolated per dev flavor like every other store.
             automations_mgr.set_bundle_dir(session::data_dir().join("monitor-bundles"));
             app.manage(alerts_log);
-            // Composite dispatcher (U7+U5): agent dispatch routes to
-            // AgentDispatcher, script dispatch routes to ScriptRunner.
-            struct CompositeDispatcher {
-                agent: std::sync::Arc<automations::AgentDispatcher>,
-                script: std::sync::Arc<automations::script::ScriptRunner>,
-            }
-            impl automations::Dispatcher for CompositeDispatcher {
-                fn dispatch_agent(
-                    &self,
-                    a: &automations::model::Automation,
-                    run_id: &str,
-                    launch: &automations::ResolvedLaunch,
-                ) -> Result<(), String> {
-                    self.agent.dispatch_agent(a, run_id, launch)
-                }
-                fn dispatch_script(
-                    &self,
-                    a: &automations::model::Automation,
-                    run_id: &str,
-                ) -> Result<(), String> {
-                    self.script.dispatch_script(a, run_id)
-                }
-            }
             automations_mgr.set_dispatcher(Arc::new(CompositeDispatcher {
-                agent: Arc::clone(&agent_dispatcher),
+                agent: agent_dispatcher,
                 script: Arc::clone(&script_runner),
+                headless: Arc::clone(&headless_runner),
             }));
             // U4a: give the manager the real config store so agent-launch
             // resolution reads the user's shared automation defaults (R12/R15).
@@ -700,14 +699,14 @@ pub fn run() {
                     // Order: sanitize → scrub → truncate (the feed io.rs::clean
                     // order; the accepted residual finding in docs/residual-
                     // review-findings/feat-feed-pending-question.md, applied
-                    // here by monitor-handoff U3). Sanitizing FIRST means a
-                    // control/zero-width char inside a token can't split it
-                    // past the scrub and be re-formed into cleartext later;
-                    // truncation is `close_run`'s tail cap, always last, so
-                    // the scrub (and the U3 verdict parse) see the full text.
-                    let sane = notify::sanitize_multiline(&text);
-                    let scrubbed = automations::redact::scrub_secrets(&sane);
-                    (!scrubbed.trim().is_empty()).then_some(scrubbed)
+                    // here by monitor-handoff U3). The composition lives in the
+                    // ONE shared helper (headless-monitor-checks U5, R8) —
+                    // `close_headless_run` cleans through it too, so the order
+                    // invariant (control chars first, or one inside a token
+                    // splits it past the scrub; the tail cap last, inside
+                    // `close_run` after the verdict parse) cannot drift
+                    // between the pane and headless capture paths.
+                    automations::redact::clean_captured(&text)
                 },
             ));
             // U5: forward agent-run closes to the frontend so the tab lifecycle
@@ -734,6 +733,26 @@ pub fn run() {
                 .set_script_killer(Arc::new(move |run_id: &str| killer_runner.kill_run(run_id)));
             let capacity_runner = Arc::clone(&script_runner);
             automations_mgr.set_script_capacity(Arc::new(move || capacity_runner.has_capacity()));
+            // Headless seams (headless-monitor-checks U4/U5 — R5/R7), all
+            // resolving against the runner's in-flight registry: the killer
+            // rides the delete / shutdown / backstop kill legs (SIGTERM →
+            // short seam grace → SIGKILL + descendant sweep); the alive probe
+            // widens the overlap check so a terminal-but-alive child blocks
+            // the next claim and manual runs; the deadline gate is the
+            // backstop's suspend-proof monotonic check (epoch age alone can
+            // lapse across a laptop suspend while the check is healthy).
+            let headless_killer = Arc::clone(&headless_runner);
+            automations_mgr.set_headless_killer(Arc::new(move |run_id: &str| {
+                headless_killer.kill_run(run_id)
+            }));
+            let headless_alive = Arc::clone(&headless_runner);
+            automations_mgr.set_headless_check_alive(Arc::new(move |automation_id: &str| {
+                headless_alive.automation_check_alive(automation_id)
+            }));
+            let headless_gate = Arc::clone(&headless_runner);
+            automations_mgr.set_headless_deadline_gate(Arc::new(move |run_id: &str| {
+                headless_gate.monotonic_deadline_lapsed(run_id)
+            }));
             // U7 pane-alive probe (KTD-D): R7 overlap check widens to include
             // deadline-failed agent runs whose linked pane is still alive
             // (stuck agent must skip, not fan out). Consulted inside the sweep's
@@ -1257,6 +1276,55 @@ pub fn dispatch_automation_op(
     }
 }
 
+/// Composite dispatcher (automations U7+U5, headless-monitor-checks U5): the
+/// one [`automations::Dispatcher`] the manager routes through. Script
+/// dispatch goes to the [`automations::script::ScriptRunner`]; agent dispatch
+/// **forks on the automation's `monitor` flag** (the "Routing lives in the
+/// existing CompositeDispatcher" KTD): a monitor check hands to the
+/// [`automations::headless::HeadlessRunner`] — no pane, no tab, no
+/// `automation://agent-run` emission (headless-monitor-checks R1) — while a
+/// regular agent automation keeps the pane path via the frontend-emitting
+/// [`automations::AgentDispatcher`]. The `agent` arm is `dyn` so the routing
+/// tests below can inject a recorder without a Tauri `AppHandle`.
+struct CompositeDispatcher {
+    agent: std::sync::Arc<dyn automations::Dispatcher>,
+    script: std::sync::Arc<automations::script::ScriptRunner>,
+    headless: std::sync::Arc<automations::headless::HeadlessRunner>,
+}
+
+impl automations::Dispatcher for CompositeDispatcher {
+    fn dispatch_agent(
+        &self,
+        a: &automations::model::Automation,
+        run_id: &str,
+        launch: &automations::ResolvedLaunch,
+    ) -> Result<(), String> {
+        if a.monitor {
+            // Headless-monitor-checks R1: the check is backend-owned — hand
+            // it to the runner and return Ok. `run()` returns fast (it never
+            // blocks the sweep on the child) and routes EVERY failure, spawn
+            // included, through its CheckCloser as an infra Failed close —
+            // so post-handoff there is no dispatch error left to surface
+            // here: `Ok` means "handed off", not "succeeded". A spawn
+            // failure thus feeds the broken-monitor escalation as a Failed
+            // close (via `close_run_stamping`'s Failed-close escalation leg)
+            // rather than as the manager's dispatch-Err close — the same R7
+            // accounting either way, only the error's carrier differs
+            // (`row.error` instead of a recompute-and-close on Err).
+            self.headless.run(a, run_id, launch);
+            return Ok(());
+        }
+        self.agent.dispatch_agent(a, run_id, launch)
+    }
+    fn dispatch_script(
+        &self,
+        a: &automations::model::Automation,
+        run_id: &str,
+    ) -> Result<(), String> {
+        self.script.dispatch_script(a, run_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1340,5 +1408,145 @@ mod tests {
     fn monitor_pointers_abstain_without_a_target_or_any_cwd() {
         assert_eq!(monitor_pointers_from_target(None, Some("/live")), None);
         assert_eq!(monitor_pointers_from_target(Some(target(None)), None), None);
+    }
+
+    // ---- headless-monitor-checks U5: the CompositeDispatcher monitor fork ----
+
+    /// A recording stand-in for the pane-path agent arm (the real
+    /// `AgentDispatcher` needs a Tauri `AppHandle`, which no unit test has —
+    /// exactly why `CompositeDispatcher.agent` is `dyn`).
+    #[derive(Default)]
+    struct RecordingAgentArm {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl automations::Dispatcher for RecordingAgentArm {
+        fn dispatch_agent(
+            &self,
+            a: &automations::model::Automation,
+            _run_id: &str,
+            _launch: &automations::ResolvedLaunch,
+        ) -> Result<(), String> {
+            self.calls.lock().unwrap().push(a.id.clone());
+            Ok(())
+        }
+        fn dispatch_script(
+            &self,
+            _a: &automations::model::Automation,
+            _run_id: &str,
+        ) -> Result<(), String> {
+            Err("unused in these tests".into())
+        }
+    }
+
+    fn dispatcher_automation(monitor: bool) -> automations::model::Automation {
+        automations::model::Automation {
+            id: "a1".into(),
+            name: "watch".into(),
+            cron: "*/5 * * * *".into(),
+            timezone: "UTC".into(),
+            enabled: true,
+            retry_on_interrupt: false,
+            monitor,
+            not_before_ms: None,
+            retired_at: None,
+            pickup_pointers: None,
+            cwd: "/tmp".into(),
+            mode: automations::model::Mode::Agent {
+                prompt: "check the run".into(),
+                model: None,
+                effort: None,
+            },
+            origin: automations::model::Origin {
+                pane_id: 1,
+                workspace_id: "ws-1".into(),
+                label: "cli".into(),
+            },
+            created_at: 0,
+            updated_at: 0,
+            next_run_at: None,
+            runs: Vec::new(),
+        }
+    }
+
+    type CheckCloses = Arc<std::sync::Mutex<Vec<(String, String, automations::headless::CheckOutcome)>>>;
+
+    /// A CompositeDispatcher whose headless arm points at a nonexistent
+    /// binary: `run()` fails its spawn synchronously and reports through the
+    /// collector closer — proving the monitor leg reached the runner without
+    /// needing a real claude.
+    fn fork_harness() -> (CompositeDispatcher, Arc<RecordingAgentArm>, CheckCloses) {
+        let agent = Arc::new(RecordingAgentArm::default());
+        let closes: CheckCloses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let c = Arc::clone(&closes);
+        let headless = Arc::new(automations::headless::HeadlessRunner::with_config(
+            Arc::new(
+                move |aid: &str, rid: &str, outcome: automations::headless::CheckOutcome| {
+                    c.lock().unwrap().push((aid.to_owned(), rid.to_owned(), outcome));
+                },
+            ),
+            "/nonexistent/fly-test-claude",
+            automations::headless::HeadlessTiming::default(),
+        ));
+        let script = Arc::new(automations::script::ScriptRunner::new(Arc::new(
+            |_: &str, _: &str, _: automations::model::RunOutcome| {},
+        )));
+        let d = CompositeDispatcher {
+            agent: Arc::clone(&agent) as Arc<dyn automations::Dispatcher>,
+            script,
+            headless,
+        };
+        (d, agent, closes)
+    }
+
+    fn no_launch() -> automations::ResolvedLaunch {
+        automations::ResolvedLaunch {
+            model: None,
+            effort: None,
+            fallback: None,
+        }
+    }
+
+    // The routing KTD ("Routing lives in the existing CompositeDispatcher"):
+    // a monitor automation hands to the HeadlessRunner — the pane arm is
+    // never consulted, and the dispatch returns Ok even though this spawn
+    // failed, because `run()` reports every failure through the CheckCloser
+    // as an infra Failed close (feeding the R7 escalation via the close
+    // path), never as a dispatch Err.
+    #[test]
+    fn composite_dispatcher_routes_a_monitor_to_the_headless_runner() {
+        let (d, agent, closes) = fork_harness();
+        let res =
+            automations::Dispatcher::dispatch_agent(&d, &dispatcher_automation(true), "r1", &no_launch());
+        assert_eq!(res, Ok(()), "handed off — failures ride the closer");
+        assert!(
+            agent.calls.lock().unwrap().is_empty(),
+            "the pane arm is never consulted for a monitor"
+        );
+        let closes = closes.lock().unwrap();
+        assert_eq!(closes.len(), 1, "the runner reported through the closer");
+        assert_eq!(closes[0].0, "a1");
+        assert_eq!(closes[0].1, "r1");
+        assert!(
+            matches!(
+                &closes[0].2,
+                automations::headless::CheckOutcome::Infra { reason }
+                    if reason.starts_with("spawn failed:")
+            ),
+            "a spawn failure is an infra close, not a dispatch Err: {:?}",
+            closes[0].2
+        );
+    }
+
+    // R15: a regular (non-monitor) agent automation keeps the pane path —
+    // the headless runner is untouched.
+    #[test]
+    fn composite_dispatcher_keeps_regular_agent_automations_on_the_pane_arm() {
+        let (d, agent, closes) = fork_harness();
+        let res =
+            automations::Dispatcher::dispatch_agent(&d, &dispatcher_automation(false), "r2", &no_launch());
+        assert_eq!(res, Ok(()));
+        assert_eq!(*agent.calls.lock().unwrap(), vec!["a1".to_string()]);
+        assert!(closes.lock().unwrap().is_empty(), "runner untouched");
     }
 }

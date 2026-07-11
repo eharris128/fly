@@ -324,6 +324,8 @@ mod tests {
             effort: None,
             verdict: None,
             bundle_path: None,
+            headless: false,
+            session_id: None,
             output: None,
             exit_code: None,
             error: None,
