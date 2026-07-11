@@ -188,19 +188,31 @@ time/inputs as arguments so they're tested without a running app.
   (`session/transcript.rs::pending_interaction_from_str`, backward walk,
   abstain-on-surprise) — **primary but blind at ask time on Claude Code ≥
   2.1.206**, which flushes the pending `tool_use` only when the turn resolves.
-  The screen fallback (feed-question-screen-fallback) covers that gap,
-  strictly behind the transcript scan: each pane tees its raw output into a
-  64 KiB tail ring (`pty/pane.rs`); when the transcript abstains but the pane
-  is corroborated waiting (roster reason `question`/`permission` **and**
-  `~/.claude/sessions/<pid>.json` says `waiting` — `session/livestate.rs`),
-  the ring is replayed through a minimal `vte` grid and matched against
-  Claude's picker shape (`feed/screen.rs`, abstain-on-surprise, digits as
-  rendered — fixtures in `tests/fixtures/screen/` are real captured renders).
+  The screen fallback (feed-question-screen-fallback, gate widened by
+  fix-feed-question-detection-gaps) covers that gap, strictly behind the
+  transcript scan: each pane tees its raw output into a 64 KiB tail ring
+  (`pty/pane.rs`); when the transcript abstains, the gate is
+  `~/.claude/sessions/<pid>.json` (`session/livestate.rs`), three-valued —
+  `waiting` engages the fallback (the attention reason is deliberately NOT
+  required: AskUserQuestion fires no hook, and a raise on a visible pane is
+  instantly acknowledged, so a blocked pane routinely has no reason);
+  explicitly not-waiting abstains; **no entry at all** (a *child-session*
+  claude — `CLAUDE_CODE_CHILD_SESSION` in its env — writes no sessions file
+  and no transcript; fly strips those markers from pane env at spawn, but a
+  pre-existing session may still lack the file) falls through to the screen
+  parse as sole authority, engaged only for a non-`working` pane and exposing
+  nothing without a fully parsed body. The ring is replayed through a minimal
+  `vte` grid and matched against Claude's picker shape (`feed/screen.rs`,
+  abstain-on-surprise, digits as rendered — fixtures in
+  `tests/fixtures/screen/` are real captured renders).
   Two-tier degrade: a body abstention still stamps `questionPendingAt`
-  (tier 1). A screen-derived body carries `source:"screen"` and its `askedAt`
-  is the ask-time raise stamp (`feed/pending.rs`, stamped by the hook
-  dispatch), never a transcript stamp — a late transcript flush takes over
-  under its own stamp and stale `ifAskedAt` answers 409.
+  (tier 1 — corroborated-waiting leg only). A screen-derived body carries
+  `source:"screen"` and its `askedAt` is the ask-time raise stamp
+  (`feed/pending.rs`, stamped by the hook dispatch) when it postdates the
+  corroborator's own stamp, else the sessions file's `statusUpdatedAt` or (on
+  the no-entry leg) the ring's last-write time — never a transcript stamp — a
+  late transcript flush takes over under its own stamp and stale `ifAskedAt`
+  answers 409.
 - `notify/`, `config/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
   reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the

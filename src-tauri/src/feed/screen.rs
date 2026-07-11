@@ -260,9 +260,14 @@ impl Perform for Grid {
             'h' | 'l' => {} // (non-private handled here too: insert mode etc. unused by Ink)
             'r' => {
                 // DECSTBM: a full reset (`ESC[r`, no params) is Ink's startup
-                // hygiene — harmless. An actual sub-region would change scroll
-                // semantics we don't model → surprise.
-                if params.iter().next().is_some() {
+                // hygiene — harmless. Note vte reports a bare `ESC[r` as one
+                // defaulted 0-param, so "has params" is NOT the reset test
+                // (that mistake tainted every capture that included spawn
+                // bytes — fix-feed-question-detection-gaps, pinned by the
+                // ask-declined-reask-80 fixture). An actual sub-region
+                // (nonzero top/bottom) changes scroll semantics we don't
+                // model → surprise.
+                if params.iter().any(|p| p.first().copied().unwrap_or(0) != 0) {
                     self.surprised = true;
                 }
             }
@@ -547,6 +552,21 @@ mod tests {
     const ASK_120: &[u8] = include_bytes!("../../tests/fixtures/screen/ask-120.raw");
     const PERM_80: &[u8] = include_bytes!("../../tests/fixtures/screen/perm-80.raw");
     const PERM_120: &[u8] = include_bytes!("../../tests/fixtures/screen/perm-120.raw");
+    /// Real captured renders (Claude Code 2.1.207, 2026-07-11,
+    /// fix-feed-question-detection-gaps): an AskUserQuestion picker RE-ASKED
+    /// after the user declined the first ask — the reported bug's exact shape.
+    /// The decline collapses the old picker to a digit-free summary line
+    /// ("User declined to answer questions · What is your name? (…)"), so the
+    /// fresh picker is the only numbered block on the grid.
+    const ASK_DECLINED_REASK_80: &[u8] =
+        include_bytes!("../../tests/fixtures/screen/ask-declined-reask-80.raw");
+    /// The same session immediately after the decline, settled back at the
+    /// idle input box — no dialog on screen. The widened fallback gate parses
+    /// quiet screens without a corroborator, so this abstention is
+    /// load-bearing: it is what keeps an answered/declined agent from being
+    /// reported as still blocked.
+    const ASK_DECLINED_IDLE_80: &[u8] =
+        include_bytes!("../../tests/fixtures/screen/ask-declined-idle-80.raw");
 
     #[test]
     fn parses_the_real_ask_picker_at_80_cols() {
@@ -576,6 +596,30 @@ mod tests {
         assert_eq!(p.options.len(), 4);
         assert_eq!(p.options[0].label, "Red");
         assert_eq!(p.options[1].label, "Blue");
+    }
+
+    #[test]
+    fn parses_the_real_reasked_picker_after_a_decline() {
+        let p = parse_screen_interaction(ASK_DECLINED_REASK_80, 80).expect("parses");
+        assert_eq!(p.kind, ScreenKind::Choice);
+        assert_eq!(p.question, "What is your name?");
+        assert_eq!(p.header, "Name");
+        // The collapsed first ask left no numbered rows, so the block is
+        // exactly the re-asked picker: 3 authored options + the picker's own
+        // "Type something." and "Chat about this" extras.
+        let digits: Vec<u32> = p.options.iter().map(|o| o.digit).collect();
+        assert_eq!(digits, vec![1, 2, 3, 4, 5]);
+        assert_eq!(p.options[0].label, "Evan");
+        assert_eq!(p.options[1].label, "Evan Harris");
+        assert_eq!(p.options[2].label, "Something else");
+        assert_eq!(p.options[3].label, "Type something.");
+        assert_eq!(p.options[4].label, "Chat about this");
+        assert_eq!(p.cursor_at, 0);
+    }
+
+    #[test]
+    fn abstains_on_the_real_post_decline_idle_screen() {
+        assert_eq!(parse_screen_interaction(ASK_DECLINED_IDLE_80, 80), None);
     }
 
     #[test]
@@ -636,6 +680,27 @@ mod tests {
         assert_eq!(p.kind, ScreenKind::Choice);
         assert_eq!(p.options.len(), 2);
         assert_eq!(p.question, "Which color do you prefer?");
+    }
+
+    #[test]
+    fn a_bare_decstbm_reset_is_harmless_but_a_sub_region_taints() {
+        // vte reports `ESC[r` (full reset — Ink startup hygiene) as one
+        // defaulted 0-param; it must NOT taint (the pinned regression from
+        // fix-feed-question-detection-gaps: every capture that includes spawn
+        // bytes carries one). A real sub-region still does.
+        let mut with_reset = b"\x1b[r".to_vec();
+        with_reset.extend_from_slice(&synthetic(GOOD));
+        assert!(
+            parse_screen_interaction(&with_reset, 80).is_some(),
+            "bare ESC[r must not taint"
+        );
+        let mut with_region = b"\x1b[1;20r".to_vec();
+        with_region.extend_from_slice(&synthetic(GOOD));
+        assert_eq!(
+            parse_screen_interaction(&with_region, 80),
+            None,
+            "a scroll sub-region is unmodeled → abstain"
+        );
     }
 
     #[test]

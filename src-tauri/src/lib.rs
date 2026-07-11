@@ -750,8 +750,9 @@ pub fn run() {
                             Arc::clone(&pending_signals),
                             screen_fn,
                         ));
-                        let io_fn: feed::server::IoFn =
-                            Arc::new(move |leaf_key, reason| resolver.resolve_io(leaf_key, reason));
+                        let io_fn: feed::server::IoFn = Arc::new(move |leaf_key, reason, status| {
+                            resolver.resolve_io(leaf_key, reason, status)
+                        });
                         // Input delivery (U5; feed-pending-question U6): leaf
                         // → live pane → the action's bytes. Submit is the
                         // sanitized bracketed paste, then Enter as its OWN

@@ -52,12 +52,13 @@ pub type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// (feed-agent-reply-io U3; widened by feed-pending-question U4) — injected so
 /// the server needs no resume-store/transcript dependency. The ONE source
 /// `GET /agents/{key}/output`, the frame's `lastReplyAt`, and the frame's
-/// `questionPendingAt` all read (R3/R4). The second argument is the leaf's
-/// live attention reason from the caller's roster read
-/// (feed-question-screen-fallback KTD4): the screen fallback behind this seam
-/// engages only for a `question`/`permission` reason, and passing the same
+/// `questionPendingAt` all read (R3/R4). The second and third arguments are
+/// the leaf's live attention reason and dashboard status from the caller's
+/// single roster read (feed-question-screen-fallback KTD4): the screen
+/// fallback behind this seam uses the reason as an accelerator and declines
+/// to engage its uncorroborated leg on a `working` pane, and passing the same
 /// snapshot the caller gates on keeps the resolution and the gate coherent.
-pub type IoFn = Arc<dyn Fn(&str, Option<&str>) -> ResolvedIo + Send + Sync>;
+pub type IoFn = Arc<dyn Fn(&str, Option<&str>, &str) -> ResolvedIo + Send + Sync>;
 /// Delivers one input action to a leaf's pane (feed-agent-reply-io U5;
 /// widened by feed-pending-question U6) — injected because delivery needs the
 /// PTY registry + attention manager + AppHandle, none of which the server
@@ -332,14 +333,14 @@ fn gated_question(question: Option<QuestionBody>, reason: Option<&str>) -> Optio
 /// question and the conversation tail (feed-conversation-tail R1 — ungated:
 /// turns are completed history, already scrubbed/capped by the resolver),
 /// `{"text": "", …}` when the agent exists but has no data, `404` for a key
-/// outside the published roster (KTD2). Existence and reason come from ONE
-/// roster snapshot ([`FeedState::agent_reason`]) so the gate can't straddle a
-/// roster swap.
+/// outside the published roster (KTD2). Existence, reason, and status come
+/// from ONE roster snapshot ([`FeedState::agent_gate`]) so the gate can't
+/// straddle a roster swap.
 fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec<u8>>> {
-    let Some(reason) = ctx.state.agent_reason(key) else {
+    let Some(gate) = ctx.state.agent_gate(key) else {
         return empty_response(404);
     };
-    let resolved = (ctx.io)(key, reason.as_deref());
+    let resolved = (ctx.io)(key, gate.reason.as_deref(), &gate.status);
     let (text, replied_at) = match resolved.reply {
         Some(reply) => (reply.text, reply.replied_at_ms),
         None => (String::new(), None),
@@ -347,7 +348,7 @@ fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec
     let body = AgentOutputBody {
         text,
         replied_at,
-        question: gated_question(resolved.question, reason.as_deref()),
+        question: gated_question(resolved.question, gate.reason.as_deref()),
         turns: resolved.turns,
     };
     json_response(serde_json::to_string(&body).unwrap_or_else(|_| "{\"text\":\"\"}".into()))
@@ -396,7 +397,7 @@ fn agent_input_response(
 ) -> Response<io::Cursor<Vec<u8>>> {
     // Existence gate only (404). The reason the guard acts on is re-read fresh
     // below, after the body read, so it can't be a stale pre-body snapshot.
-    if ctx.state.agent_reason(key).is_none() {
+    if ctx.state.agent_gate(key).is_none() {
         return empty_response(404);
     }
     let mut body = Vec::new();
@@ -468,13 +469,19 @@ fn agent_input_response(
     // The stale-answer guard + answered latch (R11), armed by ifAskedAt.
     let mut reserved = false;
     if let Some(asked) = input.if_asked_at {
-        // Re-read the reason NOW (after the body read) and gate the question on
-        // it, so reason + question are one fresh, body-independent read — a
-        // paced/chunked POST can't slip a locally-dismissed dialog's stale
-        // reason past the gate. A key that vanished meanwhile → unexposed.
-        let reason = ctx.state.agent_reason(key).flatten();
-        let Some(q) = gated_question((ctx.io)(key, reason.as_deref()).question, reason.as_deref())
-        else {
+        // Re-read the roster gate NOW (after the body read) and gate the
+        // question on it, so reason + question are one fresh, body-independent
+        // read — a paced/chunked POST can't slip a locally-dismissed dialog's
+        // stale reason past the gate. A key that vanished meanwhile →
+        // unexposed (409, the same as "nothing pending").
+        let Some(gate) = ctx.state.agent_gate(key) else {
+            return empty_response(409);
+        };
+        let reason = gate.reason;
+        let Some(q) = gated_question(
+            (ctx.io)(key, reason.as_deref(), &gate.status).question,
+            reason.as_deref(),
+        ) else {
             return empty_response(409);
         };
         if q.asked_at != asked {
@@ -636,7 +643,7 @@ fn stream_sse(mut w: Box<dyn Write + Send>, ctx: &HandlerCtx) {
 fn emit_frame(w: &mut Box<dyn Write + Send>, ctx: &HandlerCtx) -> Option<u64> {
     let mut snap = ctx.state.snapshot((ctx.automations)(), (ctx.now)());
     for agent in &mut snap.agents {
-        let resolved = (ctx.io)(&agent.leaf_key, agent.reason.as_deref());
+        let resolved = (ctx.io)(&agent.leaf_key, agent.reason.as_deref(), &agent.status);
         agent.last_reply_at = resolved.reply.and_then(|r| r.replied_at_ms);
         // The marker: a (gated) question body's own stamp, else the tier-1
         // pending signal (feed-question-screen-fallback R2) — the resolver

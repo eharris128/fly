@@ -1,21 +1,47 @@
 //! The screen-derived pending-question fallback composition
-//! (feed-question-screen-fallback U5, KTD4/KTD5/KTD7, R1/R2/R5).
+//! (feed-question-screen-fallback U5, KTD4/KTD5/KTD7, R1/R2/R5; gate widened
+//! by fix-feed-question-detection-gaps — see below).
 //!
 //! Wraps the transcript-pure [`ReplyResolver`] behind the same `IoFn` seam the
 //! server reads, adding the v2.1.206 fallback strictly *behind* it (R1): when
-//! the transcript yields a pending question nothing changes; when it abstains
-//! but the pane is corroborated waiting — live attention reason ∈
-//! {question, permission} AND Claude's sessions file says `waiting` for the
-//! leaf's session (KTD4) — the pending signal is stamped
-//! (`pending_fallback_at`, tier 1) and the question body is synthesized from
-//! the pane's rendered screen (`screen::parse_screen_interaction`, tier 2).
+//! the transcript yields a pending question nothing changes; when it abstains,
+//! the fallback keys off Claude's sessions file (KTD4), three-valued:
+//!
+//! - **`waiting`** — corroborated: the pending signal is stamped
+//!   (`pending_fallback_at`, tier 1) and the question body is synthesized from
+//!   the pane's rendered screen (`screen::parse_screen_interaction`, tier 2).
+//! - **not waiting** — Claude's own live word that nothing is pending: abstain,
+//!   whatever the screen ring still holds.
+//! - **no entry at all** — no corroborator exists in either direction (a
+//!   *child-session* claude — one spawned with `CLAUDE_CODE_CHILD_SESSION` in
+//!   its env — writes no sessions file; nor does a pre-2.1.206 build). Here
+//!   the strict, abstain-on-surprise screen parse is itself the only
+//!   admissible evidence: it runs only for a pane that is not actively
+//!   producing output (`status != "working"`, unless the live attention
+//!   reason already says a dialog is up), and *nothing* is exposed without a
+//!   fully parsed body — no bare tier-1 stamp on this leg.
+//!
+//! The original gate additionally required the live attention reason ∈
+//! {question, permission}. That conflated "needs attention (unseen)" with
+//! "blocked on input": an AskUserQuestion fires no hook at all, and a raise on
+//! a visible pane is instantly acknowledged (`state/attention.rs`), so a
+//! re-asked or merely-glanced-at picker carried no reason and the fallback
+//! never engaged — `questionPendingAt` stayed null while the agent sat
+//! blocked. The reason is now only an accelerator (it lets the no-entry leg
+//! engage even while the draw stretch still counts as `working`), never a
+//! requirement, matching the transcript-derived contract: a choice question is
+//! pending from ask until answered, independent of attention state.
 //!
 //! Timestamp discipline (R5): a screen-derived body's `askedAt` is the
-//! ask-time raise stamp ([`PendingSignals`]), falling back to the sessions
-//! file's `statusUpdatedAt` — never a transcript stamp. If the transcript
-//! later flushes (an upstream fix, or the turn resolving), the transcript body
-//! takes over under its own stamp and an in-flight screen-stamped `ifAskedAt`
-//! answer 409s — the safe direction.
+//! ask-time raise stamp ([`PendingSignals`]) when one exists *and postdates*
+//! the corroborator's own stamp (a raise stamp is never cleared, so an old
+//! dialog's stamp must not be mistaken for this one's), falling back to the
+//! sessions file's `statusUpdatedAt` — or, on the no-entry leg, the tail
+//! ring's last-write time (a parked dialog produces no output, so that is the
+//! dialog's draw time). Never a transcript stamp. If the transcript later
+//! flushes (an upstream fix, or the turn resolving), the transcript body takes
+//! over under its own stamp and an in-flight screen-stamped `ifAskedAt` answer
+//! 409s — the safe direction.
 //!
 //! The screen parse is cached per leaf keyed by the tail ring's write
 //! sequence: a pane waiting on a dialog produces no output, so its `seq` is
@@ -78,50 +104,94 @@ impl FallbackResolver {
     }
 
     /// The composed per-leaf resolution every feed surface reads (KTD7).
-    /// `reason` is the leaf's live attention reason from the same roster
-    /// snapshot the caller gates on — the fallback engages only for
-    /// `question`/`permission` (KTD4), so a settled agent costs exactly one
-    /// transcript-cache hit and nothing else.
-    pub fn resolve_io(&self, leaf_key: &str, reason: Option<&str>) -> ResolvedIo {
+    /// `reason` and `status` are the leaf's live attention reason and
+    /// dashboard status from the same roster snapshot the caller gates on
+    /// (KTD4) — reason accelerates (never gates) the no-corroborator leg, and
+    /// `status == "working"` suppresses it, so an actively-streaming pane
+    /// never pays a VT replay and a mid-scroll frame is never parsed.
+    pub fn resolve_io(&self, leaf_key: &str, reason: Option<&str>, status: &str) -> ResolvedIo {
         let mut io = self.inner.resolve_io(leaf_key);
         // R1: the transcript is primary — a transcript-derived pending
         // question short-circuits the fallback entirely.
         if io.question.is_some() {
             return io;
         }
-        if !matches!(reason, Some("question") | Some("permission")) {
-            return io;
-        }
-        // KTD4 corroboration: the leaf's captured session must be live-marked
-        // `waiting` by Claude's own sessions file. No record / no file / not
-        // waiting → no fallback (the roster reason alone can be stale).
+        // Without a captured session the sessions file can't be consulted and
+        // the leaf has no attribution to hang evidence on — no fallback.
         let Some(session_id) =
             resume::read_records(&self.resume_path).remove(leaf_key).and_then(|r| r.session_id)
         else {
             return io;
         };
-        let Some(root) = self.sessions_root.as_ref() else {
-            return io;
-        };
-        let Some(state) = livestate::waiting_state(root, &session_id) else {
-            return io;
-        };
-        if !state.waiting {
-            return io;
+        let live = self
+            .sessions_root
+            .as_ref()
+            .and_then(|root| livestate::waiting_state(root, &session_id));
+        match live {
+            // Claude's own live word: the session is NOT waiting — nothing is
+            // pending, whatever the screen ring still holds.
+            Some(state) if !state.waiting => io,
+            // Corroborated waiting (KTD4): tier 1 stamps regardless of the
+            // body, tier 2 synthesizes the body from the rendered screen.
+            Some(state) => {
+                // KTD5: the ask-time stamp — the raise stamp when the dispatch
+                // saw one AND it postdates this dialog's status flip (stamps
+                // are never cleared, so an older dialog's stamp must not leak
+                // onto this one), else the sessions file's own status-change
+                // stamp (both stable while the dialog is open).
+                let asked_at = self
+                    .signals
+                    .get(leaf_key)
+                    .filter(|s| *s >= state.status_updated_at_ms)
+                    .unwrap_or(state.status_updated_at_ms);
+                // Tier 1 (R2): the pending SIGNAL surfaces regardless of the
+                // body.
+                io.pending_fallback_at = Some(asked_at);
+                if let Some((Some(p), _)) = self.parsed_screen(leaf_key) {
+                    io.question = screen_question_body(&p, asked_at);
+                }
+                io
+            }
+            // No sessions entry for the session at all (a child-session
+            // claude writes none; neither does a pre-2.1.206 build): the
+            // strict screen parse is the only admissible evidence. Engage it
+            // only for a pane that isn't actively streaming (or whose raised
+            // reason already says a dialog is up), and expose nothing —
+            // not even a tier-1 stamp — without a fully parsed body.
+            None => {
+                let hot = matches!(reason, Some("question") | Some("permission"));
+                if !hot && status == "working" {
+                    return io;
+                }
+                let Some((Some(p), drawn_at_ms)) = self.parsed_screen(leaf_key) else {
+                    return io;
+                };
+                // Ask-time anchor: the raise stamp when it postdates the
+                // dialog's draw (the ring's last write — a parked dialog
+                // produces no output, so the last write IS the draw), else the
+                // draw time itself. A redraw moves the anchor; an in-flight
+                // `ifAskedAt` answer then 409s — the safe direction.
+                let asked_at = self
+                    .signals
+                    .get(leaf_key)
+                    .filter(|s| *s >= drawn_at_ms)
+                    .unwrap_or(drawn_at_ms);
+                if let Some(q) = screen_question_body(&p, asked_at) {
+                    io.pending_fallback_at = Some(asked_at);
+                    io.question = Some(q);
+                }
+                io
+            }
         }
-        // KTD5: the ask-time stamp — the raise stamp when the dispatch saw
-        // one, else the sessions file's own status-change stamp (both stable
-        // while the dialog is open).
-        let asked_at = self
-            .signals
-            .get(leaf_key)
-            .unwrap_or(state.status_updated_at_ms);
-        // Tier 1 (R2): the pending SIGNAL surfaces regardless of the body.
-        io.pending_fallback_at = Some(asked_at);
-        // Tier 2: the body, from the rendered screen, abstain-on-surprise.
-        let Some(tail) = (self.screen_fn)(leaf_key) else {
-            return io;
-        };
+    }
+
+    /// The leaf's screen tail and its memoized parse, keyed by the ring's
+    /// write `seq` (R7): a pane waiting on a dialog produces no output, so the
+    /// VT replay runs once per dialog, not per frame. Returns the parse (which
+    /// may itself be an abstention) plus the ring's last-write stamp; `None`
+    /// when the pane is gone.
+    fn parsed_screen(&self, leaf_key: &str) -> Option<(Option<ScreenInteraction>, u64)> {
+        let tail = (self.screen_fn)(leaf_key)?;
         let parsed = {
             let mut cache = self.parse_cache.lock().unwrap();
             match cache.get(leaf_key) {
@@ -133,10 +203,7 @@ impl FallbackResolver {
                 }
             }
         };
-        if let Some(p) = parsed {
-            io.question = screen_question_body(&p, asked_at);
-        }
-        io
+        Some((parsed, tail.last_write_at_ms))
     }
 }
 
@@ -301,6 +368,10 @@ mod tests {
         out
     }
 
+    /// The fixture screen ring's last-write stamp — the "dialog draw time"
+    /// the no-livestate leg anchors `askedAt` on.
+    const DRAWN_AT: u64 = 4_000;
+
     struct Fixture {
         dir: tempfile::TempDir,
         signals: Arc<PendingSignals>,
@@ -317,6 +388,21 @@ mod tests {
         /// Wire leaf-1 → sid-abc @ /p with `transcript` on disk, a sessions
         /// file with `status`, and `screen` bytes behind the screen seam.
         fn resolver(&self, transcript: &str, status: &str, screen: Option<Vec<u8>>) -> FallbackResolver {
+            self.build(transcript, Some(status), screen)
+        }
+
+        /// Same wiring but with NO sessions entry for the session — the
+        /// child-session / pre-2.1.206 shape the screen-authority leg covers.
+        fn resolver_no_livestate(&self, transcript: &str, screen: Option<Vec<u8>>) -> FallbackResolver {
+            self.build(transcript, None, screen)
+        }
+
+        fn build(
+            &self,
+            transcript: &str,
+            claude_status: Option<&str>,
+            screen: Option<Vec<u8>>,
+        ) -> FallbackResolver {
             let resume_path = self.dir.path().join("resume.json");
             resume::upsert_at(
                 &resume_path,
@@ -335,19 +421,22 @@ mod tests {
             std::fs::write(project.join("sid-abc.jsonl"), transcript).unwrap();
             let sessions = self.dir.path().join("sessions");
             std::fs::create_dir_all(&sessions).unwrap();
-            std::fs::write(
-                sessions.join("1234.json"),
-                format!(
-                    r#"{{"pid":1234,"sessionId":"sid-abc","cwd":"/p","status":"{status}","statusUpdatedAt":5000}}"#
-                ),
-            )
-            .unwrap();
+            if let Some(status) = claude_status {
+                std::fs::write(
+                    sessions.join("1234.json"),
+                    format!(
+                        r#"{{"pid":1234,"sessionId":"sid-abc","cwd":"/p","status":"{status}","statusUpdatedAt":5000}}"#
+                    ),
+                )
+                .unwrap();
+            }
             let screen_fn: ScreenFn = Arc::new(move |_| {
                 screen.clone().map(|bytes| ScreenTail {
                     bytes,
                     seq: 42,
                     rows: 24,
                     cols: 80,
+                    last_write_at_ms: DRAWN_AT,
                 })
             });
             FallbackResolver::with_roots(
@@ -367,7 +456,7 @@ mod tests {
         let f = Fixture::new();
         f.signals.stamp("leaf-1", 9_999);
         let r = f.resolver(TRANSCRIPT_PENDING, "waiting", Some(picker_bytes()));
-        let io = r.resolve_io("leaf-1", Some("question"));
+        let io = r.resolve_io("leaf-1", Some("question"), "waiting");
         let q = io.question.expect("transcript question");
         assert_eq!(q.source, None, "transcript-derived carries no source tag");
         assert_eq!(q.asked_at, TRANSCRIPT_ASKED_AT, "transcript stamp, not the raise stamp");
@@ -379,7 +468,7 @@ mod tests {
         let f = Fixture::new();
         f.signals.stamp("leaf-1", 7_777);
         let r = f.resolver(REPLY_ONLY, "waiting", Some(picker_bytes()));
-        let io = r.resolve_io("leaf-1", Some("question"));
+        let io = r.resolve_io("leaf-1", Some("question"), "waiting");
         let q = io.question.expect("screen-derived question");
         assert_eq!(q.source.as_deref(), Some("screen"));
         assert_eq!(q.asked_at, 7_777, "askedAt = the raise stamp (R5)");
@@ -395,13 +484,36 @@ mod tests {
     }
 
     #[test]
+    fn corroborated_waiting_needs_no_attention_reason() {
+        // THE fixed gap (fix-feed-question-detection-gaps): an AskUserQuestion
+        // fires no hook, and a raise on a visible pane is instantly
+        // acknowledged — either way the roster carries no reason while the
+        // agent sits blocked. Claude's sessions file saying `waiting` is
+        // corroboration enough; the reason must not gate the fallback. The
+        // livestate leg is not status-gated either (the picker's own draw
+        // keeps the pane `working` for the activity gap — detection must not
+        // wait it out).
+        let f = Fixture::new();
+        let r = f.resolver(REPLY_ONLY, "waiting", Some(picker_bytes()));
+        for status in ["idle", "waiting", "running", "working"] {
+            let io = r.resolve_io("leaf-1", None, status);
+            let q = io.question.expect("screen-derived question");
+            assert_eq!(q.source.as_deref(), Some("screen"), "status {status}");
+            assert_eq!(io.pending_fallback_at, Some(5_000), "statusUpdatedAt anchors");
+        }
+    }
+
+    #[test]
     fn a_screen_body_reads_other_key_off_the_rendered_row() {
         // feed-other-answer R3: the rendered "Type something." row's own digit
         // becomes otherKey — no count arithmetic, no version assumption.
         let f = Fixture::new();
         f.signals.stamp("leaf-1", 7_777);
         let r = f.resolver(REPLY_ONLY, "waiting", Some(picker_bytes_with_extras()));
-        let q = r.resolve_io("leaf-1", Some("question")).question.expect("question");
+        let q = r
+            .resolve_io("leaf-1", Some("question"), "waiting")
+            .question
+            .expect("question");
         assert!(q.answerable);
         assert_eq!(q.questions[0].other_key.as_deref(), Some("3"));
         // The row itself still rides `options` as rendered (digit fidelity).
@@ -410,24 +522,27 @@ mod tests {
         // A render without the row (older picker, or any other dialog) simply
         // has no otherKey — absent, never a guessed digit.
         let r = f.resolver(REPLY_ONLY, "waiting", Some(picker_bytes()));
-        let q = r.resolve_io("leaf-1", Some("question")).question.expect("question");
+        let q = r
+            .resolve_io("leaf-1", Some("question"), "waiting")
+            .question
+            .expect("question");
         assert_eq!(q.questions[0].other_key, None);
     }
 
     #[test]
     fn body_abstain_still_surfaces_the_pending_signal() {
-        // R2 two-tier degrade: unparseable screen → no question object, but
-        // pending_fallback_at still stamps.
+        // R2 two-tier degrade (corroborated leg only): unparseable screen →
+        // no question object, but pending_fallback_at still stamps.
         let f = Fixture::new();
         f.signals.stamp("leaf-1", 7_777);
         let garbled = b"just some plain output, no dialog".to_vec();
         let r = f.resolver(REPLY_ONLY, "waiting", Some(garbled));
-        let io = r.resolve_io("leaf-1", Some("permission"));
+        let io = r.resolve_io("leaf-1", Some("permission"), "waiting");
         assert_eq!(io.question, None);
         assert_eq!(io.pending_fallback_at, Some(7_777));
         // And with no screen at all (pane gone), same tier-1 result.
         let r = f.resolver(REPLY_ONLY, "waiting", None);
-        let io = r.resolve_io("leaf-1", Some("permission"));
+        let io = r.resolve_io("leaf-1", Some("permission"), "waiting");
         assert_eq!(io.question, None);
         assert_eq!(io.pending_fallback_at, Some(7_777));
     }
@@ -436,21 +551,16 @@ mod tests {
     fn no_fallback_without_the_corroboration_chain() {
         let f = Fixture::new();
         f.signals.stamp("leaf-1", 7_777);
-        // Wrong reason → nothing.
-        let r = f.resolver(REPLY_ONLY, "waiting", Some(picker_bytes()));
-        for reason in [None, Some("finished"), Some("alert")] {
-            let io = r.resolve_io("leaf-1", reason);
-            assert_eq!(io.question, None, "reason {reason:?}");
-            assert_eq!(io.pending_fallback_at, None);
-        }
-        // Sessions file not waiting → nothing (Claude already resolved it).
+        // Sessions file explicitly not waiting → nothing, even with a raised
+        // reason, a stamp, and a parseable picker still in the ring (Claude's
+        // own live word beats every fly-side signal).
         let r = f.resolver(REPLY_ONLY, "busy", Some(picker_bytes()));
-        let io = r.resolve_io("leaf-1", Some("question"));
+        let io = r.resolve_io("leaf-1", Some("question"), "idle");
         assert_eq!(io.question, None);
         assert_eq!(io.pending_fallback_at, None);
         // Unknown leaf (no resume record) → nothing.
         let r = f.resolver(REPLY_ONLY, "waiting", Some(picker_bytes()));
-        let io = r.resolve_io("leaf-ghost", Some("question"));
+        let io = r.resolve_io("leaf-ghost", Some("question"), "idle");
         assert_eq!(io.question, None);
         assert_eq!(io.pending_fallback_at, None);
     }
@@ -461,9 +571,83 @@ mod tests {
         // variant that didn't fire) → statusUpdatedAt anchors the guard.
         let f = Fixture::new();
         let r = f.resolver(REPLY_ONLY, "waiting", Some(picker_bytes()));
-        let io = r.resolve_io("leaf-1", Some("question"));
+        let io = r.resolve_io("leaf-1", Some("question"), "waiting");
         assert_eq!(io.pending_fallback_at, Some(5_000));
         assert_eq!(io.question.unwrap().asked_at, 5_000);
+    }
+
+    #[test]
+    fn a_stale_raise_stamp_never_leaks_onto_a_new_dialog() {
+        // Raise stamps are never cleared, so one from a long-resolved dialog
+        // must not become a NEW dialog's askedAt: only a stamp that postdates
+        // the corroborator's own stamp counts.
+        let f = Fixture::new();
+        f.signals.stamp("leaf-1", 100); // ancient raise, statusUpdatedAt is 5000
+        let r = f.resolver(REPLY_ONLY, "waiting", Some(picker_bytes()));
+        let io = r.resolve_io("leaf-1", None, "idle");
+        assert_eq!(io.pending_fallback_at, Some(5_000), "stale stamp ignored");
+        assert_eq!(io.question.unwrap().asked_at, 5_000);
+        // Same discipline on the no-livestate leg, against the draw time
+        // (fresh fixture: the leg needs the sessions dir genuinely empty).
+        let f = Fixture::new();
+        f.signals.stamp("leaf-1", 100);
+        let r = f.resolver_no_livestate(REPLY_ONLY, Some(picker_bytes()));
+        let io = r.resolve_io("leaf-1", None, "idle");
+        assert_eq!(io.question.unwrap().asked_at, DRAWN_AT, "stale stamp ignored");
+    }
+
+    #[test]
+    fn absent_livestate_screen_parse_is_the_sole_authority() {
+        // The child-session shape (fix-feed-question-detection-gaps): no
+        // sessions entry exists at all, no reason (never raised / instantly
+        // acknowledged), the transcript never flushed — only the rendered
+        // picker knows the agent is blocked. A quiet pane's strict parse
+        // exposes the question; askedAt anchors on the ring's draw time.
+        let f = Fixture::new();
+        let r = f.resolver_no_livestate(REPLY_ONLY, Some(picker_bytes()));
+        let io = r.resolve_io("leaf-1", None, "idle");
+        let q = io.question.expect("screen-derived question");
+        assert_eq!(q.source.as_deref(), Some("screen"));
+        assert_eq!(q.kind, "choice");
+        assert_eq!(q.asked_at, DRAWN_AT, "askedAt = the dialog's draw time");
+        assert_eq!(io.pending_fallback_at, Some(DRAWN_AT));
+        // A fresh raise stamp (postdating the draw) is preferred when present.
+        f.signals.stamp("leaf-1", 9_000);
+        let io = r.resolve_io("leaf-1", None, "idle");
+        assert_eq!(io.question.unwrap().asked_at, 9_000);
+    }
+
+    #[test]
+    fn absent_livestate_exposes_nothing_without_a_parsed_body() {
+        // Without any corroborator, a bare "something is pending" claim is
+        // inadmissible: an unparseable screen (or no screen) yields NO tier-1
+        // stamp — the opposite of the corroborated leg's two-tier degrade.
+        let f = Fixture::new();
+        f.signals.stamp("leaf-1", 7_777);
+        let garbled = b"just some plain output, no dialog".to_vec();
+        let r = f.resolver_no_livestate(REPLY_ONLY, Some(garbled));
+        let io = r.resolve_io("leaf-1", None, "idle");
+        assert_eq!(io.question, None);
+        assert_eq!(io.pending_fallback_at, None);
+        let r = f.resolver_no_livestate(REPLY_ONLY, None);
+        let io = r.resolve_io("leaf-1", None, "idle");
+        assert_eq!(io.question, None);
+        assert_eq!(io.pending_fallback_at, None);
+    }
+
+    #[test]
+    fn absent_livestate_never_parses_a_working_pane_unless_raised() {
+        // Cost + safety gate: an actively-streaming pane's ring churns every
+        // frame — without a corroborator the parse waits for quiet. A raised
+        // question/permission reason accelerates (a dialog is provably up).
+        let f = Fixture::new();
+        let r = f.resolver_no_livestate(REPLY_ONLY, Some(picker_bytes()));
+        let io = r.resolve_io("leaf-1", None, "working");
+        assert_eq!(io.question, None);
+        assert_eq!(io.pending_fallback_at, None);
+        // Raised reason → engages even while `working`.
+        let io = r.resolve_io("leaf-1", Some("question"), "working");
+        assert!(io.question.is_some());
     }
 
     #[test]
@@ -486,7 +670,10 @@ mod tests {
             bytes.extend_from_slice(b"\r\n");
         }
         let r = f.resolver(REPLY_ONLY, "waiting", Some(bytes));
-        let q = r.resolve_io("leaf-1", Some("question")).question.expect("question");
+        let q = r
+            .resolve_io("leaf-1", Some("question"), "waiting")
+            .question
+            .expect("question");
         let label = &q.questions[0].options[0].label;
         assert!(!label.contains("sk-ant"), "leaked: {label}");
         assert!(label.contains("[redacted]"));
@@ -515,7 +702,10 @@ mod tests {
             bytes.extend_from_slice(b"\r\n");
         }
         let r = f.resolver(REPLY_ONLY, "waiting", Some(bytes));
-        let q = r.resolve_io("leaf-1", Some("permission")).question.expect("question");
+        let q = r
+            .resolve_io("leaf-1", Some("permission"), "waiting")
+            .question
+            .expect("question");
         assert_eq!(q.kind, "permission");
         assert_eq!(q.source.as_deref(), Some("screen"));
         assert!(!q.answerable, "permission is never answerable-flagged");
@@ -543,6 +733,7 @@ mod tests {
                 seq: 42,
                 rows: 24,
                 cols: 80,
+                last_write_at_ms: DRAWN_AT,
             })
         });
         // Build the resolver by hand around the fixture's stores.
@@ -552,8 +743,8 @@ mod tests {
             parse_cache: Mutex::new(HashMap::new()),
             ..base
         };
-        assert!(r.resolve_io("leaf-1", Some("question")).question.is_some());
-        assert!(r.resolve_io("leaf-1", Some("question")).question.is_some());
+        assert!(r.resolve_io("leaf-1", Some("question"), "waiting").question.is_some());
+        assert!(r.resolve_io("leaf-1", Some("question"), "waiting").question.is_some());
         assert_eq!(calls.load(Ordering::SeqCst), 2, "screen_fn consulted per resolve");
         // The cached parse means the second resolve did no re-render; assert
         // indirectly via a poisoned second payload under the SAME seq: the

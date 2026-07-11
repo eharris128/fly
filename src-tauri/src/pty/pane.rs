@@ -135,6 +135,11 @@ struct TailRing {
     len: usize,
     /// Total bytes ever written — the snapshot version.
     seq: u64,
+    /// Wall-clock stamp (epoch ms, caller-injected) of the most recent write.
+    /// A dialog parked on screen produces no output, so this freezes at the
+    /// dialog's draw time — the screen fallback's ask-time anchor when neither
+    /// a hook raise nor Claude's sessions file provides one. 0 = never written.
+    last_write_ms: u64,
 }
 
 impl TailRing {
@@ -144,13 +149,17 @@ impl TailRing {
             pos: 0,
             len: 0,
             seq: 0,
+            last_write_ms: 0,
         }
     }
 
-    /// Append a chunk, keeping only the trailing `capacity` bytes.
-    fn write(&mut self, bytes: &[u8]) {
+    /// Append a chunk, keeping only the trailing `capacity` bytes. `now_ms` is
+    /// the wall clock (time-injected, like the state machines, so tests need no
+    /// real clock).
+    fn write(&mut self, bytes: &[u8], now_ms: u64) {
         let cap = self.buf.len();
         self.seq += bytes.len() as u64;
+        self.last_write_ms = now_ms;
         // A chunk at/over capacity replaces the whole ring with its own tail.
         let src = if bytes.len() >= cap {
             self.pos = 0;
@@ -192,6 +201,11 @@ pub struct ScreenTail {
     pub seq: u64,
     pub rows: u16,
     pub cols: u16,
+    /// Epoch ms of the ring's most recent write (0 = never written). Stable
+    /// while a dialog is parked (a waiting pane produces no output), so it
+    /// doubles as the dialog's draw-time stamp for the screen fallback's
+    /// `askedAt` when no better ask-time source exists.
+    pub last_write_at_ms: u64,
 }
 
 /// State shared between a pane and its read thread.
@@ -294,11 +308,29 @@ impl Pane {
         if let Some(cwd) = &cfg.cwd {
             cmd.cwd(cwd);
         }
-        // portable-pty clears the child env (env_clear in as_command), so we
-        // inherit the parent environment explicitly — otherwise the shell has
-        // no PATH/HOME and is unusable.
+        // Inherit the parent environment explicitly (CommandBuilder::new also
+        // seeds it from the process env, so this is belt-and-braces — which is
+        // why removals below must use env_remove, not a skip in this loop).
         for (key, value) in std::env::vars_os() {
             cmd.env(key, value);
+        }
+        // Claude Code session-identity markers are NOT inherited: when fly
+        // itself was launched from inside a Claude session (`pnpm flavor:dev`
+        // in a dev pane), these leak through and make every `claude` run in a
+        // fly pane consider itself a *child session* of that long-gone parent
+        // — verified live (2.1.207) to suppress its
+        // `~/.claude/sessions/<pid>.json` livestate file and its transcript
+        // flush, which blinds the feed's pending-question fallback, resume
+        // attribution, automation output capture, and handoff qualification.
+        // A fly pane is a top-level terminal; a session started in it is
+        // nobody's child. (fix-feed-question-detection-gaps)
+        for marker in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_ENTRYPOINT",
+        ] {
+            cmd.env_remove(marker);
         }
         // Terminal identity + a UTF-8 locale if the user has none set.
         cmd.env("TERM", "xterm-256color");
@@ -438,13 +470,18 @@ impl Pane {
     /// raw output ring, its content version, and the grid size the bytes were
     /// rendered against. Cheap enough for the registry lock (one bounded copy).
     pub fn screen_tail(&self) -> ScreenTail {
-        let (bytes, seq) = self.shared.tail.lock().unwrap().snapshot();
+        let (bytes, seq, last_write_at_ms) = {
+            let ring = self.shared.tail.lock().unwrap();
+            let (bytes, seq) = ring.snapshot();
+            (bytes, seq, ring.last_write_ms)
+        };
         let (rows, cols) = *self.shared.dims.lock().unwrap();
         ScreenTail {
             bytes,
             seq,
             rows,
             cols,
+            last_write_at_ms,
         }
     }
 
@@ -521,8 +558,13 @@ fn read_loop(
                 shared.activity.record(n);
                 // Tee into the tail ring (feed-question-screen-fallback U1) —
                 // a bounded memcpy after the bytes are already out, under a
-                // lock only the on-demand screen snapshot contends on.
-                shared.tail.lock().unwrap().write(&buf[..n]);
+                // lock only the on-demand screen snapshot contends on. The
+                // wall stamp anchors a parked dialog's draw time.
+                shared
+                    .tail
+                    .lock()
+                    .unwrap()
+                    .write(&buf[..n], crate::notify::now_unix_ms());
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // On Linux the master read returns EIO (not EOF) once the child
@@ -634,18 +676,19 @@ mod tests {
     #[test]
     fn tail_ring_holds_everything_before_wrap() {
         let mut r = TailRing::new(8);
-        r.write(b"abc");
-        r.write(b"de");
+        r.write(b"abc", 100);
+        r.write(b"de", 200);
         let (bytes, seq) = r.snapshot();
         assert_eq!(bytes, b"abcde");
         assert_eq!(seq, 5);
+        assert_eq!(r.last_write_ms, 200, "stamp tracks the newest write");
     }
 
     #[test]
     fn tail_ring_wraps_keeping_the_newest_bytes_in_order() {
         let mut r = TailRing::new(8);
-        r.write(b"abcdef");
-        r.write(b"ghij"); // 10 bytes total → keeps "cdefghij"
+        r.write(b"abcdef", 100);
+        r.write(b"ghij", 200); // 10 bytes total → keeps "cdefghij"
         let (bytes, seq) = r.snapshot();
         assert_eq!(bytes, b"cdefghij");
         assert_eq!(seq, 10, "seq counts every byte ever written");
@@ -654,14 +697,15 @@ mod tests {
     #[test]
     fn tail_ring_oversized_chunk_keeps_its_own_tail() {
         let mut r = TailRing::new(4);
-        r.write(b"xy");
-        r.write(b"abcdefgh"); // ≥ capacity → the chunk's own last 4 bytes
+        r.write(b"xy", 100);
+        r.write(b"abcdefgh", 200); // ≥ capacity → the chunk's own last 4 bytes
         let (bytes, seq) = r.snapshot();
         assert_eq!(bytes, b"efgh");
         assert_eq!(seq, 10);
         // And a later small write continues in order.
-        r.write(b"Z");
+        r.write(b"Z", 300);
         assert_eq!(r.snapshot().0, b"fghZ");
+        assert_eq!(r.last_write_ms, 300);
     }
 
     #[test]
@@ -670,5 +714,6 @@ mod tests {
         let (bytes, seq) = r.snapshot();
         assert!(bytes.is_empty());
         assert_eq!(seq, 0);
+        assert_eq!(r.last_write_ms, 0, "never written → 0 stamp");
     }
 }
