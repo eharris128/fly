@@ -18,13 +18,15 @@
 //!   visibly separate phases);
 //! - `automation://changed` emission always happens after the mutating call
 //!   returns (lock released);
-//! - the script-killer seam is invoked outside the store lock (delete,
-//!   shutdown);
+//! - the script- and headless-killer seams are invoked outside the store
+//!   lock (delete, shutdown, the headless sweep backstop — a kill sequence
+//!   sleeps a grace, which must never happen under the lock);
 //! - the sweep thread is joined ([`SweepHandle::stop_and_join`]) from
 //!   `lifecycle::shutdown`, which holds no store lock.
 //!
-//! The two injected *probes* ([`AutomationManager::set_agent_pane_alive`],
-//! [`AutomationManager::set_script_capacity`]) are the one sanctioned
+//! The injected *probes* ([`AutomationManager::set_agent_pane_alive`],
+//! [`AutomationManager::set_script_capacity`],
+//! [`AutomationManager::set_headless_check_alive`]) are the one sanctioned
 //! exception: they are consulted inside the sweep's mutate closure so the
 //! pre-claim checks (KTD-D) are atomic with the claim. They must therefore
 //! be cheap, non-blocking reads and must **never** call back into this
@@ -128,9 +130,10 @@ pub const RUN_DEADLINE_MS: u64 = 30 * 60 * 1000;
 /// enforces [`RUN_DEADLINE_MS`] itself on a MONOTONIC clock and closes the
 /// row (U3). The sweep keeps only a kill-then-close BACKSTOP for a dead
 /// runner thread, firing at deadline + this slack so the runner's own close
-/// wins every ordinary race. U4 wires the consumer — the killer seam plus
-/// the in-flight registry's monotonic gate (the entry's spawn `Instant`
-/// must also have lapsed, or the entry be gone, before the kill: epoch age
+/// wins every ordinary race. The consumer is [`AutomationManager::sweep_once`]'s
+/// phase 2c (U4) — the [`HeadlessKiller`] seam plus the in-flight registry's
+/// monotonic gate ([`HeadlessDeadlineGate`]: the entry's spawn `Instant`
+/// must also have lapsed, or the entry be gone, before the kill — epoch age
 /// alone can lapse across a laptop suspend while the check is healthy);
 /// [`headless_deadline_expired_runs`] is the epoch leg this slack bounds.
 pub const HEADLESS_DEADLINE_SLACK_MS: u64 = 60_000;
@@ -140,6 +143,16 @@ pub const HEADLESS_DEADLINE_SLACK_MS: u64 = 60_000;
 /// deadline→timed-out) is left untouched — this only catches a pane that died
 /// mid-run.
 pub const ERR_PANE_EXIT: &str = "pane exited";
+
+/// Error string for a headless check row closed by the sweep's backstop
+/// (headless-monitor-checks U4 — R7): the runner thread died without
+/// closing its row, so the sweep killed the (possibly still-live) child
+/// through the [`HeadlessKiller`] seam and closed the row itself. Distinct
+/// from the runner's own timeout reasons (`"timed out: killed at the run
+/// deadline …"`, [`headless`]) so a backstop close is tellable from a
+/// runner close at a glance.
+pub const ERR_HEADLESS_BACKSTOP: &str =
+    "timed out: check runner dead, killed by the sweep backstop";
 
 /// Skip reason recorded for the R7 overlap skip.
 pub const SKIP_IN_FLIGHT: &str = "run in flight";
@@ -211,6 +224,38 @@ pub type PaneAliveProbe = Arc<dyn Fn(&RunRow) -> bool + Send + Sync>;
 /// atomic with the claim: same constraints as [`PaneAliveProbe`]. Default:
 /// `true`; `lib.rs` wires [`script::ScriptRunner::has_capacity`] (U5).
 pub type CapacityProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Headless-monitor-checks U4 seam (R5): kill an in-flight headless monitor
+/// check by **run id** — the headless twin of [`ScriptKiller`], for checks
+/// whose child fly owns directly (no pane, no script group of fly's making).
+/// Called on delete (R5), shutdown (R5), and by the sweep's R7 backstop,
+/// always **outside** the store lock (KTD-B — the kill sequence sleeps a
+/// bounded grace). Default: no-op; `lib.rs` injects
+/// [`headless::HeadlessRunner::kill_run`] (U5).
+pub type HeadlessKiller = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Headless-monitor-checks U4 seam widening R7's in-flight check — the
+/// headless mirror of [`PaneAliveProbe`]: whether the **automation id** has
+/// an in-flight registry entry whose child process is still alive (pid +
+/// start-time pinned by the runner, never mere entry presence). A
+/// terminal-but-alive check — a backstop/deadline kill that failed to stick —
+/// must skip the next claim, not fan a second child out. Consulted inside
+/// the sweep's mutate closure (module doc): cheap, non-blocking, never
+/// re-enters the manager/store. Default: `false`; `lib.rs` wires
+/// [`headless::HeadlessRunner::automation_check_alive`] (U5).
+pub type HeadlessAliveProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Headless-monitor-checks U4 seam (R7): the backstop's **monotonic gate**
+/// for a run id — `true` when the in-flight registry entry's monotonic
+/// deadline has also lapsed, or the entry is gone entirely (runner finished
+/// or died and was evicted). The epoch leg
+/// ([`headless_deadline_expired_runs`]) alone can lapse across a laptop
+/// suspend while the check is healthy, so the backstop kills only when both
+/// legs agree. Consulted off the store lock, right before the kill. Default:
+/// `true` — an unwired manager has no registry at all, which IS the
+/// entry-gone case (matching
+/// [`headless::HeadlessRunner::monotonic_deadline_lapsed`], wired in U5).
+pub type HeadlessDeadlineGate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// U4b seam: capture an agent run's final assistant turn for its
 /// [`RunRow::output`] (R8). Given the automation's `cwd` and the run's dispatch
@@ -508,6 +553,16 @@ pub struct AutomationManager {
     script_killer: Mutex<ScriptKiller>,
     agent_pane_alive: Mutex<PaneAliveProbe>,
     script_capacity: Mutex<CapacityProbe>,
+    /// Headless-monitor-checks U4 (R5): kill an in-flight headless check by
+    /// run id (see [`HeadlessKiller`]). Default no-op; `lib.rs` injects the
+    /// runner's `kill_run` (U5).
+    headless_killer: Mutex<HeadlessKiller>,
+    /// Headless-monitor-checks U4 (R7): the overlap probe's headless leg
+    /// (see [`HeadlessAliveProbe`]). Default `false`.
+    headless_check_alive: Mutex<HeadlessAliveProbe>,
+    /// Headless-monitor-checks U4 (R7): the backstop's monotonic gate (see
+    /// [`HeadlessDeadlineGate`]). Default `true` (= entry gone).
+    headless_deadline_gate: Mutex<HeadlessDeadlineGate>,
     /// U4a: shared config for agent-launch resolution (model/effort/fallback,
     /// R11/R12/R15). Read off the store lock (KTD8). Defaults to an ephemeral
     /// store with `Config::default()` so tests need no config wiring; `lib.rs`
@@ -549,6 +604,10 @@ pub struct AutomationManager {
     retry_queue: Mutex<VecDeque<String>>,
     /// R5 gate: while false, due **agent** automations are deferred —
     /// neither claimed nor skipped (see [`AutomationManager::sweep_once`]).
+    /// Monitor automations are carved out (headless-monitor-checks R6):
+    /// their checks dispatch headless — no `automation://agent-run` event
+    /// for a listener-less webview to drop — so scheduled fires and retries
+    /// proceed with the gate down.
     frontend_ready: AtomicBool,
     /// R22 recursion registry: pane ids of automation-spawned agent panes.
     /// Populated at spawn ([`AutomationManager::register_automation_pane`]),
@@ -580,6 +639,9 @@ impl AutomationManager {
             script_killer: Mutex::new(Arc::new(|_run_id: &str| {})),
             agent_pane_alive: Mutex::new(Arc::new(|_row: &RunRow| false)),
             script_capacity: Mutex::new(Arc::new(|| true)),
+            headless_killer: Mutex::new(Arc::new(|_run_id: &str| {})),
+            headless_check_alive: Mutex::new(Arc::new(|_automation_id: &str| false)),
+            headless_deadline_gate: Mutex::new(Arc::new(|_run_id: &str| true)),
             config: Mutex::new(Arc::new(ConfigStore::ephemeral(
                 crate::config::Config::default(),
             ))),
@@ -677,6 +739,24 @@ impl AutomationManager {
     /// Inject the U5 script-capacity probe (see [`CapacityProbe`]).
     pub fn set_script_capacity(&self, c: CapacityProbe) {
         *self.script_capacity.lock().unwrap() = c;
+    }
+
+    /// Headless-monitor-checks U4: inject the headless-check killer (see
+    /// [`HeadlessKiller`]).
+    pub fn set_headless_killer(&self, k: HeadlessKiller) {
+        *self.headless_killer.lock().unwrap() = k;
+    }
+
+    /// Headless-monitor-checks U4: inject the headless in-flight probe (see
+    /// [`HeadlessAliveProbe`]).
+    pub fn set_headless_check_alive(&self, p: HeadlessAliveProbe) {
+        *self.headless_check_alive.lock().unwrap() = p;
+    }
+
+    /// Headless-monitor-checks U4: inject the backstop's monotonic gate (see
+    /// [`HeadlessDeadlineGate`]).
+    pub fn set_headless_deadline_gate(&self, g: HeadlessDeadlineGate) {
+        *self.headless_deadline_gate.lock().unwrap() = g;
     }
 
     /// U4a: inject the real file-backed [`ConfigStore`] so agent-launch
@@ -986,11 +1066,14 @@ impl AutomationManager {
 
     /// R23 teardown: remove the record + its stored script content (store
     /// owns that half), close its open rows failed([`ERR_DELETED`]), and
-    /// kill any in-flight script group via the U5 seam — killer invoked
-    /// **after** the store lock is released (KTD-B). The in-flight *agent*
-    /// pane is unlinked, never killed; its recursion-registry entry (U7)
-    /// deliberately survives until the pane exits, otherwise create → delete
-    /// would un-gate a still-live automation-spawned pane (R22).
+    /// kill any in-flight script group via the U5 seam **or in-flight
+    /// headless check via the headless-killer seam (headless-monitor-checks
+    /// U4 — R5: a delete mid-check kills the backend-owned child; there is
+    /// no pane to leave alone)** — killers invoked **after** the store lock
+    /// is released (KTD-B). The in-flight *pane* agent is unlinked, never
+    /// killed; its recursion-registry entry (U7) deliberately survives until
+    /// the pane exits, otherwise create → delete would un-gate a still-live
+    /// automation-spawned pane (R22).
     ///
     /// Returns the removed record with its rows closed — the store no longer
     /// holds it, so this return value is the only witness of the closure.
@@ -1002,13 +1085,24 @@ impl AutomationManager {
         let Some(mut automation) = self.store.delete(id) else {
             return Err(format!("no such automation: {id}"));
         };
-        // Lock released. Kill in-flight script groups (no-op seam until U5),
-        // and close the open rows on the removed record.
+        // Lock released. Kill in-flight script groups / headless children
+        // (no-op seams until wired), and close the open rows on the removed
+        // record. The row-level `headless` marker picks the killer — mode
+        // alone can't (a monitor is agent-mode).
         let now = (self.clock)();
-        let killer = Arc::clone(&self.script_killer.lock().unwrap());
-        for run_id in running_run_ids(&automation) {
-            if automation.mode.kind() == RunMode::Script {
-                killer(&run_id);
+        let script_killer = Arc::clone(&self.script_killer.lock().unwrap());
+        let headless_killer = Arc::clone(&self.headless_killer.lock().unwrap());
+        let running: Vec<(String, bool)> = automation
+            .runs
+            .iter()
+            .filter(|r| r.status == RunStatus::Running)
+            .map(|r| (r.id.clone(), r.headless))
+            .collect();
+        for (run_id, headless) in running {
+            if headless {
+                headless_killer(&run_id);
+            } else if automation.mode.kind() == RunMode::Script {
+                script_killer(&run_id);
             }
             automation.close(&run_id, failed(ERR_DELETED), now);
         }
@@ -1027,6 +1121,7 @@ impl AutomationManager {
         let now = (self.clock)();
         let run_id = mint_id();
         let alive = Arc::clone(&self.agent_pane_alive.lock().unwrap());
+        let headless_alive = Arc::clone(&self.headless_check_alive.lock().unwrap());
         // Phase 1 (KTD-D/R2): decide + record + FLUSH under one lock hold.
         // `None` = unknown id; the inner Result carries the claim outcome.
         let decision: Option<Result<ManualRun, String>> = flush_tolerant(
@@ -1034,7 +1129,7 @@ impl AutomationManager {
                 let Some(a) = map.get_mut(id) else {
                     return None;
                 };
-                if in_flight_widened(a, &alive) {
+                if in_flight_widened(a, &alive, &headless_alive) {
                     a.skip(now, Trigger::Manual, SKIP_IN_FLIGHT, &run_id);
                     return Some(Ok(ManualRun::Skipped {
                         run_id: run_id.clone(),
@@ -1127,6 +1222,22 @@ impl AutomationManager {
         run_id: &str,
         outcome: RunOutcome,
     ) -> model::CloseResult {
+        self.close_run_stamping(automation_id, run_id, outcome, None)
+    }
+
+    /// [`AutomationManager::close_run`] plus the headless session-id stamp
+    /// (headless-monitor-checks U4 — R12): when `session_id` is `Some`, it
+    /// is recorded on the row **in the same store mutation** as the close,
+    /// so a crash can never strand a closed check without its session
+    /// pointer. `None` (every non-headless caller) leaves the field
+    /// untouched — pane rows keep serializing byte-identically (R14).
+    fn close_run_stamping(
+        &self,
+        automation_id: &str,
+        run_id: &str,
+        outcome: RunOutcome,
+        session_id: Option<&str>,
+    ) -> model::CloseResult {
         let now = (self.clock)();
         // Monitor-handoff R6/R7: a failed close is an infrastructure failure
         // (never a verdict) — evaluate the broken-monitor escalation after
@@ -1134,8 +1245,17 @@ impl AutomationManager {
         let status = outcome_status(&outcome);
         let result = flush_tolerant(
             self.store.mutate(|map| {
-                map.get_mut(automation_id)
-                    .map(|a| a.close(run_id, outcome, now))
+                map.get_mut(automation_id).map(|a| {
+                    let res = a.close(run_id, outcome, now);
+                    if res == model::CloseResult::Closed {
+                        if let (Some(sid), Some(row)) =
+                            (session_id, a.runs.iter_mut().find(|r| r.id == run_id))
+                        {
+                            row.session_id = Some(sid.to_owned());
+                        }
+                    }
+                    res
+                })
             }),
             // Flush failed but the mutation applied (KTD-B store contract):
             // re-derive the result from the authoritative map. A terminal
@@ -1193,31 +1313,18 @@ impl AutomationManager {
     }
 
     /// Shared body of the pane-keyed closes: find the *running* run linked to
-    /// `pane_id` and close it with `outcome`. Idempotent — returns `Ok(())`
-    /// whether it closed a row, found no running run, or hit an already-closed
-    /// one (all benign for the Stop / pane-exit callers).
+    /// `pane_id`, capture its transcript output (U4b), and delegate to the
+    /// one shared close tail
+    /// ([`AutomationManager::close_run_with_capture`] — where the monitor
+    /// verdict/retire/escalation semantics live). Idempotent — returns
+    /// `Ok(())` whether it closed a row, found no running run, or hit an
+    /// already-closed one (all benign for the Stop / pane-exit callers).
     ///
-    /// Monitor-handoff U3 rides here: a **monitor** check that closes
-    /// `Succeeded` (a Stop) has its captured final turn parsed for the R2
-    /// verdict block **before** the R8 tail cap ever runs (the capturer
-    /// returns the full text; truncation happens inside the close mutation),
-    /// and a parsed verdict routes to the retiring close
-    /// ([`AutomationManager::close_monitor_run_retiring`]). Infra-failure
-    /// closes (pane exit here; timeout/ack/interrupt elsewhere) **never**
-    /// parse a verdict (R6) — they take the ordinary close, whose R7
-    /// escalation check lives in [`AutomationManager::close_run`]. A check
-    /// with captured output but no parseable verdict is a not-done check:
-    /// ordinary silent close, schedule untouched (R5). An **abstaining
-    /// capture** (the capturer returned `None` — busy cwd) is equally silent
-    /// but counts toward the R7 escalation (the U3 refinement: the row lands
-    /// `Succeeded` with no output, which
-    /// [`Automation::consecutive_infra_failures`] treats as an unreadable
-    /// check) — as does a **near-miss block** (output that opened a
-    /// ```` ```verdict ```` fence yet never parsed, fix(review) #5). So this
-    /// method runs the escalation check for every verdict-less Succeeded
-    /// monitor close below — a monitor whose output can never be attributed,
-    /// or whose blocks are persistently malformed, eventually rings instead
-    /// of running silent.
+    /// U4b (R8): the capturer reads a transcript from disk (off the store
+    /// lock, KTD-B) and abstains on an ambiguous cwd — so this never blocks
+    /// the close and never records the wrong session's content. The captured
+    /// text fills the outcome's output slot **in full** — the R8 tail cap
+    /// runs inside the close mutation, after the tail's verdict parse.
     fn close_run_by_pane_with(&self, pane_id: u64, mut outcome: RunOutcome) -> Result<(), String> {
         let found: Option<(Automation, String, Option<u64>)> = {
             let map = self.store.snapshot();
@@ -1242,56 +1349,144 @@ impl AutomationManager {
             // run the deadline/other path already closed).
             return Ok(());
         };
-        // U4b (R8): capture the agent's final assistant turn into the run's
-        // output, unless the caller already supplied output. The capturer reads
-        // a transcript from disk (off the store lock, KTD-B) and abstains on an
-        // ambiguous cwd — so this never blocks the close and never records the
-        // wrong session's content. `close_run` tail-caps the text (R8);
-        // `captured` keeps the FULL pre-cap text for the verdict parse and the
-        // R15 bundle evidence.
-        let mut captured: Option<String> = None;
         if outcome_output(&outcome).is_none() {
             if let Some(started) = started_at {
                 let capturer = Arc::clone(&self.output_capturer.lock().unwrap());
-                captured = capturer(&automation.cwd, started);
-                if let Some(text) = captured.clone() {
+                if let Some(text) = capturer(&automation.cwd, started) {
                     outcome = with_output(outcome, text);
                 }
             }
         }
-        // Monitor-handoff R2/R6: parse the verdict only for a live (not yet
-        // retired) monitor whose check concluded normally (Stop → Succeeded).
-        // Failed closes are infrastructure failures — never a verdict.
+        self.close_run_with_capture(&automation, &run_id, outcome, None)
+    }
+
+    /// **The one shared verdict-close tail** (headless-monitor-checks U4 —
+    /// the "One shared verdict close path" KTD, carrying monitor-handoff
+    /// U3's semantics): close `run_id` on the pre-fetched `automation` with
+    /// `outcome`, whose output slot holds the FULL already-captured,
+    /// already-cleaned text — sanitize → scrub happened upstream (the
+    /// capturer / [`AutomationManager::close_headless_run`]) and the R8 tail
+    /// cap runs downstream inside the close mutation, so the verdict parse
+    /// here always sees the full cleaned text **before** capping (R8). Both
+    /// close routes end here — the pane path
+    /// ([`AutomationManager::close_run_by_pane_with`], after transcript
+    /// capture) and the headless path
+    /// ([`AutomationManager::close_headless_run`], with the stream result) —
+    /// so retire semantics exist in exactly one place (R9):
+    ///
+    /// - a live (not yet retired) monitor's `Succeeded` close parses the R2
+    ///   verdict from the output slot — Failed closes are infrastructure
+    ///   failures, never a verdict (R6) — and a parsed verdict routes to the
+    ///   atomic close+verdict+retire
+    ///   ([`AutomationManager::close_monitor_run_retiring`]);
+    /// - otherwise the ordinary close lands the row (the Failed-close R7
+    ///   escalation lives inside [`AutomationManager::close_run`]'s body),
+    ///   `automation://run-closed` fires when the row actually closed (plain
+    ///   `close_run` never emits it), and a verdict-less `Succeeded`
+    ///   **monitor** close evaluates the R7 escalation and lets the derived
+    ///   walk decide: an absent output (abstained pane capture / empty
+    ///   headless result, the U3 refinement) and a near-miss block (an
+    ///   opened ```` ```verdict ```` fence that never parsed, fix(review)
+    ///   #5) count toward "monitor broken", while a readable not-done check
+    ///   derives zero and stays silent. Without this leg a monitor emitting
+    ///   near-miss/empty results would never ring.
+    ///
+    /// `session_id` is the headless check's stream-derived id (R12), stamped
+    /// in the same store mutation as the close on both branches; the pane
+    /// path passes `None`.
+    fn close_run_with_capture(
+        &self,
+        automation: &Automation,
+        run_id: &str,
+        outcome: RunOutcome,
+        session_id: Option<&str>,
+    ) -> Result<(), String> {
         let parsed = if automation.monitor
             && automation.retired_at.is_none()
             && matches!(outcome, RunOutcome::Succeeded { .. })
         {
-            captured.as_deref().and_then(verdict::parse_verdict)
+            outcome_output(&outcome).and_then(|t| verdict::parse_verdict(t))
         } else {
             None
         };
         if let Some(v) = parsed {
-            let evidence = captured.unwrap_or_default();
-            return self.close_monitor_run_retiring(&automation, &run_id, outcome, v, &evidence);
+            let evidence = outcome_output(&outcome).cloned().unwrap_or_default();
+            return self.close_monitor_run_retiring(
+                automation, run_id, outcome, v, &evidence, session_id,
+            );
         }
-        // U5: emit `automation://run-closed` when this close actually closed the
-        // row (idempotent no-op on a second Stop / already-closed run).
         let status = outcome_status(&outcome);
-        if self.close_run(&automation.id, &run_id, outcome) == model::CloseResult::Closed {
-            self.emit_run_closed(&automation.id, &run_id, status);
+        if self.close_run_stamping(&automation.id, run_id, outcome, session_id)
+            == model::CloseResult::Closed
+        {
+            self.emit_run_closed(&automation.id, run_id, status);
             if automation.monitor && status == RunStatus::Succeeded {
-                // R7, after the lock (KTD-B). Failed closes are checked
-                // inside `close_run`; every Succeeded close on this path is
-                // verdict-less by construction (a parsed verdict routed to
-                // the retiring close above), so evaluate the escalation and
-                // let the derived walk decide: an abstained capture (the U3
-                // refinement) and a near-miss block (an opener that never
-                // parsed, fix(review) #5) count toward R7, while a readable
-                // not-done check derives zero and stays silent.
+                // R7, after the lock (KTD-B). Every Succeeded close on this
+                // branch is verdict-less by construction (a parsed verdict
+                // routed to the retiring close above) — see the method doc.
                 self.check_monitor_escalation(&automation.id);
             }
         }
         Ok(())
+    }
+
+    /// Headless-monitor-checks U4 (R8/R9/R12): the run-id-keyed close entry
+    /// the [`headless::CheckCloser`] calls (U5 constructs the closure) — the
+    /// headless twin of the pane-keyed Stop/exit closes, delegating to the
+    /// same shared tail ([`AutomationManager::close_run_with_capture`]) so a
+    /// headless verdict retires through exactly the mutation a pane verdict
+    /// does. Also the sweep backstop's close (R7), with
+    /// [`ERR_HEADLESS_BACKSTOP`] as the infra reason.
+    ///
+    /// **Cleaning happens here**, per [`headless::CheckOutcome`]'s
+    /// sanitize/scrub contract (nothing in `headless.rs` is cleaned): both
+    /// the Clean result text and the Infra reason go sanitize → scrub before
+    /// touching the row — the same inline composition, in the same order, as
+    /// `lib.rs`'s `OutputCapturer` closure (control chars first, so one
+    /// inside a token can't split it past the scrub; the R8 tail cap last,
+    /// inside the close mutation, AFTER the tail's verdict parse). U5
+    /// extracts the composition into a named [`redact`] helper shared with
+    /// that closure so the order can't drift. Empty-after-cleaning result
+    /// text maps to `None` — exact parity with a pane capture that came back
+    /// empty, so the row reads *unreadable* in the derived R7 counter. The
+    /// Infra reason (which may embed the runner-bounded raw stderr tail) is
+    /// additionally head-capped — the fly-authored classification message
+    /// leads it — since `error` has no cap of its own in the close.
+    ///
+    /// An unknown automation id (deleted mid-check) is a benign no-op, like
+    /// every reaper-side close; an already-terminal row lands as the usual
+    /// `AlreadyClosed` no-op inside the tail.
+    pub fn close_headless_run(
+        &self,
+        automation_id: &str,
+        run_id: &str,
+        outcome: headless::CheckOutcome,
+    ) {
+        let Some(automation) = self.store.get(automation_id) else {
+            return;
+        };
+        let (outcome, session_id): (RunOutcome, Option<String>) = match outcome {
+            headless::CheckOutcome::Clean { text, session_id } => {
+                let sane = crate::notify::sanitize_multiline(&text);
+                let scrubbed = redact::scrub_secrets(&sane);
+                let output = (!scrubbed.trim().is_empty()).then_some(scrubbed);
+                (RunOutcome::Succeeded { output }, session_id)
+            }
+            headless::CheckOutcome::Infra { reason } => {
+                let sane = crate::notify::sanitize_multiline(&reason);
+                let scrubbed = redact::scrub_secrets(&sane);
+                let error = head_capped(&scrubbed, model::OUTPUT_TAIL_CAP_BYTES).to_owned();
+                (
+                    RunOutcome::Failed {
+                        error,
+                        exit_code: None,
+                        output: None,
+                    },
+                    None,
+                )
+            }
+        };
+        let _ = self.close_run_with_capture(&automation, run_id, outcome, session_id.as_deref());
     }
 
     /// Monitor-handoff U3 (R2/R3/R4/R14/R15): the verdict close. **One store
@@ -1309,6 +1504,10 @@ impl AutomationManager {
     /// failure (or an unwired bundle dir) never blocks the close/retire —
     /// the alert line notes the missing bundle instead (mirrors
     /// [`flush_tolerant`]'s in-memory-wins posture).
+    ///
+    /// Headless-monitor-checks U4 (R12): `session_id` — the headless check's
+    /// stream-derived id — rides the same mutation, stamped on the row with
+    /// the verdict; `None` on the pane path.
     fn close_monitor_run_retiring(
         &self,
         automation: &Automation,
@@ -1316,6 +1515,7 @@ impl AutomationManager {
         outcome: RunOutcome,
         verdict: Verdict,
         evidence: &str,
+        session_id: Option<&str>,
     ) -> Result<(), String> {
         let now = (self.clock)();
         let status = outcome_status(&outcome);
@@ -1342,6 +1542,7 @@ impl AutomationManager {
             note: head_capped(&verdict.note, model::OUTPUT_TAIL_CAP_BYTES).to_owned(),
         };
         let bp = bundle_path.clone();
+        let sid: Option<String> = session_id.map(str::to_owned);
         let closed: Option<model::CloseResult> = flush_tolerant(
             self.store.mutate(|map| {
                 map.get_mut(&automation.id).map(|a| {
@@ -1350,6 +1551,11 @@ impl AutomationManager {
                         if let Some(row) = a.runs.iter_mut().find(|r| r.id == run_id) {
                             row.verdict = Some(v.clone());
                             row.bundle_path = bp.clone();
+                            // Headless-monitor-checks R12: the check's
+                            // session id lands atomically with its verdict.
+                            if sid.is_some() {
+                                row.session_id = sid.clone();
+                            }
                         }
                         // R3: retire in the SAME mutation as the close.
                         a.retire(now);
@@ -1571,7 +1777,18 @@ impl AutomationManager {
     /// claims on a later tick once ready (advance-from-now then collapses
     /// any backlog into one run, R4). **Script** automations claim and
     /// dispatch normally: a webview that never loads must still run script
-    /// watchdogs (R5).
+    /// watchdogs (R5). **Monitor** automations are carved out of the
+    /// deferral too (headless-monitor-checks R6, for scheduled fires and
+    /// retries alike): their checks dispatch headless — no
+    /// `automation://agent-run` event to drop — so the gate has nothing to
+    /// protect.
+    ///
+    /// Headless backstop (headless-monitor-checks U4 — R7): phase 1 also
+    /// *collects* (never closes) Running headless rows past deadline +
+    /// slack ([`headless_deadline_expired_runs`]); phase 2c consults the
+    /// monotonic gate per run, kills through the [`HeadlessKiller`] seam,
+    /// and only then closes Failed through the shared tail — kill strictly
+    /// before close, both off the store lock.
     pub fn sweep_once(&self, now_ms: u64) {
         // Interrupt-resilience U2: surface the startup-recovery backlog (alert +
         // enqueue retries) before anything else this tick. Idempotent — a no-op
@@ -1580,6 +1797,7 @@ impl AutomationManager {
 
         let frontend_ready = self.frontend_ready.load(Ordering::Acquire);
         let alive = Arc::clone(&self.agent_pane_alive.lock().unwrap());
+        let headless_alive = Arc::clone(&self.headless_check_alive.lock().unwrap());
         let capacity = Arc::clone(&self.script_capacity.lock().unwrap());
         // Interrupt-resilience U2/R1: this tick's retry candidates, taken out of
         // the queue up front (no nested store↔queue lock). Agent retries that
@@ -1602,6 +1820,10 @@ impl AutomationManager {
         // `.monitor` bit is in hand so the phase-3 escalation check never
         // re-fetches (and clones) an ordinary automation just to bail.
         let mut monitor_infra_failed: Vec<String> = Vec::new();
+        // Headless-monitor-checks R7 backstop candidates (epoch leg): dead
+        // runners' rows, kill-then-closed in phase 2c — never inside the
+        // mutate (the kill sleeps a grace, KTD-B).
+        let mut headless_backstop: Vec<(String, String)> = Vec::new();
         let flush_result = self.store.mutate(|map| {
             for a in map.values_mut() {
                 let mut touched = false;
@@ -1638,14 +1860,28 @@ impl AutomationManager {
                     touched = true;
                 }
 
+                // Headless-monitor-checks R7 backstop (epoch leg): COLLECT
+                // Running headless rows past deadline + slack — no close
+                // here. The kill must run off the store lock (KTD-B) and
+                // strictly before the close (kill-then-close), with the
+                // monotonic gate consulted at kill time (phase 2c). The row
+                // stays Running this tick, so it still blocks the overlap
+                // check below.
+                for run_id in headless_deadline_expired_runs(a, now_ms) {
+                    headless_backstop.push((a.id.clone(), run_id));
+                }
+
                 // Due = enabled ∧ next_run_at <= now (None = paused, R23).
                 let due = a.enabled && a.next_run_at.is_some_and(|t| t <= now_ms);
                 if due {
                     let is_agent = a.mode.kind() == RunMode::Agent;
-                    if is_agent && !frontend_ready {
+                    if is_agent && !a.monitor && !frontend_ready {
                         // R5: defer — see the method doc. Deliberately no row,
-                        // no advance, no event.
-                    } else if in_flight_widened(a, &alive) {
+                        // no advance, no event. Monitors pass (headless-
+                        // monitor-checks R6): their checks dispatch headless,
+                        // so there is no event for a listener-less webview
+                        // to drop.
+                    } else if in_flight_widened(a, &alive, &headless_alive) {
                         // R7/KTD-D pre-claim skip: record + STILL advance the
                         // schedule past the skipped occurrence.
                         a.skip(now_ms, Trigger::Schedule, SKIP_IN_FLIGHT, &mint_id());
@@ -1705,11 +1941,15 @@ impl AutomationManager {
                 if !a.enabled {
                     continue; // paused/disabled since recovery — drop the retry
                 }
-                if a.mode.kind() == RunMode::Agent && !frontend_ready {
+                // Monitors are carved out of the readiness deferral
+                // (headless-monitor-checks R6): a monitor retry dispatches
+                // headless, so it neither waits on nor requeues behind the
+                // frontend-ready gate.
+                if a.mode.kind() == RunMode::Agent && !a.monitor && !frontend_ready {
                     requeue.push(rid.clone()); // defer until the frontend is up
                     continue;
                 }
-                if in_flight_widened(a, &alive) {
+                if in_flight_widened(a, &alive, &headless_alive) {
                     continue; // a run is already in flight — the retry is moot
                 }
                 let run_id = mint_id();
@@ -1819,6 +2059,36 @@ impl AutomationManager {
             }
         }
 
+        // Phase 2c (headless-monitor-checks U4 — R7): the backstop
+        // kill-then-close for headless rows a dead runner thread abandoned.
+        // Off the store lock (the kill sleeps a bounded grace, KTD-B). The
+        // MONOTONIC gate is consulted per run right before the kill: the
+        // epoch leg alone can lapse across a laptop suspend while the check
+        // is healthy, so a closed gate (registry entry present, its
+        // monotonic deadline not yet lapsed) skips both the kill and the
+        // close this tick — the runner still owns the row. The kill strictly
+        // precedes the close, so a later claim can never overlap a
+        // still-alive child; the close routes through the shared tail
+        // (run-closed emit + the Failed-close escalation), and a runner
+        // close that raced us in lands as the benign AlreadyClosed no-op.
+        if !headless_backstop.is_empty() {
+            let gate = Arc::clone(&self.headless_deadline_gate.lock().unwrap());
+            let killer = Arc::clone(&self.headless_killer.lock().unwrap());
+            for (automation_id, run_id) in headless_backstop {
+                if !gate(&run_id) {
+                    continue; // suspend case: monotonic deadline not lapsed
+                }
+                killer(&run_id);
+                self.close_headless_run(
+                    &automation_id,
+                    &run_id,
+                    headless::CheckOutcome::Infra {
+                        reason: ERR_HEADLESS_BACKSTOP.to_owned(),
+                    },
+                );
+            }
+        }
+
         // Phase 3: emit — after all store work, no lock held (KTD-B).
         for id in changed {
             (self.emit_changed)(&id);
@@ -1841,18 +2111,26 @@ impl AutomationManager {
     }
 
     /// R5 shutdown half (called from `lifecycle::shutdown` after the sweep
-    /// thread is joined): kill in-flight script groups via the U5 seam
-    /// (outside the store lock, KTD-B), then close every `Running` row
-    /// failed([`ERR_INTERRUPTED`]) in one final flush.
+    /// thread is joined): kill in-flight script groups via the U5 seam and
+    /// in-flight headless checks via the headless-killer seam
+    /// (headless-monitor-checks U4 — R5: the check's child is backend-owned,
+    /// with nothing else left to reap it) — both outside the store lock
+    /// (KTD-B) — then close every `Running` row failed([`ERR_INTERRUPTED`])
+    /// in one final flush. Pane agents are never killed (their panes are the
+    /// PTY reaper's job, later in the shutdown order).
     pub fn shutdown(&self) {
         let now = (self.clock)();
-        let killer = Arc::clone(&self.script_killer.lock().unwrap());
+        let script_killer = Arc::clone(&self.script_killer.lock().unwrap());
+        let headless_killer = Arc::clone(&self.headless_killer.lock().unwrap());
         // Kill first, with no store lock held (KTD-B): collect in-flight
-        // script run ids from a snapshot.
+        // run ids from a snapshot. The row-level `headless` marker picks the
+        // killer — mode alone can't (a monitor is agent-mode).
         for a in self.store.snapshot().values() {
-            if a.mode.kind() == RunMode::Script {
-                for run_id in running_run_ids(a) {
-                    killer(&run_id);
+            for run in a.runs.iter().filter(|r| r.status == RunStatus::Running) {
+                if run.headless {
+                    headless_killer(&run.id);
+                } else if a.mode.kind() == RunMode::Script {
+                    script_killer(&run.id);
                 }
             }
         }
@@ -2011,12 +2289,12 @@ fn deadline_expired_agent_runs(a: &Automation, now_ms: u64) -> Vec<String> {
 /// close normally wins by the whole slack; a row this probe returns means
 /// the runner thread died with its child possibly still alive, and the
 /// sweep must kill-then-close so the orphan can't block the overlap probe
-/// (or burn spend) forever. U4 wires the consumer: the killer seam plus the
-/// in-flight registry's monotonic gate — the entry's spawn `Instant` must
-/// ALSO have lapsed (or the entry be gone) before the kill, so a suspend
-/// longer than the slack never kills a healthy check. Saturating arithmetic
-/// like its siblings: release builds have overflow checks off.
-#[allow(dead_code)] // consumed by U4's sweep wiring (kill-then-close)
+/// (or burn spend) forever. Consumed by [`AutomationManager::sweep_once`]'s
+/// phase 2c (U4): the [`HeadlessKiller`] seam plus the in-flight registry's
+/// monotonic gate ([`HeadlessDeadlineGate`]) — the entry's spawn `Instant`
+/// must ALSO have lapsed (or the entry be gone) before the kill, so a
+/// suspend longer than the slack never kills a healthy check. Saturating
+/// arithmetic like its siblings: release builds have overflow checks off.
 fn headless_deadline_expired_runs(a: &Automation, now_ms: u64) -> Vec<String> {
     a.runs
         .iter()
@@ -2036,11 +2314,25 @@ fn headless_deadline_expired_runs(a: &Automation, now_ms: u64) -> Vec<String> {
 /// R7 with the U7 widening: in flight = a `Running` row exists, or the probe
 /// says a terminal agent row's linked pane is still alive (deadline-failed
 /// but not done — a stuck agent must skip, not fan out).
-fn in_flight_widened(a: &Automation, alive: &PaneAliveProbe) -> bool {
+///
+/// Headless-monitor-checks U4 widens it again (its R7): a **terminal
+/// headless row** whose in-flight registry entry still holds a live child —
+/// a backstop/deadline kill that failed to stick — keeps the automation in
+/// flight, the headless mirror of the stuck-pane clause. The row-existence
+/// pre-check keeps the probe unconsulted for automations with no headless
+/// history (every non-monitor); the probe itself is child-liveness, so a
+/// dead child's stale entry never blocks (see [`HeadlessAliveProbe`]).
+fn in_flight_widened(
+    a: &Automation,
+    alive: &PaneAliveProbe,
+    headless_alive: &HeadlessAliveProbe,
+) -> bool {
     a.in_flight()
         || a.runs
             .iter()
             .any(|r| r.status == RunStatus::Failed && r.pane_id.is_some() && alive(r))
+        || (a.runs.iter().any(|r| r.headless && r.status.is_terminal())
+            && headless_alive(&a.id))
 }
 
 /// [`schedule::advance_from`] with degraded fallbacks: an unparseable stored
@@ -2417,6 +2709,10 @@ mod tests {
         reenter: Mutex<Option<Arc<AutomationManager>>>,
         /// U4a: the resolved launch handed to each `dispatch_agent`.
         agent_launches: Mutex<Vec<ResolvedLaunch>>,
+        /// Headless-monitor-checks U4 routing contract: the `monitor` flag
+        /// visible on the `Automation` each `dispatch_agent` received — what
+        /// lib.rs's CompositeDispatcher forks on (U5).
+        agent_monitor: Mutex<Vec<bool>>,
     }
 
     impl FakeDispatcher {
@@ -2447,6 +2743,7 @@ mod tests {
             launch: &ResolvedLaunch,
         ) -> Result<(), String> {
             self.agent_launches.lock().unwrap().push(launch.clone());
+            self.agent_monitor.lock().unwrap().push(a.monitor);
             self.record(a, run_id, RunMode::Agent)
         }
         fn dispatch_script(&self, a: &Automation, run_id: &str) -> Result<(), String> {
@@ -3216,20 +3513,32 @@ mod tests {
     // R5 shutdown: kill in-flight script groups (killer seam, outside the
     // store lock) and close every in-flight row failed("interrupted") in one
     // final flush — agent rows close too, but only script groups are killed.
+    // Extended for headless-monitor-checks U4 (its R5): an in-flight monitor
+    // check is killed through the HEADLESS killer seam (its child is
+    // backend-owned) and its row closes interrupted like the rest; the pane
+    // agent alone stays unkilled.
     #[test]
     fn shutdown_kills_script_groups_and_closes_in_flight_rows_interrupted_r5() {
         let h = harness();
         h.mgr.set_frontend_ready();
         let script = h.mgr.create(script_spec("script")).unwrap().automation.id;
         let agent = h.mgr.create(agent_spec("agent")).unwrap().automation.id;
-        h.set_now(T0 + FIVE_MIN); // both due
-        h.sweep(); // → both claim
+        let monitor = h.mgr.create(agent_spec("watch")).unwrap().automation.id;
+        make_monitor(&h, &monitor);
+        h.set_now(T0 + FIVE_MIN); // all due
+        h.sweep(); // → all claim
         let script_run = h.runs(&script)[0].id.clone();
+        let check_run = h.runs(&monitor)[0].id.clone();
+        assert!(h.runs(&monitor)[0].headless, "the check row is headless");
 
         let killed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let k = Arc::clone(&killed);
         h.mgr
             .set_script_killer(Arc::new(move |rid: &str| k.lock().unwrap().push(rid.into())));
+        let headless_killed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let hk = Arc::clone(&headless_killed);
+        h.mgr
+            .set_headless_killer(Arc::new(move |rid: &str| hk.lock().unwrap().push(rid.into())));
 
         h.mgr.shutdown();
 
@@ -3238,7 +3547,12 @@ mod tests {
             vec![script_run],
             "script group killed; the agent pane is never killed (R23/R5)"
         );
-        for id in [&script, &agent] {
+        assert_eq!(
+            *headless_killed.lock().unwrap(),
+            vec![check_run],
+            "the headless check's child is killed through its own seam"
+        );
+        for id in [&script, &agent, &monitor] {
             let row = &h.runs(id)[0];
             assert_eq!(row.status, RunStatus::Failed);
             assert_eq!(row.error.as_deref(), Some(ERR_INTERRUPTED));
@@ -3525,6 +3839,638 @@ mod tests {
             T0 + FIVE_MIN + RUN_DEADLINE_MS + HEADLESS_DEADLINE_SLACK_MS + 1,
         )
         .is_empty());
+    }
+
+    // ---- headless-monitor-checks U4: routing, shared close, gates, backstop --
+
+    /// Create a monitor due at the first occurrence and sweep-claim its
+    /// headless check — deliberately WITHOUT `set_frontend_ready` (the R6
+    /// carve-out is part of the contract). Returns (automation id, run id).
+    fn claim_headless_check(h: &Harness) -> (String, String) {
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(h, &id);
+        h.set_now(T0 + FIVE_MIN);
+        h.sweep();
+        let run = h.runs(&id).last().expect("claimed check").clone();
+        assert_eq!(run.status, RunStatus::Running);
+        assert!(run.headless, "a monitor's agent claim is headless (U2)");
+        (id, run.id)
+    }
+
+    // headless-monitor-checks R1/R3 routing contract: a due monitor
+    // dispatches through Dispatcher::dispatch_agent with the `monitor` flag
+    // visible on the Automation it receives (lib.rs's CompositeDispatcher
+    // forks on exactly that, U5) and the launch resolved + stamped on the
+    // headless row (`set_run_launch` parity with the pane path) — all with
+    // the frontend-ready gate down (R6). A regular agent automation
+    // dispatches with monitor=false and a pane-shaped (non-headless) row.
+    #[test]
+    fn monitor_dispatch_rides_dispatch_agent_with_monitor_visible_and_launch_stamped() {
+        let h = harness();
+        let id = h
+            .mgr
+            .create(CreateSpec {
+                mode: CreateMode::Agent {
+                    prompt: "check the run".into(),
+                    model: Some("opus".into()),
+                    effort: Some("high".into()),
+                },
+                ..script_spec("train watch")
+            })
+            .unwrap()
+            .automation
+            .id;
+        make_monitor(&h, &id);
+        h.set_now(T0 + FIVE_MIN);
+        h.sweep(); // gate deliberately never set (R6)
+
+        assert_eq!(h.dispatcher.count(), 1, "dispatched through dispatch_agent");
+        assert_eq!(
+            *h.dispatcher.agent_monitor.lock().unwrap(),
+            vec![true],
+            "the monitor flag is visible to the dispatcher (the U5 fork point)"
+        );
+        let launches = h.dispatcher.agent_launches.lock().unwrap();
+        assert_eq!(launches[0].model.as_deref(), Some("opus"));
+        assert_eq!(launches[0].effort.as_deref(), Some("high"));
+        let row = &h.runs(&id)[0];
+        assert!(row.headless);
+        assert_eq!(row.model.as_deref(), Some("opus"), "R3: stamped on the row");
+        assert_eq!(row.effort.as_deref(), Some("high"));
+
+        // A regular agent automation routes identically but monitor=false.
+        let h2 = harness();
+        h2.mgr.set_frontend_ready();
+        let plain = create_due(&h2, agent_spec("plain"));
+        h2.sweep();
+        assert_eq!(*h2.dispatcher.agent_monitor.lock().unwrap(), vec![false]);
+        assert!(!h2.runs(&plain)[0].headless);
+    }
+
+    // headless-monitor-checks R1: a manual run on a monitor routes through
+    // dispatch_agent too (monitor visible), and the manual claim derives a
+    // headless row like any other claim path.
+    #[test]
+    fn manual_run_on_a_monitor_dispatches_through_dispatch_agent() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+
+        let outcome = h.mgr.manual_run(&id).unwrap();
+
+        assert!(matches!(outcome, ManualRun::Started { .. }));
+        assert_eq!(h.dispatcher.count(), 1);
+        assert_eq!(*h.dispatcher.agent_monitor.lock().unwrap(), vec![true]);
+        let row = &h.runs(&id)[0];
+        assert_eq!(row.trigger, Trigger::Manual);
+        assert!(row.headless, "a manual monitor claim is headless too");
+    }
+
+    // headless-monitor-checks R9 (the "One shared verdict close path" KTD):
+    // a headless close whose result text carries a FAIL verdict retires in
+    // ONE mutation — verdict + retiredAt + bundle path — writes the bundle,
+    // rings the alert sink, emits run-closed, and stamps the check's session
+    // id (R12) in that same mutation: behavior-parity with the pane path's
+    // verdict close, through the same tail.
+    #[test]
+    fn headless_fail_verdict_retires_bundles_alerts_and_stamps_session_id() {
+        let h = harness();
+        let bundles = h.dir.path().join("bundles");
+        h.mgr.set_bundle_dir(bundles.clone());
+        let (id, run_id) = claim_headless_check(&h);
+
+        h.mgr.close_headless_run(
+            &id,
+            &run_id,
+            headless::CheckOutcome::Clean {
+                text: "Traceback: boom at train.py:88\n\n```verdict\nFAIL\nloss diverged\n```"
+                    .into(),
+                session_id: Some("sess-check".into()),
+            },
+        );
+
+        let a = h.mgr.get(&id).unwrap();
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(row.status, RunStatus::Succeeded, "the CHECK concluded fine");
+        assert_eq!(row.verdict.as_ref().unwrap().outcome, VerdictOutcome::Fail);
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("sess-check"),
+            "R12: stamped in the same mutation as the verdict"
+        );
+        assert_eq!(a.retired_at, Some(T0 + FIVE_MIN), "retired with the close");
+        assert_eq!(a.next_run_at, None, "scheduling stopped permanently");
+        let bundle_path = row.bundle_path.clone().expect("row references the bundle");
+        let content = std::fs::read_to_string(&bundle_path).expect("bundle written");
+        assert!(content.contains("loss diverged"));
+        assert!(
+            content.contains("Traceback: boom at train.py:88"),
+            "full evidence, pre-cap (R8)"
+        );
+        {
+            let alerts = h.monitor_alerts.lock().unwrap();
+            assert_eq!(alerts.len(), 1, "rings once through the alert sink");
+            assert!(alerts[0].1.starts_with("monitor FAIL: loss diverged"));
+        }
+        assert_eq!(
+            *h.run_closed.lock().unwrap(),
+            vec![(run_id.clone(), RunStatus::Succeeded)],
+            "run-closed emitted (a no-op for the tab-less frontend, R16)"
+        );
+        // Durable: verdict + retirement + session id survive a reload.
+        let reloaded = store_in(&h.dir).get(&id).unwrap();
+        assert!(reloaded.retired_at.is_some());
+        let rrow = reloaded.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(rrow.session_id.as_deref(), Some("sess-check"));
+    }
+
+    // headless-monitor-checks R8: the verdict parse sees the FULL cleaned
+    // text BEFORE the tail cap. A PASS block that LEADS a text three times
+    // the R8 cap still retires — a post-cap parse would have lost the block
+    // to the tail — and the stored output is the capped tail. Cleaning ran
+    // first: a control char in the text never reaches the row.
+    #[test]
+    fn headless_verdict_parses_full_cleaned_text_before_the_tail_cap_r8() {
+        let h = harness();
+        let (id, run_id) = claim_headless_check(&h);
+        let text = format!(
+            "```verdict\nPASS\ndone\n```\n\u{1b}[2J{}",
+            "x".repeat(3 * model::OUTPUT_TAIL_CAP_BYTES)
+        );
+
+        h.mgr.close_headless_run(
+            &id,
+            &run_id,
+            headless::CheckOutcome::Clean {
+                text,
+                session_id: None,
+            },
+        );
+
+        let a = h.mgr.get(&id).unwrap();
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(
+            row.verdict.as_ref().unwrap().outcome,
+            VerdictOutcome::Pass,
+            "parsed from the full text, before capping"
+        );
+        assert!(a.retired_at.is_some());
+        let output = row.output.as_ref().expect("output recorded");
+        assert_eq!(
+            output.len(),
+            model::OUTPUT_TAIL_CAP_BYTES,
+            "output tail-capped after the parse"
+        );
+        assert!(!output.contains('\u{1b}'), "sanitized before storage");
+    }
+
+    // headless-monitor-checks R8: cleaning order on the headless entry —
+    // sanitize → scrub — for both the Clean result text (a secret token is
+    // masked before the row) and the Infra reason (which may embed the raw
+    // stderr tail: control chars stripped, then head-capped, the fly-authored
+    // classification message surviving at the head).
+    #[test]
+    fn headless_close_sanitizes_and_scrubs_result_text_and_infra_reason_r8() {
+        // Clean leg: a secret in the result text is masked on the row.
+        let h = harness();
+        let (id, run_id) = claim_headless_check(&h);
+        h.mgr.close_headless_run(
+            &id,
+            &run_id,
+            headless::CheckOutcome::Clean {
+                text: "still training; found sk-abcdefghij0123456789 in env".into(),
+                session_id: None,
+            },
+        );
+        let output = h.runs(&id)[0].output.clone().expect("output recorded");
+        assert!(!output.contains("sk-abcdefghij0123456789"), "{output}");
+        assert!(output.contains("[redacted]"), "{output}");
+
+        // Infra leg: control chars stripped, reason head-capped.
+        let h2 = harness();
+        let (id2, run2) = claim_headless_check(&h2);
+        h2.mgr.close_headless_run(
+            &id2,
+            &run2,
+            headless::CheckOutcome::Infra {
+                reason: format!(
+                    "exited 1 with no result event; stderr: \u{1b}[2J{}",
+                    "y".repeat(3 * model::OUTPUT_TAIL_CAP_BYTES)
+                ),
+            },
+        );
+        let row = h2.runs(&id2)[0].clone();
+        assert_eq!(row.status, RunStatus::Failed);
+        let error = row.error.expect("reason recorded");
+        assert!(!error.contains('\u{1b}'), "control chars never land");
+        assert!(error.len() <= model::OUTPUT_TAIL_CAP_BYTES, "reason capped");
+        assert!(
+            error.starts_with("exited 1 with no result event"),
+            "the classification message survives at the head: {error}"
+        );
+    }
+
+    // headless-monitor-checks R9 escalation parity, infra leg: three
+    // consecutive headless infra closes ring "monitor broken" exactly once,
+    // and a readable not-done check resets the derived count.
+    #[test]
+    fn three_headless_infra_closes_ring_monitor_broken_once_then_reset() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+
+        for i in 1..=3u64 {
+            h.set_now(T0 + i * FIVE_MIN);
+            h.sweep();
+            let run_id = h.runs(&id).last().unwrap().id.clone();
+            h.mgr.close_headless_run(
+                &id,
+                &run_id,
+                headless::CheckOutcome::Infra {
+                    reason: "exited 1 with no result event".into(),
+                },
+            );
+            if i < 3 {
+                assert!(
+                    h.monitor_alerts.lock().unwrap().is_empty(),
+                    "below the threshold at {i}"
+                );
+            }
+        }
+        {
+            let alerts = h.monitor_alerts.lock().unwrap();
+            assert_eq!(alerts.len(), 1, "the third infra close rings once");
+            assert!(alerts[0].1.starts_with("monitor broken:"), "{}", alerts[0].1);
+        }
+
+        // A readable not-done check resets the derived count, silently.
+        h.set_now(T0 + 4 * FIVE_MIN);
+        h.sweep();
+        let run_id = h.runs(&id).last().unwrap().id.clone();
+        h.mgr.close_headless_run(
+            &id,
+            &run_id,
+            headless::CheckOutcome::Clean {
+                text: "still training; nothing to report".into(),
+                session_id: None,
+            },
+        );
+        assert_eq!(h.mgr.get(&id).unwrap().consecutive_infra_failures(), 0);
+        assert_eq!(h.monitor_alerts.lock().unwrap().len(), 1, "no new ring");
+    }
+
+    // headless-monitor-checks R9 escalation parity, Succeeded legs — these
+    // live on the SHARED tail (plain close_run checks escalation only on
+    // Failed): three verdict-less Succeeded headless closes — near-miss
+    // fences and an empty-to-None result between them — ring "monitor
+    // broken", never retire, and never stamp a verdict.
+    #[test]
+    fn three_headless_succeeded_unreadable_closes_ring_monitor_broken() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+
+        let texts = [
+            "checked.\n```verdict\nPASS: decorated\n```", // near-miss opener
+            "",                                           // empty → output None
+            "```verdict\nnope\n```",                      // near-miss again
+        ];
+        for (i, text) in texts.iter().enumerate() {
+            h.set_now(T0 + (i as u64 + 1) * FIVE_MIN);
+            h.sweep();
+            let run_id = h.runs(&id).last().unwrap().id.clone();
+            h.mgr.close_headless_run(
+                &id,
+                &run_id,
+                headless::CheckOutcome::Clean {
+                    text: text.to_string(),
+                    session_id: None,
+                },
+            );
+        }
+
+        let a = h.mgr.get(&id).unwrap();
+        assert_eq!(a.retired_at, None, "near-misses never retire (abstain)");
+        assert!(a.runs.iter().all(|r| r.verdict.is_none()));
+        assert_eq!(a.consecutive_infra_failures(), 3);
+        let alerts = h.monitor_alerts.lock().unwrap();
+        assert_eq!(alerts.len(), 1, "the third unreadable Succeeded close rings");
+        assert!(alerts[0].1.starts_with("monitor broken:"), "{}", alerts[0].1);
+    }
+
+    // headless-monitor-checks R9 escalation parity, dispatch-failure leg
+    // (also proves R6 end-to-end: the gate is never set, yet the monitor
+    // claims and its dispatch failures land): a failing dispatch seam closes
+    // each claim failed and counts toward "monitor broken" — three ring once.
+    #[test]
+    fn monitor_dispatch_failures_close_failed_and_ring_broken_at_three() {
+        let h = harness();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        *h.dispatcher.fail_with.lock().unwrap() = Some("boom".into());
+
+        for i in 1..=3u64 {
+            h.set_now(T0 + i * FIVE_MIN);
+            h.sweep(); // gate deliberately never set (R6)
+        }
+
+        let a = h.mgr.get(&id).unwrap();
+        assert_eq!(a.runs.len(), 3, "each occurrence claimed despite the gate");
+        assert!(a
+            .runs
+            .iter()
+            .all(|r| r.status == RunStatus::Failed && r.error.as_deref() == Some("boom")));
+        assert_eq!(a.consecutive_infra_failures(), 3);
+        let alerts = h.monitor_alerts.lock().unwrap();
+        assert_eq!(alerts.len(), 1, "rings once at three");
+        assert!(alerts[0].1.starts_with("monitor broken:"), "{}", alerts[0].1);
+    }
+
+    // headless-monitor-checks (U1's empty-text mapping, close half): a
+    // Clean("") outcome closes Succeeded with output None — exact parity
+    // with an abstained pane capture — and reads UNREADABLE in the derived
+    // counter; the session id still lands on the ordinary (non-verdict) leg.
+    #[test]
+    fn empty_headless_result_closes_succeeded_output_none_and_reads_unreadable() {
+        let h = harness();
+        let (id, run_id) = claim_headless_check(&h);
+
+        h.mgr.close_headless_run(
+            &id,
+            &run_id,
+            headless::CheckOutcome::Clean {
+                text: "".into(),
+                session_id: Some("sess-empty".into()),
+            },
+        );
+
+        let a = h.mgr.get(&id).unwrap();
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(row.status, RunStatus::Succeeded);
+        assert_eq!(row.output, None, "empty maps to None (pane-capture parity)");
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("sess-empty"),
+            "R12: stamped on the ordinary close leg too"
+        );
+        assert_eq!(a.retired_at, None);
+        assert_eq!(
+            a.consecutive_infra_failures(),
+            1,
+            "an output-less Succeeded row reads unreadable"
+        );
+        assert_eq!(
+            *h.run_closed.lock().unwrap(),
+            vec![(run_id, RunStatus::Succeeded)]
+        );
+    }
+
+    // headless-monitor-checks R7 overlap widening: a TERMINAL headless row
+    // whose registry entry still holds a live child (the probe says alive)
+    // blocks the next scheduled claim (Skipped, in-flight reason) and makes
+    // manual_run refuse — mirroring the stuck-pane alive-probe. Once the
+    // child reads dead, claims resume.
+    #[test]
+    fn terminal_headless_row_with_live_child_blocks_claims_and_manual_runs_r7() {
+        let h = harness();
+        let (id, run_id) = claim_headless_check(&h);
+        // The check's row goes terminal, but the child survived the kill.
+        h.mgr.close_headless_run(
+            &id,
+            &run_id,
+            headless::CheckOutcome::Infra {
+                reason: ERR_HEADLESS_BACKSTOP.into(),
+            },
+        );
+        h.mgr
+            .set_headless_check_alive(Arc::new(|_automation_id: &str| true));
+
+        let next = h.next_run_at(&id).expect("still scheduled");
+        h.set_now(next);
+        h.sweep();
+        let runs = h.runs(&id);
+        assert_eq!(runs.last().unwrap().status, RunStatus::Skipped);
+        assert_eq!(runs.last().unwrap().error.as_deref(), Some(SKIP_IN_FLIGHT));
+        assert_eq!(h.dispatcher.count(), 1, "no fan-out beside a live child");
+
+        let outcome = h.mgr.manual_run(&id).unwrap();
+        assert!(
+            matches!(outcome, ManualRun::Skipped { .. }),
+            "manual_run refuses too"
+        );
+
+        // The child finally dies: the probe reads dead, the schedule resumes.
+        h.mgr
+            .set_headless_check_alive(Arc::new(|_automation_id: &str| false));
+        let next = h.next_run_at(&id).expect("re-armed past the skip");
+        h.set_now(next);
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 2, "claims resume once the child is gone");
+    }
+
+    // headless-monitor-checks R6: with the frontend-ready gate down, a due
+    // MONITOR is claimed and dispatched while a due regular agent automation
+    // stays deferred un-claimed (its occurrence not burned) — the carve-out
+    // exists because a headless check emits no agent-run event to drop.
+    #[test]
+    fn frontend_gate_down_monitor_claims_while_regular_agent_defers_r6() {
+        let h = harness();
+        let monitor = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &monitor);
+        let plain = h.mgr.create(agent_spec("plain")).unwrap().automation.id;
+        h.set_now(T0 + FIVE_MIN); // both due; gate never set
+
+        h.sweep();
+
+        let mruns = h.runs(&monitor);
+        assert_eq!(mruns.len(), 1, "monitor claimed with the gate down");
+        assert_eq!(mruns[0].status, RunStatus::Running);
+        assert!(mruns[0].headless);
+        assert_eq!(h.dispatcher.count(), 1, "and dispatched");
+        assert!(h.runs(&plain).is_empty(), "regular agent still deferred");
+        assert_eq!(
+            h.next_run_at(&plain),
+            Some(T0 + FIVE_MIN),
+            "the deferred occurrence is not burned"
+        );
+    }
+
+    // headless-monitor-checks R6, retry leg: an interrupted monitor's
+    // one-shot retry claims and dispatches on the FIRST sweep with the gate
+    // down — never requeued behind frontend-ready (contrast
+    // agent_retry_defers_until_frontend_ready_r5 for regular agents).
+    #[test]
+    fn monitor_retry_dispatches_with_the_gate_down_and_never_requeues_r6() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = store_in(&dir);
+            store
+                .mutate(|map| {
+                    let mut a = raw_automation("m1");
+                    a.monitor = true;
+                    a.retry_on_interrupt = true;
+                    a.mode = agent_mode();
+                    a.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, Trigger::Schedule, "r1")
+                        .unwrap();
+                    map.insert(a.id.clone(), a);
+                })
+                .unwrap();
+        }
+        let h = harness_in(dir);
+
+        h.sweep(); // gate never set
+
+        assert_eq!(h.dispatcher.count(), 1, "retry dispatched immediately");
+        let runs = h.runs("m1");
+        assert_eq!(runs.len(), 2, "failed original + running retry");
+        assert_eq!(runs[1].trigger, Trigger::Retry);
+        assert_eq!(runs[1].status, RunStatus::Running);
+        assert!(runs[1].headless, "the retry claim derives headless too");
+        assert!(
+            h.mgr.retry_queue.lock().unwrap().is_empty(),
+            "nothing requeued on the gate"
+        );
+    }
+
+    // headless-monitor-checks R7 backstop: a Running headless row past
+    // deadline + slack is kill-then-closed ONLY when the monotonic gate
+    // agrees. Gate closed (the suspend case: epoch lapsed, monotonic not) →
+    // neither kill nor close; gate open → the killer fires strictly BEFORE
+    // the Failed close (it observes the row still Running — and reads the
+    // store, structurally asserting the kill runs off the store lock,
+    // KTD-B), then the row closes with the backstop reason through the
+    // shared tail: run-closed emitted, escalation counted.
+    #[test]
+    fn backstop_kills_then_closes_only_when_the_monotonic_gate_agrees_r7() {
+        let h = harness();
+        let (id, run_id) = claim_headless_check(&h);
+        let killed: Arc<Mutex<Vec<(String, RunStatus)>>> = Arc::new(Mutex::new(Vec::new()));
+        let k = Arc::clone(&killed);
+        let probe_mgr = Arc::downgrade(&h.mgr);
+        let (aid, rid) = (id.clone(), run_id.clone());
+        h.mgr.set_headless_killer(Arc::new(move |run_id: &str| {
+            let status = probe_mgr
+                .upgrade()
+                .and_then(|m| m.get(&aid))
+                .and_then(|a| a.runs.iter().find(|r| r.id == rid).map(|r| r.status))
+                .expect("the row exists at kill time");
+            k.lock().unwrap().push((run_id.to_owned(), status));
+        }));
+
+        // Suspend case: epoch age lapsed, monotonic deadline not.
+        h.mgr.set_headless_deadline_gate(Arc::new(|_run_id: &str| false));
+        h.set_now(T0 + FIVE_MIN + RUN_DEADLINE_MS + HEADLESS_DEADLINE_SLACK_MS);
+        h.sweep();
+        assert!(killed.lock().unwrap().is_empty(), "closed gate: no kill");
+        assert_eq!(
+            h.runs(&id)[0].status,
+            RunStatus::Running,
+            "and no close — the runner still owns the row"
+        );
+
+        // Gate opens (monotonic lapsed / entry gone): kill, then close.
+        h.mgr.set_headless_deadline_gate(Arc::new(|_run_id: &str| true));
+        h.sweep();
+        assert_eq!(
+            *killed.lock().unwrap(),
+            vec![(run_id.clone(), RunStatus::Running)],
+            "killer fired exactly once, BEFORE the close"
+        );
+        let a = h.mgr.get(&id).unwrap();
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(row.status, RunStatus::Failed);
+        assert_eq!(row.error.as_deref(), Some(ERR_HEADLESS_BACKSTOP));
+        assert_eq!(
+            a.consecutive_infra_failures(),
+            1,
+            "a backstop close counts toward broken"
+        );
+        assert!(
+            h.run_closed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(r, s)| *r == run_id && *s == RunStatus::Failed),
+            "run-closed emitted through the shared tail"
+        );
+    }
+
+    // headless-monitor-checks R5: deleting an automation mid-check invokes
+    // the HEADLESS killer for the check's run (the script killer stays
+    // silent — a monitor is agent-mode) and closes the row deleted on the
+    // removed record.
+    #[test]
+    fn delete_mid_check_invokes_headless_killer_and_closes_deleted_r5() {
+        let h = harness();
+        let (id, run_id) = claim_headless_check(&h);
+        let killed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let k = Arc::clone(&killed);
+        h.mgr
+            .set_headless_killer(Arc::new(move |rid: &str| k.lock().unwrap().push(rid.into())));
+        let script_killed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sk = Arc::clone(&script_killed);
+        h.mgr
+            .set_script_killer(Arc::new(move |rid: &str| sk.lock().unwrap().push(rid.into())));
+
+        let removed = h.mgr.delete(&id).unwrap();
+
+        assert_eq!(*killed.lock().unwrap(), vec![run_id.clone()]);
+        assert!(script_killed.lock().unwrap().is_empty(), "not a script kill");
+        let row = removed.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(row.status, RunStatus::Failed);
+        assert_eq!(row.error.as_deref(), Some(ERR_DELETED));
+        assert!(h.mgr.get(&id).is_none(), "record removed");
+    }
+
+    // headless-monitor-checks retirement race: a verdict close landing on a
+    // monitor a concurrent path already retired takes the existing
+    // idempotent branch — the fetched record's `retired_at` gates the parse,
+    // so the row closes as an ordinary Succeeded check: no verdict stamped,
+    // no re-ring, the original retirement stamp untouched.
+    #[test]
+    fn headless_verdict_close_on_an_already_retired_monitor_is_the_idempotent_no_op() {
+        let h = harness();
+        let (id, run_id) = claim_headless_check(&h);
+        // Concurrent retirement while the check runs (stamped directly, the
+        // make_monitor pattern — a retired monitor refuses new claims, so
+        // the Running-row + retired pair only arises from this race).
+        let _ = h.mgr.store.mutate(|map| {
+            map.get_mut(&id).unwrap().retired_at = Some(T0);
+        });
+
+        h.mgr.close_headless_run(
+            &id,
+            &run_id,
+            headless::CheckOutcome::Clean {
+                text: "```verdict\nPASS\ndone\n```".into(),
+                session_id: None,
+            },
+        );
+
+        let a = h.mgr.get(&id).unwrap();
+        assert_eq!(a.retired_at, Some(T0), "original stamp untouched");
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(row.status, RunStatus::Succeeded, "the row still closes");
+        assert_eq!(row.verdict, None, "no verdict stamped past retirement");
+        assert!(row.bundle_path.is_none());
+        assert!(h.monitor_alerts.lock().unwrap().is_empty(), "nothing rings");
+    }
+
+    // headless-monitor-checks: an unknown automation id (deleted mid-check)
+    // makes close_headless_run a calm no-op — the reaper-side convention.
+    #[test]
+    fn close_headless_run_on_a_deleted_automation_is_a_no_op() {
+        let h = harness();
+        h.mgr.close_headless_run(
+            "ghost",
+            "r1",
+            headless::CheckOutcome::Clean {
+                text: "```verdict\nPASS\ndone\n```".into(),
+                session_id: None,
+            },
+        );
+        assert!(h.monitor_alerts.lock().unwrap().is_empty());
+        assert!(h.run_closed.lock().unwrap().is_empty());
     }
 
     // U5 (automations-workspace-and-model): an agent-run close emits
@@ -4381,6 +5327,8 @@ mod tests {
         assert_eq!(h.mgr.close_run_by_pane(42), Ok(()));
         // And the tighter interleaving — snapshot before the delete, close
         // mutation after it — hits close_monitor_run_retiring's NotFound arm.
+        // (Reworked for headless-monitor-checks U4: the retiring close gained
+        // a session-id parameter — `None` here, the pane path's value.)
         assert_eq!(
             h.mgr.close_monitor_run_retiring(
                 &pre_delete,
@@ -4393,6 +5341,7 @@ mod tests {
                     note: "died".into(),
                 },
                 "evidence",
+                None,
             ),
             Ok(())
         );
