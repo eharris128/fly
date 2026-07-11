@@ -321,7 +321,20 @@ named `fly-automation-sweep` thread ticks every 10s; a due automation is
 **Monitors** (`docs/plans/2026-07-10-002-feat-monitor-handoff-plan.md` — its own
 U1–U8/R1–R18). A monitor is an agent-mode automation flavor for parked
 experiments: a not-before floor (`schedule.rs` clamps every `next_run_at`
-recompute) + a sparse recurring cron; each check's captured final turn is
+recompute) + a sparse recurring cron. **Checks dispatch headless**
+(`docs/plans/2026-07-11-003-feat-headless-monitor-checks-plan.md`): a
+backend-owned `claude -p --output-format stream-json` child
+(`automations/headless.rs` — clean env via the shared pane strip list minus
+the fly socket vars, tolerant init/result-only stream parse, monotonic
+deadline, SIGTERM-first kill with a /proc descendant-snapshot sweep), NOT a
+pane — no tab appears, `automation://agent-run` never fires, and a running
+check is visible only as its dashboard automation row. The run output is the
+stream's `result` event text (no transcript-capture race; the check's
+`session_id` is stamped on the row and rides the FAIL bundle), routed through
+`redact::clean_captured` and the manager's one shared verdict-close tail
+(`close_headless_run` — the same retire/escalation/run-closed mutation the
+pane path uses); anything surprising in the stream degrades to an
+infra-unreadable Failed close, never a fabricated verdict. The check text is
 parsed for one fenced ` ```verdict ` block (`automations/verdict.rs` — the
 contract text is `VERDICT_BLOCK_SPEC`, quoted verbatim by
 `skills/fly-monitor-handoff/SKILL.md`, edited only together; abstain-on-surprise,
