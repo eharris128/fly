@@ -36,6 +36,12 @@
 //! consecutive-infra-failure count (monitor-handoff R6/R7). Same purity
 //! rules: no I/O, no clocks — retirement and counting are testable
 //! transitions over plain data.
+//!
+//! Headless-check vocabulary (U2 of
+//! `docs/plans/2026-07-11-003-feat-headless-monitor-checks-plan.md`): the
+//! per-run `headless` marker on [`RunRow`], derived inside
+//! [`Automation::claim`] (R7), and the check's `session_id` (R12). Plain
+//! data again — the sweep exemptions the marker drives live in `mod.rs`.
 
 use serde::{Deserialize, Serialize};
 
@@ -246,6 +252,28 @@ pub struct RunRow {
     /// tail cap; the short verdict note rides `output` as usual.
     #[serde(default)]
     pub bundle_path: Option<String>,
+    /// Headless-check marker (U2 of
+    /// `docs/plans/2026-07-11-003-feat-headless-monitor-checks-plan.md` —
+    /// R7): `true` when this run is a monitor check dispatched as a
+    /// backend-managed `claude -p` child — no pane, no tab. Derived inside
+    /// [`Automation::claim`] from `monitor` + agent mode (the one funnel for
+    /// scheduled, manual, and retry claims — no call-site signature churn).
+    /// The sweep's pane-oriented ack-timeout and deadline closes exclude
+    /// marked rows (`mod.rs`, R7); their deadline is the runner's own, with
+    /// the sweep only as a slack-delayed backstop. `#[serde(default)]` keeps
+    /// legacy rows loading as `false`; an old binary rewriting a new store
+    /// merely drops the marker on already-terminal rows (harmless — the
+    /// plan's KTD).
+    #[serde(default)]
+    pub headless: bool,
+    /// The headless check's Claude session id (headless-monitor-checks
+    /// plan, U2 — R12): stamped from the stream's `init` event when the run
+    /// closes (U4/U5) and riding the FAIL bundle alongside the derived
+    /// transcript path. `None` for pane runs and for checks whose stream
+    /// never delivered an `init`; omitted from the wire entirely when
+    /// `None`, so pane rows serialize byte-identically to before (R14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Captured output, capped to an [`OUTPUT_TAIL_CAP_BYTES`] tail (R8).
     pub output: Option<String>,
     pub exit_code: Option<i32>,
@@ -399,6 +427,11 @@ impl Automation {
     /// Monitor-handoff R3: a retired monitor refuses every claim — sweep
     /// and manual alike — with [`ClaimError::Retired`], checked before the
     /// softer `enabled` gate (retirement is the permanent state).
+    ///
+    /// Headless-monitor-checks U2 (R7): the appended row's `headless`
+    /// marker is derived HERE — `monitor` + agent mode — because every
+    /// claim path (scheduled sweep, manual run, retry drain) funnels
+    /// through this one method, so no caller signature changes.
     pub fn claim(
         &mut self,
         next_run_at: Option<u64>,
@@ -418,6 +451,11 @@ impl Automation {
             Trigger::Schedule => self.next_run_at,
             Trigger::Manual | Trigger::Retry => None,
         };
+        // Headless-monitor-checks U2 (R7): a monitor's agent check
+        // dispatches as a backend-managed `claude -p` child (no pane), so
+        // the row is marked at claim — letting the sweep's pane-oriented
+        // probes leave it alone regardless of which path claimed it.
+        let headless = self.monitor && self.mode.kind() == RunMode::Agent;
         self.next_run_at = next_run_at;
         self.updated_at = now_ms;
         self.push_row(RunRow {
@@ -430,6 +468,8 @@ impl Automation {
             effort: None,
             verdict: None,
             bundle_path: None,
+            headless,
+            session_id: None,
             output: None,
             exit_code: None,
             error: None,
@@ -464,6 +504,10 @@ impl Automation {
             effort: None,
             verdict: None,
             bundle_path: None,
+            // A skip never dispatches, so the dispatch-shape marker stays
+            // unset even on a monitor (headless-monitor-checks U2).
+            headless: false,
+            session_id: None,
             output: None,
             exit_code: None,
             error: Some(reason.to_owned()),
@@ -1017,6 +1061,10 @@ mod tests {
         assert_eq!(row["status"], "failed");
         assert_eq!(row["trigger"], "schedule");
         assert_eq!(row["mode"], "script");
+        // headless-monitor-checks U2 (R14): the marker rides the wire as a
+        // plain bool; a None session id is omitted entirely.
+        assert_eq!(row["headless"], false, "script rows are never headless");
+        assert!(row.get("sessionId").is_none(), "None sessionId omitted");
 
         let back: Automation = serde_json::from_value(v).unwrap();
         assert_eq!(back, a);
@@ -1102,6 +1150,126 @@ mod tests {
         assert_eq!(back, with);
     }
 
+    // headless-monitor-checks U2 (R14): a legacy RunRow JSON without
+    // `headless`/`sessionId` loads with defaults (false/None) — and in the
+    // other direction a fresh row omits `sessionId` when None, so pane rows
+    // serialize with no new key churn; a populated row round-trips under
+    // camelCase.
+    #[test]
+    fn run_row_headless_and_session_id_are_back_compat_and_round_trip() {
+        // Legacy row (no headless/sessionId keys) still loads.
+        let legacy = serde_json::json!({
+            "id": "r1",
+            "mode": "agent",
+            "trigger": "schedule",
+            "status": "succeeded",
+            "paneId": 3,
+            "output": "done",
+            "exitCode": null,
+            "error": null,
+            "scheduledFor": 60_000,
+            "startedAt": 61_000,
+            "finishedAt": 62_000,
+        });
+        let row: RunRow = serde_json::from_value(legacy).unwrap();
+        assert!(!row.headless, "legacy rows default to pane dispatch");
+        assert_eq!(row.session_id, None);
+
+        // Serializing it back omits sessionId (skip-if-none) and writes the
+        // marker as a plain defaulted bool.
+        let v = serde_json::to_value(&row).unwrap();
+        assert!(v.get("sessionId").is_none(), "None sessionId omitted");
+        assert_eq!(v["headless"], false);
+
+        // A populated headless row round-trips losslessly under camelCase.
+        let mut with = row.clone();
+        with.headless = true;
+        with.session_id = Some("sess-42".into());
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["headless"], true);
+        assert_eq!(v["sessionId"], "sess-42");
+        let back: RunRow = serde_json::from_value(v).unwrap();
+        assert_eq!(back, with);
+    }
+
+    // headless-monitor-checks U2 (R7): `headless` derives inside claim() —
+    // the one funnel for scheduled, manual, AND retry claims — as `monitor`
+    // + agent mode. Regular agent automations and scripts (even a
+    // defensively mis-flagged script monitor) stay unmarked, and a skip row
+    // never dispatched at all, so it stays unmarked too.
+    #[test]
+    fn claim_derives_headless_for_monitor_agent_claims_on_every_trigger() {
+        let agent_mode = || Mode::Agent {
+            prompt: "check the run".into(),
+            model: None,
+            effort: None,
+        };
+
+        // Monitor + agent mode: every claim path derives true.
+        let mut m = automation(agent_mode());
+        m.monitor = true;
+        m.claim(Some(360_000), 61_000, Trigger::Schedule, "sched")
+            .unwrap();
+        m.claim(None, 62_000, Trigger::Manual, "manual").unwrap();
+        m.claim(None, 63_000, Trigger::Retry, "retry").unwrap();
+        assert_eq!(m.runs.len(), 3);
+        for row in &m.runs {
+            assert!(row.headless, "claim path {:?} derives headless", row.trigger);
+            assert_eq!(row.session_id, None, "stamped later by the runner (R12)");
+        }
+
+        // Regular (non-monitor) agent automation: pane dispatch, unmarked.
+        let mut a = automation(agent_mode());
+        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+            .unwrap();
+        assert!(!a.runs[0].headless);
+
+        // Script mode is never agent dispatch — even under a monitor flag.
+        let mut s = automation(script_mode());
+        s.monitor = true;
+        s.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+            .unwrap();
+        assert!(!s.runs[0].headless);
+
+        // A monitor's skip row never dispatched: unmarked.
+        let mut k = automation(agent_mode());
+        k.monitor = true;
+        k.skip(61_000, Trigger::Schedule, "run in flight", "r2");
+        assert!(!k.runs[0].headless);
+    }
+
+    // headless-monitor-checks U2 (R7/R14) + R8/U7: the eviction guarantees
+    // hold with the new fields present — a Running headless check row (with
+    // a stamped session id) survives the cap and keeps its fields intact
+    // through the churn.
+    #[test]
+    fn history_eviction_preserves_a_headless_running_row_with_its_fields() {
+        let mut a = automation(Mode::Agent {
+            prompt: "check the run".into(),
+            model: None,
+            effort: None,
+        });
+        a.monitor = true;
+        a.claim(Some(60_000), 10, Trigger::Schedule, "check").unwrap();
+        // U4/U5 stamp the session id from the stream's init event; the model
+        // test sets the pub field directly (the verdict-test convention).
+        a.runs[0].session_id = Some("sess-42".into());
+        for i in 0..RUN_HISTORY_CAP as u64 + 5 {
+            a.skip(100 + i, Trigger::Schedule, "overlap", &format!("r{i}"));
+        }
+
+        assert_eq!(a.runs.len(), RUN_HISTORY_CAP);
+        let live = a
+            .runs
+            .iter()
+            .find(|r| r.id == "check")
+            .expect("the Running headless row survives eviction");
+        assert_eq!(live.status, RunStatus::Running);
+        assert!(live.headless, "marker intact through the churn");
+        assert_eq!(live.session_id.as_deref(), Some("sess-42"));
+        assert!(a.in_flight(), "in_flight still reads the surviving row");
+    }
+
     // monitor-handoff U1 back-compat: a legacy store Automation JSON written
     // before the monitor plan (no monitor / notBeforeMs / retiredAt /
     // pickupPointers keys; rows without verdict / bundlePath) loads with
@@ -1147,6 +1315,10 @@ mod tests {
         assert!(!a.retry_on_interrupt, "pre-existing default still holds");
         assert_eq!(a.runs[0].verdict, None);
         assert_eq!(a.runs[0].bundle_path, None);
+        // headless-monitor-checks U2 (R14): pre-plan rows also lack
+        // headless/sessionId — they default too.
+        assert!(!a.runs[0].headless);
+        assert_eq!(a.runs[0].session_id, None);
         // The derived count reads legacy rows too: one trailing verdict-less
         // Failed row is one infra failure (monitor-handoff R6).
         assert_eq!(a.consecutive_infra_failures(), 1);

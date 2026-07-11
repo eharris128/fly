@@ -121,6 +121,20 @@ pub const ERR_SPAWN_ACK: &str = "spawn ack timeout";
 /// simply stays terminal.
 pub const RUN_DEADLINE_MS: u64 = 30 * 60 * 1000;
 
+/// Headless backstop slack (U2 of
+/// `docs/plans/2026-07-11-003-feat-headless-monitor-checks-plan.md` — R7).
+/// A headless monitor check is exempt from both pane-oriented sweep closes
+/// (ack timeout and deadline — see the probes below): its runner thread
+/// enforces [`RUN_DEADLINE_MS`] itself on a MONOTONIC clock and closes the
+/// row (U3). The sweep keeps only a kill-then-close BACKSTOP for a dead
+/// runner thread, firing at deadline + this slack so the runner's own close
+/// wins every ordinary race. U4 wires the consumer — the killer seam plus
+/// the in-flight registry's monotonic gate (the entry's spawn `Instant`
+/// must also have lapsed, or the entry be gone, before the kill: epoch age
+/// alone can lapse across a laptop suspend while the check is healthy);
+/// [`headless_deadline_expired_runs`] is the epoch leg this slack bounds.
+pub const HEADLESS_DEADLINE_SLACK_MS: u64 = 60_000;
+
 /// Error string for the run linked to a pane that exited before any Stop
 /// closed it (U7 pane-exit tap). A run already closed (Stop→succeeded or the
 /// deadline→timed-out) is left untouched — this only catches a pane that died
@@ -1594,6 +1608,8 @@ impl AutomationManager {
 
                 // R10 ack-timeout: agent rows never linked to a pane within
                 // the window close failed (a dropped agent-run event).
+                // Headless check rows are exempt — see the probe
+                // (headless-monitor-checks R7).
                 for run_id in ack_timed_out_agent_runs(a, now_ms) {
                     a.close(&run_id, failed(ERR_SPAWN_ACK), now_ms);
                     closed_agent_runs.push((a.id.clone(), run_id));
@@ -1609,7 +1625,10 @@ impl AutomationManager {
                 // alive the R7 alive-probe keeps this occurrence in flight —
                 // a genuinely stuck agent skips the next occurrence instead of
                 // fanning out a second pane; once the pane exits, the probe
-                // reads dead and the schedule resumes.
+                // reads dead and the schedule resumes. Headless check rows
+                // are exempt — their runner owns the deadline on a monotonic
+                // clock; see the probe's suspend-race note
+                // (headless-monitor-checks R7).
                 for run_id in deadline_expired_agent_runs(a, now_ms) {
                     a.close(&run_id, failed(ERR_TIMED_OUT), now_ms);
                     closed_agent_runs.push((a.id.clone(), run_id));
@@ -1940,13 +1959,17 @@ fn running_run_ids(a: &Automation) -> Vec<String> {
         .collect()
 }
 
-/// Agent rows past the R10 ack window with no pane ever linked.
+/// Agent rows past the R10 ack window with no pane ever linked. Headless
+/// monitor-check rows are exempt (headless-monitor-checks plan, U2 — R7):
+/// they never link a pane by design, so without the exclusion every check
+/// running longer than the 30 s window would be force-failed.
 fn ack_timed_out_agent_runs(a: &Automation, now_ms: u64) -> Vec<String> {
     a.runs
         .iter()
         .filter(|r| {
             r.status == RunStatus::Running
                 && r.mode == RunMode::Agent
+                && !r.headless
                 && r.pane_id.is_none()
                 && r.started_at
                     .is_some_and(|t| t.saturating_add(AGENT_ACK_TIMEOUT_MS) <= now_ms)
@@ -1959,14 +1982,52 @@ fn ack_timed_out_agent_runs(a: &Automation, now_ms: u64) -> Vec<String> {
 /// have a linked pane (an unlinked run hits the ack timeout first); the
 /// deadline close keeps that `pane_id` so the alive-probe can still see a
 /// stuck-but-alive agent (R7 widening).
+///
+/// Headless monitor-check rows are exempt (headless-monitor-checks plan,
+/// U2 — R7): the runner thread enforces the same deadline itself on a
+/// MONOTONIC clock, while this sweep counts epoch time. Across a laptop
+/// suspend the epoch age can lapse while the monotonic deadline has not, so
+/// the sweep would close a healthy check first and the runner's later
+/// verdict would land [`model::CloseResult::AlreadyClosed`] — silently
+/// discarded. A dead runner thread is caught instead by the
+/// [`headless_deadline_expired_runs`] backstop at deadline + slack.
 fn deadline_expired_agent_runs(a: &Automation, now_ms: u64) -> Vec<String> {
     a.runs
         .iter()
         .filter(|r| {
             r.status == RunStatus::Running
                 && r.mode == RunMode::Agent
+                && !r.headless
                 && r.started_at
                     .is_some_and(|t| t.saturating_add(RUN_DEADLINE_MS) <= now_ms)
+        })
+        .map(|r| r.id.clone())
+        .collect()
+}
+
+/// Headless rows still `Running` past [`RUN_DEADLINE_MS`] +
+/// [`HEADLESS_DEADLINE_SLACK_MS`] — the epoch leg of the R7 backstop
+/// (headless-monitor-checks plan, U2). The runner's own monotonic deadline
+/// close normally wins by the whole slack; a row this probe returns means
+/// the runner thread died with its child possibly still alive, and the
+/// sweep must kill-then-close so the orphan can't block the overlap probe
+/// (or burn spend) forever. U4 wires the consumer: the killer seam plus the
+/// in-flight registry's monotonic gate — the entry's spawn `Instant` must
+/// ALSO have lapsed (or the entry be gone) before the kill, so a suspend
+/// longer than the slack never kills a healthy check. Saturating arithmetic
+/// like its siblings: release builds have overflow checks off.
+#[allow(dead_code)] // consumed by U4's sweep wiring (kill-then-close)
+fn headless_deadline_expired_runs(a: &Automation, now_ms: u64) -> Vec<String> {
+    a.runs
+        .iter()
+        .filter(|r| {
+            r.status == RunStatus::Running
+                && r.headless
+                && r.started_at.is_some_and(|t| {
+                    t.saturating_add(RUN_DEADLINE_MS)
+                        .saturating_add(HEADLESS_DEADLINE_SLACK_MS)
+                        <= now_ms
+                })
         })
         .map(|r| r.id.clone())
         .collect()
@@ -3351,6 +3412,121 @@ mod tests {
         assert_eq!(h.dispatcher.count(), 2, "schedule resumes once the pane is gone");
     }
 
+    // headless-monitor-checks U2 (R7): a monitor's claimed check row is
+    // marked headless (through the real manager claim path) and both
+    // pane-oriented sweep closes leave it alone — it never links a pane, so
+    // the ack window would force-fail every check over 30 s, and the epoch
+    // deadline would race the runner's monotonic one across a suspend.
+    // Pane-less/pane-linked REGULAR agent rows stay governed as before.
+    #[test]
+    fn headless_check_rows_are_exempt_from_ack_and_deadline_sweep_closes() {
+        let h = harness();
+        h.mgr.set_frontend_ready();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.set_now(T0 + FIVE_MIN);
+        h.sweep(); // claim (dispatch still rides the pane seam until U4)
+
+        let t = T0 + FIVE_MIN;
+        let claimed = h.runs(&id);
+        let run_id = claimed[0].id.clone();
+        assert!(claimed[0].headless, "monitor agent claim derives headless");
+        assert_eq!(claimed[0].pane_id, None, "a check never links a pane");
+
+        // Probe level: neither pane-oriented probe ever returns it.
+        let a = h.mgr.get(&id).unwrap();
+        assert!(
+            ack_timed_out_agent_runs(&a, t + AGENT_ACK_TIMEOUT_MS + 1).is_empty(),
+            "pane-less headless row is not ack-timed-out"
+        );
+        assert!(
+            deadline_expired_agent_runs(&a, t + RUN_DEADLINE_MS + 1).is_empty(),
+            "headless row is not deadline-closed by the sweep"
+        );
+
+        // Sweep level: past the ack window AND past the deadline the row is
+        // still Running — no ERR_SPAWN_ACK, no ERR_TIMED_OUT close.
+        h.set_now(t + AGENT_ACK_TIMEOUT_MS + 1);
+        h.sweep();
+        h.set_now(t + RUN_DEADLINE_MS + 1);
+        h.sweep();
+        let row = h
+            .runs(&id)
+            .into_iter()
+            .find(|r| r.id == run_id)
+            .expect("the check row survives");
+        assert_eq!(row.status, RunStatus::Running, "exempt from both closes");
+        assert!(h.run_closed.lock().unwrap().is_empty(), "no run-closed fired");
+
+        // Regular agent rows keep the old rules: a pane-less one still hits
+        // the ack window, and a pane-linked one is still deadline-returned.
+        let h2 = harness();
+        h2.mgr.set_frontend_ready();
+        let plain = create_due(&h2, agent_spec("plain"));
+        h2.sweep();
+        let a2 = h2.mgr.get(&plain).unwrap();
+        let run2 = a2.runs[0].id.clone();
+        assert_eq!(
+            ack_timed_out_agent_runs(&a2, T0 + FIVE_MIN + AGENT_ACK_TIMEOUT_MS),
+            vec![run2.clone()],
+            "pane-less regular agent row still ack-times-out"
+        );
+        h2.mgr.set_run_pane(&run2, 9).unwrap();
+        let a2 = h2.mgr.get(&plain).unwrap();
+        assert_eq!(
+            deadline_expired_agent_runs(&a2, T0 + FIVE_MIN + RUN_DEADLINE_MS),
+            vec![run2],
+            "pane-linked regular agent row still deadline-expires"
+        );
+    }
+
+    // headless-monitor-checks U2 (R7): the backstop probe returns Running
+    // headless rows only past deadline + slack (inside the slack the
+    // runner's own close wins), never terminal rows, and never regular
+    // agent rows. This is the epoch leg only — U4 wires the kill-then-close
+    // consumer plus the registry's monotonic suspend gate.
+    #[test]
+    fn headless_backstop_probe_fires_only_past_deadline_plus_slack() {
+        let h = harness();
+        h.mgr.set_frontend_ready();
+        let id = h.mgr.create(agent_spec("train watch")).unwrap().automation.id;
+        make_monitor(&h, &id);
+        h.set_now(T0 + FIVE_MIN);
+        h.sweep();
+        let mut a = h.mgr.get(&id).unwrap();
+        let run_id = a.runs[0].id.clone();
+        assert!(a.runs[0].headless);
+
+        let fire_at = T0 + FIVE_MIN + RUN_DEADLINE_MS + HEADLESS_DEADLINE_SLACK_MS;
+        assert!(
+            headless_deadline_expired_runs(&a, fire_at - 1).is_empty(),
+            "inside the slack the runner still owns the close"
+        );
+        assert_eq!(
+            headless_deadline_expired_runs(&a, fire_at),
+            vec![run_id.clone()],
+            "a dead runner's row is returned past deadline + slack"
+        );
+
+        // Terminal rows never fire — a closed check is out of the backstop's
+        // jurisdiction no matter how old.
+        a.close(&run_id, failed(ERR_TIMED_OUT), fire_at);
+        assert!(headless_deadline_expired_runs(&a, fire_at + 1).is_empty());
+
+        // Regular agent rows never fire — the existing deadline close (and
+        // its pane alive-probe) governs them.
+        let h2 = harness();
+        h2.mgr.set_frontend_ready();
+        let plain = create_due(&h2, agent_spec("plain"));
+        h2.sweep();
+        let a2 = h2.mgr.get(&plain).unwrap();
+        assert!(headless_deadline_expired_runs(
+            &a2,
+            T0 + FIVE_MIN + RUN_DEADLINE_MS + HEADLESS_DEADLINE_SLACK_MS + 1,
+        )
+        .is_empty());
+    }
+
     // U5 (automations-workspace-and-model): an agent-run close emits
     // `automation://run-closed` with the terminal status — succeeded on a Stop
     // (pane close), failed on a deadline timeout — while a script close never
@@ -4265,8 +4441,13 @@ mod tests {
     }
 
     // Monitor-handoff R6: a check that hangs to the R11 deadline closes
-    // failed(timed out) by the sweep — never a verdict — and counts toward
-    // the broken escalation, which the sweep evaluates after the lock.
+    // failed(timed out) — never a verdict — and counts toward the broken
+    // escalation. Since headless-monitor-checks U2 the SWEEP no longer
+    // closes it (the claimed row is headless — deadline-exempt; the runner
+    // enforces the deadline itself, U3, with the U4 backstop behind it), so
+    // the timeout close arrives through the manager's close entry exactly
+    // as the runner's will, and `close_run` evaluates the escalation on the
+    // Failed close.
     #[test]
     fn deadline_timed_out_check_counts_toward_broken_escalation_r6() {
         let h = harness();
@@ -4278,11 +4459,24 @@ mod tests {
             h.set_now(T0 + i * FIVE_MIN);
             infra_fail_cycle(&h, &id, 200 + i);
         }
-        // …then a check that never Stops: the deadline sweep closes it.
+        // …then a check that hangs: the deadline sweep leaves the headless
+        // row alone (the U2 exemption)…
         h.set_now(T0 + 3 * FIVE_MIN);
-        let run_id = claim_and_link(&h, &id, 203);
+        h.sweep();
+        let run_id = h.runs(&id).last().expect("claimed row").id.clone();
         h.set_now(T0 + 3 * FIVE_MIN + RUN_DEADLINE_MS);
         h.sweep();
+        {
+            let a = h.mgr.get(&id).unwrap();
+            let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+            assert!(row.headless, "monitor claim is headless (U2)");
+            assert_eq!(row.status, RunStatus::Running, "sweep-exempt at the deadline");
+        }
+        // …and the runner's own timeout close reports back (U3 owns this).
+        assert_eq!(
+            h.mgr.close_run(&id, &run_id, failed(ERR_TIMED_OUT)),
+            model::CloseResult::Closed
+        );
 
         let a = h.mgr.get(&id).unwrap();
         let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
