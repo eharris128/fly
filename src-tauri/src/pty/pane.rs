@@ -37,6 +37,25 @@ const GRACE: Duration = Duration::from_millis(200);
 /// needs the screen.
 const TAIL_RING_CAP: usize = 64 * 1024;
 
+/// Claude Code session-identity markers stripped from every child fly spawns
+/// — pane children below, and the headless monitor-check runner
+/// (`crate::automations::headless`, R13 of the headless-monitor-checks plan),
+/// which shares this one list rather than duplicating it. When fly itself was
+/// launched from inside a Claude session (`pnpm flavor:dev` in a dev pane),
+/// these leak through and make every `claude` run in a fly child consider
+/// itself a *child session* of that long-gone parent — verified live (2.1.207)
+/// to suppress its `~/.claude/sessions/<pid>.json` livestate file and its
+/// transcript flush, which blinds the feed's pending-question fallback, resume
+/// attribution, automation output capture, and handoff qualification. A fly
+/// pane (or a backend-owned check) is a top-level context; a session started
+/// in it is nobody's child. (fix-feed-question-detection-gaps)
+pub(crate) const CLAUDE_SESSION_MARKERS: [&str; 4] = [
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+];
+
 /// Output chunks smaller than this don't anchor or extend a work stretch (U3):
 /// a lone keystroke echo or a tiny cursor/spinner redraw is not "the agent
 /// working". Deliberately small — real agent output arrives in larger bursts —
@@ -314,22 +333,9 @@ impl Pane {
         for (key, value) in std::env::vars_os() {
             cmd.env(key, value);
         }
-        // Claude Code session-identity markers are NOT inherited: when fly
-        // itself was launched from inside a Claude session (`pnpm flavor:dev`
-        // in a dev pane), these leak through and make every `claude` run in a
-        // fly pane consider itself a *child session* of that long-gone parent
-        // — verified live (2.1.207) to suppress its
-        // `~/.claude/sessions/<pid>.json` livestate file and its transcript
-        // flush, which blinds the feed's pending-question fallback, resume
-        // attribution, automation output capture, and handoff qualification.
-        // A fly pane is a top-level terminal; a session started in it is
-        // nobody's child. (fix-feed-question-detection-gaps)
-        for marker in [
-            "CLAUDECODE",
-            "CLAUDE_CODE_CHILD_SESSION",
-            "CLAUDE_CODE_SESSION_ID",
-            "CLAUDE_CODE_ENTRYPOINT",
-        ] {
+        // Claude Code session-identity markers are NOT inherited — see
+        // [`CLAUDE_SESSION_MARKERS`] for the full (live-verified) rationale.
+        for marker in CLAUDE_SESSION_MARKERS {
             cmd.env_remove(marker);
         }
         // Terminal identity + a UTF-8 locale if the user has none set.
