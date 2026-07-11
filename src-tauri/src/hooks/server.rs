@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use super::protocol::{Envelope, HookMessage};
+use super::protocol::{AskPayload, Envelope, HookMessage, ASK_ACK_LINE};
 use super::token::TokenRegistry;
 use crate::pty::PaneId;
 use crate::state::attention::Reason;
@@ -22,6 +22,16 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bound the response write so a peer that connects but never reads can't wedge
 /// an automation handler thread indefinitely (U9).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Wall-clock bound on the whole request phase (hook-ask-channel R2): a peer
+/// trickling bytes could previously stretch the per-read timeout indefinitely;
+/// with newline framing (which never EOFs) that would be an unbounded
+/// pre-validation hold, so the phase gets a hard deadline instead.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+/// Cadence of the held-connection loop (hook-ask-channel U2): how often a
+/// holding thread re-checks its decision mailbox and probes the peer for
+/// death. Latency ceiling between a local dialog resolution and the registry
+/// clearing.
+const HOLD_POLL: Duration = Duration::from_millis(250);
 
 /// An authenticated callback, resolved to its pane.
 #[derive(Debug, Clone)]
@@ -66,6 +76,24 @@ pub type Dispatch = Arc<dyn Fn(PaneId, ValidatedHook) + Send + Sync>;
 /// after token validation, outside every app lock the caller must avoid.
 pub type RequestHandler = Arc<dyn Fn(PaneId, &[u8]) -> Vec<u8> + Send + Sync>;
 
+/// What the app-side registrar hands back for one accepted held ask
+/// (hook-ask-channel U2/KTD1). The connection thread acks, then parks on
+/// `decision_rx`: a received line is written to the client (a remote answer);
+/// a closed channel means release (registry replacement or shutdown) — close
+/// with no decision. `on_drop` is called only when the *peer* vanishes first
+/// (the local answer killed the hook) so the registrar clears its entry; it is
+/// generation-guarded upstream, so a late call after replacement is harmless.
+pub struct AskTicket {
+    pub decision_rx: std::sync::mpsc::Receiver<String>,
+    pub on_drop: Box<dyn FnOnce() + Send>,
+}
+
+/// Registers a held ask for a validated pane (hook-ask-channel U2). `None`
+/// declines the hold (registry at cap, or the pane resolves to no leaf): the
+/// connection closes without an ack and the hook exits immediately — the
+/// dialog proceeds normally, detection degrades to the existing chain (KTD2).
+pub type AskHandler = Arc<dyn Fn(PaneId, AskPayload) -> Option<AskTicket> + Send + Sync>;
+
 /// A running hook socket server. Dropping it shuts the server down and removes
 /// the socket file.
 pub struct HookServer {
@@ -94,6 +122,19 @@ impl HookServer {
         dispatch: Dispatch,
         request_handler: Option<RequestHandler>,
     ) -> std::io::Result<HookServer> {
+        Self::start_full(socket_path, tokens, dispatch, request_handler, None)
+    }
+
+    /// Bind the socket and start accepting callbacks, with the automation
+    /// request handler and the held-ask handler (hook-ask-channel U2). The
+    /// full production constructor; the narrower ones delegate here.
+    pub fn start_full(
+        socket_path: PathBuf,
+        tokens: Arc<TokenRegistry>,
+        dispatch: Dispatch,
+        request_handler: Option<RequestHandler>,
+        ask_handler: Option<AskHandler>,
+    ) -> std::io::Result<HookServer> {
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -109,7 +150,14 @@ impl HookServer {
         let accept_handle = std::thread::Builder::new()
             .name("fly-hook-accept".into())
             .spawn(move || {
-                accept_loop(listener, tokens, dispatch, request_handler, accept_stopping)
+                accept_loop(
+                    listener,
+                    tokens,
+                    dispatch,
+                    request_handler,
+                    ask_handler,
+                    accept_stopping,
+                )
             })?;
 
         Ok(HookServer {
@@ -149,6 +197,7 @@ fn accept_loop(
     tokens: Arc<TokenRegistry>,
     dispatch: Dispatch,
     request_handler: Option<RequestHandler>,
+    ask_handler: Option<AskHandler>,
     stopping: Arc<AtomicBool>,
 ) {
     for incoming in listener.incoming() {
@@ -160,11 +209,18 @@ fn accept_loop(
                 let tokens = Arc::clone(&tokens);
                 let dispatch = Arc::clone(&dispatch);
                 let request_handler = request_handler.clone();
+                let ask_handler = ask_handler.clone();
                 // Handle each callback concurrently.
                 let _ = std::thread::Builder::new()
                     .name("fly-hook-conn".into())
                     .spawn(move || {
-                        handle_conn(stream, &tokens, &dispatch, request_handler.as_ref())
+                        handle_conn(
+                            stream,
+                            &tokens,
+                            &dispatch,
+                            request_handler.as_ref(),
+                            ask_handler.as_ref(),
+                        )
                     });
             }
             Err(_) => {
@@ -176,22 +232,59 @@ fn accept_loop(
     }
 }
 
+/// Read one request: bytes up to the first `\n` (the held ask/hold framing —
+/// trailing same-chunk bytes are a protocol violation and are discarded) or
+/// EOF (the classic framing), whichever comes first, bounded by
+/// [`MAX_MESSAGE`] and the [`REQUEST_DEADLINE`] wall clock (hook-ask-channel
+/// R2 — with newline framing a byte-trickling peer never EOFs, so the
+/// pre-validation phase needs a hard deadline, which also tightens the
+/// classic path's previous per-read-timeout-only bound). `None` rejects.
+fn read_request(stream: &mut UnixStream) -> Option<Vec<u8>> {
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    let deadline = std::time::Instant::now() + REQUEST_DEADLINE;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return Some(buf), // EOF framing
+            Ok(n) => {
+                if let Some(pos) = chunk[..n].iter().position(|&b| b == b'\n') {
+                    buf.extend_from_slice(&chunk[..pos]);
+                    return Some(buf); // newline framing
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() as u64 > MAX_MESSAGE {
+                    return None; // oversized → reject silently
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue // re-check the deadline
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 fn handle_conn(
     mut stream: UnixStream,
     tokens: &TokenRegistry,
     dispatch: &Dispatch,
     request_handler: Option<&RequestHandler>,
+    ask_handler: Option<&AskHandler>,
 ) {
     // The PTY is a trust boundary; only same-UID local peers may signal.
     if !peer_uid_matches(&stream) {
         return;
     }
-    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-
-    let mut buf = Vec::new();
-    if (&stream).take(MAX_MESSAGE).read_to_end(&mut buf).is_err() {
+    let Some(buf) = read_request(&mut stream) else {
         return;
-    }
+    };
     // Two-stage parse (U9): read the envelope first so token validation (the
     // constant-time compare + lockout, the security boundary) happens once for
     // every message — notify and automation alike — before any op-specific work.
@@ -217,6 +310,21 @@ fn handle_conn(
         return;
     }
 
+    // Held permission asks (hook-ask-channel U2/KTD1): register, ack, then
+    // hold the connection for the ask's lifetime. Declined registration (or
+    // no handler wired) closes without an ack — the client's ack deadline
+    // reads that exactly like an old server and exits immediately.
+    if envelope.is_ask_hold() {
+        let ask: AskPayload = match serde_json::from_slice(&buf) {
+            Ok(a) => a,
+            Err(_) => return, // malformed → reject silently
+        };
+        if let Some(ticket) = ask_handler.and_then(|h| h(pane, ask)) {
+            hold_ask(stream, ticket);
+        }
+        return;
+    }
+
     let msg: HookMessage = match serde_json::from_slice(&buf) {
         Ok(m) => m,
         Err(_) => return, // malformed → reject silently
@@ -233,6 +341,64 @@ fn handle_conn(
             capture_only: msg.capture_only,
         },
     );
+}
+
+/// Hold a registered ask's connection until it resolves (hook-ask-channel
+/// U2/KTD1): write the ack line, then park on the decision mailbox with a
+/// peer-death probe each [`HOLD_POLL`]. Three exits:
+/// - **decision received** — write it as one line and close (the hook prints
+///   it, Claude applies it; the registrar already removed the entry);
+/// - **mailbox closed** — release: close with no decision (registry
+///   replacement or shutdown already forgot this ask; the hook exits quietly
+///   and the dialog proceeds normally);
+/// - **peer gone** — the local answer killed the hook (probed contract): call
+///   `on_drop` so the registrar clears the entry, then exit.
+fn hold_ask(mut stream: UnixStream, ticket: AskTicket) {
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    if stream
+        .write_all(format!("{ASK_ACK_LINE}\n").as_bytes())
+        .and_then(|()| stream.flush())
+        .is_err()
+    {
+        (ticket.on_drop)();
+        return;
+    }
+    let _ = stream.set_read_timeout(Some(HOLD_POLL));
+    let mut scratch = [0u8; 256];
+    loop {
+        match ticket.decision_rx.recv_timeout(HOLD_POLL) {
+            Ok(line) => {
+                let _ = stream
+                    .write_all(format!("{line}\n").as_bytes())
+                    .and_then(|()| stream.flush());
+                let _ = stream.shutdown(Shutdown::Both);
+                return;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                return;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match stream.read(&mut scratch) {
+                Ok(0) => {
+                    // Peer closed: the ask resolved locally (or the hook
+                    // timed out / claude exited) — clear the registry entry.
+                    (ticket.on_drop)();
+                    return;
+                }
+                // Stray post-request bytes: tolerated and discarded (bounded
+                // per poll tick — a spamming peer costs one small read per
+                // HOLD_POLL, never a wedge).
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => {
+                    (ticket.on_drop)();
+                    return;
+                }
+            },
+        }
+    }
 }
 
 /// Verify the connecting peer's UID equals ours via `SO_PEERCRED`.

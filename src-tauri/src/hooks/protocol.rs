@@ -5,16 +5,34 @@
 //! `command` hook → `fly notify` → this socket.
 //!
 //! Framing: the client opens a connection, writes one UTF-8 JSON object, and
-//! closes its write half. The server reads to EOF (bounded), parses, and
-//! authenticates.
+//! either closes its write half (the fire-and-forget notify path and the
+//! `automation/*` request path — the server reads to EOF, bounded) **or**
+//! terminates the object with `\n` and keeps the connection open (the
+//! hook-ask-channel `op:"ask/hold"` path, U1/KTD1: the server stops reading at
+//! the newline, writes an ack line, and *holds* the connection — its lifetime
+//! mirrors the ask's lifetime, because Claude Code kills the hook process when
+//! the dialog resolves locally). Both framings face the same size bound and a
+//! request-phase deadline (`server.rs`), so neither can wedge a
+//! pre-validation thread. Consequence: a message must be **one line** —
+//! compact JSON with no raw newlines (what `serde_json::to_vec` always emits,
+//! and what every fly client sends); a pretty-printed message truncates at
+//! its first newline and is silently rejected as malformed.
 //!
-//! Schema:
+//! Schema (notify path):
 //! ```json
 //! { "token": "<hex>", "reason": "question|permission|finished|error|alert",
 //!   "title": "<optional>", "body": "<optional>",
 //!   "session_id": "<optional>", "cwd": "<optional>",
 //!   "hook_event": "<optional>", "capture_only": false }
 //! ```
+//!
+//! Schema (`op:"ask/hold"`, hook-ask-channel U1): the envelope's token/op plus
+//! [`AskPayload`]'s all-optional fields. Server → client responses are single
+//! JSON lines: the ack `{"ok":true,"held":true}` immediately after
+//! registration, then either one decision object (the exact
+//! `hookSpecificOutput` JSON the hook prints to stdout, hook-ask-channel R7)
+//! or a bare close (release — the hook exits printing nothing and the dialog
+//! proceeds normally).
 //!
 //! `capture_only` (fix-session-pane-attribution U2, KTD1) marks a message that
 //! only updates the pane's resume record — the dispatch returns before the
@@ -60,6 +78,15 @@ impl Envelope {
     pub fn is_automation(&self) -> bool {
         self.op.starts_with("automation/")
     }
+
+    /// Whether this op is a held permission-ask registration
+    /// (hook-ask-channel U1/KTD1). On an OLD server this op falls through to
+    /// the notify path, whose `HookMessage` parse fails on the missing
+    /// `reason` — a silent reject, so skew can never raise attention (R8);
+    /// the client's ack deadline handles its side.
+    pub fn is_ask_hold(&self) -> bool {
+        self.op == "ask/hold"
+    }
 }
 
 /// A callback payload sent by an agent (via `fly notify`).
@@ -91,6 +118,63 @@ pub struct HookMessage {
     pub hook_event: Option<String>,
     #[serde(default)]
     pub capture_only: bool,
+}
+
+/// A held permission-ask registration (hook-ask-channel U1, KTD4): the
+/// bounded, typed subset `fly notify --permission-request` extracts from the
+/// `PermissionRequest` hook payload. Every field is optional — an over-cap or
+/// unparseable hook payload degrades to a body-less ask that still registers
+/// "a dialog is up" (the held connection carries the resolution signal either
+/// way). All strings are **raw and untrusted** here: the feed re-runs its
+/// sanitize → scrub → truncate pipeline at serve time; the client-side caps
+/// are a transport bound, not the sanitization boundary.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, Deserialize)]
+pub struct AskPayload {
+    /// The pending tool's name (`AskUserQuestion` → a choice ask; anything
+    /// else → a permission ask).
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// The session's `permission_mode` at ask time (informational).
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    /// Session attribution, same semantics as the notify path (upserted at
+    /// `Hook` rank by the registration handler — hook-ask-channel KTD6).
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// The raw AskUserQuestion `{"questions":[…]}` input object, count- and
+    /// string-capped client-side (KTD4); absent for permission asks.
+    #[serde(default)]
+    pub questions: Option<serde_json::Value>,
+    /// One-line request summary for known permission tools (`Bash.command`,
+    /// `Edit`/`Write.file_path`), pre-capped client-side.
+    #[serde(default)]
+    pub request: Option<String>,
+}
+
+/// The ack line written to a held client immediately after registration
+/// (hook-ask-channel R8): its arrival within the client's deadline is what
+/// distinguishes a holding server from an old one that silently ignored the
+/// op. Newline-terminated on the wire.
+pub const ASK_ACK_LINE: &str = "{\"ok\":true,\"held\":true}";
+
+/// The decision line for a remotely answered permission ask
+/// (hook-ask-channel R7): the exact `hookSpecificOutput` object the hook
+/// process prints to stdout for Claude Code to apply (schema live-verified on
+/// 2.1.207 — a mid-dialog decision dismisses the dialog). `allow_` selects the
+/// behavior; both carry a fixed provenance message. Built here, next to the
+/// wire schema, so the CLI and the answer path can never drift.
+pub fn ask_decision_line(allow: bool) -> String {
+    let (behavior, message) = if allow {
+        ("allow", "Approved remotely via fly")
+    } else {
+        ("deny", "Denied remotely via fly")
+    };
+    format!(
+        "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PermissionRequest\",\
+         \"decision\":{{\"behavior\":\"{behavior}\",\"message\":\"{message}\"}}}}}}"
+    )
 }
 
 #[cfg(test)]
@@ -164,6 +248,55 @@ mod tests {
         let unknown: Envelope =
             serde_json::from_str(r#"{"token":"t","op":"something/else"}"#).unwrap();
         assert!(!unknown.is_automation());
+    }
+
+    #[test]
+    fn envelope_routes_ask_hold_and_its_payload_never_parses_as_notify() {
+        // hook-ask-channel U1: the op routes to the held-ask path…
+        let e: Envelope = serde_json::from_str(r#"{"token":"t","op":"ask/hold"}"#).unwrap();
+        assert!(e.is_ask_hold());
+        assert!(!e.is_automation());
+        // …and on an OLD server (which treats an unknown op as notify), the
+        // ask payload — which carries no `reason` — fails the HookMessage
+        // parse: silent reject, never a spurious raise (R8 skew rule).
+        let ask_wire = r#"{"token":"t","op":"ask/hold","tool":"Bash","request":"ls"}"#;
+        assert!(serde_json::from_str::<HookMessage>(ask_wire).is_err());
+    }
+
+    #[test]
+    fn ask_payload_all_fields_default_and_roundtrip() {
+        // KTD4 degrade: a body-less ask (unparseable hook payload) is valid.
+        let bare: AskPayload = serde_json::from_str("{}").unwrap();
+        assert_eq!(bare, AskPayload::default());
+        // Full shape round-trips.
+        let full: AskPayload = serde_json::from_str(
+            r#"{"tool":"AskUserQuestion","permission_mode":"bypassPermissions",
+                "session_id":"s1","cwd":"/p",
+                "questions":{"questions":[{"question":"Which?","options":[{"label":"A"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(full.tool.as_deref(), Some("AskUserQuestion"));
+        assert!(full.questions.is_some());
+        assert_eq!(full.request, None);
+    }
+
+    #[test]
+    fn ask_decision_line_is_the_verified_hook_schema() {
+        // R7: exactly the shape the 2.1.207 probe confirmed Claude applies.
+        let allow: serde_json::Value =
+            serde_json::from_str(&ask_decision_line(true)).unwrap();
+        assert_eq!(
+            allow["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
+        assert_eq!(allow["hookSpecificOutput"]["decision"]["behavior"], "allow");
+        let deny: serde_json::Value =
+            serde_json::from_str(&ask_decision_line(false)).unwrap();
+        assert_eq!(deny["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert!(deny["hookSpecificOutput"]["decision"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("via fly"));
     }
 
     #[test]

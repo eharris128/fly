@@ -93,6 +93,13 @@ pub enum InputAction {
     /// cancels the picker outright — so no chunk here ever contains an ESC
     /// byte, and the gaps are mandatory, not a nicety.
     Other { select: Vec<u8>, text: Vec<u8> },
+    /// A remote answer to a held *permission* ask (hook-ask-channel U7/KTD5):
+    /// resolved through the `PermissionRequest` hook's own response channel
+    /// (`AskRegistry::answer` — the held connection writes the decision JSON
+    /// and Claude dismisses the dialog), never PTY bytes. `if_asked_at` rides
+    /// along so the registry's atomic stamp check closes the TOCTOU between
+    /// the route's guard and the delivery.
+    Decision { allow: bool, if_asked_at: u64 },
 }
 
 /// What became of one `POST /agents/{key}/input` delivery attempt.
@@ -102,6 +109,9 @@ pub enum InputOutcome {
     Delivered,
     /// The leaf resolves to no live pane (closed/exited) — `404`.
     UnknownPane,
+    /// The delivery target vanished between guard and delivery — a decision's
+    /// held ask was resolved locally first (hook-ask-channel R6/R7) — `409`.
+    Conflict,
     /// The pane exists but the PTY write failed — `500`.
     Failed(String),
 }
@@ -323,10 +333,19 @@ fn json_status(status: u16, body: &str) -> Response<io::Cursor<Vec<u8>>> {
 /// so pending means waiting, from the transcript alone); a **permission**
 /// question is exposed only while the roster entry's live attention reason is
 /// `"permission"` (without that corroboration, a pending `tool_use` just means
-/// the tool is executing). The reason is read outside the resolver cache, at
-/// emit/response time — staleness degrades to "not exposed".
+/// the tool is executing) — UNLESS the body is hook-sourced (hook-ask-channel
+/// KTD3): a `PermissionRequest` hook fires only when a dialog is actually up
+/// and its held connection drops when the dialog resolves, so the body's very
+/// existence is live corroboration and needs no attention reason (a raise on
+/// a visible pane is instantly acknowledged, so a blocked pane routinely has
+/// none). The reason is read outside the resolver cache, at emit/response
+/// time — staleness degrades to "not exposed".
 fn gated_question(question: Option<QuestionBody>, reason: Option<&str>) -> Option<QuestionBody> {
-    question.filter(|q| q.kind != "permission" || reason == Some("permission"))
+    question.filter(|q| {
+        q.kind != "permission"
+            || reason == Some("permission")
+            || q.source.as_deref() == Some("hook")
+    })
 }
 
 /// `GET /agents/{key}/output`: the latest reply plus the gated pending
@@ -375,8 +394,12 @@ fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec
 /// "Type something." free-text row and submits it — fly resolves the row's
 /// digit from the guarded question's `otherKey` and owns the three-chunk
 /// choreography, so the payload never contains an ESC byte the picker could
-/// read as cancel. `ifAskedAt` — mandatory for `"keys"` and `"other"`,
-/// optional for `"submit"` — arms the R11 guard against the freshly re-read
+/// read as cancel; `"decision"` (hook-ask-channel U7/KTD5) answers a
+/// HOOK-sourced permission ask through the `PermissionRequest` hook's own
+/// response channel (`{"decision":"allow"|"deny"}`, no `text`, never PTY
+/// bytes). `ifAskedAt` — mandatory for `"keys"`, `"other"`, and
+/// `"decision"`, optional for `"submit"` — arms the R11 guard against the
+/// freshly re-read
 /// reason (not the entry snapshot, so a slow body read can't gate on a stale
 /// dialog state): the value must equal the current gated pending question's
 /// `askedAt`, and the per-leaf latch admits one guarded delivery per `askedAt`
@@ -415,29 +438,42 @@ fn agent_input_response(
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct InputBody {
-        text: String,
+        /// Required for every PTY-writing mode; absent/ignored for
+        /// `mode:"decision"` (hook-ask-channel U7 — a decision carries no
+        /// text, only a verdict).
+        #[serde(default)]
+        text: Option<String>,
         #[serde(default)]
         mode: Option<String>,
         #[serde(default)]
         if_asked_at: Option<u64>,
+        /// `"allow"` | `"deny"`, `mode:"decision"` only.
+        #[serde(default)]
+        decision: Option<String>,
     }
     let Ok(input) = serde_json::from_slice::<InputBody>(&body) else {
         return empty_response(400);
     };
+    // Every PTY-writing mode requires `text` (the pre-decision contract,
+    // byte-identical: a text-less body was a deserialization 400 before).
+    let mode = input.mode.as_deref().unwrap_or("submit");
+    let text = match (&input.text, mode) {
+        (Some(t), _) => t.as_str(),
+        (None, "decision") => "",
+        (None, _) => return empty_response(400),
+    };
 
-    let mut action = match input.mode.as_deref().unwrap_or("submit") {
-        "submit" => InputAction::Submit(input.text.clone()),
+    let mut action = match mode {
+        "submit" => InputAction::Submit(text.to_string()),
         "keys" => {
             // KTD6: a keys answer without a guard could approve whatever
             // dialog happens to be up — ifAskedAt is mandatory, the text is
             // hard-capped (never truncated into the pane), and the R9 filter
             // must leave something deliverable.
-            if input.if_asked_at.is_none()
-                || input.text.chars().count() > super::io::KEYS_MAX_CHARS
-            {
+            if input.if_asked_at.is_none() || text.chars().count() > super::io::KEYS_MAX_CHARS {
                 return empty_response(400);
             }
-            match super::io::keys_payload(&input.text) {
+            match super::io::keys_payload(text) {
                 Some(bytes) => InputAction::Keys(bytes),
                 None => return empty_response(400),
             }
@@ -448,12 +484,10 @@ fn agent_input_response(
             // — with the sentence-scale cap instead of the digit cap. The
             // select digit is resolved from the guarded question below; only
             // the text half is built here.
-            if input.if_asked_at.is_none()
-                || input.text.chars().count() > super::io::OTHER_MAX_CHARS
-            {
+            if input.if_asked_at.is_none() || text.chars().count() > super::io::OTHER_MAX_CHARS {
                 return empty_response(400);
             }
-            match super::io::other_payload(&input.text) {
+            match super::io::other_payload(text) {
                 // A placeholder select — the guard block below either fills
                 // it from the question's otherKey or 409s.
                 Some(bytes) => InputAction::Other {
@@ -461,6 +495,23 @@ fn agent_input_response(
                     text: bytes,
                 },
                 None => return empty_response(400),
+            }
+        }
+        "decision" => {
+            // hook-ask-channel R6: a decision is a remote permission answer —
+            // ifAskedAt is mandatory (same posture as keys) and the verdict
+            // must be one of exactly two strings.
+            let Some(asked) = input.if_asked_at else {
+                return empty_response(400);
+            };
+            let allow = match input.decision.as_deref() {
+                Some("allow") => true,
+                Some("deny") => false,
+                _ => return empty_response(400),
+            };
+            InputAction::Decision {
+                allow,
+                if_asked_at: asked,
             }
         }
         _ => return empty_response(400),
@@ -512,6 +563,16 @@ fn agent_input_response(
         if matches!(action, InputAction::Keys(_)) && q.kind == "choice" && !q.answerable {
             return empty_response(409);
         }
+        // hook-ask-channel R6: a decision can only resolve a HOOK-sourced
+        // permission ask — that is the one shape with a live response channel.
+        // A choice question is never decision-answerable (an allow cannot skip
+        // the picker — live-verified, KTD5), and a transcript/screen-derived
+        // permission body has no held connection to answer through.
+        if matches!(action, InputAction::Decision { .. })
+            && (q.kind != "permission" || q.source.as_deref() != Some("hook"))
+        {
+            return empty_response(409);
+        }
         // feed-other-answer R4: an Other answer additionally needs a known
         // free-text-row digit (`otherKey`), which only an answerable choice
         // body carries — a permission dialog has no Other row, and an
@@ -549,6 +610,10 @@ fn agent_input_response(
     match outcome {
         InputOutcome::Delivered => json_response("{\"ok\":true}".into()),
         InputOutcome::UnknownPane => empty_response(404),
+        // A decision's held ask resolved locally between guard and delivery
+        // (hook-ask-channel R7) — the local answer won; same code as every
+        // other "the question you answered is gone" outcome.
+        InputOutcome::Conflict => empty_response(409),
         InputOutcome::Failed(e) => {
             // Never echo pane/write details to the caller; stderr is ours.
             eprintln!("[fly] feed input delivery failed: {e}");
@@ -707,6 +772,24 @@ mod tests {
         assert!(gated_question(Some(permission(1)), Some("question")).is_none());
         // Nothing pending stays nothing.
         assert!(gated_question(None, Some("permission")).is_none());
+    }
+
+    #[test]
+    fn gated_question_exempts_hook_sourced_permission_bodies() {
+        // hook-ask-channel KTD3: the held connection IS the corroboration —
+        // a hook-sourced permission body serves with no reason at all…
+        let hook = QuestionBody {
+            source: Some("hook".into()),
+            ..permission(1)
+        };
+        assert!(gated_question(Some(hook.clone()), None).is_some());
+        assert!(gated_question(Some(hook), Some("question")).is_some());
+        // …while a screen-sourced one still needs the live reason.
+        let screen = QuestionBody {
+            source: Some("screen".into()),
+            ..permission(1)
+        };
+        assert!(gated_question(Some(screen), None).is_none());
     }
 
     #[test]

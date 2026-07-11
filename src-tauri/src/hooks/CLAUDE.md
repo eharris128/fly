@@ -4,10 +4,11 @@ This directory is fly's **trust boundary**. Read this before changing anything
 here, then see the module doc-comments for detail. The root `CLAUDE.md` covers
 the rest of the app; this note is scoped to the socket.
 
-IDs below are scoped to two plans (per-plan numbering — see
+IDs below are scoped to three plans (per-plan numbering — see
 `docs/plans/README.md`): the foundation plan
-`2026-06-16-001-feat-fly-agent-terminal` (`KTD7`/`U8`/`R10`) and the automations
-plan `2026-07-01-002-feat-automations` (`U9`/`R22`).
+`2026-06-16-001-feat-fly-agent-terminal` (`KTD7`/`U8`/`R10`), the automations
+plan `2026-07-01-002-feat-automations` (`U9`/`R22`), and the hook-ask-channel
+plan `2026-07-11-002-feat-hook-ask-channel` (the held `ask/hold` op).
 
 ## What it defends
 
@@ -44,16 +45,28 @@ here is mandatory, not a nicety.
   `is_automation_pane`), which blocks an automation-spawned pane from creating or
   running automations. Keep the origin faithfully stamped here so that gate can
   do its job.
+- **Held asks stay bounded** (hook-ask-channel `R2`/`KTD1`) — the `ask/hold` op
+  holds its connection for the ask's lifetime, so the pre-validation phase now
+  has a hard wall-clock deadline (`REQUEST_DEADLINE`) on top of the size bound
+  (newline framing never EOFs — a byte-trickler must not wedge a thread), held
+  connections are capped upstream (`feed/ask.rs::MAX_HELD_ASKS`, decline =
+  close-without-ack), and messages are **one line** of compact JSON (an
+  embedded newline truncates → silent reject). Token validation still precedes
+  any held work; a held connection can only ever *receive* one decision line —
+  nothing a peer writes after its request is parsed.
 
 ## Layout
 
 - `token.rs` — `TokenRegistry`: mint / resolve tokens, constant-time compare,
   lockout.
-- `protocol.rs` — the wire schema (one UTF-8 JSON object, client closes its
-  write half; the `notify` path + the `automation/*` envelope, `U9`). Its
-  doc-comment is the authoritative schema + rejection-rule spec.
+- `protocol.rs` — the wire schema (one UTF-8 JSON object per message: the
+  EOF-framed `notify` path + `automation/*` envelope, `U9`, and the
+  newline-framed held `ask/hold` op). Its doc-comment is the authoritative
+  schema + rejection-rule spec.
 - `server.rs` — `HookServer`: the accept loop, `SO_PEERCRED`, bounds/timeouts,
-  and dispatch into `AttentionManager` / the automation handler.
+  dispatch into `AttentionManager` / the automation handler, and the held-ask
+  connection loop (`hold_ask` — ack, park on the decision mailbox, probe for
+  peer death).
 
 ## Testing
 
@@ -61,7 +74,9 @@ The boundary has an integration test — run it after any change here:
 
 ```bash
 cargo test --offline --manifest-path src-tauri/Cargo.toml --test hook_auth
+cargo test --offline --manifest-path src-tauri/Cargo.toml --test hook_ask
 ```
 
-Add cases whenever you touch the token compare, peer-cred check, lockout, or
-message bounds — these are the parts that must not silently weaken.
+Add cases whenever you touch the token compare, peer-cred check, lockout,
+message bounds, or the held-ask framing — these are the parts that must not
+silently weaken.

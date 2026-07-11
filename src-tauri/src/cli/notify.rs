@@ -52,8 +52,13 @@ pub fn send(
     Ok(())
 }
 
-/// CLI entry for `fly notify <reason> [--claude] [--capture] [--title T] [--body B]`.
+/// CLI entry for `fly notify <reason> [--claude] [--capture] [--title T] [--body B]`,
+/// plus the held-ask path `fly notify --claude --permission-request`
+/// (hook-ask-channel U4).
 pub fn run(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--permission-request") {
+        return run_permission_request();
+    }
     let mut reason: Option<Reason> = None;
     let mut from_claude = false;
     // fix-attribution U2 (KTD1): the SessionStart capture path — update the
@@ -213,6 +218,233 @@ pub fn parse_claude_payload(json: &str) -> ClaudePayload {
     }
 }
 
+// ---- the held-ask path (hook-ask-channel U4, KTD1/KTD4) --------------------
+
+/// Stdin cap for a `PermissionRequest` payload — far above the notify path's
+/// 64 KiB because `tool_input` can carry a whole file (a `Write` permission);
+/// the extraction below discards the bulk before anything crosses the socket.
+const ASK_STDIN_CAP: u64 = 1024 * 1024;
+/// Per-string transport cap (chars) for forwarded question text. A transport
+/// bound only — the feed re-caps at serve time (`feed::io::clean`).
+const ASK_STRING_CAP: usize = 2048;
+/// Count caps mirroring the feed's serve ceilings. Exceeding a COUNT cap
+/// drops the questions wholesale (a truncated option list would misalign the
+/// on-screen digit mapping — the screen fallback then supplies rendered-digit
+/// truth); exceeding a STRING cap merely truncates (text never moves digits).
+const ASK_MAX_QUESTIONS: usize = 4;
+const ASK_MAX_OPTIONS: usize = 8;
+/// Belt on the serialized message (< the server's 64 KiB `MAX_MESSAGE`): an
+/// over-belt payload is rebuilt without `questions` (KTD4 degrade).
+const ASK_WIRE_BELT: usize = 56 * 1024;
+/// How long to wait for the server's ack line before concluding the app is
+/// old or absent (R8) and exiting so the dialog proceeds normally.
+const ASK_ACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `fly notify --claude --permission-request`: forward the ask over the
+/// socket, then HOLD the connection for the ask's lifetime (KTD1). Claude
+/// Code kills this process when the dialog resolves locally — the drop is the
+/// signal — and the dialog renders while we run (live-verified), so blocking
+/// here never delays the user. Exit is always 0: a permission hook must never
+/// surface an error into the session.
+fn run_permission_request() -> i32 {
+    let (token, socket) = match (
+        std::env::var("FLY_PANE_TOKEN"),
+        std::env::var("FLY_SOCKET_PATH"),
+    ) {
+        (Ok(t), Ok(s)) if !t.is_empty() && !s.is_empty() => (t, s),
+        _ => {
+            eprintln!("fly notify: not inside a fly pane (FLY_PANE_TOKEN unset); skipping");
+            return 0;
+        }
+    };
+    let payload = read_ask_stdin()
+        .map(|raw| extract_ask(&raw))
+        .unwrap_or_default();
+    match hold_ask(Path::new(&socket), &token, &payload) {
+        Ok(Some(decision_line)) => {
+            // The exact hookSpecificOutput JSON Claude applies (R7).
+            println!("{decision_line}");
+            0
+        }
+        Ok(None) => 0, // released / resolved locally — dialog proceeds normally
+        Err(e) => {
+            eprintln!("fly notify: failed to reach fly socket {socket}: {e}");
+            0
+        }
+    }
+}
+
+/// Read the hook payload from stdin (up to [`ASK_STDIN_CAP`]), unless stdin is
+/// a terminal (manual run). Mirrors [`read_stdin_payload`] with the larger cap.
+fn read_ask_stdin() -> Option<String> {
+    // SAFETY: isatty on fd 0 is always safe.
+    if unsafe { libc::isatty(0) } == 1 {
+        return None;
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .take(ASK_STDIN_CAP)
+        .read_to_string(&mut buf)
+        .ok()?;
+    if buf.trim().is_empty() {
+        None
+    } else {
+        Some(buf)
+    }
+}
+
+/// Extract the bounded, typed [`AskPayload`] subset from a raw
+/// `PermissionRequest` payload (KTD4). Unparseable JSON yields the default
+/// (body-less) payload — the ask still registers "a dialog is up".
+pub fn extract_ask(raw: &str) -> crate::hooks::protocol::AskPayload {
+    use crate::hooks::protocol::AskPayload;
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return AskPayload::default();
+    };
+    let s = |key: &str| v.get(key).and_then(|x| x.as_str()).map(str::to_string);
+    let tool = s("tool_name");
+    let input = v.get("tool_input");
+    let questions = match (tool.as_deref(), input) {
+        (Some("AskUserQuestion"), Some(input)) => bound_questions(input),
+        _ => None,
+    };
+    let request = match (tool.as_deref(), input) {
+        (Some("Bash"), Some(i)) => i.get("command"),
+        (Some("Edit") | Some("Write"), Some(i)) => i.get("file_path"),
+        _ => None,
+    }
+    .and_then(|x| x.as_str())
+    .map(|x| cap_chars(x, ASK_STRING_CAP));
+    AskPayload {
+        tool,
+        permission_mode: s("permission_mode"),
+        session_id: s("session_id"),
+        cwd: s("cwd"),
+        questions,
+        request,
+    }
+}
+
+fn cap_chars(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        s.to_string()
+    } else {
+        s.chars().take(cap).collect()
+    }
+}
+
+/// Bound an AskUserQuestion `tool_input` for the wire (KTD4): string caps
+/// truncate (text never moves the picker's digits); COUNT caps abstain — a
+/// dropped question or option would misalign the wire's index-derived digits
+/// with the rendered picker, so over-count batches ship no questions at all
+/// and the feed's screen leg supplies rendered-digit truth instead.
+fn bound_questions(input: &serde_json::Value) -> Option<serde_json::Value> {
+    let questions = input.get("questions")?.as_array()?;
+    if questions.is_empty() || questions.len() > ASK_MAX_QUESTIONS {
+        return None;
+    }
+    let mut out_questions = Vec::new();
+    for q in questions {
+        let opts = q.get("options").and_then(|o| o.as_array());
+        if opts.is_some_and(|o| o.len() > ASK_MAX_OPTIONS) {
+            return None;
+        }
+        let mut out_q = serde_json::Map::new();
+        if let Some(text) = q.get("question").and_then(|x| x.as_str()) {
+            out_q.insert("question".into(), cap_chars(text, ASK_STRING_CAP).into());
+        }
+        if let Some(h) = q.get("header").and_then(|x| x.as_str()) {
+            out_q.insert("header".into(), cap_chars(h, ASK_STRING_CAP).into());
+        }
+        if let Some(m) = q.get("multiSelect").and_then(|x| x.as_bool()) {
+            out_q.insert("multiSelect".into(), m.into());
+        }
+        if let Some(opts) = opts {
+            let out_opts: Vec<serde_json::Value> = opts
+                .iter()
+                .map(|o| {
+                    let mut out_o = serde_json::Map::new();
+                    if let Some(l) = o.get("label").and_then(|x| x.as_str()) {
+                        out_o.insert("label".into(), cap_chars(l, ASK_STRING_CAP).into());
+                    }
+                    if let Some(d) = o.get("description").and_then(|x| x.as_str()) {
+                        out_o.insert("description".into(), cap_chars(d, ASK_STRING_CAP).into());
+                    }
+                    serde_json::Value::Object(out_o)
+                })
+                .collect();
+            out_q.insert("options".into(), out_opts.into());
+        }
+        out_questions.push(serde_json::Value::Object(out_q));
+    }
+    Some(serde_json::json!({ "questions": out_questions }))
+}
+
+/// Connect, send the newline-framed `ask/hold` message, await the ack within
+/// [`ASK_ACK_DEADLINE`] (no ack → old/absent app, R8 → `Ok(None)`), then park
+/// until the server writes a decision line (→ `Ok(Some(line))`) or closes
+/// (release / fly shutdown → `Ok(None)`). Claude killing this process is the
+/// third, invisible exit. Public for the U9 integration test.
+pub fn hold_ask(
+    socket_path: &Path,
+    token: &str,
+    payload: &crate::hooks::protocol::AskPayload,
+) -> std::io::Result<Option<String>> {
+    let mut msg = serde_json::to_value(payload)?;
+    let obj = msg.as_object_mut().expect("AskPayload serializes as object");
+    obj.insert("token".into(), token.into());
+    obj.insert("op".into(), "ask/hold".into());
+    let mut bytes = serde_json::to_vec(&msg)?;
+    if bytes.len() > ASK_WIRE_BELT {
+        // KTD4 belt: rebuild body-less rather than risk the server's bound.
+        let mut lean = payload.clone();
+        lean.questions = None;
+        let mut msg = serde_json::to_value(&lean)?;
+        let obj = msg.as_object_mut().expect("object");
+        obj.insert("token".into(), token.into());
+        obj.insert("op".into(), "ask/hold".into());
+        bytes = serde_json::to_vec(&msg)?;
+    }
+    bytes.push(b'\n');
+
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.write_all(&bytes)?;
+    // Write half stays OPEN (KTD1): the server distinguishes a live-but-quiet
+    // peer (read timeout) from a dead one (EOF), which is the whole
+    // resolution signal.
+
+    // Ack phase: one line within the deadline, or conclude old/absent server.
+    stream.set_read_timeout(Some(ASK_ACK_DEADLINE))?;
+    let mut buf: Vec<u8> = Vec::new();
+    if read_line(&mut stream, &mut buf).is_none() {
+        return Ok(None); // no ack (R8 skew fast-fail) — exit, dialog proceeds
+    }
+
+    // Hold phase: block until a decision line or close. No timeout — Claude
+    // kills us when the dialog resolves locally, and its own hook timeout is
+    // the outer bound.
+    stream.set_read_timeout(None)?;
+    Ok(read_line(&mut stream, &mut buf))
+}
+
+/// Read one `\n`-terminated line from `stream` into/continuing `buf` (which
+/// may already hold bytes past the previous line). `None` on EOF/timeout
+/// before a full line arrives.
+fn read_line(stream: &mut UnixStream, buf: &mut Vec<u8>) -> Option<String> {
+    loop {
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            return Some(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned());
+        }
+        let mut chunk = [0u8; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => return None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +525,87 @@ mod tests {
         ] {
             assert_ne!(parse_claude_payload(json).reason, Some(Reason::Error));
         }
+    }
+
+    // ---- hook-ask-channel U4: extraction ------------------------------------
+
+    /// The live-captured 2.1.207 PermissionRequest shape for a Bash dialog.
+    const PERMREQ_BASH: &str = r#"{
+        "session_id":"sess-1","transcript_path":"/t.jsonl","cwd":"/p",
+        "prompt_id":"pr-1","permission_mode":"default",
+        "hook_event_name":"PermissionRequest","tool_name":"Bash",
+        "tool_input":{"command":"touch /tmp/x","description":"Create marker"},
+        "permission_suggestions":[{"type":"addDirectories","directories":["/tmp"]}]
+    }"#;
+
+    /// The live-captured shape for an AskUserQuestion dialog.
+    const PERMREQ_ASK: &str = r#"{
+        "session_id":"sess-1","cwd":"/p","permission_mode":"bypassPermissions",
+        "hook_event_name":"PermissionRequest","tool_name":"AskUserQuestion",
+        "tool_input":{"questions":[{"question":"Favorite color?","header":"Color",
+            "multiSelect":false,
+            "options":[{"label":"Red","description":"The color red"},
+                       {"label":"Blue","description":"The color blue"}]}]}
+    }"#;
+
+    #[test]
+    fn extract_ask_maps_a_bash_permission_payload() {
+        let a = extract_ask(PERMREQ_BASH);
+        assert_eq!(a.tool.as_deref(), Some("Bash"));
+        assert_eq!(a.permission_mode.as_deref(), Some("default"));
+        assert_eq!(a.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(a.cwd.as_deref(), Some("/p"));
+        assert_eq!(a.request.as_deref(), Some("touch /tmp/x"));
+        assert_eq!(a.questions, None, "a permission ask carries no questions");
+    }
+
+    #[test]
+    fn extract_ask_maps_an_ask_user_question_payload() {
+        let a = extract_ask(PERMREQ_ASK);
+        assert_eq!(a.tool.as_deref(), Some("AskUserQuestion"));
+        assert_eq!(a.permission_mode.as_deref(), Some("bypassPermissions"));
+        assert_eq!(a.request, None);
+        let q = a.questions.expect("questions forwarded");
+        assert_eq!(q["questions"][0]["question"], "Favorite color?");
+        assert_eq!(q["questions"][0]["options"][1]["label"], "Blue");
+    }
+
+    #[test]
+    fn extract_ask_degrades_to_a_body_less_payload() {
+        // KTD4: unparseable stdin still registers "a dialog is up".
+        let a = extract_ask("{ not json");
+        assert_eq!(a, crate::hooks::protocol::AskPayload::default());
+        // Unknown tools forward the name but no request summary (KTD1 posture:
+        // never guess at arbitrary input shapes).
+        let a = extract_ask(
+            r#"{"tool_name":"WebFetch","tool_input":{"url":"http://x"},"session_id":"s"}"#,
+        );
+        assert_eq!(a.tool.as_deref(), Some("WebFetch"));
+        assert_eq!(a.request, None);
+    }
+
+    #[test]
+    fn bound_questions_truncates_strings_but_abstains_on_counts() {
+        // String over-cap truncates (text never moves digits)…
+        let long = "x".repeat(ASK_STRING_CAP + 100);
+        let input = serde_json::json!({"questions":[
+            {"question": long, "options":[{"label":"A"}]}
+        ]});
+        let bounded = bound_questions(&input).expect("served");
+        let text = bounded["questions"][0]["question"].as_str().unwrap();
+        assert_eq!(text.chars().count(), ASK_STRING_CAP);
+        // …but an over-count option list drops the questions wholesale — a
+        // truncated list would misalign the picker's digit mapping.
+        let opts: Vec<serde_json::Value> = (0..ASK_MAX_OPTIONS + 1)
+            .map(|i| serde_json::json!({"label": format!("o{i}")}))
+            .collect();
+        let input = serde_json::json!({"questions":[{"question":"q","options":opts}]});
+        assert_eq!(bound_questions(&input), None);
+        // Over-count question batches likewise.
+        let qs: Vec<serde_json::Value> = (0..ASK_MAX_QUESTIONS + 1)
+            .map(|i| serde_json::json!({"question": format!("q{i}")}))
+            .collect();
+        let input = serde_json::json!({ "questions": qs });
+        assert_eq!(bound_questions(&input), None);
     }
 }

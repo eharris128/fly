@@ -90,14 +90,22 @@ export interface QuestionBody {
   questions?: QuestionSpec[];
   request?: string;
   /**
-   * Provenance (feed-question-screen-fallback R5): `"screen"` when the body
-   * was synthesized from the pane's rendered terminal grid (Claude Code ≥
-   * 2.1.206 no longer flushes the ask to the transcript at ask time); absent
-   * for a transcript-derived body. A screen body's `askedAt` is the ask-time
-   * raise stamp; a permission-kind screen body also carries the rendered
-   * options in `questions` (a transcript-derived permission never does).
+   * Provenance (feed-question-screen-fallback R5; hook-ask-channel KTD3):
+   * `"hook"` when the body came from a live `PermissionRequest` hook holding
+   * fly's socket — the primary source, exposed with no attention-reason
+   * corroboration (the held connection is the proof), `askedAt` = fly's
+   * receipt stamp. A hook-sourced *permission* body is the one shape a
+   * `mode:"decision"` answer — `POST {mode:"decision", decision:"allow"|
+   * "deny", ifAskedAt}`, opt-in-gated like every remote permission answer —
+   * can resolve (through the hook's own response channel, no keystrokes; a
+   * choice picker still answers via keys/other). `"screen"` when the body was
+   * synthesized from the pane's rendered terminal grid (Claude Code ≥ 2.1.206
+   * no longer flushes the ask to the transcript at ask time); absent for a
+   * transcript-derived body. A screen body's `askedAt` is the ask-time raise
+   * stamp; a permission-kind screen body also carries the rendered options in
+   * `questions` (a transcript-derived permission never does).
    */
-  source?: "screen";
+  source?: "screen" | "hook";
 }
 
 /**

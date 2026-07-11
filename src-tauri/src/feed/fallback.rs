@@ -51,6 +51,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use super::ask::HeldAsk;
 use super::io::{self, ReplyResolver, ResolvedIo};
 use super::pending::PendingSignals;
 use super::screen::{self, ScreenInteraction, ScreenKind};
@@ -62,10 +63,15 @@ use crate::session::{livestate, resume, transcript};
 /// `PtyManager` dependency (tests feed synthetic bytes).
 pub type ScreenFn = Arc<dyn Fn(&str) -> Option<ScreenTail> + Send + Sync>;
 
+/// Supplies a leaf's held permission ask (hook-ask-channel U6) — injected so
+/// this module needs no `AskRegistry` dependency (tests feed synthetic asks).
+pub type AskFn = Arc<dyn Fn(&str) -> Option<HeldAsk> + Send + Sync>;
+
 pub struct FallbackResolver {
     inner: ReplyResolver,
     signals: Arc<PendingSignals>,
     screen_fn: ScreenFn,
+    ask_fn: AskFn,
     resume_path: PathBuf,
     sessions_root: Option<PathBuf>,
     /// Per-leaf memoized screen parse, keyed by the tail's `seq`.
@@ -75,13 +81,19 @@ pub struct FallbackResolver {
 impl FallbackResolver {
     /// Production construction: fly's resume store, Claude's real projects +
     /// sessions roots.
-    pub fn new(resume_path: PathBuf, signals: Arc<PendingSignals>, screen_fn: ScreenFn) -> Self {
+    pub fn new(
+        resume_path: PathBuf,
+        signals: Arc<PendingSignals>,
+        screen_fn: ScreenFn,
+        ask_fn: AskFn,
+    ) -> Self {
         Self::with_roots(
             resume_path,
             transcript::claude_projects_root(),
             livestate::claude_sessions_root(),
             signals,
             screen_fn,
+            ask_fn,
         )
     }
 
@@ -92,11 +104,13 @@ impl FallbackResolver {
         sessions_root: Option<PathBuf>,
         signals: Arc<PendingSignals>,
         screen_fn: ScreenFn,
+        ask_fn: AskFn,
     ) -> Self {
         Self {
             inner: ReplyResolver::with_projects_root(resume_path.clone(), projects_root),
             signals,
             screen_fn,
+            ask_fn,
             resume_path,
             sessions_root,
             parse_cache: Mutex::new(HashMap::new()),
@@ -109,7 +123,39 @@ impl FallbackResolver {
     /// (KTD4) — reason accelerates (never gates) the no-corroborator leg, and
     /// `status == "working"` suppresses it, so an actively-streaming pane
     /// never pays a VT replay and a mid-scroll frame is never parsed.
+    ///
+    /// A **held ask** (hook-ask-channel U6/KTD3) is consulted first: a live
+    /// `PermissionRequest` connection is proof a dialog is up *right now*, so
+    /// its body supersedes any transcript-derived pending question (whose
+    /// stamp may describe the same dialog under a different `askedAt`) and
+    /// short-circuits both fallback legs. A held ask whose body cannot be
+    /// served (KTD4's count-cap degrade) falls through to the whole existing
+    /// chain — the screen leg can still render the picker with authoritative
+    /// digits — and, when everything abstains, still surfaces the tier-1
+    /// pending stamp (an uncorroborated bare stamp is inadmissible for the
+    /// screen legs, but the held connection IS a live corroborator).
     pub fn resolve_io(&self, leaf_key: &str, reason: Option<&str>, status: &str) -> ResolvedIo {
+        let ask = (self.ask_fn)(leaf_key);
+        if let Some(ask) = &ask {
+            if let Some(q) = hook_question_body(ask) {
+                let mut io = self.inner.resolve_io(leaf_key);
+                io.question = Some(q);
+                io.pending_fallback_at = None;
+                return io;
+            }
+        }
+        let mut io = self.resolve_io_chain(leaf_key, reason, status);
+        if let Some(ask) = &ask {
+            if io.question.is_none() && io.pending_fallback_at.is_none() {
+                io.pending_fallback_at = Some(ask.asked_at_ms);
+            }
+        }
+        io
+    }
+
+    /// The pre-hook-leg resolution chain, verbatim (R10): transcript primary,
+    /// then the three-valued sessions-file gate over the screen parse.
+    fn resolve_io_chain(&self, leaf_key: &str, reason: Option<&str>, status: &str) -> ResolvedIo {
         let mut io = self.inner.resolve_io(leaf_key);
         // R1: the transcript is primary — a transcript-derived pending
         // question short-circuits the fallback entirely.
@@ -205,6 +251,58 @@ impl FallbackResolver {
         };
         Some((parsed, tail.last_write_at_ms))
     }
+}
+
+/// Shape a held ask into the wire `QuestionBody` (hook-ask-channel U6,
+/// R4/R5). An AskUserQuestion ask reuses the transcript pipeline end-to-end:
+/// the payload's `questions` object goes through the same
+/// `transcript::parse_questions` → `io::question_body` path a pending
+/// `tool_use` would, so caps, drops, answerability, digit keys (index+1 = the
+/// rendered picker's digits), and `otherKey` (source count + 1) cannot drift
+/// between sources — only `source:"hook"` and the registry's receipt stamp
+/// differ. Any other tool is a permission ask: tool name + the pre-extracted
+/// request summary, never answerable, no reason corroboration needed (KTD3 —
+/// the held connection is the corroborator). `None` only for a choice ask
+/// whose questions were count-cap-dropped client-side (KTD4) — the caller
+/// falls through to the screen leg.
+fn hook_question_body(ask: &HeldAsk) -> Option<QuestionBody> {
+    let asked_at = ask.asked_at_ms;
+    if ask.payload.tool.as_deref() == Some("AskUserQuestion") {
+        let input = ask.payload.questions.as_ref()?;
+        let (questions, dropped) = transcript::parse_questions(input)?;
+        let answerable = transcript::answerable_shape(&questions, dropped);
+        let pending = transcript::PendingInteraction {
+            kind: transcript::PendingKind::Choice,
+            asked_at_ms: asked_at,
+            tool: "AskUserQuestion".to_string(),
+            answerable,
+            context: None,
+            questions,
+            input: None,
+        };
+        let mut q = io::question_body(&pending)?;
+        q.source = Some("hook".into());
+        return Some(q);
+    }
+    Some(QuestionBody {
+        asked_at,
+        kind: "permission".into(),
+        tool: ask
+            .payload
+            .tool
+            .as_deref()
+            .and_then(|t| io::clean(t, io::LABEL_CAP))
+            .unwrap_or_else(|| "permission".into()),
+        answerable: false,
+        context: None,
+        questions: Vec::new(),
+        request: ask
+            .payload
+            .request
+            .as_deref()
+            .and_then(|r| io::clean(r, io::REQUEST_CAP)),
+        source: Some("hook".into()),
+    })
 }
 
 /// The exact label the picker renders on its appended free-text row (2.1.206,
@@ -375,6 +473,10 @@ mod tests {
     struct Fixture {
         dir: tempfile::TempDir,
         signals: Arc<PendingSignals>,
+        /// The held ask the fixture's `AskFn` serves for leaf-1
+        /// (hook-ask-channel U6); `None` = no ask held (every pre-existing
+        /// test's shape).
+        ask: Arc<Mutex<Option<HeldAsk>>>,
     }
 
     impl Fixture {
@@ -382,7 +484,16 @@ mod tests {
             Self {
                 dir: tempfile::tempdir().unwrap(),
                 signals: Arc::new(PendingSignals::new()),
+                ask: Arc::new(Mutex::new(None)),
             }
+        }
+
+        /// Arm the fixture's held ask (leaf-1).
+        fn hold_ask(&self, asked_at_ms: u64, payload: crate::hooks::protocol::AskPayload) {
+            *self.ask.lock().unwrap() = Some(HeldAsk {
+                asked_at_ms,
+                payload,
+            });
         }
 
         /// Wire leaf-1 → sid-abc @ /p with `transcript` on disk, a sessions
@@ -439,12 +550,17 @@ mod tests {
                     last_write_at_ms: DRAWN_AT,
                 })
             });
+            let ask = Arc::clone(&self.ask);
+            let ask_fn: AskFn = Arc::new(move |leaf| {
+                (leaf == "leaf-1").then(|| ask.lock().unwrap().clone()).flatten()
+            });
             FallbackResolver::with_roots(
                 resume_path,
                 Some(projects),
                 Some(sessions),
                 Arc::clone(&self.signals),
                 screen_fn,
+                ask_fn,
             )
         }
     }
@@ -715,6 +831,130 @@ mod tests {
         assert_eq!(q.questions[0].options.len(), 3);
         assert_eq!(q.questions[0].options[0].label, "Yes");
         assert_eq!(q.questions[0].options[2].key, "3");
+    }
+
+    // ---- hook-ask-channel U6: the held-ask leg ------------------------------
+
+    /// A held AskUserQuestion payload matching the live-captured 2.1.207 shape.
+    fn hook_choice_payload() -> crate::hooks::protocol::AskPayload {
+        crate::hooks::protocol::AskPayload {
+            tool: Some("AskUserQuestion".into()),
+            questions: Some(serde_json::json!({"questions":[{
+                "question":"Which color?","header":"Color","multiSelect":false,
+                "options":[{"label":"Red","description":"Warm"},
+                           {"label":"Blue","description":"Cool"}]}]})),
+            ..Default::default()
+        }
+    }
+
+    fn hook_permission_payload() -> crate::hooks::protocol::AskPayload {
+        crate::hooks::protocol::AskPayload {
+            tool: Some("Bash".into()),
+            request: Some("touch /tmp/x".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_held_ask_is_the_primary_source_over_transcript_and_screen() {
+        // KTD3: with a transcript pending question AND a parseable screen AND
+        // a waiting sessions file all present, the held ask's body wins, under
+        // the REGISTRY stamp (never a transcript stamp).
+        let f = Fixture::new();
+        f.signals.stamp("leaf-1", 9_999);
+        f.hold_ask(8_888, hook_choice_payload());
+        let r = f.resolver(TRANSCRIPT_PENDING, "waiting", Some(picker_bytes()));
+        let io = r.resolve_io("leaf-1", Some("question"), "waiting");
+        let q = io.question.expect("hook question");
+        assert_eq!(q.source.as_deref(), Some("hook"));
+        assert_eq!(q.asked_at, 8_888, "registry receipt stamp");
+        assert_eq!(io.pending_fallback_at, None);
+        assert_eq!(q.kind, "choice");
+        assert!(q.answerable);
+        assert_eq!(q.questions[0].question, "Which color?");
+        assert_eq!(q.questions[0].options[0].key, "1");
+        assert_eq!(q.questions[0].options[1].label, "Blue");
+        // otherKey: source count + 1, same arithmetic as a transcript body.
+        assert_eq!(q.questions[0].other_key.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn a_held_permission_ask_serves_without_reason_corroboration() {
+        // KTD3: the held connection is the corroborator — no attention reason,
+        // no sessions file, no screen, transcript reply-only. The body still
+        // serves (the /output gate exempts hook bodies; this test pins the
+        // resolver half: the body exists with source:"hook").
+        let f = Fixture::new();
+        f.hold_ask(7_000, hook_permission_payload());
+        let r = f.resolver_no_livestate(REPLY_ONLY, None);
+        let io = r.resolve_io("leaf-1", None, "idle");
+        let q = io.question.expect("hook permission body");
+        assert_eq!(q.source.as_deref(), Some("hook"));
+        assert_eq!(q.kind, "permission");
+        assert_eq!(q.tool, "Bash");
+        assert_eq!(q.request.as_deref(), Some("touch /tmp/x"));
+        assert!(!q.answerable);
+        assert_eq!(q.asked_at, 7_000);
+        // The reply/turns halves still come from the transcript read.
+        assert!(io.reply.is_some());
+    }
+
+    #[test]
+    fn a_body_less_held_ask_falls_through_but_still_stamps() {
+        // KTD4 degrade: an AskUserQuestion ask whose questions were
+        // count-cap-dropped client-side. With a parseable screen the screen
+        // leg supplies the body (rendered digits are authoritative); with
+        // nothing else, the held ask's stamp still surfaces tier-1.
+        let f = Fixture::new();
+        let ask_without_questions = crate::hooks::protocol::AskPayload {
+            tool: Some("AskUserQuestion".into()),
+            ..Default::default()
+        };
+        f.hold_ask(7_000, ask_without_questions.clone());
+        // Screen available → screen body, its own stamp discipline.
+        let r = f.resolver(REPLY_ONLY, "waiting", Some(picker_bytes()));
+        let io = r.resolve_io("leaf-1", None, "waiting");
+        let q = io.question.expect("screen body");
+        assert_eq!(q.source.as_deref(), Some("screen"));
+        // Nothing else → the held ask alone carries the pending signal.
+        let f = Fixture::new();
+        f.hold_ask(7_000, ask_without_questions);
+        let r = f.resolver_no_livestate(REPLY_ONLY, None);
+        let io = r.resolve_io("leaf-1", None, "idle");
+        assert_eq!(io.question, None);
+        assert_eq!(io.pending_fallback_at, Some(7_000));
+    }
+
+    #[test]
+    fn hook_body_strings_pass_the_clean_pipeline() {
+        // R4/R5: hook-borne strings are agent-authored — secrets scrub, and a
+        // permission tool/request are cleaned like every other wire string.
+        let f = Fixture::new();
+        f.hold_ask(
+            7_000,
+            crate::hooks::protocol::AskPayload {
+                tool: Some("Bash".into()),
+                request: Some("export KEY=sk-ant-api03-abcdefghijklmnopqrstuv".into()),
+                ..Default::default()
+            },
+        );
+        let r = f.resolver_no_livestate(REPLY_ONLY, None);
+        let q = r.resolve_io("leaf-1", None, "idle").question.expect("body");
+        let req = q.request.expect("request");
+        assert!(!req.contains("sk-ant"), "leaked: {req}");
+        assert!(req.contains("[redacted]"));
+    }
+
+    #[test]
+    fn without_a_held_ask_the_chain_is_untouched() {
+        // R10 regression guard: ask_fn returning None leaves every leg exactly
+        // as before (the whole pre-existing test suite reruns this implicitly;
+        // this pins the leaf-targeting — an ask for another leaf is invisible).
+        let f = Fixture::new();
+        f.signals.stamp("leaf-1", 7_777);
+        let r = f.resolver(REPLY_ONLY, "waiting", Some(picker_bytes()));
+        let io = r.resolve_io("leaf-1", Some("question"), "waiting");
+        assert_eq!(io.question.unwrap().source.as_deref(), Some("screen"));
     }
 
     #[test]

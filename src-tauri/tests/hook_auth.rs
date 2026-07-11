@@ -151,20 +151,21 @@ fn capture_gates_thread_through_the_authenticated_path() {
     // stale installed binary that forwards the event without the flag — a
     // SessionStart hook_event. A raising reason on the same message is ignored
     // by is_capture_only (KTD1).
+    // Single-line payloads: the wire contract is compact JSON (hook-ask-channel
+    // U2 — the request read stops at a newline for the held-ask framing, so an
+    // embedded newline truncates the message).
     let (_dir, tokens, rec, server) = setup();
     let tok = tokens.issue(PaneId(4));
     send(
         server.socket_path(),
         &format!(
-            r#"{{"token":"{tok}","reason":"question","capture_only":true,
-                 "session_id":"sess-flag","cwd":"/proj"}}"#
+            r#"{{"token":"{tok}","reason":"question","capture_only":true,"session_id":"sess-flag","cwd":"/proj"}}"#
         ),
     );
     send(
         server.socket_path(),
         &format!(
-            r#"{{"token":"{tok}","reason":"permission","hook_event":"SessionStart",
-                 "session_id":"sess-event","cwd":"/proj"}}"#
+            r#"{{"token":"{tok}","reason":"permission","hook_event":"SessionStart","session_id":"sess-event","cwd":"/proj"}}"#
         ),
     );
     assert_eq!(wait_count(&rec, 2, Duration::from_secs(2)), 2);
@@ -220,13 +221,42 @@ fn a_wire_session_source_field_is_inert() {
     send(
         server.socket_path(),
         &format!(
-            r#"{{"token":"{tok}","reason":"question","session_id":"sess-forged",
-                 "session_source":"pick","sessionSource":"pick"}}"#
+            r#"{{"token":"{tok}","reason":"question","session_id":"sess-forged","session_source":"pick","sessionSource":"pick"}}"#
         ),
     );
     assert_eq!(wait_count(&rec, 1, Duration::from_secs(2)), 1);
     let got = rec.lock().unwrap();
     assert_eq!(got[0].1.session_id.as_deref(), Some("sess-forged"));
+}
+
+// ---- request framing (hook-ask-channel U2/R2) -------------------------------
+
+#[test]
+fn a_newline_terminated_notify_message_still_dispatches() {
+    // The held-ask framing tolerance applies to every op: a client that
+    // terminates its compact JSON with \n (instead of closing its write half)
+    // dispatches identically.
+    let (_dir, tokens, rec, server) = setup();
+    let tok = tokens.issue(PaneId(7));
+    send(
+        server.socket_path(),
+        &format!("{{\"token\":\"{tok}\",\"reason\":\"finished\"}}\n"),
+    );
+    assert_eq!(wait_count(&rec, 1, Duration::from_secs(2)), 1);
+}
+
+#[test]
+fn a_multi_line_message_is_rejected_silently() {
+    // The one-line contract: an embedded newline truncates the message at the
+    // frame boundary → malformed → silent reject (the pinned trade-off for
+    // held-connection framing; every fly client sends compact JSON).
+    let (_dir, tokens, rec, server) = setup();
+    let tok = tokens.issue(PaneId(8));
+    send(
+        server.socket_path(),
+        &format!("{{\"token\":\"{tok}\",\n\"reason\":\"finished\"}}"),
+    );
+    assert_eq!(wait_count(&rec, 1, Duration::from_millis(400)), 0);
 }
 
 #[test]

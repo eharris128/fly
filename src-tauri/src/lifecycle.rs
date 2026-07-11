@@ -47,6 +47,14 @@ pub fn shutdown(app: &AppHandle) {
     if let Some(feed) = app.try_state::<Arc<crate::feed::FeedState>>() {
         feed.shutdown();
     }
+    // Held permission asks (hook-ask-channel R9): release every held hook
+    // connection — each `fly notify --permission-request` sees a clean close,
+    // exits with no decision, and its dialog proceeds normally. Ordered before
+    // the pane reap so no hook process is left holding a socket into teardown
+    // (no hung hooks, no zombies).
+    if let Some(asks) = app.try_state::<Arc<crate::feed::ask::AskRegistry>>() {
+        asks.shutdown();
+    }
     if let Some(pty) = app.try_state::<Arc<PtyManager>>() {
         pty.close_all();
     }
