@@ -297,9 +297,18 @@ impl StreamFold {
                 infra("malformed stream: runner kill with no result event".to_owned())
             }
             // A non-success result is infra regardless of how the process
-            // ended (abstain-on-surprise) — never Clean, even on exit 0.
+            // ended (abstain-on-surprise) — never Clean, even on exit 0. The
+            // result's own text rides the reason (raw here, per the
+            // sanitize/scrub contract): claude's error results carry their
+            // explanation in that text (rate limit, context length, API
+            // error), and it is the operator's only diagnostic — nothing
+            // else on the Infra path records what claude said.
             (Some(r), _) if !r.success => {
-                infra("stream reported a non-success result event".to_owned())
+                if r.text.is_empty() {
+                    infra("stream reported a non-success result event".to_owned())
+                } else {
+                    infra(format!("stream reported a non-success result event: {}", r.text))
+                }
             }
             // The Clean rows (R10): a sole success result corroborated by a
             // clean exit or by the runner's own lingering-exit kill.
@@ -1210,18 +1219,38 @@ mod tests {
 
     // R10: a non-success result is Infra, never Clean — `is_error: true`
     // (even with subtype "success"), an unobserved error subtype, or a
-    // missing subtype all abstain, exit 0 notwithstanding.
+    // missing subtype all abstain, exit 0 notwithstanding. The result's own
+    // text survives into the reason (fix(review) #1: it is the operator's
+    // only diagnostic for a claude-reported error); empty text leaves the
+    // plain message with no dangling separator.
     #[test]
     fn is_error_true_or_non_success_subtype_is_infra_never_clean() {
-        let cases: &[&[u8]] = &[
-            br#"{"type":"result","subtype":"success","is_error":true,"result":"lying"}"#,
-            br#"{"type":"result","subtype":"error_during_execution","is_error":false,"result":"x"}"#,
-            br#"{"type":"result","is_error":false,"result":"no subtype at all"}"#,
+        let cases: &[(&[u8], &str)] = &[
+            (
+                br#"{"type":"result","subtype":"success","is_error":true,"result":"rate limit exceeded"}"#,
+                "rate limit exceeded",
+            ),
+            (
+                br#"{"type":"result","subtype":"error_during_execution","is_error":false,"result":"tool crashed"}"#,
+                "tool crashed",
+            ),
+            (
+                br#"{"type":"result","is_error":false,"result":"no subtype at all"}"#,
+                "no subtype at all",
+            ),
         ];
-        for line in cases {
+        for (line, text) in cases {
             let r = reason(classify(&[line], ExitFacts::Exited { code: Some(0) }, ""));
             assert!(r.contains("non-success"), "reason: {r}");
+            assert!(r.contains(text), "claude's own text survives: {r}");
         }
+        // Empty result text: the generic reason alone, no dangling ": ".
+        let r = reason(classify(
+            &[br#"{"type":"result","subtype":"success","is_error":true,"result":""}"#],
+            ExitFacts::Exited { code: Some(0) },
+            "",
+        ));
+        assert_eq!(r, "stream reported a non-success result event");
     }
 
     // R11: a malformed JSON line mid-stream is skipped; the surrounding
