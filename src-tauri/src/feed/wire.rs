@@ -135,9 +135,32 @@ pub struct QuestionBody {
     pub source: Option<String>,
 }
 
+/// The last run's healthcheck verdict on the wire (monitor enrichment, U6 of
+/// `docs/plans/2026-07-11-001-feat-ambient-wall-monitor-fixture-plan.md`):
+/// the PASS/FAIL outcome plus its short note, projected from the terminal
+/// run's [`crate::automations::model::Verdict`]. A verdict is parsed only from
+/// a run whose infra outcome *succeeded* (the check process ran cleanly), so a
+/// FAIL verdict rides a `lastStatus: "succeeded"` row — run status alone would
+/// show green on a failed experiment, which is exactly why the Wall reads the
+/// verdict. Omitted (not null) when the last run carried no parsed verdict —
+/// every non-monitor automation, and a monitor's not-done checks — so an older
+/// consumer sees today's shape unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerdictEntry {
+    /// `"pass"` | `"fail"` — the machine-readable outcome (the file-wide
+    /// lowercase/camelCase wire spelling, not the `PASS`/`FAIL` prompt form).
+    pub outcome: String,
+    /// The check's short verdict note (already head-capped upstream at close);
+    /// empty string when the parse produced no note.
+    pub note: String,
+}
+
 /// One automation, projected from `automations::model::Automation` + its derived
 /// last run. Read-only: schedule (`cron`/`timezone`) plus the next occurrence and
-/// the last run's outcome.
+/// the last run's outcome. The monitor-enrichment fields (`monitor`,
+/// `retiredAt`, `lastVerdict`) are additive (U6) — an older consumer that
+/// ignores them reads the pre-enrichment shape unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutomationEntry {
@@ -149,6 +172,12 @@ pub struct AutomationEntry {
     pub timezone: String,
     /// Whether the automation is active (a paused one is `false`).
     pub enabled: bool,
+    /// Whether this automation is a monitor (a bounded healthcheck that
+    /// delivers one verdict and retires), vs. an ordinary recurring
+    /// automation (U6). `#[serde(default)]` loads an old payload (no key) as
+    /// `false`; always serialized so a plain automation carries `false`.
+    #[serde(default)]
+    pub monitor: bool,
     /// Next occurrence, epoch ms; null when paused.
     pub next_run_at: Option<u64>,
     /// Last run's status (`running`/`succeeded`/`failed`/`skipped`), or null if
@@ -157,6 +186,19 @@ pub struct AutomationEntry {
     /// When the last run reached a terminal status (or started, for a still-
     /// running row), epoch ms; null if it has never run.
     pub last_run_at: Option<u64>,
+    /// When a parsed verdict retired this monitor (epoch ms); null when not
+    /// retired (every non-monitor, and a still-live monitor). Serialized
+    /// explicitly (null when absent), matching the other `Option` time fields
+    /// the consumer reads by key; `#[serde(default)]` loads an old payload as
+    /// null (U6).
+    #[serde(default)]
+    pub retired_at: Option<u64>,
+    /// The last run's parsed verdict (U6): the honest pass/fail the Wall
+    /// latches on, distinct from `last_status` (a FAIL verdict rides a
+    /// `succeeded` run — see [`VerdictEntry`]). Omitted when the last run
+    /// carried no verdict; `#[serde(default)]` loads an old payload as None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verdict: Option<VerdictEntry>,
 }
 
 /// What the webview pushes each poll — just the agent half (the automations
@@ -236,12 +278,35 @@ impl AutomationEntry {
             cron: a.cron.clone(),
             timezone: a.timezone.clone(),
             enabled: a.enabled,
+            monitor: a.monitor,
             next_run_at: a.next_run_at,
             last_status: last.map(|r| run_status_str(&r.status).to_string()),
             // A terminal row carries finished_at; a still-running one only
             // started_at — fall back so a live run still stamps a time.
             last_run_at: last.and_then(|r| r.finished_at.or(r.started_at)),
+            // U6: a monitor retires in the same store mutation that stamps its
+            // verdict, so a retired monitor's `retiredAt`, its `lastRunAt`, and
+            // the verdict below all point at that final run.
+            retired_at: a.retired_at,
+            // U6: the verdict rides the last run because a monitor retires on
+            // its first verdict and refuses every later claim — the
+            // verdict-bearing run stays `last_run()` permanently.
+            last_verdict: last.and_then(|r| r.verdict.as_ref()).map(|v| VerdictEntry {
+                outcome: verdict_outcome_str(&v.outcome).to_string(),
+                note: v.note.clone(),
+            }),
         }
+    }
+}
+
+/// Lowercase wire spelling for a verdict outcome (the file-wide camelCase/
+/// lowercase convention). Distinct from `VerdictOutcome::as_str`, which is the
+/// uppercase `PASS`/`FAIL` prompt/display form.
+fn verdict_outcome_str(outcome: &crate::automations::model::VerdictOutcome) -> &'static str {
+    use crate::automations::model::VerdictOutcome;
+    match outcome {
+        VerdictOutcome::Pass => "pass",
+        VerdictOutcome::Fail => "fail",
     }
 }
 
@@ -286,9 +351,12 @@ mod tests {
                 cron: "*/5 * * * *".into(),
                 timezone: "UTC".into(),
                 enabled: true,
+                monitor: false,
                 next_run_at: Some(1_700_000_300_000),
                 last_status: Some("succeeded".into()),
                 last_run_at: Some(1_700_000_000_000),
+                retired_at: None,
+                last_verdict: None,
             }],
         };
         let v = serde_json::to_value(&snap).unwrap();
@@ -304,6 +372,11 @@ mod tests {
         assert_eq!(v["automations"][0]["cron"], "*/5 * * * *");
         assert_eq!(v["automations"][0]["nextRunAt"], 1_700_000_300_000u64);
         assert_eq!(v["automations"][0]["lastStatus"], "succeeded");
+        // U6 enrichment: a plain automation carries monitor false and an
+        // explicit-null retiredAt, and omits lastVerdict entirely.
+        assert_eq!(v["automations"][0]["monitor"], false);
+        assert!(v["automations"][0]["retiredAt"].is_null());
+        assert!(v["automations"][0].get("lastVerdict").is_none());
         // And it round-trips back byte-for-byte.
         let back: FeedSnapshot = serde_json::from_value(v).unwrap();
         assert_eq!(back, snap);
@@ -370,6 +443,92 @@ mod tests {
         assert_eq!(e.last_status.as_deref(), Some("succeeded"));
         // Terminal row → finished_at is the last-run stamp.
         assert_eq!(e.last_run_at, Some(1_200));
+        // U6: an ordinary automation projects monitor false, no retirement,
+        // and no verdict (its run carried none).
+        assert!(!e.monitor);
+        assert_eq!(e.retired_at, None);
+        assert_eq!(e.last_verdict, None);
+    }
+
+    /// U6: a monitor whose last run parsed a FAIL verdict — the case run
+    /// status alone gets wrong. The infra run *succeeded* (the check process
+    /// completed cleanly), so `lastStatus` is `"succeeded"`, while the honest
+    /// outcome the Wall latches on rides `lastVerdict.outcome == "fail"`. The
+    /// monitor retired in the same mutation, so `retiredAt` is set and the
+    /// verdict-bearing run is `last_run()`.
+    #[test]
+    fn from_automation_projects_monitor_verdict_and_retirement() {
+        use crate::automations::model::{
+            Automation, Mode, Origin, RunMode, RunRow, RunStatus, Trigger, Verdict, VerdictOutcome,
+        };
+        let run = RunRow {
+            id: "r1".into(),
+            mode: RunMode::Agent,
+            trigger: Trigger::Schedule,
+            // A verdict is parsed only from a Succeeded infra outcome.
+            status: RunStatus::Succeeded,
+            pane_id: None,
+            model: None,
+            effort: None,
+            verdict: Some(Verdict {
+                outcome: VerdictOutcome::Fail,
+                note: "disk still climbing".into(),
+            }),
+            bundle_path: Some("/bundles/a1-r1.md".into()),
+            headless: true,
+            session_id: Some("sess-9".into()),
+            output: Some("FAIL: disk still climbing".into()),
+            exit_code: Some(0),
+            error: None,
+            scheduled_for: Some(1_000),
+            started_at: Some(1_100),
+            finished_at: Some(1_200),
+        };
+        let a = Automation {
+            id: "a1".into(),
+            name: "disk monitor".into(),
+            cron: "*/30 * * * *".into(),
+            timezone: "UTC".into(),
+            enabled: true,
+            retry_on_interrupt: true,
+            monitor: true,
+            not_before_ms: Some(500),
+            // Retired in the same mutation that closed the verdict run.
+            retired_at: Some(1_200),
+            pickup_pointers: None,
+            cwd: "/tmp".into(),
+            mode: Mode::Agent {
+                prompt: "check disk".into(),
+                model: None,
+                effort: None,
+            },
+            origin: Origin {
+                pane_id: 1,
+                workspace_id: "ws".into(),
+                label: "cli".into(),
+            },
+            created_at: 0,
+            updated_at: 1_200,
+            next_run_at: None,
+            runs: vec![run],
+        };
+        let e = AutomationEntry::from_automation(&a);
+        assert!(e.monitor, "the monitor flag rides the wire");
+        assert_eq!(e.retired_at, Some(1_200));
+        // Run status is succeeded (infra ran clean) but the verdict is fail —
+        // the whole reason the consumer must read the verdict, not the status.
+        assert_eq!(e.last_status.as_deref(), Some("succeeded"));
+        let verdict = e.last_verdict.as_ref().expect("the FAIL verdict projects");
+        assert_eq!(verdict.outcome, "fail");
+        assert_eq!(verdict.note, "disk still climbing");
+
+        // And the enriched fields cross the wire as camelCase.
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["monitor"], true);
+        assert_eq!(v["retiredAt"], 1_200u64);
+        assert_eq!(v["lastStatus"], "succeeded");
+        assert_eq!(v["lastVerdict"]["outcome"], "fail");
+        assert_eq!(v["lastVerdict"]["note"], "disk still climbing");
     }
 
     #[test]
@@ -407,6 +566,98 @@ mod tests {
         assert_eq!(e.next_run_at, None);
         assert_eq!(e.last_status, None);
         assert_eq!(e.last_run_at, None);
+        // U6: no runs → no verdict; a plain automation is not a monitor and
+        // never retired.
+        assert!(!e.monitor);
+        assert_eq!(e.retired_at, None);
+        assert_eq!(e.last_verdict, None);
+    }
+
+    /// U6 back-compat: an old feed payload (pre-enrichment: no monitor /
+    /// retiredAt / lastVerdict keys) still deserializes — an older producer's
+    /// frame loads with the new fields defaulted (monitor false, not retired,
+    /// no verdict), so a mixed-version pairing never breaks the boundary.
+    #[test]
+    fn automation_entry_without_enrichment_fields_deserializes_to_defaults() {
+        let old = serde_json::json!({
+            "id": "a1", "name": "legacy", "cron": "*/5 * * * *",
+            "timezone": "UTC", "enabled": true,
+            "nextRunAt": 1_700_000_300_000u64,
+            "lastStatus": "succeeded",
+            "lastRunAt": 1_700_000_000_000u64
+        });
+        let e: AutomationEntry = serde_json::from_value(old).unwrap();
+        assert!(!e.monitor, "absent monitor defaults false");
+        assert_eq!(e.retired_at, None, "absent retiredAt defaults null");
+        assert_eq!(e.last_verdict, None, "absent lastVerdict defaults None");
+        // The pre-enrichment fields still load.
+        assert_eq!(e.next_run_at, Some(1_700_000_300_000));
+        assert_eq!(e.last_status.as_deref(), Some("succeeded"));
+    }
+
+    /// U6: a retired monitor whose verdict was PASS carries its retirement
+    /// stamp and a `"pass"` verdict — the pass spelling on the wire is
+    /// lowercase, not the `PASS` prompt form.
+    #[test]
+    fn from_automation_projects_retired_pass_monitor() {
+        use crate::automations::model::{
+            Automation, Mode, Origin, RunMode, RunRow, RunStatus, Trigger, Verdict, VerdictOutcome,
+        };
+        let run = RunRow {
+            id: "r1".into(),
+            mode: RunMode::Agent,
+            trigger: Trigger::Schedule,
+            status: RunStatus::Succeeded,
+            pane_id: None,
+            model: None,
+            effort: None,
+            verdict: Some(Verdict {
+                outcome: VerdictOutcome::Pass,
+                note: String::new(),
+            }),
+            bundle_path: None,
+            headless: true,
+            session_id: None,
+            output: Some("PASS".into()),
+            exit_code: Some(0),
+            error: None,
+            scheduled_for: Some(1_000),
+            started_at: Some(1_100),
+            finished_at: Some(1_200),
+        };
+        let a = Automation {
+            id: "a1".into(),
+            name: "deploy watch".into(),
+            cron: "*/30 * * * *".into(),
+            timezone: "UTC".into(),
+            enabled: true,
+            retry_on_interrupt: true,
+            monitor: true,
+            not_before_ms: None,
+            retired_at: Some(1_200),
+            pickup_pointers: None,
+            cwd: "/tmp".into(),
+            mode: Mode::Agent {
+                prompt: "check deploy".into(),
+                model: None,
+                effort: None,
+            },
+            origin: Origin {
+                pane_id: 1,
+                workspace_id: "ws".into(),
+                label: "cli".into(),
+            },
+            created_at: 0,
+            updated_at: 1_200,
+            next_run_at: None,
+            runs: vec![run],
+        };
+        let e = AutomationEntry::from_automation(&a);
+        assert!(e.monitor);
+        assert_eq!(e.retired_at, Some(1_200));
+        let verdict = e.last_verdict.as_ref().expect("the PASS verdict projects");
+        assert_eq!(verdict.outcome, "pass");
+        assert_eq!(verdict.note, "");
     }
 
     #[test]

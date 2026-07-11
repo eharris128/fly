@@ -137,6 +137,19 @@ export interface AgentOutputBody {
   turns?: TurnEntry[];
 }
 
+/**
+ * The last run's healthcheck verdict on the wire (mirrors Rust `VerdictEntry`,
+ * U6). A verdict is parsed only from a run whose infra outcome succeeded, so a
+ * `fail` verdict rides a `lastStatus: "succeeded"` row — read the verdict, not
+ * the status, for honest pass/fail.
+ */
+export interface VerdictEntry {
+  /** `"pass"` | `"fail"` — the lowercase wire spelling. */
+  outcome: string;
+  /** The check's short verdict note; empty string when the parse had none. */
+  note: string;
+}
+
 /** One automation on the wire (mirrors Rust `AutomationEntry`). Backend-filled. */
 export interface AutomationEntry {
   id: string;
@@ -144,9 +157,15 @@ export interface AutomationEntry {
   cron: string;
   timezone: string;
   enabled: boolean;
+  /** Whether this automation is a monitor (bounded healthcheck) — U6. */
+  monitor: boolean;
   nextRunAt: number | null;
   lastStatus: string | null;
   lastRunAt: number | null;
+  /** When a parsed verdict retired this monitor (epoch ms); null otherwise. U6. */
+  retiredAt: number | null;
+  /** The last run's parsed verdict; absent when the run carried none. U6. */
+  lastVerdict?: VerdictEntry;
 }
 
 /** The full SSE frame (mirrors Rust `FeedSnapshot`). */

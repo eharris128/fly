@@ -278,9 +278,12 @@ mod tests {
             cron: "* * * * *".into(),
             timezone: "UTC".into(),
             enabled: true,
+            monitor: false,
             next_run_at: None,
             last_status: None,
             last_run_at: None,
+            retired_at: None,
+            last_verdict: None,
         }];
         let snap = s.snapshot(autos, 123);
         assert_eq!(snap.version, 1);
