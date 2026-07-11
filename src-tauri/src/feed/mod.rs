@@ -54,6 +54,16 @@ pub struct WaitResult {
     pub shutting_down: bool,
 }
 
+/// One published agent's gate-relevant roster fields, read in a single
+/// snapshot by [`FeedState::agent_gate`]: the live attention `reason` (the
+/// permission-exposure gate) and the dashboard `status` (the fallback's
+/// working-pane suppressor).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentGate {
+    pub reason: Option<String>,
+    pub status: String,
+}
+
 impl Default for FeedState {
     fn default() -> Self {
         Self::new()
@@ -104,23 +114,29 @@ impl FeedState {
         self.inner.lock().unwrap().version
     }
 
-    /// Existence **and** attention reason in one lock acquisition — the key
-    /// authority for the per-agent endpoints (feed-agent-reply-io KTD2;
-    /// feed-pending-question U4/KTD4): `None` = unknown agent (a key the feed
-    /// has never served is a 404, and a non-agent pane never becomes remotely
-    /// addressable); `Some(reason)` = published, carrying the entry's pushed
-    /// `reason` (`Some("permission")` while a permission dialog holds the pane
-    /// raised, `None` otherwise). The permission gate must read existence and
-    /// reason from one roster snapshot — two separate reads could straddle a
-    /// roster swap and gate on another moment's reason.
-    pub fn agent_reason(&self, leaf_key: &str) -> Option<Option<String>> {
+    /// Existence **and** the gate-relevant roster fields in one lock
+    /// acquisition — the key authority for the per-agent endpoints
+    /// (feed-agent-reply-io KTD2; feed-pending-question U4/KTD4): `None` =
+    /// unknown agent (a key the feed has never served is a 404, and a
+    /// non-agent pane never becomes remotely addressable); `Some(gate)` =
+    /// published, carrying the entry's pushed attention `reason`
+    /// (`Some("permission")` while a permission dialog holds the pane raised,
+    /// `None` otherwise — an *acknowledged* raise clears it) and its `status`
+    /// (the screen fallback declines to engage on a `working` pane). The
+    /// permission gate must read existence, reason, and status from one
+    /// roster snapshot — separate reads could straddle a roster swap and gate
+    /// on another moment's state.
+    pub fn agent_gate(&self, leaf_key: &str) -> Option<AgentGate> {
         self.inner
             .lock()
             .unwrap()
             .agents
             .iter()
             .find(|a| a.leaf_key == leaf_key)
-            .map(|a| a.reason.clone())
+            .map(|a| AgentGate {
+                reason: a.reason.clone(),
+                status: a.status.clone(),
+            })
     }
 
     /// Assemble the frame to emit: the cached roster + the caller-supplied
@@ -203,22 +219,35 @@ mod tests {
     }
 
     #[test]
-    fn agent_reason_tracks_existence_and_reason_across_the_published_roster() {
+    fn agent_gate_tracks_existence_reason_and_status_across_the_roster() {
         // feed-pending-question U4 (the sole 404-authority + gate read): None =
-        // unknown (404); Some(None) = published, no reason; Some(Some(..)) =
-        // published + raised reason. A gone agent is unknown again.
+        // unknown (404); Some with no reason = published, unraised; Some with
+        // a reason = published + raised. Status rides the same snapshot (the
+        // fallback's working-pane suppressor). A gone agent is unknown again.
         let s = FeedState::new();
-        assert_eq!(s.agent_reason("l1"), None);
+        assert_eq!(s.agent_gate("l1"), None);
         s.publish(vec![agent("l1", "working")]);
-        assert_eq!(s.agent_reason("l1"), Some(None));
-        assert_eq!(s.agent_reason("l2"), None);
+        assert_eq!(
+            s.agent_gate("l1"),
+            Some(AgentGate {
+                reason: None,
+                status: "working".into()
+            })
+        );
+        assert_eq!(s.agent_gate("l2"), None);
         let mut raised = agent("l2", "waiting");
         raised.reason = Some("permission".into());
         s.publish(vec![raised]);
-        assert_eq!(s.agent_reason("l2"), Some(Some("permission".into())));
-        assert_eq!(s.agent_reason("l1"), None, "gone from the roster again");
+        assert_eq!(
+            s.agent_gate("l2"),
+            Some(AgentGate {
+                reason: Some("permission".into()),
+                status: "waiting".into()
+            })
+        );
+        assert_eq!(s.agent_gate("l1"), None, "gone from the roster again");
         s.publish(vec![]);
-        assert_eq!(s.agent_reason("l2"), None, "empty roster → unknown");
+        assert_eq!(s.agent_gate("l2"), None, "empty roster → unknown");
     }
 
     #[test]

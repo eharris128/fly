@@ -28,7 +28,7 @@ const PROMPTED_AT: u64 = 1_781_896_600_000;
 /// (exposure of which the server must gate on the roster reason —
 /// feed-pending-question KTD3/KTD4).
 fn fake_io() -> IoFn {
-    Arc::new(|leaf_key, _reason| {
+    Arc::new(|leaf_key, _reason, _status| {
         let reply = || LastReply {
             text: "All tests pass.".into(),
             replied_at_ms: Some(REPLIED_AT),
@@ -527,7 +527,7 @@ fn a_delegating_tool_pending_abstains_end_to_end() {
     )
     .unwrap();
     let resolver = Arc::new(ReplyResolver::with_projects_root(resume_path, Some(root)));
-    let io_fn: IoFn = Arc::new(move |leaf, _reason| resolver.resolve_io(leaf));
+    let io_fn: IoFn = Arc::new(move |leaf, _reason, _status| resolver.resolve_io(leaf));
 
     let state = Arc::new(FeedState::new());
     let server = FeedServer::start(
@@ -667,7 +667,7 @@ fn a_transcript_takeover_makes_a_screen_stamped_answer_409() {
     let flipped_io = Arc::clone(&flipped);
     const SCREEN_AT: u64 = 1_000;
     const TRANSCRIPT_AT: u64 = 2_000;
-    let io_fn: IoFn = Arc::new(move |_leaf, _reason| {
+    let io_fn: IoFn = Arc::new(move |_leaf, _reason, _status| {
         let (asked_at, source, pending) = if flipped_io.load(Ordering::SeqCst) {
             (TRANSCRIPT_AT, None, None)
         } else {
