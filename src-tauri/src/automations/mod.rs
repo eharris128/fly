@@ -31,6 +31,7 @@
 //! manager or its store (the store mutex is not re-entrant).
 
 pub mod alerts;
+pub mod headless;
 pub mod model;
 pub mod redact;
 pub mod schedule;
