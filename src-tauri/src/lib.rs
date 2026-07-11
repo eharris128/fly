@@ -1310,14 +1310,8 @@ impl automations::Dispatcher for CompositeDispatcher {
             // close (via `close_run_stamping`'s Failed-close escalation leg)
             // rather than as the manager's dispatch-Err close — the same R7
             // accounting either way, only the error's carrier differs
-            // (`row.error` instead of a recompute-and-close on Err). The one
-            // Err below is the non-agent-mode BUG guard, mirroring
-            // `AgentDispatcher`.
-            let prompt = match &a.mode {
-                automations::model::Mode::Agent { prompt, .. } => prompt,
-                _ => return Err("BUG: dispatch_agent on non-agent automation".into()),
-            };
-            self.headless.run(&a.id, run_id, &a.cwd, prompt, launch);
+            // (`row.error` instead of a recompute-and-close on Err).
+            self.headless.run(a, run_id, launch);
             return Ok(());
         }
         self.agent.dispatch_agent(a, run_id, launch)

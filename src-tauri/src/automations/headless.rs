@@ -59,7 +59,7 @@ use super::{ResolvedLaunch, RUN_DEADLINE_MS};
 /// [`CheckOutcome::Infra`]. The runner (U3) also enforces this cap at read
 /// time — a bounded reader may hand the fold a truncated over-cap line,
 /// which then fails JSON parsing and is skipped all the same.
-pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// The minimal event view over one NDJSON stream line (R11): only the two
 /// shapes the check depends on are distinguished; everything else is
@@ -335,7 +335,7 @@ impl StreamFold {
 /// timeout, so stderr is drained concurrently on its own thread into this
 /// small tail. Raw here BY CONTRACT — the caller of the closer (U4/U5)
 /// cleans it before it lands anywhere (see [`CheckOutcome`]'s doc).
-pub const STDERR_TAIL_BYTES: usize = 4 * 1024;
+const STDERR_TAIL_BYTES: usize = 4 * 1024;
 
 /// stdout read-chunk size. Line assembly is byte-exact across chunk
 /// boundaries (see [`read_stdout`]), so this is throughput tuning only — a
@@ -346,13 +346,13 @@ const READ_BUF: usize = 8 * 1024;
 /// makes claude reap its own child tree and exit within ~6 s even mid-tool,
 /// so the runner's own kill legs (deadline, stream-end) afford 10 s before
 /// escalating. The seam legs use [`SEAM_KILL_GRACE`] instead.
-pub const TERM_KILL_GRACE: Duration = Duration::from_secs(10);
+const TERM_KILL_GRACE: Duration = Duration::from_secs(10);
 
 /// Seam-leg grace (delete / shutdown / backstop, R5): deliberately short —
 /// these run on paths that must stay fast (`script.rs::SEAM_KILL_GRACE`
 /// precedent). The descendant-snapshot sweep, not the grace, is the
 /// no-orphan guarantee here.
-pub const SEAM_KILL_GRACE: Duration = Duration::from_millis(200);
+const SEAM_KILL_GRACE: Duration = Duration::from_millis(200);
 
 /// Post-result linger (the stream-end policy): once a success `result` has
 /// been streamed the child is expected to wrap up and exit on its own; a
@@ -362,7 +362,7 @@ pub const SEAM_KILL_GRACE: Duration = Duration::from_millis(200);
 /// **result event**, not stdout EOF — a lingering claude holds stdout open,
 /// so an EOF-anchored clock would never fire and the check would wrongly
 /// ride to the deadline (which classifies Infra).
-pub const LINGER_EXIT_GRACE: Duration = Duration::from_secs(5);
+const LINGER_EXIT_GRACE: Duration = Duration::from_secs(5);
 
 /// `try_wait` / liveness poll interval (`script.rs::REAP_POLL` precedent).
 const CHECK_POLL: Duration = Duration::from_millis(25);
@@ -629,14 +629,20 @@ impl HeadlessRunner {
     /// automation-mutation socket surface — the headless R22 equivalent,
     /// guarded by a refactor-proof integration test) plus the shared
     /// child-session marker list ([`crate::pty::CLAUDE_SESSION_MARKERS`]).
-    pub fn run(
-        &self,
-        automation_id: &str,
-        run_id: &str,
-        cwd: &str,
-        prompt: &str,
-        launch: &ResolvedLaunch,
-    ) {
+    pub fn run(&self, a: &super::model::Automation, run_id: &str, launch: &ResolvedLaunch) {
+        let (automation_id, cwd) = (a.id.as_str(), a.cwd.as_str());
+        // Sibling-shaped signature (`Dispatcher::dispatch_agent` /
+        // `ScriptRunner::dispatch`): the prompt lives in the automation. A
+        // non-agent automation here is a routing bug; it closes through the
+        // one close path like every other failure.
+        let super::model::Mode::Agent { prompt, .. } = &a.mode else {
+            (self.closer)(
+                automation_id,
+                run_id,
+                CheckOutcome::spawn_failed("BUG: headless dispatch on non-agent automation"),
+            );
+            return;
+        };
         let mut cmd = Command::new(&self.claude_bin);
         cmd.arg("-p")
             .arg("--output-format")
@@ -707,7 +713,11 @@ impl HeadlessRunner {
                 read_stdout(stdout, &out_stream);
                 let _ = out_done_tx.send(());
             });
-        let rx_err = spawn_stderr_tail(child.stderr.take().expect("stderr piped"));
+        let rx_err = super::script::spawn_reader(
+            "fly-monitor-check-err",
+            child.stderr.take().expect("stderr piped"),
+            STDERR_TAIL_BYTES,
+        );
 
         let job = CheckJob {
             automation_id: automation_id.to_owned(),
@@ -841,9 +851,15 @@ fn drive(mut child: Child, job: CheckJob) {
     // wait, or the kill sequence's own wait) — no zombie survives the loop.
     // Bounded drains: the pipes EOF once every holder is dead (the sweep
     // guarantees that on kill legs); the fold is complete once the stdout
-    // reader is done, and a wedged reader degrades to whatever was fed.
+    // reader is done, and a wedged reader degrades to whatever was fed. The
+    // two waits share ONE deadline — the readers run concurrently, so two
+    // wedged pipes still cost one grace, not two.
+    let drain_end = Instant::now() + DRAIN_GRACE;
     let _ = job.rx_out_done.recv_timeout(DRAIN_GRACE);
-    let stderr_tail = job.rx_err.recv_timeout(DRAIN_GRACE).unwrap_or_default();
+    let stderr_tail = job
+        .rx_err
+        .recv_timeout(drain_end.saturating_duration_since(Instant::now()))
+        .unwrap_or_default();
     let fold = job.stream.fold.lock().unwrap().clone();
     let outcome = fold.finish(facts, &stderr_tail);
     // Deregister BEFORE closing: the closer may consult the overlap probe
@@ -915,40 +931,6 @@ fn read_stdout(mut r: impl Read, shared: &StreamShared) {
     shared.eof.store(true, Ordering::Release);
 }
 
-/// Drain a reader to EOF keeping only the trailing `cap` bytes (the
-/// [`STDERR_TAIL_BYTES`] tail). Byte-granular cut; the lossy conversion
-/// renders a split leading char as U+FFFD — head damage only.
-fn drain_tail(mut r: impl Read, cap: usize) -> String {
-    let mut tail: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                tail.extend_from_slice(&buf[..n]);
-                if tail.len() > cap {
-                    let cut = tail.len() - cap;
-                    tail.drain(..cut);
-                }
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        }
-    }
-    String::from_utf8_lossy(&tail).into_owned()
-}
-
-/// Start the stderr tail thread; the final tail arrives on the channel.
-fn spawn_stderr_tail(r: impl Read + Send + 'static) -> Receiver<String> {
-    let (tx, rx) = mpsc::channel();
-    let _ = std::thread::Builder::new()
-        .name("fly-monitor-check-err".into())
-        .spawn(move || {
-            let _ = tx.send(drain_tail(r, STDERR_TAIL_BYTES));
-        });
-    rx
-}
-
 // ---- kill discipline (R5) ---------------------------------------------------------
 
 const SIGTERM: i32 = libc::SIGTERM;
@@ -1014,7 +996,7 @@ fn kill_and_sweep_child(child: &mut Child, grace: Duration, poll: Duration) -> O
 /// *current* pgid from that same fresh stat; groups ≤ 1 and fly's own group
 /// are never signaled (a hostile descendant could `setpgid` into fly's group
 /// — same session — and a blind `kill(-pgid)` would take fly down with it).
-fn sweep_survivors(child_pid: u32, snapshot: &[ProcStat]) {
+fn sweep_survivors(child_pid: u32, snapshot: &[ProcEntry]) {
     // SAFETY: getpgrp(2) has no failure mode.
     let own_pgid = unsafe { libc::getpgrp() } as u32;
     let mut seen: HashSet<u32> = HashSet::new();
@@ -1057,53 +1039,13 @@ fn reap_wnohang(pid: u32, bound: Duration, poll: Duration) {
 }
 
 // ---- /proc reading ---------------------------------------------------------------
+//
+// The stat parsing (comm-in-parens trap, starttime pid-reuse pin) and the
+// descendant walk are SHARED with the dashboard task count:
+// [`crate::cwd::parse_stat_line`] / [`crate::cwd::read_stat`] /
+// [`crate::cwd::descendants_in_table`] — one parser, one traversal, no drift.
 
-/// The slice of `/proc/<pid>/stat` the kill discipline needs. Field numbers
-/// per `proc(5)`: `ppid` (4), `pgrp` (5), `starttime` (22) — the latter is
-/// clock ticks since boot at process start, the pid-reuse pin.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProcStat {
-    pid: u32,
-    ppid: u32,
-    pgid: u32,
-    start_time: u64,
-    /// Single-char run state (`R`/`S`/`Z`/`X`/…) — zombies are "dead" to
-    /// liveness probes (unsignalable, kept only for their parent's reap).
-    state: char,
-}
-
-/// Parse one `stat` line. The parsing trap (the `cwd::parse_stat_line`
-/// precedent): field 2 (`comm`) is parenthesized and may itself contain
-/// spaces and parens, so split on the LAST `')'`; the space-separated
-/// remainder is fields 3.. — index 0 = `state`, 1 = `ppid`, 2 = `pgrp`,
-/// 19 = `starttime`. Any missing/non-numeric field yields `None` (skipped,
-/// never a panic — same tolerance as the rest of fly's `/proc` readers).
-fn parse_stat_line(line: &str) -> Option<ProcStat> {
-    let lparen = line.find('(')?;
-    let rparen = line.rfind(')')?;
-    if rparen < lparen {
-        return None;
-    }
-    let pid: u32 = line[..lparen].trim().parse().ok()?;
-    let rest: Vec<&str> = line[rparen + 1..].split_whitespace().collect();
-    let state = rest.first()?.chars().next()?;
-    let ppid: u32 = rest.get(1)?.parse().ok()?;
-    let pgid: u32 = rest.get(2)?.parse().ok()?;
-    let start_time: u64 = rest.get(19)?.parse().ok()?;
-    Some(ProcStat {
-        pid,
-        ppid,
-        pgid,
-        start_time,
-        state,
-    })
-}
-
-/// Read + parse one pid's stat. `None` when the process is gone/unreadable.
-fn read_stat(pid: u32) -> Option<ProcStat> {
-    let line = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse_stat_line(&line)
-}
+use crate::cwd::{descendants_in_table, read_proc_table, read_stat, ProcEntry};
 
 /// Whether the pinned child is still alive: `/proc` present, start-time
 /// matching the recorded pin (a reused pid has a later starttime), and not
@@ -1125,46 +1067,13 @@ fn child_alive(pid: u32, recorded: Option<u64>) -> bool {
 }
 
 /// Snapshot the transitive descendants of `root` (root excluded): one
-/// `/proc` scan (the `cwd::read_proc_table` shape — vanished/unreadable
-/// entries silently skipped), PPID-edge BFS with a visited set so a
-/// malformed table (self-parent, cycle) cannot loop. Each descendant is
-/// recorded with its start-time so the later sweep can pin against pid
-/// reuse. Cross-session residue accepted like `script.rs::drain_captures`.
-fn descendants_of(root: u32) -> Vec<ProcStat> {
-    let mut table: Vec<ProcStat> = Vec::new();
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return table;
-    };
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{name}/stat")) {
-            if let Some(s) = parse_stat_line(&stat) {
-                table.push(s);
-            }
-        }
-    }
-    let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (i, e) in table.iter().enumerate() {
-        children.entry(e.ppid).or_default().push(i);
-    }
-    let mut visited: HashSet<u32> = HashSet::from([root]);
-    let mut out: Vec<ProcStat> = Vec::new();
-    let mut frontier = vec![root];
-    while let Some(parent) = frontier.pop() {
-        let Some(kids) = children.get(&parent) else { continue };
-        for &i in kids {
-            let e = &table[i];
-            if visited.insert(e.pid) {
-                out.push(e.clone());
-                frontier.push(e.pid);
-            }
-        }
-    }
-    out
+/// `/proc` scan ([`read_proc_table`] — vanished/unreadable entries silently
+/// skipped) walked by the shared cycle-safe BFS. Each descendant carries its
+/// start-time so the later sweep can pin against pid reuse. Cross-session
+/// residue accepted like `script.rs::drain_captures`.
+fn descendants_of(root: u32) -> Vec<ProcEntry> {
+    let table = read_proc_table();
+    descendants_in_table(&table, root).into_iter().cloned().collect()
 }
 
 #[cfg(test)]
@@ -1470,45 +1379,19 @@ mod tests {
 
     // ================= U3 pure helpers (no processes) =================
 
-    // R5: the stat parse survives the proc(5) comm trap (spaces + parens)
-    // and pulls starttime from field 22 — the pid-reuse pin the whole kill
-    // discipline leans on.
+    // R5: the pid-reuse pin the whole kill discipline leans on.
     #[test]
-    fn parse_stat_line_extracts_pgid_and_starttime_past_a_hostile_comm() {
-        // 22 fields' worth after the comm: state ppid pgrp session tty tpgid
-        // flags minflt cminflt majflt cmajflt utime stime cutime cstime
-        // priority nice threads itrealvalue STARTTIME ...
-        let line = "4242 (weird (proc) name) S 4200 4241 4200 0 -1 4194560 \
-                    10 0 0 0 1 2 0 0 20 0 1 0 987654321 12345 67";
-        let s = parse_stat_line(line).expect("parses despite parens in comm");
-        assert_eq!(s.pid, 4242);
-        assert_eq!(s.state, 'S');
-        assert_eq!(s.ppid, 4200);
-        assert_eq!(s.pgid, 4241);
-        assert_eq!(s.start_time, 987_654_321);
-    }
-
-    #[test]
-    fn parse_stat_line_rejects_truncated_or_malformed_lines() {
-        assert!(parse_stat_line("").is_none());
-        assert!(parse_stat_line("no parens").is_none());
-        // Enough fields for ppid/pgrp but truncated before starttime (19).
-        assert!(parse_stat_line("1 (init) S 0 1 1 0 -1 4194560 10").is_none());
-        assert!(parse_stat_line("abc (c) S 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 5").is_none());
-    }
-
-    #[test]
-    fn read_stat_sees_our_own_process() {
+    fn child_alive_pins_liveness_on_the_starttime() {
+        // Stat parsing itself is covered where it lives (`crate::cwd`); this
+        // pins the headless-specific liveness rule on top of it.
         let me = std::process::id();
         let s = read_stat(me).expect("own /proc stat is readable");
-        assert_eq!(s.pid, me);
-        assert!(s.start_time > 0, "starttime is a real tick count");
-        assert!(!matches!(s.state, 'Z' | 'X'));
         assert!(child_alive(me, Some(s.start_time)));
         assert!(
             !child_alive(me, Some(s.start_time + 1)),
             "a start-time mismatch reads as a reused pid — dead"
         );
+        assert!(child_alive(me, None), "no pin degrades to bare existence");
     }
 
     // R11 at read time: the accumulator caps at MAX_LINE_BYTES + 1, so an
@@ -1580,10 +1463,12 @@ mod tests {
         assert!(fold.has_result());
     }
 
+    // The stderr tail rides the shared script.rs reader; this pins the
+    // contract the runner depends on — the TRAILING bytes survive the cap.
     #[test]
-    fn drain_tail_keeps_the_trailing_bytes() {
+    fn stderr_tail_reader_keeps_the_trailing_bytes() {
         let data = [vec![b'a'; 5000], b"THE END".to_vec()].concat();
-        let tail = drain_tail(&data[..], 16);
+        let tail = super::super::script::drain_reader(&data[..], 16);
         assert_eq!(tail.len(), 16);
         assert!(tail.ends_with("THE END"));
     }

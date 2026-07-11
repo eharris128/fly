@@ -20,10 +20,13 @@
 //! [`scrub_secrets`] — this scan matches tokens by prefix/shape, which a
 //! zero-width or control character *inside* a token defeats (`sk-\u{200B}ant-…`
 //! slips past, and a later sanitize pass would re-form the cleartext). Truncate
-//! last, so the scrub always sees full, unstraddled values. The order lives in
-//! ONE place: [`clean_text`] / [`clean_captured`] (headless-monitor-checks U5,
-//! R8) — every capture path calls those, never the composition inline, so the
-//! invariant cannot drift between paths.
+//! last, so the scrub always sees full, unstraddled values. For the
+//! automation capture paths the order lives in ONE place: [`clean_text`] /
+//! [`clean_captured`] (headless-monitor-checks U5, R8) — the pane transcript
+//! capture and the headless stream capture both call those, never the
+//! composition inline, so the invariant cannot drift between them. (The feed
+//! surface keeps its own same-order composition with an inline truncation,
+//! `crate::feed::io::clean` — the convention this contract was named after.)
 
 /// The placeholder every match collapses to.
 const MASK: &str = "[redacted]";

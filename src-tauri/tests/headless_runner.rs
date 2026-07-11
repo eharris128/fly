@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fly_lib::automations::headless::{CheckOutcome, HeadlessRunner, HeadlessTiming};
+use fly_lib::automations::model::{Automation, Mode, Origin};
 use fly_lib::automations::ResolvedLaunch;
 
 /// Absolute path of a fixture script (executable `sh`, checked in with the
@@ -25,6 +26,31 @@ fn fixture(name: &str) -> String {
         .join(name)
         .to_string_lossy()
         .into_owned()
+}
+
+
+/// A minimal monitor automation: `run()` takes the whole `Automation`
+/// (sibling-shaped signature), so every test drives it through one of these.
+fn monitor_automation(id: &str, cwd: &str, prompt: &str) -> Automation {
+    Automation {
+        id: id.into(),
+        name: format!("{id} watch"),
+        cron: "*/5 * * * *".into(),
+        timezone: "UTC".into(),
+        enabled: true,
+        retry_on_interrupt: false,
+        monitor: true,
+        not_before_ms: None,
+        retired_at: None,
+        pickup_pointers: None,
+        cwd: cwd.into(),
+        mode: Mode::Agent { prompt: prompt.into(), model: None, effort: None },
+        origin: Origin { pane_id: 1, workspace_id: "ws-1".into(), label: "test".into() },
+        created_at: 0,
+        updated_at: 0,
+        next_run_at: None,
+        runs: Vec::new(),
+    }
 }
 
 /// Fast timings for tests that never exercise the deadline.
@@ -158,7 +184,7 @@ fn assert_pids_gone(pids: &[u32]) {
 fn happy_verdict_stream_closes_clean_with_exact_text_and_session_id() {
     let h = harness("happy.sh", fast_timing());
     h.runner
-        .run("auto-1", "r1", &h.cwd(), "check the experiment", &ResolvedLaunch::default());
+        .run(&monitor_automation("auto-1", &h.cwd(), "check the experiment"), "r1", &ResolvedLaunch::default());
 
     let (aid, rid, outcome) = h.one_closed(Duration::from_secs(10));
     assert_eq!((aid.as_str(), rid.as_str()), ("auto-1", "r1"));
@@ -179,7 +205,7 @@ fn happy_verdict_stream_closes_clean_with_exact_text_and_session_id() {
 fn no_verdict_success_result_closes_clean_with_text() {
     let h = harness("no-verdict.sh", fast_timing());
     h.runner
-        .run("auto-nv", "r1", &h.cwd(), "look around", &ResolvedLaunch::default());
+        .run(&monitor_automation("auto-nv", &h.cwd(), "look around"), "r1", &ResolvedLaunch::default());
 
     let (_, _, outcome) = h.one_closed(Duration::from_secs(10));
     assert_eq!(
@@ -198,7 +224,7 @@ fn no_verdict_success_result_closes_clean_with_text() {
 fn utf8_split_across_read_chunks_inside_a_line_survives_intact() {
     let h = harness("utf8-split.sh", fast_timing());
     h.runner
-        .run("auto-utf8", "r1", &h.cwd(), "emit unicode", &ResolvedLaunch::default());
+        .run(&monitor_automation("auto-utf8", &h.cwd(), "emit unicode"), "r1", &ResolvedLaunch::default());
 
     let (_, _, outcome) = h.one_closed(Duration::from_secs(10));
     let expected = format!("{}🚀", "héllo☃世界—".repeat(800));
@@ -219,7 +245,7 @@ fn utf8_split_across_read_chunks_inside_a_line_survives_intact() {
 fn malformed_stream_with_exit_zero_is_infra() {
     let h = harness("garbage.sh", fast_timing());
     h.runner
-        .run("auto-garbage", "r1", &h.cwd(), "speak json", &ResolvedLaunch::default());
+        .run(&monitor_automation("auto-garbage", &h.cwd(), "speak json"), "r1", &ResolvedLaunch::default());
 
     let (_, _, outcome) = h.one_closed(Duration::from_secs(10));
     let reason = infra_reason(outcome);
@@ -233,7 +259,7 @@ fn malformed_stream_with_exit_zero_is_infra() {
 fn nonzero_exit_without_result_is_infra_with_code_and_stderr_tail() {
     let h = harness("fail.sh", fast_timing());
     h.runner
-        .run("auto-fail", "r1", &h.cwd(), "try anyway", &ResolvedLaunch::default());
+        .run(&monitor_automation("auto-fail", &h.cwd(), "try anyway"), "r1", &ResolvedLaunch::default());
 
     let (_, _, outcome) = h.one_closed(Duration::from_secs(10));
     let reason = infra_reason(outcome);
@@ -259,10 +285,8 @@ fn spawn_failure_closes_spawn_failed_and_registers_nothing() {
     );
     let dir = tempfile::tempdir().unwrap();
     runner.run(
-        "auto-spawn",
+        &monitor_automation("auto-spawn", &dir.path().to_string_lossy(), "never runs"),
         "r1",
-        &dir.path().to_string_lossy(),
-        "never runs",
         &ResolvedLaunch::default(),
     );
 
@@ -287,7 +311,7 @@ fn hang_past_deadline_is_killed_timed_out_with_no_survivors() {
     let h = harness("hang.sh", timing);
     let start = Instant::now();
     h.runner
-        .run("auto-hang", "r1", &h.cwd(), "hang forever", &ResolvedLaunch::default());
+        .run(&monitor_automation("auto-hang", &h.cwd(), "hang forever"), "r1", &ResolvedLaunch::default());
 
     let (_, _, outcome) = h.one_closed(Duration::from_secs(15));
     assert!(
@@ -317,7 +341,7 @@ fn kill_sweep_reaps_a_setsid_grandchild_from_the_snapshot() {
     // argv and from there into the grandchild's `sh -c` string.
     let marker = format!("fly-headless-grandchild-{}", std::process::id());
     h.runner
-        .run("auto-gc", "r1", &h.cwd(), &marker, &ResolvedLaunch::default());
+        .run(&monitor_automation("auto-gc", &h.cwd(), &marker), "r1", &ResolvedLaunch::default());
 
     let (_, _, outcome) = h.one_closed(Duration::from_secs(15));
     let reason = infra_reason(outcome);
@@ -340,7 +364,7 @@ fn eof_without_result_kills_immediately_never_waiting_out_the_deadline() {
     let h = harness("close-stdout-hang.sh", timing);
     let start = Instant::now();
     h.runner
-        .run("auto-eof", "r1", &h.cwd(), "close stdout", &ResolvedLaunch::default());
+        .run(&monitor_automation("auto-eof", &h.cwd(), "close stdout"), "r1", &ResolvedLaunch::default());
 
     let (_, _, outcome) = h.one_closed(Duration::from_secs(15));
     assert!(
@@ -365,7 +389,7 @@ fn result_then_linger_is_killed_but_closes_clean() {
     let h = harness("linger.sh", timing);
     let start = Instant::now();
     h.runner
-        .run("auto-linger", "r1", &h.cwd(), "report early", &ResolvedLaunch::default());
+        .run(&monitor_automation("auto-linger", &h.cwd(), "report early"), "r1", &ResolvedLaunch::default());
 
     // The in-flight liveness probe (U4's overlap check) sees the live child
     // while it lingers — pid + start-time, not mere entry presence.
@@ -405,7 +429,7 @@ fn kill_run_seam_terminates_the_check_and_the_runner_closes() {
     let timing = fast_timing(); // 30s deadline — the seam, not the deadline, ends this
     let h = harness("hang.sh", timing);
     h.runner
-        .run("auto-seam", "r-seam", &h.cwd(), "hang for the seam", &ResolvedLaunch::default());
+        .run(&monitor_automation("auto-seam", &h.cwd(), "hang for the seam"), "r-seam", &ResolvedLaunch::default());
 
     assert!(h.runner.automation_check_alive("auto-seam"));
     assert!(
@@ -472,7 +496,7 @@ fn env_is_inherited_minus_strip_list_and_argv_has_pane_parity() {
         fallback: Some("haiku".into()),
     };
     h.runner
-        .run("auto-env", "r1", &h.cwd(), "dump the env", &launch);
+        .run(&monitor_automation("auto-env", &h.cwd(), "dump the env"), "r1", &launch);
     let (_, _, outcome) = h.one_closed(Duration::from_secs(10));
     for key in STRIPPED {
         std::env::remove_var(key);

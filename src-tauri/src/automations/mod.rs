@@ -1247,11 +1247,13 @@ impl AutomationManager {
             self.store.mutate(|map| {
                 map.get_mut(automation_id).map(|a| {
                     let res = a.close(run_id, outcome, now);
+                    // Guard on `session_id` first: the row scan must not run
+                    // on the (vastly more common) `None` closes.
                     if res == model::CloseResult::Closed {
-                        if let (Some(sid), Some(row)) =
-                            (session_id, a.runs.iter_mut().find(|r| r.id == run_id))
-                        {
-                            row.session_id = Some(sid.to_owned());
+                        if let Some(sid) = session_id {
+                            if let Some(row) = a.runs.iter_mut().find(|r| r.id == run_id) {
+                                row.session_id = Some(sid.to_owned());
+                            }
                         }
                     }
                     res
