@@ -20,10 +20,41 @@
 //! [`scrub_secrets`] — this scan matches tokens by prefix/shape, which a
 //! zero-width or control character *inside* a token defeats (`sk-\u{200B}ant-…`
 //! slips past, and a later sanitize pass would re-form the cleartext). Truncate
-//! last, so the scrub always sees full, unstraddled values.
+//! last, so the scrub always sees full, unstraddled values. The order lives in
+//! ONE place: [`clean_text`] / [`clean_captured`] (headless-monitor-checks U5,
+//! R8) — every capture path calls those, never the composition inline, so the
+//! invariant cannot drift between paths.
 
 /// The placeholder every match collapses to.
 const MASK: &str = "[redacted]";
+
+/// The module-doc call-order contract as one named step (headless-monitor-
+/// checks U5, R8): **sanitize control chars FIRST, then scrub** — a control /
+/// zero-width char inside a token would otherwise split it past the prefix/
+/// shape scan and a later sanitize pass would re-form the cleartext (the
+/// order test below proves the hazard). The tail cap stays OUT of this
+/// helper deliberately: it runs at close inside `Automation::close`, after
+/// the verdict parse, so R8's parse-before-cap holds by construction.
+///
+/// This is the raw composition — it preserves an all-whitespace result. Most
+/// callers want [`clean_captured`]; the Infra-reason path
+/// (`AutomationManager::close_headless_run`) uses this directly because a
+/// stored error string must never collapse to `None`.
+pub fn clean_text(text: &str) -> String {
+    scrub_secrets(&crate::notify::sanitize_multiline(text))
+}
+
+/// [`clean_text`] plus the empty→`None` mapping: the shared cleaning helper
+/// for captured run output (headless-monitor-checks U5, R8). Both capture
+/// paths call it — `lib.rs`'s `OutputCapturer` closure (the pane transcript
+/// capture) and `AutomationManager::close_headless_run` (the headless stream
+/// result) — so an output that cleans to nothing reads as an *absent*
+/// capture on either path (`None`, which the derived broken-monitor counter
+/// counts as unreadable).
+pub fn clean_captured(text: &str) -> Option<String> {
+    let cleaned = clean_text(text);
+    (!cleaned.trim().is_empty()).then_some(cleaned)
+}
 
 /// Uppercased substrings that mark an env-style assignment key as sensitive:
 /// `AWS_SECRET_ACCESS_KEY=…`, `GITHUB_TOKEN=…`, `DB_PASSWORD=…`, … The value
@@ -261,5 +292,44 @@ mod tests {
         // Sanitize-then-scrub re-joins the token and masks it whole.
         let sane = crate::notify::sanitize_multiline(raw);
         assert_eq!(scrub_secrets(&sane), "the token [redacted] leaked");
+    }
+
+    // ---- clean_text / clean_captured (headless-monitor-checks U5, R8) -------
+
+    // The shared helper bakes the order in: a control char (and a zero-width
+    // char) INSIDE a secret token would split it past the scrub if the order
+    // flipped — through the helper the token is re-joined first and masked
+    // whole. This is the same hazard the test above documents, asserted on
+    // the one entry both capture paths actually call.
+    #[test]
+    fn clean_captured_sanitizes_before_scrubbing_so_split_tokens_still_mask() {
+        // Zero-width space inside the token (a format char, stripped).
+        assert_eq!(
+            clean_captured("the token s\u{200B}k-ant-api03-abcdefghijklmnop leaked").as_deref(),
+            Some("the token [redacted] leaked")
+        );
+        // A control char inside the token (BEL, stripped) — same guarantee.
+        assert_eq!(
+            clean_captured("key: gh\u{7}p_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345").as_deref(),
+            Some("key: [redacted]")
+        );
+    }
+
+    // Empty-after-cleaning maps to None (an absent capture, which the derived
+    // broken-monitor counter reads as unreadable) — but only through
+    // `clean_captured`; the raw `clean_text` sibling preserves the string for
+    // the Infra-reason path, which must never lose its stored error.
+    #[test]
+    fn clean_captured_maps_empty_after_cleaning_to_none() {
+        assert_eq!(clean_captured(""), None);
+        assert_eq!(clean_captured("   \n\t"), None, "whitespace-only");
+        assert_eq!(
+            clean_captured("\u{1b}\u{7}\u{200B}"),
+            None,
+            "control/format chars alone clean to nothing"
+        );
+        // The sibling keeps whatever survives cleaning, even pure whitespace.
+        assert_eq!(clean_text("   \n\t"), "   \n\t");
+        assert_eq!(clean_text("\u{1b}[2Jok"), "[2Jok");
     }
 }

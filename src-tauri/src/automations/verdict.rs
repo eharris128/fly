@@ -162,17 +162,42 @@ pub struct BundleContext<'a> {
     pub closed_at_ms: u64,
 }
 
+/// Headless-monitor-checks U5 (its R12): the failing **check's own**
+/// diagnostic session — the stream-derived session id stamped on the closed
+/// run row plus the transcript path derived from it
+/// (`~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, the plan's
+/// Empirical Contract). The caller derives the path via
+/// `session::transcript::claude_project_dir` (the one home of the cwd
+/// encoding — never reimplemented here; this module stays pure) and
+/// sanitizes the id at build time (the R16 rendered-document posture — the
+/// id is untrusted stream JSON). `transcript_path` is `None` when no
+/// home/config root resolves; the block then renders the id alone.
+///
+/// Rendered as its own labeled block, deliberately **distinct from the
+/// registration-time "Pickup pointers"**: the pointers are the parked
+/// experiment's parent session (the pickup target); this is the check run
+/// that produced the verdict (the diagnostic). An operator triaging a FAIL
+/// must never conflate the two.
+pub struct CheckSession {
+    pub session_id: String,
+    pub transcript_path: Option<String>,
+}
+
 /// R15: render the durable failure bundle written for a FAIL verdict — the
-/// verdict note, the pickup pointers captured at registration (R11/R4), and
-/// the captured final turn as evidence (the bundle lives outside the R8
-/// run-output tail cap; the caller applies its own generous evidence cap).
-/// Pure string assembly; the manager writes it to disk after the close
+/// verdict note, the pickup pointers captured at registration (R11/R4), the
+/// failing check's own session block when one is known
+/// ([`CheckSession`], headless-monitor-checks U5 — omitted entirely when the
+/// close carried no session id, e.g. a legacy row closed without an `init`
+/// event), and the captured final turn as evidence (the bundle lives outside
+/// the R8 run-output tail cap; the caller applies its own generous evidence
+/// cap). Pure string assembly; the manager writes it to disk after the close
 /// mutation releases the store lock (KTD-B), fail-tolerant.
 pub fn render_bundle(
     ctx: &BundleContext,
     verdict: &Verdict,
     evidence: &str,
     pointers: Option<&MonitorPointers>,
+    check_session: Option<&CheckSession>,
 ) -> String {
     let pointers_block = match pointers {
         Some(p) => format!(
@@ -180,6 +205,24 @@ pub fn render_bundle(
             p.session_id, p.transcript_path, p.session_cwd
         ),
         None => "(none captured — pointers are stamped at monitor registration)".to_owned(),
+    };
+    let check_session_block = match check_session {
+        Some(cs) => {
+            let path_line = match &cs.transcript_path {
+                Some(p) => format!("\n- transcriptPath: {p}"),
+                None => String::new(),
+            };
+            format!(
+                "\n## Check session\n\
+                 \n\
+                 The failing check's own session (diagnostic) — NOT a pickup target;\n\
+                 pick up from the pointers above.\n\
+                 \n\
+                 - sessionId: {}{path_line}\n",
+                cs.session_id
+            )
+        }
+        None => String::new(),
     };
     format!(
         "# Monitor failure bundle — {name}\n\
@@ -196,6 +239,7 @@ pub fn render_bundle(
          ## Pickup pointers\n\
          \n\
          {pointers_block}\n\
+         {check_session_block}\
          \n\
          ## Evidence — the check's full final message\n\
          \n\
@@ -373,7 +417,7 @@ mod tests {
             run_id: "r1",
             closed_at_ms: 70_000,
         };
-        let b = render_bundle(&ctx, &v, "full final turn here", Some(&p));
+        let b = render_bundle(&ctx, &v, "full final turn here", Some(&p), None);
         assert!(b.contains("train watch"));
         assert!(b.contains("- automation: a1"));
         assert!(b.contains("- run: r1"));
@@ -383,6 +427,84 @@ mod tests {
         assert!(b.contains("transcriptPath: /home/u/.claude/projects/x/sess-9.jsonl"));
         assert!(b.contains("sessionCwd: /home/u/exp"));
         assert!(b.contains("full final turn here"));
+        // No session id on the close (pane-era/legacy edge) ⇒ the Check
+        // session block is omitted entirely, never rendered empty.
+        assert!(!b.contains("Check session"));
+    }
+
+    // Headless-monitor-checks U5 (its R12): the failing check's own session
+    // rides the bundle as a clearly-labeled block — id + derived transcript
+    // path — distinct from the registration-time pickup pointers, so an
+    // operator never confuses the check's diagnostic session with the parent
+    // pickup target.
+    #[test]
+    fn bundle_renders_the_check_session_block_distinct_from_pickup_pointers() {
+        let v = Verdict {
+            outcome: VerdictOutcome::Fail,
+            note: "loss diverged".into(),
+        };
+        let p = MonitorPointers {
+            session_id: "sess-parent".into(),
+            transcript_path: "/home/u/.claude/projects/x/sess-parent.jsonl".into(),
+            session_cwd: "/home/u/exp".into(),
+        };
+        let cs = CheckSession {
+            session_id: "sess-check".into(),
+            transcript_path: Some("/home/u/.claude/projects/x/sess-check.jsonl".into()),
+        };
+        let ctx = BundleContext {
+            automation_name: "train watch",
+            automation_id: "a1",
+            run_id: "r1",
+            closed_at_ms: 70_000,
+        };
+        let b = render_bundle(&ctx, &v, "evidence", Some(&p), Some(&cs));
+        assert!(b.contains("## Check session"), "its own labeled block");
+        assert!(b.contains("- sessionId: sess-check"));
+        assert!(b.contains(
+            "- transcriptPath: /home/u/.claude/projects/x/sess-check.jsonl"
+        ));
+        assert!(
+            b.contains("NOT a pickup target"),
+            "the block itself disambiguates against the pointers"
+        );
+        // Both blocks coexist; the pickup pointers are untouched.
+        assert!(b.contains("## Pickup pointers"));
+        assert!(b.contains("- sessionId: sess-parent"));
+        // Ordering: pointers first (the pickup target leads), then the
+        // check's diagnostic session, then the evidence.
+        let pointers_at = b.find("## Pickup pointers").unwrap();
+        let check_at = b.find("## Check session").unwrap();
+        let evidence_at = b.find("## Evidence").unwrap();
+        assert!(pointers_at < check_at && check_at < evidence_at);
+    }
+
+    // U5 degraded shape: a check session whose transcript path could not be
+    // derived (no home/config root) still renders its id — the path line is
+    // simply absent, never a blank value.
+    #[test]
+    fn check_session_without_a_derivable_path_renders_the_id_alone() {
+        let v = Verdict {
+            outcome: VerdictOutcome::Fail,
+            note: "died".into(),
+        };
+        let cs = CheckSession {
+            session_id: "sess-check".into(),
+            transcript_path: None,
+        };
+        let ctx = BundleContext {
+            automation_name: "w",
+            automation_id: "a1",
+            run_id: "r1",
+            closed_at_ms: 1,
+        };
+        let b = render_bundle(&ctx, &v, "evidence", None, Some(&cs));
+        assert!(b.contains("- sessionId: sess-check"));
+        let check_block = &b[b.find("## Check session").unwrap()..];
+        assert!(
+            !check_block.contains("transcriptPath"),
+            "no path line inside the check block when none derived"
+        );
     }
 
     // R15 degraded shape: a monitor without pointers (defensive — U4 refuses
@@ -399,7 +521,7 @@ mod tests {
             run_id: "r1",
             closed_at_ms: 1,
         };
-        let b = render_bundle(&ctx, &v, "evidence", None);
+        let b = render_bundle(&ctx, &v, "evidence", None, None);
         assert!(b.contains("(none captured"));
         assert!(b.contains("evidence"));
     }

@@ -1441,17 +1441,19 @@ impl AutomationManager {
     /// **Cleaning happens here**, per [`headless::CheckOutcome`]'s
     /// sanitize/scrub contract (nothing in `headless.rs` is cleaned): both
     /// the Clean result text and the Infra reason go sanitize → scrub before
-    /// touching the row — the same inline composition, in the same order, as
-    /// `lib.rs`'s `OutputCapturer` closure (control chars first, so one
-    /// inside a token can't split it past the scrub; the R8 tail cap last,
-    /// inside the close mutation, AFTER the tail's verdict parse). U5
-    /// extracts the composition into a named [`redact`] helper shared with
-    /// that closure so the order can't drift. Empty-after-cleaning result
-    /// text maps to `None` — exact parity with a pane capture that came back
-    /// empty, so the row reads *unreadable* in the derived R7 counter. The
-    /// Infra reason (which may embed the runner-bounded raw stderr tail) is
-    /// additionally head-capped — the fly-authored classification message
-    /// leads it — since `error` has no cap of its own in the close.
+    /// touching the row, through the ONE shared helper pair
+    /// ([`redact::clean_captured`] / [`redact::clean_text`], U5) that
+    /// `lib.rs`'s `OutputCapturer` closure also calls — so the order
+    /// invariant (control chars first, or one inside a token splits it past
+    /// the scrub; the R8 tail cap last, inside the close mutation, AFTER the
+    /// tail's verdict parse) cannot drift between paths.
+    /// Empty-after-cleaning result text maps to `None` — exact parity with a
+    /// pane capture that came back empty, so the row reads *unreadable* in
+    /// the derived R7 counter. The Infra reason (which may embed the
+    /// runner-bounded raw stderr tail) goes through [`redact::clean_text`] —
+    /// the non-`None`ing sibling, since a stored error string must survive —
+    /// and is additionally head-capped (the fly-authored classification
+    /// message leads it) since `error` has no cap of its own in the close.
     ///
     /// An unknown automation id (deleted mid-check) is a benign no-op, like
     /// every reaper-side close; an already-terminal row lands as the usual
@@ -1467,15 +1469,12 @@ impl AutomationManager {
         };
         let (outcome, session_id): (RunOutcome, Option<String>) = match outcome {
             headless::CheckOutcome::Clean { text, session_id } => {
-                let sane = crate::notify::sanitize_multiline(&text);
-                let scrubbed = redact::scrub_secrets(&sane);
-                let output = (!scrubbed.trim().is_empty()).then_some(scrubbed);
+                let output = redact::clean_captured(&text);
                 (RunOutcome::Succeeded { output }, session_id)
             }
             headless::CheckOutcome::Infra { reason } => {
-                let sane = crate::notify::sanitize_multiline(&reason);
-                let scrubbed = redact::scrub_secrets(&sane);
-                let error = head_capped(&scrubbed, model::OUTPUT_TAIL_CAP_BYTES).to_owned();
+                let cleaned = redact::clean_text(&reason);
+                let error = head_capped(&cleaned, model::OUTPUT_TAIL_CAP_BYTES).to_owned();
                 (
                     RunOutcome::Failed {
                         error,
@@ -1507,7 +1506,12 @@ impl AutomationManager {
     ///
     /// Headless-monitor-checks U4 (R12): `session_id` — the headless check's
     /// stream-derived id — rides the same mutation, stamped on the row with
-    /// the verdict; `None` on the pane path.
+    /// the verdict; `None` on the pane path. On a FAIL it also rides the
+    /// bundle as the "Check session" block (U5): the id plus the transcript
+    /// path derived from the automation's cwd
+    /// ([`crate::session::transcript::claude_project_dir`] — the one home of
+    /// the cwd encoding), distinct from the registration-time pickup
+    /// pointers; omitted entirely when the close carried no id.
     fn close_monitor_run_retiring(
         &self,
         automation: &Automation,
@@ -1599,11 +1603,34 @@ impl AutomationManager {
                 run_id,
                 closed_at_ms: now,
             };
+            // Headless-monitor-checks U5 (R12): the check's own diagnostic
+            // session block. The id is untrusted stream JSON embedded into a
+            // rendered document — flatten control chars at write time, the
+            // alerts-log posture (R16), like the name above (the row keeps
+            // the raw id; real ids are UUIDs, so this is a no-op there). The
+            // transcript path derives from the sanitized id so the two lines
+            // cohere; `None` (no home/config root) drops just the path line.
+            let check_session = session_id.map(|sid| {
+                let safe_sid = crate::notify::sanitize_title(sid);
+                let transcript_path = crate::session::transcript::claude_project_dir(
+                    std::path::Path::new(&automation.cwd),
+                )
+                .map(|d| {
+                    d.join(format!("{safe_sid}.jsonl"))
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                verdict::CheckSession {
+                    session_id: safe_sid,
+                    transcript_path,
+                }
+            });
             let rendered = verdict::render_bundle(
                 &ctx,
                 &verdict,
                 tail_capped(evidence, BUNDLE_EVIDENCE_CAP_BYTES),
                 automation.pickup_pointers.as_ref(),
+                check_session.as_ref(),
             );
             bundle_note = match &bundle_path {
                 Some(p) => match write_bundle_file(std::path::Path::new(p), &rendered) {
@@ -3967,6 +3994,17 @@ mod tests {
             content.contains("Traceback: boom at train.py:88"),
             "full evidence, pre-cap (R8)"
         );
+        // U5 (R12): the check's own session rides the bundle as its labeled
+        // block — id plus the transcript path derived from the automation's
+        // cwd through the ONE encoding home (session::transcript, never
+        // reimplemented). The spec cwd is "/tmp" → "-tmp".
+        assert!(content.contains("## Check session"));
+        assert!(content.contains("- sessionId: sess-check"));
+        let enc = crate::session::transcript::encode_cwd("/tmp");
+        assert!(
+            content.contains(&format!("{enc}/sess-check.jsonl")),
+            "the derived transcript path rides the bundle: {content}"
+        );
         {
             let alerts = h.monitor_alerts.lock().unwrap();
             assert_eq!(alerts.len(), 1, "rings once through the alert sink");
@@ -4987,6 +5025,9 @@ mod tests {
             content.contains("Traceback (most recent call last): boom at train.py:88"),
             "the full evidence text, not the tail cap"
         );
+        // U5 (R12): a pane-path close carries no check session id — the
+        // Check-session block is omitted entirely, never rendered empty.
+        assert!(!content.contains("Check session"));
 
         let alerts = h.monitor_alerts.lock().unwrap();
         assert_eq!(alerts.len(), 1);
