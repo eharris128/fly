@@ -158,6 +158,10 @@ pub const ERR_HEADLESS_BACKSTOP: &str =
 pub const SKIP_IN_FLIGHT: &str = "run in flight";
 /// Skip reason recorded for the U5 global script-capacity skip (KTD-D).
 pub const SKIP_CAPACITY: &str = "capacity";
+/// Skip reason recorded for the usage-limit deferral skip (usage-limit-
+/// deferral plan, R3). Terse like its siblings — the deferred time is
+/// visible as the automation's next run, not in the reason.
+pub const SKIP_USAGE_LIMIT: &str = "usage limit";
 
 /// The Tauri event emitted after every mutation (payload: the automation id).
 /// The dashboard (U10) refetches on it.
@@ -256,6 +260,18 @@ pub type HeadlessAliveProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// entry-gone case (matching
 /// [`headless::HeadlessRunner::monotonic_deadline_lapsed`], wired in U5).
 pub type HeadlessDeadlineGate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Usage-limit-deferral U3 seam: the plan-usage gate consulted before an
+/// **agent-mode** claim. Given now (epoch ms), returns `Some(floor_ms)` when
+/// the plan is confidently at a usage limit until `floor_ms` — the sweep then
+/// records a pre-claim skip and defers the schedule to the first occurrence
+/// at-or-after the floor — and `None` otherwise (dispatch normally). Fail-open
+/// is the *implementation's* contract (KTD3): every fetch/parse/credential
+/// uncertainty must come back `None`, so the gate can only ever delay a run.
+/// May do bounded network I/O — consulted **before** the sweep's mutate takes
+/// the store lock (KTD2/KTD-B), never inside it. Default: always-open
+/// (`None`); `lib.rs` injects [`crate::usage::gate::OauthUsageGate`] (U4).
+pub type UsageGate = Arc<dyn Fn(u64) -> Option<u64> + Send + Sync>;
 
 /// U4b seam: capture an agent run's final assistant turn for its
 /// [`RunRow::output`] (R8). Given the automation's `cwd` and the run's dispatch
@@ -563,6 +579,10 @@ pub struct AutomationManager {
     /// Headless-monitor-checks U4 (R7): the backstop's monotonic gate (see
     /// [`HeadlessDeadlineGate`]). Default `true` (= entry gone).
     headless_deadline_gate: Mutex<HeadlessDeadlineGate>,
+    /// Usage-limit-deferral U3: the plan-usage gate (see [`UsageGate`]).
+    /// Default: always-open, so tests and the CLI role need no wiring;
+    /// `lib.rs` injects the OAuth-backed gate (U4).
+    usage_gate: Mutex<UsageGate>,
     /// U4a: shared config for agent-launch resolution (model/effort/fallback,
     /// R11/R12/R15). Read off the store lock (KTD8). Defaults to an ephemeral
     /// store with `Config::default()` so tests need no config wiring; `lib.rs`
@@ -642,6 +662,7 @@ impl AutomationManager {
             headless_killer: Mutex::new(Arc::new(|_run_id: &str| {})),
             headless_check_alive: Mutex::new(Arc::new(|_automation_id: &str| false)),
             headless_deadline_gate: Mutex::new(Arc::new(|_run_id: &str| true)),
+            usage_gate: Mutex::new(Arc::new(|_now_ms: u64| None)),
             config: Mutex::new(Arc::new(ConfigStore::ephemeral(
                 crate::config::Config::default(),
             ))),
@@ -757,6 +778,12 @@ impl AutomationManager {
     /// [`HeadlessDeadlineGate`]).
     pub fn set_headless_deadline_gate(&self, g: HeadlessDeadlineGate) {
         *self.headless_deadline_gate.lock().unwrap() = g;
+    }
+
+    /// Inject the plan-usage gate (usage-limit-deferral U3; `lib.rs` wires
+    /// [`crate::usage::gate::OauthUsageGate`] in U4).
+    pub fn set_usage_gate(&self, g: UsageGate) {
+        *self.usage_gate.lock().unwrap() = g;
     }
 
     /// U4a: inject the real file-backed [`ConfigStore`] so agent-launch
@@ -1789,10 +1816,14 @@ impl AutomationManager {
     ///    flushes before returning — R2's persist-before-run): close R10
     ///    ack-timed-out agent rows; then for each due automation run the
     ///    KTD-D pre-claim checks (R7 overlap → skipped row + advance; U5
-    ///    capacity → skipped("capacity") + advance) or claim it (advance via
-    ///    [`schedule::advance`] + `Running` row). No `Running` row is ever
-    ///    persisted and then abandoned: every claim collected here is
-    ///    dispatched in phase 2, and a dispatch failure closes it.
+    ///    capacity → skipped("capacity") + advance; usage-limit-deferral U3 —
+    ///    agent-mode at a confidently-exhausted plan window →
+    ///    skipped("usage limit") + advance floored to the limit's reset,
+    ///    with the gate verdict resolved *before* this lock, KTD2) or claim
+    ///    it (advance via [`schedule::advance`] + `Running` row). No
+    ///    `Running` row is ever persisted and then abandoned: every claim
+    ///    collected here is dispatched in phase 2, and a dispatch failure
+    ///    closes it.
     /// 2. **Lock released**: dispatch each claim. Failure → recompute
     ///    `next_run_at` from now (R3 — never the pre-claim value) and close
     ///    the row failed, in a second short mutate.
@@ -1834,6 +1865,43 @@ impl AutomationManager {
         // put back after the mutate.
         let retry_ids: Vec<String> = self.retry_queue.lock().unwrap().drain(..).collect();
         let mut requeue: Vec<String> = Vec::new();
+
+        // Usage-limit-deferral U3 (KTD2): resolve the plan-usage verdict
+        // BEFORE the store lock — the gate may do bounded network I/O, which
+        // must never ride a lock hold (KTD-B). It is consulted at all only
+        // when this tick could actually claim an agent-mode occurrence (a due
+        // agent automation that the R5 readiness gate would let through, or a
+        // drained agent retry), so no dispatch-less tick ever fetches —
+        // KTD-C's "never on a timer" holds subsystem-wide. The snapshot
+        // peek is a benign TOCTOU: an automation becoming due between the
+        // peek and the mutate misses the gate for one 10s tick.
+        let usage_floor: Option<u64> = if !self
+            .config
+            .lock()
+            .unwrap()
+            .get()
+            .automation_defaults
+            .usage_gate
+        {
+            None // R9: gated off in config — never consulted.
+        } else {
+            let snap = self.store.snapshot();
+            let agent_claim_possible = snap.values().any(|a| {
+                a.enabled
+                    && a.mode.kind() == RunMode::Agent
+                    && (frontend_ready || a.monitor)
+                    && a.next_run_at.is_some_and(|t| t <= now_ms)
+            }) || retry_ids.iter().any(|id| {
+                snap.get(id)
+                    .is_some_and(|a| a.enabled && a.mode.kind() == RunMode::Agent)
+            });
+            if agent_claim_possible {
+                let gate = Arc::clone(&self.usage_gate.lock().unwrap());
+                gate(now_ms)
+            } else {
+                None
+            }
+        };
 
         // Phase 1: decide + mutate + flush under ONE lock hold.
         let mut changed: Vec<String> = Vec::new();
@@ -1922,6 +1990,22 @@ impl AutomationManager {
                         a.skip(now_ms, Trigger::Schedule, SKIP_CAPACITY, &mint_id());
                         a.rollback_recompute(advance_or_pause(a, now_ms));
                         touched = true;
+                    } else if is_agent && usage_floor.is_some() {
+                        // Usage-limit-deferral U3 (R3/KTD1): the plan is
+                        // confidently at a usage limit — record the occurrence
+                        // as skipped and defer the schedule to the first cron
+                        // occurrence at-or-after the reset (the floor composes
+                        // with a monitor's own not-before via max, KTD4).
+                        // Monitors included: an at-limit check would only burn
+                        // an infra failure toward "monitor broken". Scripts
+                        // never reach this arm (no model spend).
+                        a.skip(now_ms, Trigger::Schedule, SKIP_USAGE_LIMIT, &mint_id());
+                        a.rollback_recompute(advance_or_pause_floored(
+                            a,
+                            now_ms,
+                            usage_floor,
+                        ));
+                        touched = true;
                     } else {
                         // Claim (R2/R4): advance from NOW — collapsing any
                         // backlog into this one occurrence — and append the
@@ -1980,6 +2064,17 @@ impl AutomationManager {
                 }
                 if in_flight_widened(a, &alive, &headless_alive) {
                     continue; // a run is already in flight — the retry is moot
+                }
+                if a.mode.kind() == RunMode::Agent && usage_floor.is_some() {
+                    // Usage-limit-deferral KTD8: an unattended retry at the
+                    // limit is skip-closed with the reason on record — never
+                    // re-queued (readiness flips in seconds; a limit window
+                    // can last days, and re-queueing would poll the endpoint
+                    // until it resets). A retry consumes no occurrence, so no
+                    // recompute — mirroring the retry dispatch-failure path.
+                    a.skip(now_ms, Trigger::Retry, SKIP_USAGE_LIMIT, &mint_id());
+                    changed.push(a.id.clone());
+                    continue;
                 }
                 let run_id = mint_id();
                 let keep = a.next_run_at;
@@ -2371,7 +2466,21 @@ fn in_flight_widened(
 /// pre-claim overlap skip, and capacity skip alike — so no path schedules
 /// early.
 fn advance_or_pause(a: &Automation, now_ms: u64) -> Option<u64> {
-    match schedule::advance_from(&a.cron, &a.timezone, now_ms, a.not_before_ms) {
+    advance_or_pause_floored(a, now_ms, None)
+}
+
+/// [`advance_or_pause`] with an extra one-shot floor (usage-limit-deferral
+/// KTD4): the effective floor is the **max** of the record's own not-before
+/// and the transient floor, so a monitor's parked window still holds when a
+/// usage deferral is in play. The floor rides the same `advance_from` funnel
+/// as every other recompute — the R1 min-gap clamp and the fail-closed range
+/// check on huge floors apply unchanged.
+fn advance_or_pause_floored(a: &Automation, now_ms: u64, floor: Option<u64>) -> Option<u64> {
+    let effective = match (a.not_before_ms, floor) {
+        (Some(nb), Some(f)) => Some(nb.max(f)),
+        (nb, f) => nb.or(f),
+    };
+    match schedule::advance_from(&a.cron, &a.timezone, now_ms, effective) {
         Ok(next) => next,
         Err(e) => {
             eprintln!(
@@ -3334,6 +3443,7 @@ mod tests {
             model: Some("sonnet".into()),
             effort: Some("medium".into()),
             fallback_model: "sonnet".into(),
+            ..AutomationDefaults::default()
         };
         // Automation values win over the shared default; primary opus ≠ sonnet.
         let r = resolve_agent_launch(Some("opus"), Some("high"), &defaults);
@@ -4791,6 +4901,210 @@ mod tests {
         assert_eq!(alerts.lock().unwrap().len(), 1, "not re-alerted on the second tick");
         assert_eq!(h.dispatcher.count(), 1, "agent retry now dispatched");
         assert_eq!(h.runs("a1")[1].trigger, Trigger::Retry);
+    }
+
+    // ---- usage-limit-deferral U3: the pre-claim usage gate -------------------
+
+    /// A settable fake gate: the sweep sees whatever the cell holds, and the
+    /// counter records every consultation (for the KTD-C parity assertions).
+    #[allow(clippy::type_complexity)]
+    fn fake_usage_gate() -> (UsageGate, Arc<Mutex<Option<u64>>>, Arc<AtomicU64>) {
+        let cell: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let calls = Arc::new(AtomicU64::new(0));
+        let (c, n) = (Arc::clone(&cell), Arc::clone(&calls));
+        let gate: UsageGate = Arc::new(move |_now_ms: u64| {
+            n.fetch_add(1, Ordering::SeqCst);
+            *c.lock().unwrap()
+        });
+        (gate, cell, calls)
+    }
+
+    // R3/KTD1: a due agent occurrence at the limit records skipped("usage
+    // limit") — never a dispatch — and the schedule defers to the first
+    // occurrence at-or-after the reset floor, with `automation://changed`
+    // emitted like any other mutation (R7).
+    #[test]
+    fn usage_limit_defers_agent_occurrence_to_the_reset_floor_u3() {
+        let h = harness();
+        h.mgr.set_frontend_ready();
+        let (gate, cell, _calls) = fake_usage_gate();
+        let floor = T0 + 13 * FIVE_MIN;
+        *cell.lock().unwrap() = Some(floor);
+        h.mgr.set_usage_gate(gate);
+        let id = create_due(&h, agent_spec("nightly audit"));
+
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 0, "at-limit: nothing dispatches");
+        let runs = h.runs(&id);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Skipped);
+        assert_eq!(runs[0].error.as_deref(), Some(SKIP_USAGE_LIMIT));
+        assert_eq!(runs[0].trigger, Trigger::Schedule);
+        assert_eq!(runs[0].started_at, None, "born terminal — never ran");
+        let next = h.next_run_at(&id).expect("still scheduled, not paused");
+        assert!(
+            next >= floor,
+            "deferred past the reset: {next} >= {floor}"
+        );
+        assert!(
+            h.events.lock().unwrap().contains(&id),
+            "the skip emits automation://changed"
+        );
+
+        // One skip per limit episode: the same tick re-swept finds the
+        // occurrence deferred, not due — no second row, no fan-out.
+        h.sweep();
+        assert_eq!(h.runs(&id).len(), 1);
+    }
+
+    // KTD3 fail-open: the moment the gate reads open again (limit reset,
+    // fetch error, whatever), the deferred occurrence claims and dispatches
+    // normally.
+    #[test]
+    fn usage_gate_reopening_resumes_normal_dispatch_u3() {
+        let h = harness();
+        h.mgr.set_frontend_ready();
+        let (gate, cell, _calls) = fake_usage_gate();
+        let floor = T0 + 13 * FIVE_MIN;
+        *cell.lock().unwrap() = Some(floor);
+        h.mgr.set_usage_gate(gate);
+        let id = create_due(&h, agent_spec("nightly audit"));
+
+        h.sweep(); // deferred (asserted in the test above)
+        *cell.lock().unwrap() = None;
+        h.set_now(h.next_run_at(&id).unwrap());
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 1, "gate open: the deferred occurrence runs");
+        assert_eq!(h.runs(&id).last().unwrap().status, RunStatus::Running);
+    }
+
+    // R1/KTD-C parity: scripts are never gated — and a tick with no
+    // agent-mode claim possible never consults the gate at all (no
+    // dispatch-less fetch; the gate impl may do network I/O).
+    #[test]
+    fn scripts_dispatch_ungated_and_do_not_consult_the_gate_u3() {
+        let h = harness();
+        let (gate, cell, calls) = fake_usage_gate();
+        *cell.lock().unwrap() = Some(T0 + 13 * FIVE_MIN);
+        h.mgr.set_usage_gate(gate);
+        let id = create_due(&h, script_spec("disk watch"));
+
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 1, "script dispatched at the limit");
+        assert_eq!(h.runs(&id)[0].status, RunStatus::Running);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "script-only tick: the gate is never consulted"
+        );
+    }
+
+    // KTD-C parity, readiness leg: a due agent occurrence the R5 frontend
+    // gate would defer anyway cannot claim this tick, so the usage gate is
+    // not consulted for it either.
+    #[test]
+    fn usage_gate_not_consulted_while_frontend_not_ready_u3() {
+        let h = harness();
+        let (gate, cell, calls) = fake_usage_gate();
+        *cell.lock().unwrap() = Some(T0 + 13 * FIVE_MIN);
+        h.mgr.set_usage_gate(gate);
+        let id = create_due(&h, agent_spec("nightly audit"));
+
+        h.sweep();
+        assert_eq!(h.runs(&id).len(), 0, "R5: untouched — no claim, no skip");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no claim possible ⇒ no consult");
+    }
+
+    // R9: the config knob switches even the *attempt* off — the gate is not
+    // consulted and dispatch proceeds as before the plan.
+    #[test]
+    fn usage_gate_config_off_dispatches_without_consulting_r9() {
+        let h = harness();
+        h.mgr.set_frontend_ready();
+        let mut cfg = crate::config::Config::default();
+        cfg.automation_defaults.usage_gate = false;
+        h.mgr.set_config(Arc::new(ConfigStore::ephemeral(cfg)));
+        let (gate, cell, calls) = fake_usage_gate();
+        *cell.lock().unwrap() = Some(T0 + 13 * FIVE_MIN);
+        h.mgr.set_usage_gate(gate);
+        let id = create_due(&h, agent_spec("nightly audit"));
+
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 1, "knob off: dispatches at the limit");
+        assert_eq!(h.runs(&id)[0].status, RunStatus::Running);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "knob off: never consulted");
+    }
+
+    // R7: a monitor's usage skip is neutral — it neither counts toward the
+    // broken-monitor escalation nor rings an alert, and the monitor's floor
+    // composes with the deferral (KTD4: max of not-before and reset floor).
+    #[test]
+    fn monitor_usage_skip_stays_neutral_and_floor_composes_r7() {
+        let h = harness();
+        let (gate, cell, _calls) = fake_usage_gate();
+        let reset_floor = T0 + 13 * FIVE_MIN;
+        *cell.lock().unwrap() = Some(reset_floor);
+        h.mgr.set_usage_gate(gate);
+        let id = create_due(&h, agent_spec("curve check"));
+        make_monitor(&h, &id);
+        // A parked not-before FURTHER out than the reset floor must win.
+        let parked_floor = T0 + 40 * FIVE_MIN;
+        let _ = h.mgr.store.mutate(|map| {
+            map.get_mut(&id).unwrap().not_before_ms = Some(parked_floor);
+        });
+
+        h.sweep(); // monitors bypass the frontend-ready gate, not this one
+        let a = h.mgr.get(&id).unwrap();
+        assert_eq!(a.runs.len(), 1);
+        assert_eq!(a.runs[0].status, RunStatus::Skipped);
+        assert_eq!(a.runs[0].error.as_deref(), Some(SKIP_USAGE_LIMIT));
+        assert_eq!(
+            a.consecutive_infra_failures(),
+            0,
+            "a usage skip is neutral to the broken-monitor counter"
+        );
+        assert!(
+            h.monitor_alerts.lock().unwrap().is_empty(),
+            "a deferral is expected behavior — no alert"
+        );
+        assert!(
+            a.next_run_at.unwrap() >= parked_floor,
+            "the larger not-before floor still holds (KTD4)"
+        );
+    }
+
+    // KTD8: an unattended agent retry at the limit is skip-closed with the
+    // reason on record — no recompute (a retry consumes no occurrence) and
+    // no re-queue (retry-once).
+    #[test]
+    fn usage_limit_skip_closes_agent_retry_without_recompute_ktd8() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_interrupted(&dir, true, agent_mode(), Trigger::Schedule);
+        let h = harness_in(dir);
+        h.mgr.set_frontend_ready();
+        let (gate, cell, _calls) = fake_usage_gate();
+        *cell.lock().unwrap() = Some(T0 + 13 * FIVE_MIN);
+        h.mgr.set_usage_gate(gate);
+        let before = h.next_run_at("a1");
+
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 0, "at-limit: the retry never dispatches");
+        let runs = h.runs("a1");
+        assert_eq!(runs.len(), 2, "failed original + skipped retry");
+        assert_eq!(runs[1].status, RunStatus::Skipped);
+        assert_eq!(runs[1].trigger, Trigger::Retry);
+        assert_eq!(runs[1].error.as_deref(), Some(SKIP_USAGE_LIMIT));
+        assert_eq!(
+            h.next_run_at("a1"),
+            before,
+            "a retry consumes no occurrence — no recompute"
+        );
+
+        // Retry-once: the gate reopening later does not resurrect the retry.
+        *cell.lock().unwrap() = None;
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 0, "skip-closed retry is not re-enqueued");
+        assert_eq!(h.runs("a1").len(), 2);
     }
 
     // ---- monitor-handoff U3: verdict close, retire, bundle, escalation ------

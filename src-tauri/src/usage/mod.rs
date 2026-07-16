@@ -27,6 +27,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub mod gate;
+
 /// The endpoint behind `/usage`'s gauges.
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// The OAuth beta header Claude Code sends with `/api/oauth/*` calls.
@@ -187,12 +189,20 @@ fn snapshot_from_json(body: &str, plan: Option<String>) -> Result<UsageSnapshot,
 /// blank panel. Called on dashboard open only (KTD-C), never on a timer.
 #[tauri::command]
 pub async fn usage_snapshot() -> Result<UsageSnapshot, String> {
+    fetch_snapshot(REQUEST_TIMEOUT).await
+}
+
+/// The shared request core behind [`usage_snapshot`] (dashboard, 30s budget)
+/// and the automations usage gate ([`gate`], short budget — usage-limit-
+/// deferral plan, KTD5). One code path so the two callers can't drift on
+/// credentials, headers, or parse.
+pub(crate) async fn fetch_snapshot(timeout: Duration) -> Result<UsageSnapshot, String> {
     let oauth = read_oauth()?;
     let plan = oauth.subscription_type.clone();
     let token = oauth.access_token.unwrap_or_default();
 
     let client = reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(timeout)
         .user_agent(concat!("fly/", env!("CARGO_PKG_VERSION"), " (usage-panel)"))
         .build()
         .map_err(|e| format!("couldn't build HTTP client: {e}"))?;
