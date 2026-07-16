@@ -136,7 +136,10 @@ pub struct QuestionBody {
 }
 
 /// The last run's healthcheck verdict on the wire (monitor enrichment, U6 of
-/// `docs/plans/2026-07-11-001-feat-ambient-wall-monitor-fixture-plan.md`):
+/// the *game* repo's `2026-07-11-001-feat-ambient-wall-monitor-fixture-plan.md`
+/// — not a fly plan; fly's own `2026-07-11-001-*` is the unrelated
+/// feed-other-answer plan. Fly-side record:
+/// `docs/notes/2026-07-16-feed-monitor-enrichment.md`):
 /// the PASS/FAIL outcome plus its short note, projected from the terminal
 /// run's [`crate::automations::model::Verdict`]. A verdict is parsed only from
 /// a run whose infra outcome *succeeded* (the check process ran cleanly), so a

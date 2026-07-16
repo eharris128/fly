@@ -7,8 +7,11 @@
 
 This feature shipped without a fly-side plan: its design lives in the *game*
 repo's Ambient Wall plan (the `U6`/`U7` IDs cited in the wire doc-comments are
-that plan's units, not a fly plan's). This note is the fly-side record so the
-wire-contract change has a doc footprint here.
+that plan's units, not a fly plan's — and the
+`2026-07-11-001-feat-ambient-wall-monitor-fixture-plan.md` path they cite
+resolves in the game repo, not under fly's `docs/plans/`, where
+`2026-07-11-001-*` is the unrelated feed-other-answer plan). This note is the
+fly-side record so the wire-contract change has a doc footprint here.
 
 ## What and why
 

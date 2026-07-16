@@ -9,6 +9,15 @@ origin: none (solo ce-plan invocation)
 
 # feat: Local read-only agent/automation feed for the `game` portfolio
 
+> **Addendum (2026-07-16) — wire sketch superseded by the shipped contract.**
+> The entry shapes sketched below have drifted as later plans enriched the
+> feed (feed-agent-reply-io, feed-pending-question, feed-conversation-tail,
+> feed-other-answer, and the feed-monitor-enrichment note): `AgentEntry`
+> dropped `title` and gained `num`/`lastReplyAt`/`questionPendingAt`;
+> `AutomationEntry` renamed `schedule`→`cron`+`timezone` and `paused`→`enabled`
+> and gained `monitor`/`retiredAt`/`lastVerdict`. The live contract is
+> `src-tauri/src/feed/wire.rs`, mirrored in `src/lib/feed.ts`.
+
 ## Summary
 
 Expose fly's live picture of **what agents are running** and **what automations

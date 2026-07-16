@@ -7,6 +7,15 @@ deepened: 2026-07-01
 
 # feat: Automations — scheduled agent and script runs
 
+> **Addendum (2026-07-16) — agent-run placement superseded.** R9/U8 place an
+> agent run's tab in the automation's *origin* workspace (first workspace when
+> the origin is gone). `2026-07-03-002-feat-automations-workspace-and-model-plan.md`
+> replaced that: every agent run (and the alerts-log tab) now lands in one
+> durable Automations workspace resolved by a persisted `role: "automations"`
+> marker (provision-if-absent), never by workspace id. Read R9/U8's placement
+> mechanics as the legacy path; the rest of the dispatch contract (background
+> tab, no focus steal, ephemeral flag, run↔pane linkage) is unchanged.
+
 ## Summary
 
 Port bb's automations concept (github.com/ymichael/bb) into fly: cron-scheduled tasks that, when due, either spawn a fresh pane running Claude Code with a stored prompt (**agent** mode) or run a stored script with no model spend (**script** mode). Script runs use bb's silent-tick wake gate — empty stdout or a trailing `{"wakeAgent": false}` line is a silent success; any other stdout is an alert surfaced in a dedicated alerts pane and raised through fly's existing attention/notification pipeline. Scheduling is bb's sweep + persist-before-run claim adapted to fly's single-process desktop shape. Creation is CLI-first (`fly automation …`) over the existing authenticated hook socket, with bb's origin-stamping and no-recursion gate. The dashboard gains a read-only automations panel.

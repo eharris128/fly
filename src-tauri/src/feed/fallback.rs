@@ -2,6 +2,12 @@
 //! (feed-question-screen-fallback U5, KTD4/KTD5/KTD7, R1/R2/R5; gate widened
 //! by fix-feed-question-detection-gaps — see below).
 //!
+//! Since hook-ask-channel (its U6), a held `ask/hold` permission ask is
+//! consulted *first* — ahead of the transcript — and short-circuits the whole
+//! chain (`source:"hook"`; the held connection is the proof, no corroboration
+//! needed). Everything below is the fallback chain behind it, unchanged when
+//! no ask is held.
+//!
 //! Wraps the transcript-pure [`ReplyResolver`] behind the same `IoFn` seam the
 //! server reads, adding the v2.1.206 fallback strictly *behind* it (R1): when
 //! the transcript yields a pending question nothing changes; when it abstains,
