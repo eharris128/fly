@@ -7,6 +7,16 @@ deepened: 2026-07-06
 
 # feat: Expose pending agent questions over the local feed (`feed-pending-question`)
 
+> **Addendum (2026-07-16) — the "single content source" premise superseded.**
+> KTD1's claim that the transcript is the only source of question content no
+> longer holds: `2026-07-10-001-feat-feed-question-screen-fallback-plan.md`
+> added a screen-grid source (Claude Code ≥ 2.1.206 stopped flushing the ask at
+> ask time), and `2026-07-11-002-feat-hook-ask-channel-plan.md` made a held
+> `PermissionRequest` hook ask the *primary* leg, ahead of the transcript. Read
+> KTD1/KTD2 as the transcript leg of a three-source chain (hook → transcript →
+> screen). The guarded answer path (`ifAskedAt`, the answered latch, the
+> permission gate) below is unchanged and applies to all three sources.
+
 ## Summary
 
 When an agent stops to ask the user something — an AskUserQuestion

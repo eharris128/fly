@@ -241,8 +241,9 @@ time/inputs as arguments so they're tested without a running app.
 - `notify/`, `config/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
   reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the
-  frontend's typed wrappers for them live in `src/ipc.ts`. Add a command in both
-  places.
+  frontend's typed wrappers for them live in `src/ipc.ts` (except the
+  config/session ones, which live next to their models in `lib/config.ts` /
+  `lib/serialize.ts`). Add a command in both places.
 
 ### Automations (`src-tauri/src/automations/`, cross-referenced U1–U12)
 Cron-scheduled runs that either spawn a `claude --dangerously-skip-permissions

@@ -1,8 +1,10 @@
 //! Hook channel wire protocol (U8, R10).
 //!
-//! Transport: a Unix-domain socket (never TCP). The browser-reachable loopback
-//! HTTP endpoint is deferred (KTD7) — v1 receives Claude Code callbacks via the
-//! `command` hook → `fly notify` → this socket.
+//! Transport: a Unix-domain socket (never TCP). The loopback HTTP endpoint
+//! KTD7 originally deferred has since shipped as the *separate* `feed/`
+//! surface (bearer-token, loopback-only, its own boundary); this hook socket
+//! remains Unix-only and receives Claude Code callbacks via the `command`
+//! hook → `fly notify` → this socket.
 //!
 //! Framing: the client opens a connection, writes one UTF-8 JSON object, and
 //! either closes its write half (the fire-and-forget notify path and the

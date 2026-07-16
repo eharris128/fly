@@ -41,12 +41,15 @@ here is mandatory, not a nicety.
   select its own trust rank: rank is assigned downstream at the dispatch call
   site (a socket hook is always `Hook`), never from the wire payload. A forged
   in-pane capture is thus pane-precise but can't outrank or clear a human `Pick`.
-- **Recursion origin** (`R22`) — the `automation/*` envelope carries its origin
-  pane (`protocol.rs`, `Envelope::is_automation`); the actual recursion **gate**
-  lives downstream in `automations/mod.rs` (the recursion registry —
-  `is_automation_pane`), which blocks an automation-spawned pane from creating or
-  running automations. Keep the origin faithfully stamped here so that gate can
-  do its job.
+- **Recursion origin** (`R22`) — an `automation/*` request's origin pane is the
+  **authenticated token's pane**: resolved by the socket's token→pane validation
+  (`server.rs`) and handed to the request handler, never read from the wire
+  payload (`Envelope` carries only `token` + `op`; `Envelope::is_automation`
+  merely routes by op prefix, so a client cannot claim a different origin). The
+  actual recursion **gate** lives downstream in `automations/mod.rs` (the
+  recursion registry — `is_automation_pane`), which blocks an automation-spawned
+  pane from creating or running automations. Keep the origin the token-resolved
+  pane so that gate can do its job.
 - **Held asks stay bounded** (hook-ask-channel `R2`/`KTD1`) — the `ask/hold` op
   holds its connection for the ask's lifetime, so the pre-validation phase now
   has a hard wall-clock deadline (`REQUEST_DEADLINE`) on top of the size bound

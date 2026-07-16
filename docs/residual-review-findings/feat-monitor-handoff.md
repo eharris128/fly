@@ -28,6 +28,13 @@ the applied commit; the below are the deliberately-deferred remainder.
   automations too, and a wall-clock "no verdict in N days" fallback is a new
   mechanism. The wedged pane itself is visible in the Automations workspace,
   which bounds the practical blindness.
+- **2026-07-16 re-assessment (not live-verified):** the wedgeable check *pane*
+  no longer exists — `2026-07-11-003-feat-headless-monitor-checks` dispatches
+  checks as backend-owned headless children with a monotonic deadline and a
+  SIGTERM-first kill, so a wedged check now closes `Failed` each cycle and
+  feeds `consecutive_infra_failures` (three consecutive ring "monitor
+  broken"). The scenario as written applies only to the legacy pane path;
+  re-validate against the headless sweep before acting on it.
 
 ### #9 — `cli/automation.rs` crossed 1,000 lines (P2)
 - **What:** U5's monitor rendering/validation pushed the file to ~1.5k lines
