@@ -253,13 +253,16 @@ fn sanitize_snippet(raw: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Parse an ISO-8601 UTC timestamp (`2026-06-19T19:17:04.506Z`, the form Claude
-/// writes on each transcript turn) to milliseconds since the Unix epoch. The
-/// fractional part is optional; the trailing `Z` (UTC) is required — Claude always
-/// writes UTC, so no timezone-offset handling is needed. Hand-rolled to avoid a
-/// date-crate dependency. `None` for any shape we don't recognize.
-fn iso8601_to_ms(s: &str) -> Option<u64> {
-    let s = s.strip_suffix('Z')?;
+/// Parse an ISO-8601 / RFC 3339 timestamp to milliseconds since the Unix epoch.
+/// Accepts the `Z`-suffixed UTC form Claude writes on each transcript turn
+/// (`2026-06-19T19:17:04.506Z`) and the numeric-offset form the
+/// `/api/oauth/usage` endpoint serves (`2026-06-30T12:49:59+00:00` —
+/// usage-limit-deferral plan, U1/R6). The fractional part is optional; a
+/// trailing `Z` **or** strict `±HH:MM` offset is required — anything else is a
+/// shape we don't recognize → `None`. Hand-rolled to avoid a date-crate
+/// dependency. `pub(crate)` for the usage gate ([`crate::usage::gate`]).
+pub(crate) fn iso8601_to_ms(s: &str) -> Option<u64> {
+    let (s, offset_ms) = split_utc_designator(s)?;
     let (date, time) = s.split_once('T')?;
 
     let mut d = date.split('-');
@@ -315,8 +318,42 @@ fn iso8601_to_ms(s: &str) -> Option<u64> {
         .checked_mul(86_400)
         .and_then(|d| d.checked_add(hour * 3_600 + min * 60 + sec))
         .and_then(|s| s.checked_mul(1_000))
-        .and_then(|s| s.checked_add(frac_ms))?;
+        .and_then(|s| s.checked_add(frac_ms))
+        // UTC = local wall-clock minus the offset (offset is bounded ±24h by
+        // the split, so with the year bound this can't overflow — checked
+        // anyway, same discipline).
+        .and_then(|s| s.checked_sub(offset_ms))?;
     (ms >= 0).then_some(ms as u64)
+}
+
+/// Split the trailing UTC designator off an ISO-8601 timestamp: `Z` → offset 0,
+/// strict `±HH:MM` → that offset in ms. Returns the body (date + time, no
+/// designator) and the offset. `None` when neither form is present — a bare
+/// local time is a shape we don't trust, not "assume UTC".
+fn split_utc_designator(s: &str) -> Option<(&str, i64)> {
+    if let Some(body) = s.strip_suffix('Z') {
+        return Some((body, 0));
+    }
+    // The offset sign can only appear after the 'T' (the date's own '-'
+    // separators live before it).
+    let t = s.find('T')?;
+    let sign_idx = s[t..].find(['+', '-']).map(|i| t + i)?;
+    let (body, off) = (&s[..sign_idx], &s[sign_idx..]);
+    // Strict `±HH:MM`: sign, two digits, ':', two digits — nothing else.
+    let bytes = off.as_bytes();
+    if bytes.len() != 6 || bytes[3] != b':' {
+        return None;
+    }
+    let hh: i64 = off[1..3].parse().ok()?;
+    let mm: i64 = off[4..6].parse().ok()?;
+    if !off[1..3].bytes().chain(off[4..6].bytes()).all(|b| b.is_ascii_digit())
+        || hh > 23
+        || mm > 59
+    {
+        return None;
+    }
+    let magnitude_ms = (hh * 3_600 + mm * 60) * 1_000;
+    Some((body, if bytes[0] == b'-' { -magnitude_ms } else { magnitude_ms }))
 }
 
 /// Days since the Unix epoch (1970-01-01) for a civil (proleptic Gregorian) date —
@@ -1331,6 +1368,41 @@ mod tests {
         assert_eq!(iso8601_to_ms("2026-06-19T19:17:16"), None); // no trailing 'Z'
         assert_eq!(iso8601_to_ms("2026-13-01T00:00:00Z"), None); // month out of range
         assert_eq!(iso8601_to_ms("2026-06-19T19:17Z"), None); // missing seconds
+    }
+
+    #[test]
+    fn parses_rfc3339_numeric_offsets() {
+        // The exact form `/api/oauth/usage` serves (usage-limit-deferral U1).
+        assert_eq!(
+            iso8601_to_ms("2026-06-30T12:49:59+00:00"),
+            iso8601_to_ms("2026-06-30T12:49:59Z")
+        );
+        // A positive offset is *behind* UTC-as-written: subtract it.
+        assert_eq!(
+            iso8601_to_ms("2000-01-01T05:30:00+05:30"),
+            Some(946_684_800_000) // == 2000-01-01T00:00:00Z
+        );
+        // A negative offset adds.
+        assert_eq!(
+            iso8601_to_ms("1999-12-31T19:00:00-05:00"),
+            Some(946_684_800_000)
+        );
+        // Fractional part composes with an offset.
+        assert_eq!(
+            iso8601_to_ms("2026-06-19T19:17:16.402+00:00"),
+            Some(1_781_896_636_402)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_offsets() {
+        assert_eq!(iso8601_to_ms("2026-06-30T12:49:59+0000"), None); // no colon
+        assert_eq!(iso8601_to_ms("2026-06-30T12:49:59+00"), None); // short
+        assert_eq!(iso8601_to_ms("2026-06-30T12:49:59+24:00"), None); // hour range
+        assert_eq!(iso8601_to_ms("2026-06-30T12:49:59+00:60"), None); // minute range
+        assert_eq!(iso8601_to_ms("2026-06-30T12:49:59+aa:bb"), None); // non-digit
+        assert_eq!(iso8601_to_ms("2026-06-30T12:49:59++1:00"), None); // sign inside
+        assert_eq!(iso8601_to_ms("2026-06-30T12:49:59+00:00Z"), None); // both forms
     }
 
     #[test]

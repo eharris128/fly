@@ -160,7 +160,10 @@ time/inputs as arguments so they're tested without a running app.
 - `usage/` — live plan-usage snapshot for the dashboard: reproduces Claude Code's
   `/usage` gauges via `GET /api/oauth/usage` (read-only OAuth bearer from
   `~/.claude/.credentials.json`), fetched on dashboard open only (KTD-C), never
-  on a timer.
+  on a timer. `usage/gate.rs` is the automations **usage gate** (usage-limit-
+  deferral plan): the pure at-limit predicate plus a short-timeout, TTL-cached
+  blocking fetch over the same request core — consulted by the sweep only when
+  an agent-mode claim is possible, so KTD-C's no-timer rule still holds.
 - `feed/` — the loopback HTTP surface for an external local consumer
   (feat-agent-state-local-feed + feed-agent-reply-io + feed-pending-question +
   feed-conversation-tail + feed-question-screen-fallback + hook-ask-channel +
@@ -251,7 +254,18 @@ Cron-scheduled runs that either spawn a `claude --dangerously-skip-permissions
 mode) or run a stored script with no model spend (Script mode). Data flow: a
 named `fly-automation-sweep` thread ticks every 10s; a due automation is
 **claimed + persisted before it runs** (R2), then dispatched off the store lock
-(KTD-B). Modules:
+(KTD-B). A due **agent-mode** occurrence is usage-gated first
+(`docs/plans/2026-07-16-001-feat-automations-usage-limit-deferral-plan.md`):
+when the plan reads confidently at a session/weekly limit (`usage/gate.rs` —
+fail-open on every uncertainty, incl. active overage billing), the sweep
+records a pre-claim `Skipped("usage limit")` row and defers `next_run_at`
+through the existing `advance_from` floor to the first occurrence at-or-after
+the window's `resets_at`; scripts and manual runs are never gated, an
+unattended retry skip-closes instead (retry-once), and the knob is
+`config.automation_defaults.usage_gate` (default on). Note the pane-mode
+at-limit close still reads `Succeeded` (Stop fires regardless) — the honest
+reclassification is the plan's deferred U6, gated on an empirical pin the
+next time the account is actually at a limit. Modules:
 - `model.rs` (U1) — pure domain vocabulary: `Automation`, its bounded run
   history (`RunRow`, R8), and the run-row state machine (claim/skip/close). Serde
   **camelCase** — this shape crosses the store file, the socket, and the

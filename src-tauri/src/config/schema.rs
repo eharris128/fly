@@ -96,6 +96,12 @@ pub struct AutomationDefaults {
     /// Model handed to `--fallback-model` for unattended over-quota runs (R15).
     /// Non-optional — there is always a fallback; default `sonnet`.
     pub fallback_model: String,
+    /// Usage-limit-deferral plan (R9): when true (the default), the sweep
+    /// consults the plan-usage gate before claiming a due **agent-mode**
+    /// occurrence and defers it to the limit's reset instead of dispatching
+    /// into an exhausted window. The gate is fail-open (KTD3) — this knob
+    /// exists to switch even the *attempt* off, not to make it safe.
+    pub usage_gate: bool,
 }
 
 impl Default for AutomationDefaults {
@@ -104,6 +110,7 @@ impl Default for AutomationDefaults {
             model: None,
             effort: None,
             fallback_model: "sonnet".into(),
+            usage_gate: true,
         }
     }
 }
@@ -267,6 +274,22 @@ mod tests {
             "omitted sibling kept its default"
         );
         assert_eq!(c.automation_defaults.effort, None);
+        assert!(
+            c.automation_defaults.usage_gate,
+            "config predating the usage gate loads with it on (usage-limit-deferral R9)"
+        );
+    }
+
+    // Usage-limit-deferral R9: the gate knob defaults on, can be switched off
+    // in the file, and round-trips camelCase.
+    #[test]
+    fn usage_gate_defaults_on_and_can_be_disabled() {
+        assert!(AutomationDefaults::default().usage_gate);
+        let c: Config =
+            serde_json::from_str(r#"{"automationDefaults":{"usageGate":false}}"#).unwrap();
+        assert!(!c.automation_defaults.usage_gate);
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["automationDefaults"]["usageGate"], false);
     }
 
     // U3: the shared defaults round-trip under camelCase.

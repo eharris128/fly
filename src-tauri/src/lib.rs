@@ -769,6 +769,16 @@ pub fn run() {
                     .and_then(|id| pty_mgr.lifecycle(pty::PaneId(id)))
                     .is_some_and(|s| s.is_live())
             }));
+            // Usage-limit-deferral U4: the plan-usage gate. The sweep consults
+            // it before the store lock and only on a tick that could claim an
+            // agent-mode occurrence (KTD2/KTD-C); the gate itself is the
+            // OAuth-backed fetch (short timeout + TTL cache) over the same
+            // request core as the dashboard gauges, fail-open on every
+            // uncertainty (KTD3).
+            let usage_gate = Arc::new(usage::gate::OauthUsageGate::new());
+            automations_mgr.set_usage_gate(Arc::new(move |now_ms: u64| {
+                usage_gate.defer_floor(now_ms)
+            }));
             app.manage(script_runner);
             app.manage(Arc::clone(&automations_mgr));
             // The sweep starts unconditionally (R5): script automations run
