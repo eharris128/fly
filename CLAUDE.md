@@ -163,11 +163,18 @@ time/inputs as arguments so they're tested without a running app.
   on a timer.
 - `feed/` — the loopback HTTP surface for an external local consumer
   (feat-agent-state-local-feed + feed-agent-reply-io + feed-pending-question +
-  feed-conversation-tail + feed-question-screen-fallback + hook-ask-channel):
+  feed-conversation-tail + feed-question-screen-fallback + hook-ask-channel +
+  feed-monitor-enrichment):
   bearer-token auth (constant-time, silent 401; **the token is the whole
   boundary** — loopback TCP has no `SO_PEERCRED`), SSE `/feed` (webview-pushed
   roster + backend automations; `lastReplyAt` **and** `questionPendingAt`
-  stamped at emit), `GET /agents/{key}/output` (latest reply + the gated
+  stamped at emit; the automation projection additionally carries `monitor`,
+  `retiredAt`, and `lastVerdict {outcome, note}` — additive, absent-field
+  back-compat — because a verdict parses only from an infra-clean run, so a
+  monitor's FAIL rides a `lastStatus:"succeeded"` row and a consumer must read
+  the verdict, not run status, for honest pass/fail; see
+  `docs/notes/2026-07-16-feed-monitor-enrichment.md`),
+  `GET /agents/{key}/output` (latest reply + the gated
   pending `question` object + the `turns` conversation tail — ≤12 turns ×
   ≤2048 chars, oldest→newest ending at the current reply with
   `at == repliedAt`, key omitted when no servable history — all via
@@ -422,7 +429,8 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
 - `App.svelte` — orchestrates workspaces, tabs, and the split tree; owns
   attention/cwd/activity state, debounced session persistence (~800ms), and the
   overlay wiring (hotkey menu, command palette, notification panel, triage nudge,
-  dashboard, destructive-confirm).
+  dashboard, settings menu, destructive-confirm — the latter also guards quit
+  while agents are mid-work, via `home.ts::busyAgentCount`).
 - `lib/layout.ts` — **pure split-tree model**. Leaves render flat and keyed, so
   splitting/resizing never unmounts a pane (which would respawn its agent). Leaf
   keys are stable and also key the scrollback files — preserve this invariant.
@@ -443,6 +451,14 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   breadcrumb + pane controls).
 - `lib/{config,serialize}.ts` (`serialize.migrateSession` upgrades old sessions
   into the workspace shape), `lib/HotkeyMenu.svelte` (passive cheat-sheet).
+- `lib/SettingsMenu.svelte` — focus-taking toggle-settings modal (`leader ,`,
+  the ⚙ control-bar button, or the palette). A dumb view: App owns the values
+  (seeded from and persisted to config) and restores terminal focus on close.
+- `lib/feed.ts` — the frontend half of `feed/`: pure wire-contract mirror of
+  `feed/wire.rs` (`AgentEntry`/`AutomationEntry`/`VerdictEntry`) plus
+  `buildFeedPayload`, which flattens the dashboard's grouped model into the
+  pushed roster — reusing the dashboard's own status values so the feed can
+  never drift from what fly displays.
 - `lib/CommandPalette.svelte` + `lib/palette.ts` — type-to-run command palette
   on `leader p`: every `BINDINGS` action (so it can't drift) plus live
   jump-to-workspace/tab navigation. Unlike the cheat-sheet it takes DOM focus,

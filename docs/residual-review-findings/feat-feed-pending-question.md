@@ -31,7 +31,7 @@ deliberately-deferred remainder.
   deliberate design decision. Revisit if a second live consumer or very large
   transcripts make the serialization observable.
 
-### R-2 — `session/transcript.rs` file-size regression (1802 lines)
+### R-2 — `session/transcript.rs` file-size regression (1802 lines at review; 2163 as of 2026-07-16)
 - **Where:** `src-tauri/src/session/transcript.rs`
 - **Reviewer:** maintainability (P2).
 - **What:** The pending-scan subsystem (`pending_interaction_from_str`, the

@@ -7,6 +7,16 @@ origin: docs/brainstorms/2026-07-10-monitor-handoff-requirements.md
 
 # feat: Monitor handoff — parked experiments become retiring automations
 
+> **Addendum (2026-07-11) — check dispatch superseded.** This plan frames every
+> check run as a spawned Claude *pane* (the sequence diagram's "check pane",
+> `close_run_by_pane`). One day later,
+> `2026-07-11-003-feat-headless-monitor-checks-plan.md` changed that: monitor
+> checks now dispatch as backend-owned headless `claude -p --output-format
+> stream-json` children — no pane or tab appears — with one shared
+> verdict-close tail for the pane and headless paths. The verdict contract,
+> retire-on-fire, bundles, and escalation below are unchanged; read the
+> pane-based dispatch mechanics as the legacy path.
+
 ## Summary
 
 Extend the automations subsystem with a monitor flavor: an agent-mode automation with a not-before time and a sparse re-check schedule that delivers one machine-readable verdict and retires. A Claude session hands its experiment monitor off via a new skill and `fly automation create --monitor`, capturing pickup pointers before its tab closes. Pass notifies; fail notifies with a durable failure bundle and a one-action dashboard pickup that spawns a fresh recovery session.

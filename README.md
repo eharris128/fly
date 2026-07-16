@@ -34,7 +34,18 @@ attention — so you can run a fleet and only look when there's something to do.
 - **Session attribution** — precise, per-pane session identity even when several
   `claude` sessions share one working directory (see below).
 - **Automations** — cron-scheduled agent or script runs, with alert surfacing
-  back into a pane (`fly automation …`).
+  back into a pane (`fly automation …`), a dedicated Automations workspace,
+  and per-automation model/effort defaults.
+- **Monitors** — an automation flavor for parked experiments: sparse re-checks
+  run headless (a backend-owned `claude -p`, no pane or tab), deliver one
+  fenced PASS/FAIL verdict, and retire the monitor. A FAIL writes a durable
+  failure bundle and the dashboard offers a one-action recovery pickup
+  (`fly automation create --monitor --not-before …`, taught to agents by the
+  `fly-monitor-handoff` skill).
+- **The feed** — a loopback HTTP surface (bearer-token auth) for an external
+  local consumer: an SSE roster of agents + automations (including monitor
+  verdicts), per-agent latest reply / pending question / conversation tail,
+  and a guarded input route for answering an agent remotely.
 - **Agent dashboard** — a "home" view (`leader d`) of every agent's status
   (waiting / working / idle / running), plus live plan-usage gauges.
 
@@ -115,8 +126,9 @@ cargo test --offline --manifest-path src-tauri/Cargo.toml         # Rust (state 
 
 - `src-tauri/src/` — Rust backend: `pty/`, `stream/`, `state/` (pure state
   machines), `hooks/` (the socket **security boundary** — has its own scoped
-  `CLAUDE.md`), `session/` (layout + resume/handoff/attribution), `automations/`,
-  `usage/`, `cli/`.
+  `CLAUDE.md`), `session/` (layout + resume/handoff/attribution), `automations/`
+  (incl. monitors + the headless check runner), `feed/` (the loopback HTTP
+  surface), `usage/`, `cli/`.
 - `src/` — Svelte frontend: `App.svelte` orchestrator, pure view-models
   (`lib/layout.ts`, `lib/home.ts`, `lib/session-picker.ts`, …), and the
   `Terminal.svelte` xterm leaf.
@@ -128,4 +140,5 @@ cargo test --offline --manifest-path src-tauri/Cargo.toml         # Rust (state 
 The same binary is both the desktop app and the `fly` CLI. Inside a pane, `fly
 notify` talks to the running app; `fly hooks setup|teardown` manages the Claude
 Code hooks; `fly automation <create|list|show|runs|pause|resume|run|delete>`
-manages cron-scheduled runs.
+manages cron-scheduled runs (`create --monitor --not-before …` registers a
+monitor; `list`/`show`/`runs` are monitor-aware).
