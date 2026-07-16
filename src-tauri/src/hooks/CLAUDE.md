@@ -13,8 +13,10 @@ plan `2026-07-11-002-feat-hook-ask-channel` (the held `ask/hold` op).
 ## What it defends
 
 `fly notify` (and `fly automation …`) reach the running app over a
-**Unix-domain socket** — never TCP; the browser-reachable loopback-HTTP endpoint
-is deliberately deferred (`KTD7`). The PTY runs untrusted agent output and any
+**Unix-domain socket** — never TCP. (The loopback-HTTP endpoint `KTD7`
+originally deferred has since shipped as the *separate* `feed/` surface —
+bearer-token-authenticated, loopback-only, its own boundary; the hook socket
+itself remains Unix-only.) The PTY runs untrusted agent output and any
 local process can try to connect, so an unauthenticated endpoint would let an
 attacker spoof attention, enumerate panes, or drive automations. Authentication
 here is mandatory, not a nicety.

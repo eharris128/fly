@@ -51,6 +51,17 @@ a plan header's own `status:` field may lag behind the code.
 | `2026-07-11-002-feat-hook-ask-channel` | Event-first pending-question detection + hook-answered permissions (stages 1–2 of the supervisor assessment; `PermissionRequest` contract live-verified on 2.1.207): `fly hooks setup` installs `PermissionRequest` (matcher `*`) → `fly notify --permission-request` forwards a bounded typed ask over the socket as a **held**, newline-framed `ask/hold` request (connection lifetime = ask lifetime; Claude kills the hook on local resolution → drop clears), `feed/ask.rs::AskRegistry` (leaf-keyed, last-write-wins, capped), hook leg ahead of transcript/screen in the resolver (`source:"hook"`, no reason gate — the held connection is the corroboration), `mode:"decision"` answers a hook-sourced permission ask through the hook's own response channel (opt-in-gated; the picker keeps keys/other — an allow can't skip it) | `hooks/{protocol,server}.rs`, `feed/{ask,fallback,io,server}.rs`, `cli/{notify,hooks}.rs`, `session/transcript.rs`, `lib.rs`, `lifecycle.rs`, `lib/feed.ts`, `tests/hook_ask.rs` |
 | `2026-07-11-003-feat-headless-monitor-checks` | Monitor checks dispatch as backend-owned `claude -p --output-format stream-json` children instead of panes (empirical stream contract pinned on 2.1.207): tolerant init/result-only NDJSON parse + pure infra-vs-readable outcome classification (abstain-to-infra), clean env by inherit-minus-strip, monotonic deadline, SIGTERM-first kill with /proc descendant-snapshot sweep, `RunRow.headless`/`sessionId` + sweep exemptions + suspend-proof slack backstop, one shared verdict-close tail for pane and headless paths, `redact::clean_captured` extraction, FAIL-bundle "Check session" block; monitors bypass the frontend-ready claim gate (no event to drop) | `automations/{headless,model,mod,redact,verdict}.rs`, `pty/pane.rs`, `lib.rs`, `lifecycle.rs`, `tests/headless_runner.rs`, `tests/fixtures/headless/` |
 
+The plan dir also holds one non-plan artifact:
+`2026-07-03-002-automations-workspace-and-model-LIVE-CHECKLIST.md`, the
+live-validation checklist that accompanied the workspace-and-model plan.
+
+Not every merge has a plan. Small QoL features are documented in `CLAUDE.md`
+only (the settings-menu overlay, `leader ,`; quit-confirm while agents are
+mid-work), and the feed-monitor-enrichment follow-up (`monitor` / `retiredAt` /
+`lastVerdict` on the feed's automation projection, commit `608bb46` — designed
+in the *game* repo's Ambient Wall plan) is recorded in
+`docs/notes/2026-07-16-feed-monitor-enrichment.md`.
+
 ## Brainstorms
 
 `docs/brainstorms/` holds the requirements captured before a plan was written —
@@ -67,4 +78,5 @@ brainstorm for the "why".
   be recorded and triaged.
 - `docs/notes/` — one-off evaluations and research notes that are neither a
   plan nor a brainstorm (e.g. the conductor-oss evaluation, the
-  fix-feed-question-detection-gaps root-cause post-mortem).
+  fix-feed-question-detection-gaps root-cause post-mortem, the
+  feed-monitor-enrichment record).

@@ -1,9 +1,16 @@
 # Automations Work Queue (U6-U10)
 
-**Status:** ✅ **Feature complete.** All of U1–U12 have landed — U1-U5 + U11-U12
-committed, U7/U7.5/U8/U9/U10 complete, and **U6 complete** (see their sections).  
-**Last Updated:** 2026-07-02  
-**Remaining:** none — the automations feature is done.
+**Status:** ✅ **Archived.** All of U1–U12 of the *original* automations plan
+(`docs/plans/2026-07-01-002-feat-automations-plan.md`) have landed — U1-U5 +
+U11-U12 committed, U7/U7.5/U8/U9/U10 complete, and **U6 complete** (see their
+sections).  
+**Last Updated:** 2026-07-02 (archival note 2026-07-16)  
+**Remaining:** none *for that plan* — but automations were substantially
+extended afterward. This file is a historical work-queue scratchpad, not a
+live queue or a statement that automations are frozen; for the later layers
+see `docs/plans/` — automations-workspace-and-model (2026-07-03),
+automations-interrupt-resilience (2026-07-05), monitor-handoff (2026-07-10),
+and headless-monitor-checks (2026-07-11).
 
 ---
 
