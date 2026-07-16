@@ -412,7 +412,7 @@ fn handle_create(args: &[String]) -> i32 {
                 println!("  --effort <level>        agent mode: reasoning effort (low, medium, high, xhigh, max)");
                 println!("  --script <code>         script mode: inline script code");
                 println!("  --script-file <path>    script mode: read script from file");
-                println!("  --interpreter <name>    script interpreter: bash, sh, python3 (default: bash)");
+                println!("  --interpreter <name>    script interpreter: bash, sh, node, python3 (default: bash)");
                 println!("  --timeout <ms>          script timeout in milliseconds (default: 120000)");
                 println!("  --retry-on-interrupt    re-run once on the next launch if an app");
                 println!("                          crash/restart interrupts a run (default: off)");
