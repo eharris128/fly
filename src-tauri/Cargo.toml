@@ -56,3 +56,12 @@ lto = true
 opt-level = "s"
 panic = "abort"
 strip = true
+
+# Fast local release bundle (`pnpm build:local`): same semantics as release
+# (panic/strip/overflow behavior inherited), but thin LTO + parallel codegen
+# trade a few % binary size for a much shorter build. Shipping builds keep
+# the fat-LTO `release` profile above.
+[profile.release-dev]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
