@@ -57,11 +57,19 @@ opt-level = "s"
 panic = "abort"
 strip = true
 
-# Fast local release bundle (`pnpm build:local`): same semantics as release
-# (panic/strip/overflow behavior inherited), but thin LTO + parallel codegen
+# Fast local release bundle (`pnpm build:local`): thin LTO + parallel codegen
 # trade a few % binary size for a much shorter build. Shipping builds keep
 # the fat-LTO `release` profile above.
+#
+# Semantics DELIBERATELY diverge from `release` on one axis (audit-remediation
+# U3/KTD3): overflow-checks are ON here so local iteration catches silent
+# integer wrap (the recorded iso8601-parser bug class, invisible to the
+# checked dev/test profiles' suites once shipped). The shipping `release`
+# profile keeps them OFF on purpose: with `panic = "abort"` a wrap would
+# become an abort that kills every live agent pane at once — bounded/checked
+# arithmetic on untrusted numeric input remains the shipping defense.
 [profile.release-dev]
 inherits = "release"
 lto = "thin"
 codegen-units = 16
+overflow-checks = true

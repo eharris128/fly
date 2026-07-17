@@ -27,6 +27,7 @@
     type Orientation,
     type DividerRect,
   } from "./lib/layout";
+  import { prunePaneIdMaps } from "./lib/pane-maps";
   import {
     tabDisplayTitle,
     findTab,
@@ -95,6 +96,7 @@
     paneCommand,
     paneSessionId,
     paneActivity,
+    ptyWrite,
     publishAgentFeed,
     usageSnapshot,
     saveResumeRecord,
@@ -161,7 +163,7 @@
     type Notification,
     type NotificationView,
   } from "./lib/notifications";
-  import { Keymap, type KeymapActions } from "./lib/keymap";
+  import { Keymap, leaderLiteralBytes, type KeymapActions } from "./lib/keymap";
   import { actionCommands, navCommands, type PaletteCommand } from "./lib/palette";
   import { getConfig, setConfig } from "./lib/config";
   import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -1442,7 +1444,14 @@
     return set;
   }
   function pruneNotifications() {
-    notifications = pruneToLeaves(notifications, allLiveLeafKeys());
+    const live = allLiveLeafKeys();
+    notifications = pruneToLeaves(notifications, live);
+    // Audit-remediation U9/KTD9: the pane-id maps must hold entries only for
+    // live leaves — every close path already routes through here, so the
+    // id-map prune shares the notification prune's lifecycle.
+    const pruned = prunePaneIdMaps(live, paneIdByLeaf, leafByPaneId);
+    paneIdByLeaf = pruned.paneIdByLeaf;
+    leafByPaneId = pruned.leafByPaneId;
   }
 
   function startDrag(d: DividerRect, ev: PointerEvent) {
@@ -1993,6 +2002,14 @@
     handoffQuick: () => void handoff("quick"),
     handoffGuided: () => void handoff("guided"),
     handoffRepick: () => void handoffRepick(),
+    // U10/KTD10: double-tapped leader → one literal leader keystroke to the
+    // focused pane. A leader with no terminal encoding (super+…) is a no-op.
+    sendLiteralLeader: () => {
+      const bytes = leaderLiteralBytes(leaderKey);
+      const key = activeTab?.focusedLeafKey;
+      const pid = key != null ? paneIdByLeaf[key] : undefined;
+      if (bytes != null && pid != null) void ptyWrite(pid, bytes);
+    },
   };
   // Palette commands: every leader action (from BINDINGS) plus live "jump to
   // workspace/tab" navigation, built from the same resolved view model the

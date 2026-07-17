@@ -272,3 +272,44 @@ fn repeated_invalid_tokens_trip_a_lockout() {
     // While locked, even the valid token is refused.
     assert_eq!(tokens.validate(&valid), None);
 }
+
+// Audit-remediation U6/KTD6: concurrent connection threads are bounded. With
+// every slot held by an idle connection, a further (valid!) notify is dropped
+// before any read — never dispatched; once slots free (peer close → EOF →
+// handler exit), the same notify dispatches again.
+#[test]
+fn over_cap_connections_are_dropped_and_slots_free_on_close() {
+    use fly_lib::hooks::server::MAX_CONNECTIONS;
+    let (_dir, tokens, rec, server) = setup();
+    let tok = tokens.issue(PaneId(7));
+    let msg = format!(r#"{{"token":"{tok}","reason":"permission"}}"#);
+
+    // Fill the cap with idle connections (a slot is claimed on accept, before
+    // any read, so these hold slots while sending nothing).
+    let mut idle: Vec<UnixStream> = (0..MAX_CONNECTIONS)
+        .map(|_| UnixStream::connect(server.socket_path()).unwrap())
+        .collect();
+    // Let the accept loop drain its backlog and claim every slot.
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Over-cap: dropped pre-read, so a valid message never dispatches.
+    send(server.socket_path(), &msg);
+    assert_eq!(
+        wait_count(&rec, 1, Duration::from_millis(700)),
+        0,
+        "over-cap connection must be dropped before dispatch"
+    );
+
+    // Close the idle peers → their handlers see EOF, reject silently, and the
+    // RAII slots free → the same message now dispatches.
+    idle.clear();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rec.lock().unwrap().is_empty() && Instant::now() < deadline {
+        send(server.socket_path(), &msg);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        !rec.lock().unwrap().is_empty(),
+        "a freed slot must admit and dispatch a valid notify"
+    );
+}

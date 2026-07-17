@@ -31,7 +31,19 @@ export interface KeymapActions {
   handoffQuick: () => void;
   handoffGuided: () => void;
   handoffRepick: () => void;
+  /** Write one literal leader keystroke to the focused PTY (audit-remediation
+   * U10/KTD10, the tmux `C-a C-a` convention) — the escape valve for whatever
+   * the leader permanently shadows (readline's beginning-of-line under the
+   * default Ctrl-A). See [`leaderLiteralBytes`] for the byte encoding. */
+  sendLiteralLeader: () => void;
 }
+
+/** Sentinel `keys[0]` for the double-tap binding: the chord key IS the leader
+ * itself, which no fixed string can name — the menu and palette render it as
+ * the formatted leader (so it tracks a remapped leader), and `dispatch` never
+ * key-matches it (the double-tap is recognized in `handle` by `matchLeader`,
+ * before ordinary chord dispatch). */
+export const LEADER_KEY = "leader";
 
 /**
  * A leader chord → action binding. `keys` are matched against
@@ -105,6 +117,11 @@ export const BINDINGS: Binding[] = [
   // setting hides the control-bar notifications icon (KTD1, no drift).
   { keys: [","], label: "Settings", action: "openSettings" },
   { keys: ["?"], label: "Hotkey menu", action: "openMenu" },
+  // Double-tap the leader → one literal leader keystroke to the PTY (U10,
+  // tmux's `C-a C-a`). A BINDINGS entry like every command so the cheat-sheet
+  // and palette derive it (no drift); its key is the LEADER_KEY sentinel —
+  // see that constant for why.
+  { keys: [LEADER_KEY], label: "Send literal leader key", action: "sendLiteralLeader" },
 ];
 
 /**
@@ -148,6 +165,42 @@ export function formatLeader(spec: string): string {
         (p.length === 1 ? p.toUpperCase() : p[0].toUpperCase() + p.slice(1)),
     )
     .join("-");
+}
+
+/**
+ * The PTY bytes for one literal press of the leader combo (U10/KTD10):
+ * `ctrl+<key>` maps to its C0 control byte (`ctrl+a` → 0x01 — what the shell
+ * would have received had the leader not swallowed it), a bare key sends its
+ * character, and an `alt+` prefix ESC-prefixes the result (the terminal Meta
+ * convention). `null` when the combo has no terminal encoding (`super+…` —
+ * the compositor's key, invisible to a PTY): the action becomes a consumed
+ * no-op, never a guessed byte.
+ */
+export function leaderLiteralBytes(spec: string): string | null {
+  const parts = spec.toLowerCase().split("+").map((p) => p.trim()).filter((p) => p.length > 0);
+  const raw = parts.pop() ?? "";
+  const key = raw === "space" ? " " : raw;
+  if (key.length !== 1) return null;
+  if (parts.includes("super") || parts.includes("meta") || parts.includes("cmd")) return null;
+  let bytes: string;
+  if (parts.includes("ctrl")) {
+    if (key >= "a" && key <= "z") {
+      bytes = String.fromCharCode(key.charCodeAt(0) - 96); // C-a → 0x01 … C-z → 0x1a
+    } else {
+      const c0: Record<string, string> = {
+        " ": "\x00",
+        "[": "\x1b",
+        "\\": "\x1c",
+        "]": "\x1d",
+      };
+      const mapped = c0[key];
+      if (mapped === undefined) return null;
+      bytes = mapped;
+    }
+  } else {
+    bytes = key;
+  }
+  return parts.includes("alt") ? `\x1b${bytes}` : bytes;
 }
 
 /** Bare modifier keys, which fire their own keydown before the modified key. */
@@ -205,6 +258,15 @@ export class Keymap {
       // or shifted chords (`?`, `X`, `|`, `_`) would never fire.
       if (isModifierKey(e.key)) return true;
       this.leaderPending = false;
+      // Double-tap (U10/KTD10): the leader pressed again while pending sends
+      // one literal leader keystroke. Recognized by the same matcher as the
+      // first press — so it follows any remapped leader — and routed through
+      // its BINDINGS entry so the action can never drift from the menu row.
+      if (this.matchLeader(e)) {
+        const literal = BINDINGS.find((b) => b.keys[0] === LEADER_KEY);
+        if (literal) this.actions[literal.action]();
+        return true;
+      }
       this.dispatch(e);
       return true; // the command key never reaches the shell
     }

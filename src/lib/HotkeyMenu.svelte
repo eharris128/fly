@@ -4,7 +4,7 @@
   // so it can never drift from the real bindings (R3/KTD1). The parent owns the
   // open state and dismissal; this component is purely presentational and takes
   // no DOM focus (KTD3) — Escape is handled by the parent's window listener.
-  import { BINDINGS, DIGIT_CHORD, formatLeader, type Binding } from "./keymap";
+  import { BINDINGS, DIGIT_CHORD, LEADER_KEY, formatLeader, type Binding } from "./keymap";
 
   interface Props {
     open: boolean;
@@ -19,6 +19,9 @@
   // are suppressed. Cased to match how the chord is typed (X vs x).
   function keyLabel(b: Binding): string {
     const k = b.keys[0];
+    // The double-tap binding's key IS the leader (U10) — render the live
+    // leader so a remap keeps the row truthful.
+    if (k === LEADER_KEY) return formattedLeader;
     return b.upper ? k.toUpperCase() : k;
   }
 </script>

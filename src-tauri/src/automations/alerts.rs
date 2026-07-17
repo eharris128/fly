@@ -251,7 +251,12 @@ fn write_atomic_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)
+    // fsync-before-rename + best-effort dir sync (audit-remediation U5/KTD5),
+    // mirroring the store's writer.
+    std::fs::File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    super::store::sync_parent_dir(path);
+    Ok(())
 }
 
 /// `create_dir_all` + explicit `0700` (never left to umask).

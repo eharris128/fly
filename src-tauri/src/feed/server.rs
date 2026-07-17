@@ -212,14 +212,28 @@ impl Drop for FeedServer {
 }
 
 fn accept_loop(server: Server, shutdown: Arc<AtomicBool>, ctx: Arc<HandlerCtx>) {
+    let cap = crate::hooks::server::ConnCap::new(crate::hooks::server::MAX_CONNECTIONS);
     while !shutdown.load(Ordering::SeqCst) {
         match server.recv_timeout(ACCEPT_POLL) {
             Ok(Some(req)) => {
+                // U6/KTD6: claim a slot before any handler work (auth, body
+                // read); at cap, refuse with a bare 503 on the accept thread —
+                // no handler thread, no auth, no body read — so a local
+                // flooder can't grow threads without bound. (A plain drop is
+                // not quieter: tiny_http auto-responds 500 to an unanswered
+                // request, so the explicit empty 503 is the minimal signal.)
+                let Some(slot) = cap.try_claim() else {
+                    let _ = req.respond(Response::empty(503));
+                    continue;
+                };
                 // Thread-per-connection: an SSE stream blocks for the life of
                 // the client, so it must not stall the accept loop or other
                 // consumers (mirrors the hook server's one-thread-per-conn).
                 let ctx = Arc::clone(&ctx);
-                std::thread::spawn(move || handle(req, &ctx));
+                std::thread::spawn(move || {
+                    let _slot = slot;
+                    handle(req, &ctx)
+                });
             }
             Ok(None) => continue, // timeout — re-check the shutdown flag
             Err(_) => break,      // listener dead
@@ -378,7 +392,9 @@ fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec
 /// U6/KTD6; feed-other-answer U2). Status precedence is pinned, in the order
 /// the code checks it: 401 (upstream auth) → 404 (unpublished key, before any
 /// pending comparison) → 400 (bad body / unknown mode / keys or other without
-/// `ifAskedAt` / over-cap or empty-after-filter answer text) → **409** (the
+/// `ifAskedAt` / over-cap or empty-after-filter answer text) → **409**
+/// `{"error":"askPending"}` (an unguarded submit while a permission ask is
+/// pending — audit-remediation U2) → **409** (the
 /// guarded question is not exposed — nothing pending, reason gone, or
 /// `ifAskedAt` mismatch) → **403** (a guarded answer to a *permission* dialog
 /// without the config opt-in) → **409** (a keys/other answer to a shape it
@@ -411,8 +427,10 @@ fn agent_output_response(ctx: &HandlerCtx, key: &str) -> Response<io::Cursor<Vec
 /// question is `permission`-kind, not only `mode:"keys"` — a guarded submit's
 /// trailing Enter confirms the dialog's default just as a digit does, so both
 /// are remote permission approval and both require the opt-in. An *unguarded*
-/// submit (no `ifAskedAt`) stays the pre-existing inject-anytime contract,
-/// byte-for-byte.
+/// submit (no `ifAskedAt`) stays the inject-anytime contract **unless a
+/// permission ask is pending** (audit-remediation U2/KTD2): then it refuses
+/// `409 {"error":"askPending"}` before any PTY write — no path answers a
+/// permission dialog without both the freshness guard and the opt-in.
 fn agent_input_response(
     ctx: &HandlerCtx,
     key: &str,
@@ -516,6 +534,34 @@ fn agent_input_response(
         }
         _ => return empty_response(400),
     };
+
+    // Audit-remediation U2/KTD2: while a permission ask is pending, EVERY
+    // PTY-writing input requires the `ifAskedAt` guard. Only an unguarded
+    // submit reaches here without one (keys/other/decision 400'd above), and
+    // its bracketed-paste + Enter would confirm the dialog's default — the
+    // exact act the opt-in gates on the guarded path. Do the same fresh,
+    // body-independent gate + question read the guarded block does; a pending
+    // permission ask (incl. a screen-derived body under a live `permission`
+    // reason — the guarded path's widened predicate) refuses 409 with an
+    // `askPending` discriminator: the blocker is the missing guard, not the
+    // opt-in, so a caller supplies `ifAskedAt` and the existing opt-in logic
+    // applies unchanged. A submit with no pending permission ask stays the
+    // pre-existing inject-anytime contract, byte-for-byte.
+    if input.if_asked_at.is_none() {
+        if let Some(gate) = ctx.state.agent_gate(key) {
+            let reason = gate.reason;
+            if let Some(q) = gated_question(
+                (ctx.io)(key, reason.as_deref(), &gate.status).question,
+                reason.as_deref(),
+            ) {
+                let screen_under_permission = q.source.as_deref() == Some("screen")
+                    && reason.as_deref() == Some("permission");
+                if q.kind == "permission" || screen_under_permission {
+                    return json_status(409, "{\"error\":\"askPending\"}");
+                }
+            }
+        }
+    }
 
     // The stale-answer guard + answered latch (R11), armed by ifAskedAt.
     let mut reserved = false;

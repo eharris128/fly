@@ -185,11 +185,14 @@ time/inputs as arguments so they're tested without a running app.
   `at == repliedAt`, key omitted when no servable history — all via
   `fallback.rs::FallbackResolver.resolve_io` (wrapping the transcript-pure
   `io.rs::ReplyResolver`) — the ONE source for every per-agent
-  surface; question and turn strings are control-sanitized, *then*
-  secret-scrubbed, *then* truncated — see `io.rs::clean` for why that order),
+  surface; the reply `text` is control-sanitized *then* secret-scrubbed
+  (never truncated — audit-remediation U1), and question and turn strings are
+  control-sanitized, *then* secret-scrubbed, *then* truncated — see
+  `io.rs::clean` for why that order),
   and the single mutation route
   `POST /agents/{key}/input` (submit = control-stripped bracketed-paste +
-  Enter; `mode:"keys"` = raw filtered answer keys with **mandatory**
+  Enter — refused 409 `askPending` when unguarded while a permission ask is
+  pending, audit-remediation U2; `mode:"keys"` = raw filtered answer keys with **mandatory**
   `ifAskedAt` + a per-leaf answered latch; `mode:"other"` =
   feed-other-answer's free-text answer into the picker's own
   "Type something." row — fly resolves the row's digit from the question's

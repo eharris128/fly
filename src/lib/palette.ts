@@ -5,7 +5,7 @@
 // dynamic navigation built from live workspace/tab state. Kept pure and
 // framework-free so it unit-tests without a DOM, mirroring layout.ts / keymap.ts.
 
-import { BINDINGS, formatLeader, type KeymapActions } from "./keymap";
+import { BINDINGS, LEADER_KEY, formatLeader, type KeymapActions } from "./keymap";
 
 export interface PaletteCommand {
   /** Stable id; also the keyed-list key in the overlay. */
@@ -31,8 +31,10 @@ export function actionCommands(
 ): PaletteCommand[] {
   const lead = formatLeader(leader);
   return BINDINGS.filter((b) => b.action !== "openPalette").map((b) => {
-    // keys[0] is the canonical chord key; cased to match how it's typed (X vs x).
-    const key = b.upper ? b.keys[0].toUpperCase() : b.keys[0];
+    // keys[0] is the canonical chord key; cased to match how it's typed (X vs
+    // x). The double-tap binding's key is the leader itself (U10/LEADER_KEY).
+    const key =
+      b.keys[0] === LEADER_KEY ? lead : b.upper ? b.keys[0].toUpperCase() : b.keys[0];
     return {
       id: `action:${b.action}`,
       title: b.label,

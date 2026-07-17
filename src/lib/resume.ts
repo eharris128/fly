@@ -32,7 +32,9 @@ const VALUE_FLAGS = new Set([
   "--settings",
   "--setting-sources",
   "--agents",
-  "--session-id",
+  // `--session-id` is deliberately NOT here: sanitizeFlags strips it outright
+  // (U11/KTD11) — a replayed argv must never carry a mint/attach-id flag next
+  // to the appended `--resume`.
   "--output-format",
   "--input-format",
 ]);
@@ -94,12 +96,21 @@ function sanitizeFlags(rest: string[]): string[] {
       continue;
     }
     if (tok === "--continue" || tok === "-c") continue;
+    // `--session-id <uuid>` mints/attaches a SPECIFIC id — replayed alongside
+    // the appended `--resume` it is a self-conflicting invocation, so strip it
+    // exactly like the attach flags (audit-remediation U11/KTD11).
+    if (tok === "--session-id") {
+      const next = rest[i + 1];
+      if (next !== undefined && !next.startsWith("-")) i++;
+      continue;
+    }
     // …and the `--flag=value` form.
     if (
       tok.startsWith("--resume=") ||
       tok.startsWith("-r=") ||
       tok.startsWith("--continue=") ||
-      tok.startsWith("-c=")
+      tok.startsWith("-c=") ||
+      tok.startsWith("--session-id=")
     ) {
       continue;
     }

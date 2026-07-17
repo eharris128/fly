@@ -45,9 +45,11 @@
 //!
 //! **Alert hand-off (U6 seam).** An alert-classified run closes SUCCEEDED
 //! with its output captured and emits an [`AlertEvent`] through the
-//! [`AlertSink`]. TODO(U6): the default sink is a no-op — U6 replaces it
-//! with the alerts-log append + `Reason::Alert` raise; until then alerts are
-//! visible only as the run row's captured output.
+//! [`AlertSink`]. The default sink is a no-op; the production sink (U6,
+//! wired by `lib.rs::set_alert_sink` via [`ScriptRunner::set_alert_sink`])
+//! appends to the sanitized alerts log and raises `Reason::Alert` on the
+//! sink pane — a runner without one shows alerts only as the run row's
+//! captured output (the tests' shape).
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -108,8 +110,8 @@ pub type RunCloser = Arc<dyn Fn(&str, &str, RunOutcome) + Send + Sync>;
 /// An alert-classified run (R15: exit 0 with non-silent stdout), handed off
 /// for surfacing.
 ///
-/// TODO(U6): the default sink is a no-op. U6 replaces it (via
-/// [`ScriptRunner::set_alert_sink`]) with the sanitized alerts-log append +
+/// The default sink is a no-op; the production sink (U6, installed via
+/// [`ScriptRunner::set_alert_sink`]) does the sanitized alerts-log append +
 /// the `Signal { reason: Alert, tier: Cli }` raise on the sink pane (R16).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlertEvent {

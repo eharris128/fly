@@ -1510,6 +1510,131 @@ fn unguarded_submit_keeps_the_inject_anytime_contract() {
 }
 
 #[test]
+fn an_unguarded_submit_against_a_pending_permission_ask_409s() {
+    // Audit-remediation U2/KTD2: a guardless submit's trailing Enter would
+    // confirm the pending dialog's default, so it refuses 409 askPending —
+    // with the opt-in OFF and ON alike (the blocker is the missing ifAskedAt
+    // guard, not the opt-in).
+    for opted_in in [false, true] {
+        let (state, server, delivered) = start_with(opted_in);
+        // Hook-sourced ask: exposed with no attention reason at all.
+        state.publish(vec![agent("leaf-hook-permission", "waiting")]);
+        let (head, resp_body) = post(
+            server.local_addr(),
+            "/agents/leaf-hook-permission/input",
+            Some(TOKEN),
+            r#"{"text":"do it"}"#,
+        );
+        assert!(head.starts_with("HTTP/1.1 409"), "opted_in={opted_in}: {head}");
+        assert!(
+            resp_body.contains("askPending"),
+            "409 must carry the askPending discriminator, was: {resp_body}"
+        );
+        assert!(delivered.lock().unwrap().is_empty());
+    }
+
+    // A transcript-derived permission ask under the corroborating reason is
+    // exposed, so it blocks the same way…
+    let (state, server, delivered) = start();
+    state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")]);
+    let (head, _) =
+        post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), r#"{"text":"go"}"#);
+    assert!(head.starts_with("HTTP/1.1 409"), "transcript permission: {head}");
+    assert!(delivered.lock().unwrap().is_empty());
+
+    // …and a SCREEN-derived body under a live permission reason blocks too
+    // (the guarded path's widened predicate — the screen classifier can read a
+    // permission dialog as a choice picker).
+    let (state, server, delivered) = start();
+    state.publish(vec![agent_with_reason("leaf-screen-choice", "waiting", "permission")]);
+    let (head, _) = post(
+        server.local_addr(),
+        "/agents/leaf-screen-choice/input",
+        Some(TOKEN),
+        r#"{"text":"go"}"#,
+    );
+    assert!(head.starts_with("HTTP/1.1 409"), "screen under permission: {head}");
+    assert!(delivered.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_unguarded_submit_with_a_pending_choice_or_unexposed_permission_delivers() {
+    // KTD2 scope: only a pending PERMISSION ask blocks a guardless submit. A
+    // pending choice question stays the inject-anytime contract…
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("leaf-choice", "waiting")]);
+    let (head, _) =
+        post(server.local_addr(), "/agents/leaf-choice/input", Some(TOKEN), r#"{"text":"hi"}"#);
+    assert!(head.starts_with("HTTP/1.1 200"), "choice pending: {head}");
+    assert_eq!(
+        delivered.lock().unwrap().as_slice(),
+        &[("leaf-choice".to_string(), "submit:hi".to_string())]
+    );
+
+    // …and an UNEXPOSED transcript permission body (no corroborating reason —
+    // the tool is just executing) does not block either: the gate reads the
+    // same gated_question the guarded path does.
+    let (state, server, delivered) = start();
+    state.publish(vec![agent("leaf-permission", "working")]);
+    let (head, _) =
+        post(server.local_addr(), "/agents/leaf-permission/input", Some(TOKEN), r#"{"text":"hi"}"#);
+    assert!(head.starts_with("HTTP/1.1 200"), "unexposed permission: {head}");
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn over_cap_connections_are_dropped_and_a_freed_slot_is_reusable() {
+    // Audit-remediation U6/KTD6: handler threads are bounded. Long-lived SSE
+    // streams hold every slot → a further request is dropped with no response
+    // (not even /healthz — the claim precedes all handler work); dropping one
+    // stream frees its slot and requests serve again.
+    use fly_lib::hooks::server::MAX_CONNECTIONS;
+    let (state, server, _) = start();
+    let addr = server.local_addr();
+
+    let mut streams: Vec<TcpStream> = Vec::new();
+    for _ in 0..MAX_CONNECTIONS {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        write!(
+            s,
+            "GET /feed HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"
+        )
+        .unwrap();
+        // Read the initial frame so we KNOW this stream's handler thread is
+        // live and holding its slot before opening the next.
+        let mut buf = [0u8; 2048];
+        let n = s.read(&mut buf).unwrap();
+        assert!(n > 0, "SSE stream must serve its initial frame");
+        streams.push(s);
+    }
+
+    // Over-cap: refused with a bare 503 from the accept thread (no handler).
+    let (head, body) = get(addr, "/healthz", None, Duration::from_millis(500));
+    assert!(
+        head.starts_with("HTTP/1.1 503"),
+        "over-cap request must be refused 503, got: {head}"
+    );
+    assert!(body.is_empty(), "the refusal carries no body");
+
+    // Drop one stream, then bump the state so its handler's next write fails
+    // and the thread (and slot) is reclaimed; a request then serves again.
+    streams.pop();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut served = false;
+    while std::time::Instant::now() < deadline {
+        state.publish(vec![agent("l1", "waiting")]); // version bump → dead-peer write
+        let (head, _) = get(addr, "/healthz", None, Duration::from_millis(300));
+        if head.starts_with("HTTP/1.1 200") {
+            served = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    assert!(served, "a freed slot must serve requests again");
+}
+
+#[test]
 fn input_with_the_wrong_method_is_405() {
     // GET on /input (and POST on /output) is a method error post-auth — the
     // route exists, the verb is wrong; unauthenticated callers still see 401.

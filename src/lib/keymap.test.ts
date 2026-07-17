@@ -3,7 +3,9 @@ import {
   Keymap,
   parseLeader,
   formatLeader,
+  leaderLiteralBytes,
   BINDINGS,
+  LEADER_KEY,
   type KeymapActions,
 } from "./keymap";
 
@@ -55,6 +57,7 @@ function spyActions(): KeymapActions & { calls: string[] } {
     handoffQuick: mk("handoffQuick"),
     handoffGuided: mk("handoffGuided"),
     handoffRepick: mk("handoffRepick"),
+    sendLiteralLeader: mk("sendLiteral"),
   };
 }
 
@@ -392,5 +395,63 @@ describe("Keymap digit chords (U1)", () => {
     km.handle(ev("a", { ctrl: true })); // leader, e.g. from a focused pane
     km.handle(ev("2")); // digit, e.g. via the window listener after a click
     expect(digits).toEqual([2]);
+  });
+});
+
+describe("leader double-tap (audit-remediation U10/KTD10)", () => {
+  it("leader,leader fires sendLiteralLeader once and clears the pending state", () => {
+    const a = spyActions();
+    const km = new Keymap("ctrl+a", a);
+    // First leader arms; modifier keydowns in between are inert.
+    expect(km.handle(ev("Control", { ctrl: true }))).toBe(false);
+    expect(km.handle(ev("a", { ctrl: true }))).toBe(true);
+    expect(km.handle(ev("Control", { ctrl: true }))).toBe(true);
+    // Second leader → the literal action, consumed.
+    expect(km.handle(ev("a", { ctrl: true }))).toBe(true);
+    expect(a.calls).toEqual(["sendLiteral"]);
+    // Pending cleared: a following plain key passes to the PTY untouched.
+    expect(km.handle(ev("c"))).toBe(false);
+    expect(a.calls).toEqual(["sendLiteral"]);
+  });
+
+  it("works under a remapped leader, and the old leader chord is ordinary dispatch", () => {
+    const a = spyActions();
+    const km = new Keymap("ctrl+b", a);
+    expect(km.handle(ev("b", { ctrl: true }))).toBe(true);
+    expect(km.handle(ev("b", { ctrl: true }))).toBe(true);
+    expect(a.calls).toEqual(["sendLiteral"]);
+    // leader then ctrl+a (not the leader) is an unbound chord → consumed no-op.
+    expect(km.handle(ev("b", { ctrl: true }))).toBe(true);
+    expect(km.handle(ev("a", { ctrl: true }))).toBe(true);
+    expect(a.calls).toEqual(["sendLiteral"]);
+  });
+
+  it("is a BINDINGS entry (menu/palette derive it) keyed by the LEADER_KEY sentinel", () => {
+    const entry = BINDINGS.find((b) => b.action === "sendLiteralLeader");
+    expect(entry).toBeDefined();
+    expect(entry?.keys[0]).toBe(LEADER_KEY);
+    // The sentinel never collides with a real produced key.
+    expect(LEADER_KEY.length).toBeGreaterThan(1);
+  });
+});
+
+describe("leaderLiteralBytes (U10)", () => {
+  it("maps ctrl combos to their C0 bytes", () => {
+    expect(leaderLiteralBytes("ctrl+a")).toBe("\x01");
+    expect(leaderLiteralBytes("ctrl+b")).toBe("\x02");
+    expect(leaderLiteralBytes("ctrl+space")).toBe("\x00");
+    expect(leaderLiteralBytes("ctrl+[")).toBe("\x1b");
+  });
+
+  it("sends bare keys as-is and ESC-prefixes alt combos", () => {
+    expect(leaderLiteralBytes("alt+a")).toBe("\x1ba");
+    expect(leaderLiteralBytes("alt+ctrl+a")).toBe("\x1b\x01");
+    expect(leaderLiteralBytes("space")).toBe(" ");
+  });
+
+  it("returns null when the combo has no terminal encoding", () => {
+    expect(leaderLiteralBytes("super+space")).toBeNull();
+    expect(leaderLiteralBytes("cmd+a")).toBeNull();
+    expect(leaderLiteralBytes("ctrl+f1")).toBeNull();
   });
 });

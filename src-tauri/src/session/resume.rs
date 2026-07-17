@@ -175,7 +175,13 @@ pub fn write_records(path: &Path, records: &ResumeRecords) -> std::io::Result<()
     let write = || -> std::io::Result<()> {
         std::fs::write(&tmp, serde_json::to_vec_pretty(records)?)?;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        // fsync-before-rename + best-effort dir sync (audit-remediation
+        // U5/KTD5): the rename alone gives atomicity against a crash of this
+        // process, not durability against power loss — which is exactly the
+        // claim the module doc makes for an unclean shutdown.
+        std::fs::File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, path)?;
+        crate::automations::store::sync_parent_dir(path);
         Ok(())
     };
     match write() {

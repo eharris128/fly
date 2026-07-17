@@ -38,6 +38,7 @@ function spyActions(calls: string[]): KeymapActions {
     renameTab: mk("rename"),
     handoffQuick: mk("handoffQuick"),
     handoffGuided: mk("handoffGuided"),
+    sendLiteralLeader: mk("sendLiteral"),
     handoffRepick: mk("handoffRepick"),
   };
 }

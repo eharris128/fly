@@ -33,6 +33,53 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 /// clearing.
 const HOLD_POLL: Duration = Duration::from_millis(250);
 
+/// Cap on concurrent connection-handler threads per server (audit-remediation
+/// U6/KTD6). Availability guard only: 64 is far above any legitimate load —
+/// the feed has ~1 consumer, hook connections are short-lived except held
+/// asks, which `feed/ask.rs::MAX_HELD_ASKS` bounds at 64 anyway — but without
+/// it a local flooder could grow handler threads without bound: both surfaces
+/// are thread-per-connection, the hook socket reachable by any same-uid
+/// process and the feed port by any local uid.
+pub const MAX_CONNECTIONS: usize = 64;
+
+/// Bounded concurrent-connection counter for a thread-per-connection accept
+/// loop (audit-remediation U6/KTD6), shared with `feed/server.rs`. A slot is
+/// claimed on accept — *before* any read or auth work — and released by RAII
+/// when the handler thread finishes, so a panicking handler can never leak a
+/// slot. Over-cap connections are dropped immediately.
+pub(crate) struct ConnCap {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    cap: usize,
+}
+
+impl ConnCap {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            cap,
+        }
+    }
+
+    /// Claim a slot, or `None` at cap (the caller drops the connection).
+    pub(crate) fn try_claim(&self) -> Option<ConnSlot> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.cap).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| ConnSlot(Arc::clone(&self.active)))
+    }
+}
+
+/// RAII slot handle — dropping it frees the slot ([`ConnCap`]).
+pub(crate) struct ConnSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// An authenticated callback, resolved to its pane.
 #[derive(Debug, Clone)]
 pub struct ValidatedHook {
@@ -136,7 +183,7 @@ impl HookServer {
         ask_handler: Option<AskHandler>,
     ) -> std::io::Result<HookServer> {
         if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_private_socket_dir(parent)?;
         }
         // Reclaim a stale socket left by a prior crash.
         let _ = std::fs::remove_file(&socket_path);
@@ -200,12 +247,20 @@ fn accept_loop(
     ask_handler: Option<AskHandler>,
     stopping: Arc<AtomicBool>,
 ) {
+    let cap = ConnCap::new(MAX_CONNECTIONS);
     for incoming in listener.incoming() {
         if stopping.load(Ordering::Acquire) {
             break;
         }
         match incoming {
             Ok(stream) => {
+                // U6/KTD6: claim a slot before any read or auth work; at cap,
+                // drop the connection immediately (silent, like every other
+                // rejection on this socket).
+                let Some(slot) = cap.try_claim() else {
+                    drop(stream);
+                    continue;
+                };
                 let tokens = Arc::clone(&tokens);
                 let dispatch = Arc::clone(&dispatch);
                 let request_handler = request_handler.clone();
@@ -214,6 +269,7 @@ fn accept_loop(
                 let _ = std::thread::Builder::new()
                     .name("fly-hook-conn".into())
                     .spawn(move || {
+                        let _slot = slot;
                         handle_conn(
                             stream,
                             &tokens,
@@ -437,4 +493,63 @@ fn peer_uid_matches(stream: &UnixStream) -> bool {
         return false;
     }
     euid == unsafe { libc::geteuid() }
+}
+
+/// Create the socket's parent dir owner-only, on every path (audit-remediation
+/// U7/KTD7 — belt and braces): mode `0700` at creation time via
+/// `DirBuilderExt` (never left to umask — with `XDG_RUNTIME_DIR` unset the
+/// dir lands under the world-writable system temp at a predictable name), and
+/// an explicit chmod when the dir pre-exists. A pre-existing dir owned by
+/// another uid (a temp-path squat) fails the chmod, so server start errors
+/// instead of silently serving out of an attacker-controlled directory.
+pub(crate) fn create_private_socket_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Audit-remediation U6/KTD6: the cap admits exactly `cap` concurrent
+    // slots, over-cap claims fail, and dropping a slot (RAII) frees it.
+    #[test]
+    fn conn_cap_claims_to_cap_and_raii_drop_frees_a_slot() {
+        let cap = ConnCap::new(2);
+        let a = cap.try_claim().expect("slot 1");
+        let _b = cap.try_claim().expect("slot 2");
+        assert!(cap.try_claim().is_none(), "over-cap claim refused");
+        drop(a);
+        let _c = cap.try_claim().expect("freed slot reusable");
+        assert!(cap.try_claim().is_none(), "back at cap");
+    }
+
+    // Audit-remediation U7/KTD7: the socket dir is 0700 whether freshly
+    // created (runtime-dir shape, nested temp-fallback shape) or pre-existing
+    // with looser modes.
+    #[test]
+    fn socket_dir_is_0700_on_create_and_tightened_when_pre_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // Fresh create, single segment ($XDG_RUNTIME_DIR/<app> shape).
+        let runtime = tmp.path().join("fly");
+        create_private_socket_dir(&runtime).unwrap();
+        assert_eq!(mode(&runtime), 0o700);
+
+        // Fresh create, nested (temp-fallback shape).
+        let nested = tmp.path().join("deep").join("fly");
+        create_private_socket_dir(&nested).unwrap();
+        assert_eq!(mode(&nested), 0o700);
+
+        // Pre-existing dir with a loose mode is tightened, not trusted.
+        let loose = tmp.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_socket_dir(&loose).unwrap();
+        assert_eq!(mode(&loose), 0o700);
+    }
 }

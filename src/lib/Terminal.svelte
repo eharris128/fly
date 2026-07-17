@@ -8,6 +8,7 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getConfig } from "./config";
   import type { Keymap } from "./keymap";
+  import { resolveSpawnRace } from "./pane-maps";
   import type { ResumeTier } from "./resume";
   import {
     injectionSpawned,
@@ -100,6 +101,9 @@
   let term: Terminal | undefined;
   let fit: FitAddon | undefined;
   let paneId: PaneId | null = null;
+  // Audit-remediation U9/KTD9: set by onDestroy so a spawnPane resolving after
+  // the component's cleanup closes its orphan pane instead of adopting it.
+  let destroyed = false;
   let unlisteners: UnlistenFn[] = [];
   let resizeObs: ResizeObserver | null = null;
 
@@ -295,6 +299,19 @@
       term.write(`\r\n\x1b[31m[failed to start: ${String(e)}]\x1b[0m\r\n`);
       return;
     }
+    // Audit-remediation U9/KTD9: the component can be destroyed while the
+    // spawn await is in flight (close-during-spawn) — onDestroy saw paneId
+    // null and closed nothing, so this fresh pane has no owner. Close it now
+    // and never announce it; without this it lives until shutdown reap.
+    {
+      const race = resolveSpawnRace(destroyed);
+      if (race.closeNow) {
+        const orphan = paneId;
+        paneId = null;
+        if (orphan !== null) void closePane(orphan);
+        return;
+      }
+    }
     term.onData((data) => {
       // Guided-handoff U3: a user-originated chunk → the user's intent wins;
       // skip injection. `isUserInputChunk` (handoff.ts) holds the rule: ESC-free
@@ -361,6 +378,7 @@
   });
 
   onDestroy(() => {
+    destroyed = true; // U9/KTD9: an in-flight spawn must not adopt its pane
     endInjection(); // guided-handoff U3: stop the ticker, release the entry
     if (resumeBannerTimer) clearTimeout(resumeBannerTimer);
     resizeObs?.disconnect();

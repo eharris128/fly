@@ -127,6 +127,17 @@ impl Grid {
     }
 
     fn ensure_row(&mut self) {
+        // Clamp before allocating (audit-remediation U8/KTD8): a CSI cursor
+        // jump can put `row` up to 65535 past the grid, and pushing every
+        // intermediate row before the drain below would transiently allocate
+        // ~65k Vecs. When the jump exceeds the retained window, every
+        // surviving row would be a fresh empty anyway — so drop the old rows
+        // now and land the cursor at the cap. Final state is identical to the
+        // push-then-drain result; peak allocation is O(MAX_GRID_ROWS) always.
+        if self.row >= self.lines.len() + MAX_GRID_ROWS {
+            self.lines.clear();
+            self.row = MAX_GRID_ROWS - 1;
+        }
         while self.lines.len() <= self.row {
             self.lines.push(Vec::new());
         }
@@ -567,6 +578,39 @@ mod tests {
     /// reported as still blocked.
     const ASK_DECLINED_IDLE_80: &[u8] =
         include_bytes!("../../tests/fixtures/screen/ask-declined-idle-80.raw");
+
+    // Audit-remediation U8/KTD8: a 65535-row cursor jump must not transiently
+    // allocate ~65k rows — the grid stays within MAX_GRID_ROWS at all times
+    // (the clamp runs before the row-push loop) and rendering proceeds
+    // unsurprised with the post-jump write on the final row.
+    #[test]
+    fn a_huge_cursor_jump_never_allocates_past_the_row_cap() {
+        for seq in ["\x1b[65535B", "\x1b[65535e", "\x1b[65535E"] {
+            let bytes = format!("hello{seq}world");
+            let grid = render_tail(bytes.as_bytes(), 80);
+            assert!(!grid.surprised, "{seq:?} is a supported sequence");
+            assert!(
+                grid.lines.len() <= MAX_GRID_ROWS,
+                "{seq:?} grew the grid to {} rows",
+                grid.lines.len()
+            );
+            let text = grid.text_lines();
+            assert!(
+                text.last().unwrap().contains("world"),
+                "post-jump write lands on the tail row"
+            );
+        }
+        // Stacked jumps stay bounded too (row is astronomically past the grid
+        // by the time the next glyph forces ensure_row).
+        let mut bytes: Vec<u8> = Vec::new();
+        for _ in 0..10 {
+            bytes.extend_from_slice(b"\x1b[65535B");
+        }
+        bytes.extend_from_slice(b"x");
+        let grid = render_tail(&bytes, 80);
+        assert!(grid.lines.len() <= MAX_GRID_ROWS);
+        assert!(grid.text_lines().last().unwrap().contains('x'));
+    }
 
     #[test]
     fn parses_the_real_ask_picker_at_80_cols() {

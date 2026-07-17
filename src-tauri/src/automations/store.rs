@@ -196,6 +196,19 @@ impl Store {
         Store::load_at(store_path(), scripts_dir())
     }
 
+    /// Lock the inner state, **recovering from poison** (audit-remediation
+    /// U4/KTD4, the `session/resume.rs` precedent): a mutation closure that
+    /// panicked poisons the mutex, and a plain `unwrap` would then panic every
+    /// subsequent sweep tick — killing the sweep thread for the rest of the
+    /// session. Recovery is safe for the same reason `resume.rs` documents:
+    /// the on-disk file is only ever a complete renamed snapshot (never a
+    /// partial write), so the worst a mid-mutation panic leaves behind is a
+    /// half-applied *in-memory* edit of one automation — which the next
+    /// mutation continues from, exactly as if the closure had returned early.
+    fn lock_recovered(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     // ---- mutation (KTD-B: lock → mutate → flush → return) ------------------
 
     /// Run `f` against the map and flush the full document atomically before
@@ -211,7 +224,7 @@ impl Store {
     /// Per KTD-B lock discipline, `f` must be pure map manipulation — never
     /// dispatch, emit events, or block on I/O inside it.
     pub fn mutate<R>(&self, f: impl FnOnce(&mut BTreeMap<String, Automation>) -> R) -> io::Result<R> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_recovered();
         let result = f(&mut inner.map);
         match write_map(&self.path, &inner.map) {
             Ok(()) => {
@@ -250,7 +263,7 @@ impl Store {
     /// entry never flushed); its failure is logged, not surfaced.
     pub fn delete(&self, id: &str) -> Option<Automation> {
         let removed = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.lock_recovered();
             let removed = inner.map.remove(id);
             match write_map(&self.path, &inner.map) {
                 Ok(()) => inner.health.flush_error = None,
@@ -279,17 +292,17 @@ impl Store {
 
     /// Clone of the full map (dashboard/list reads, U10).
     pub fn snapshot(&self) -> BTreeMap<String, Automation> {
-        self.inner.lock().unwrap().map.clone()
+        self.lock_recovered().map.clone()
     }
 
     /// Clone of one automation.
     pub fn get(&self, id: &str) -> Option<Automation> {
-        self.inner.lock().unwrap().map.get(id).cloned()
+        self.lock_recovered().map.get(id).cloned()
     }
 
     /// Current health (R6) — see [`StoreHealth`].
     pub fn health(&self) -> StoreHealth {
-        self.inner.lock().unwrap().health.clone()
+        self.lock_recovered().health.clone()
     }
 
     // ---- script content files (KTD-B: on disk, not in the JSON) -------------
@@ -395,7 +408,27 @@ pub(crate) fn write_atomic_owner_only(path: &Path, bytes: &[u8]) -> io::Result<(
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)
+    // fsync-before-rename (audit-remediation U5/KTD5): without it, a power
+    // loss after the rename can leave the *new* name pointing at unwritten
+    // data on some filesystems — atomicity against crashes of this process
+    // was already covered by the rename, durability against power loss was
+    // not. The files are small and writes per-mutation, so the cost is noise.
+    std::fs::File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    sync_parent_dir(path);
+    Ok(())
+}
+
+/// Best-effort fsync of `path`'s parent directory after a rename, so the
+/// directory entry itself is durable (U5/KTD5). Failure is ignored: some
+/// filesystems refuse directory fsync, and the data-file sync above already
+/// covers the common cases.
+pub(crate) fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 }
 
 /// `create_dir_all` + explicit `0700` (never left to umask).
@@ -687,6 +720,44 @@ mod tests {
         let reloaded = store_in(&dir);
         assert_eq!(reloaded.snapshot().len(), 3, "a2 caught up on the next flush");
         assert!(reloaded.get("a2").is_some());
+    }
+
+    // Audit-remediation U4/KTD4: a panicking mutation closure poisons the
+    // mutex; every later lock must recover (resume.rs precedent) — a plain
+    // unwrap would panic the sweep thread on its next tick and kill it for
+    // the session.
+    #[test]
+    fn a_panicking_mutation_closure_does_not_poison_later_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        store
+            .mutate(|map| {
+                map.insert("a1".into(), automation("a1"));
+            })
+            .unwrap();
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.mutate(|map| {
+                // A half-applied edit, then a panic mid-closure.
+                map.insert("a2".into(), automation("a2"));
+                panic!("mutation closure blew up");
+            });
+        }));
+        assert!(panicked.is_err(), "the closure's panic propagates to its caller");
+
+        // Every entry point recovers: reads…
+        assert!(store.get("a1").is_some());
+        assert!(store.health().flush_error.is_none());
+        // …and the next mutation proceeds against the recovered map (the
+        // half-applied a2 insert is simply present — continue-from semantics).
+        store
+            .mutate(|map| {
+                map.insert("a3".into(), automation("a3"));
+            })
+            .expect("post-panic mutate succeeds");
+        assert_eq!(store.snapshot().len(), 3);
+        assert_eq!(store_in(&dir).snapshot().len(), 3, "flushed after recovery");
+        assert_eq!(store.delete("a2").map(|a| a.id), Some("a2".to_string()));
     }
 
     // R6: on-disk modes are explicit, never umask — store file 0600 in a

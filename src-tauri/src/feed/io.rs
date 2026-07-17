@@ -98,20 +98,19 @@ impl ReplyResolver {
     /// record, no captured session/cwd, no transcript on disk, a text-free
     /// tail, nothing pending. All of those mean "no data" — never an error.
     ///
-    /// Reply text is control-sanitized (R16 posture; newlines/tabs kept) so
-    /// every consumer of the pair sees the same bytes; a reply that sanitizes
-    /// to blank counts as absent. Question strings additionally pass secret
-    /// scrubbing **before** sanitize + truncation (R8/KTD7 — see [`clean`]);
-    /// the reply itself stays unscrubbed (unchanged, deferred parity — the
-    /// trust model remains "token holder ≈ user at the keyboard").
+    /// Reply text is control-sanitized (R16 posture; newlines/tabs kept),
+    /// *then* secret-scrubbed (audit-remediation U1/R1 — the same
+    /// sanitize-before-scrub order [`clean`] pins, so a control char inside a
+    /// token can't defeat the prefix/marker scan; see [`clean`] for the
+    /// anti-reassembly argument) so every consumer of the pair sees the same
+    /// bytes; a reply that sanitizes to blank counts as absent. The reply is
+    /// never truncated — only questions and turns carry caps.
     ///
     /// The conversation tail (feed-conversation-tail U2) is served only
     /// alongside a *stamped* wire reply — the array must end with the current
     /// reply, `at == repliedAt` (R3) — and every turn's text goes through the
-    /// full [`clean`] pipeline (R7). That is deliberately stricter than the
-    /// sibling `text` field's legacy no-scrub posture: turns are newly exposed
-    /// strings, so a secret-bearing final turn may read `[redacted]` where
-    /// `text` shows the raw reply.
+    /// full [`clean`] pipeline (R7): a secret-bearing final turn reads
+    /// `[redacted]` in both `text` and `turns`.
     pub fn resolve_io(&self, leaf_key: &str) -> ResolvedIo {
         let Some(path) = self.transcript_path(leaf_key) else {
             return ResolvedIo::default();
@@ -131,7 +130,7 @@ impl ReplyResolver {
         let io = transcript::transcript_io(&path)
             .map(|t| {
                 let reply = t.reply.and_then(|r| {
-                    let text = crate::notify::sanitize_multiline(&r.text);
+                    let text = redact::clean_text(&r.text);
                     (!text.trim().is_empty()).then_some(LastReply {
                         text,
                         replied_at_ms: r.replied_at_ms,
@@ -583,6 +582,39 @@ mod tests {
         let blank = r#"{"type":"assistant","message":{"role":"assistant","content":"\u0007\u001b"}}"#;
         let r = fixture(dir.path(), "leaf-2", "sid-def", "/q", &format!("{blank}\n"));
         assert_eq!(r.resolve_io("leaf-2").reply, None);
+    }
+
+    #[test]
+    fn reply_text_is_secret_scrubbed_in_both_text_and_turns() {
+        // Audit-remediation U1/R1: the reply passes sanitize → scrub like every
+        // other feed-exposed string, so a secret echoed in the final assistant
+        // turn reads [redacted] in `text` AND in the tail's last turn.
+        let secret = format!("sk-ant-api03-{}", "a".repeat(30));
+        let body = [
+            user_line(1, "what key did you use?"),
+            agent_line(5, &format!("I used {secret} for that call.")),
+        ]
+        .join("\n");
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{body}\n"));
+        let io = r.resolve_io("leaf-1");
+        let text = &io.reply.as_ref().unwrap().text;
+        assert!(!text.contains("sk-ant"), "reply leaked: {text}");
+        assert!(text.contains("[redacted]"));
+        assert_eq!(&io.turns.last().unwrap().text, text, "parity with turns");
+        // A cache hit (unchanged mtime/len) serves the scrubbed form too.
+        let cached = r.resolve_io("leaf-1");
+        assert_eq!(&cached.reply.unwrap().text, text);
+    }
+
+    #[test]
+    fn a_reply_that_scrubs_to_redacted_only_still_serves() {
+        // Scrubbing never blanks a reply into absence — the marker itself is
+        // non-blank, so a secret-only reply serves as "[redacted]".
+        let body = agent_line(5, "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234");
+        let dir = tempfile::tempdir().unwrap();
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/p", &format!("{body}\n"));
+        assert_eq!(r.resolve_io("leaf-1").reply.unwrap().text, "[redacted]");
     }
 
     // ---- resolve_io: reply + pending from one read (feed-pending-question U3)

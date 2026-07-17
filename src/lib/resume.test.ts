@@ -93,6 +93,33 @@ describe("buildResumeCommand (U5)", () => {
     expect(out).toEqual(["claude", "--resume", "new"]);
   });
 
+  it("strips --session-id in both forms — never replayed beside --resume (U11/KTD11)", () => {
+    // Separate-value form: flag and its uuid both dropped.
+    const out = buildResumeCommand(
+      rec({
+        argv: ["claude", "--session-id", "11111111-2222-3333-4444-555555555555", "--model", "opus"],
+        sessionId: "new",
+      }),
+      DEFAULT,
+    );
+    expect(out).toEqual(["claude", "--model", "opus", "--resume", "new"]);
+    // `=` form.
+    const eq = buildResumeCommand(
+      rec({ argv: ["claude", "--session-id=deadbeef"], sessionId: "new" }),
+      DEFAULT,
+    );
+    expect(eq).toEqual(["claude", "--resume", "new"]);
+    // Interaction: composes with the --resume strip and a variadic --add-dir.
+    const mixed = buildResumeCommand(
+      rec({
+        argv: ["claude", "--session-id", "old", "-r", "stale", "--add-dir", "/a", "/b"],
+        sessionId: "new",
+      }),
+      DEFAULT,
+    );
+    expect(mixed).toEqual(["claude", "--add-dir", "/a", "/b", "--resume", "new"]);
+  });
+
   it("strips a trailing positional prompt after a boolean flag (no re-send)", () => {
     const out = buildResumeCommand(
       rec({ argv: ["claude", "--dangerously-skip-permissions", "write a poem"], sessionId: "x" }),
