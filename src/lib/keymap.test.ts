@@ -36,6 +36,8 @@ function spyActions(): KeymapActions & { calls: string[] } {
     focusRight: mk("right"),
     focusUp: mk("up"),
     focusDown: mk("down"),
+    focusNextPane: mk("nextPane"),
+    focusPrevPane: mk("prevPane"),
     cycleAttention: mk("cycle"),
     jumpNewestUnread: mk("jumpUnread"),
     openNotifications: mk("openNotifications"),
@@ -234,6 +236,16 @@ describe("Keymap", () => {
     km.handle(ev("a", { ctrl: true }));
     km.handle(ev("X", { shift: true })); // literal uppercase → close tab
     expect(a.calls).toEqual(["close", "closeTab"]);
+  });
+
+  it("distinguishes leader o (next pane) from leader O (previous pane)", () => {
+    const a = spyActions();
+    const km = new Keymap("ctrl+a", a);
+    km.handle(ev("a", { ctrl: true }));
+    km.handle(ev("o")); // literal lowercase → rotate forward
+    km.handle(ev("a", { ctrl: true }));
+    km.handle(ev("O", { shift: true })); // literal uppercase → rotate backward
+    expect(a.calls).toEqual(["nextPane", "prevPane"]);
   });
 
   it("maps the workspace + sidebar chords", () => {

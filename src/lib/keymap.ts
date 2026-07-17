@@ -12,6 +12,8 @@ export interface KeymapActions {
   focusRight: () => void;
   focusUp: () => void;
   focusDown: () => void;
+  focusNextPane: () => void;
+  focusPrevPane: () => void;
   cycleAttention: () => void;
   jumpNewestUnread: () => void;
   openNotifications: () => void;
@@ -57,6 +59,14 @@ export const BINDINGS: Binding[] = [
   { keys: ["l", "arrowright"], label: "Focus right", action: "focusRight" },
   { keys: ["k", "arrowup"], label: "Focus up", action: "focusUp" },
   { keys: ["j", "arrowdown"], label: "Focus down", action: "focusDown" },
+  // Pane rotation (tmux's `o`): cycles focus through the active tab's panes in
+  // leaf order (left-to-right / top-to-bottom, wrapping), so it scales to any
+  // number of splits — with two panes it degenerates to a toggle. Uppercase O
+  // rotates backwards, distinct via `upper` exactly like x / X. Complements the
+  // directional h/j/k/l moves: one repeatable chord visits every pane without
+  // thinking about geometry.
+  { keys: ["o"], label: "Next pane", action: "focusNextPane" },
+  { keys: ["o"], upper: true, label: "Previous pane", action: "focusPrevPane" },
   { keys: ["u"], label: "Cycle attention", action: "cycleAttention" },
   // Uppercase U is distinct from lowercase u (cycle attention) via `upper`,
   // exactly like x / X: it jumps within the notification history, not the

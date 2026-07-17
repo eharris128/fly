@@ -20,6 +20,8 @@ function spyActions(calls: string[]): KeymapActions {
     focusRight: mk("focusRight"),
     focusUp: mk("focusUp"),
     focusDown: mk("focusDown"),
+    focusNextPane: mk("focusNextPane"),
+    focusPrevPane: mk("focusPrevPane"),
     cycleAttention: mk("cycle"),
     jumpNewestUnread: mk("jumpUnread"),
     openNotifications: mk("openNotifications"),

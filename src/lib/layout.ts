@@ -68,6 +68,26 @@ export function leaves(node: Node): Leaf[] {
     : [...leaves(node.first), ...leaves(node.second)];
 }
 
+/**
+ * The leaf `delta` steps from `fromKey` in leaf order (left-to-right /
+ * top-to-bottom, wrapping), for the leader o/O focus rotation. Rotation order
+ * is `leaves()` order — the same stable order splits render in — so it scales
+ * to any pane count, not just a two-pane toggle. Returns `null` when there is
+ * nothing to rotate to (a sole leaf); a stale `fromKey` recovers to the first
+ * leaf rather than dead-ending focus.
+ */
+export function cycleLeafKey(
+  root: Node,
+  fromKey: string,
+  delta: 1 | -1 = 1,
+): string | null {
+  const ls = leaves(root);
+  if (ls.length < 2) return null;
+  const i = ls.findIndex((l) => l.key === fromKey);
+  if (i === -1) return ls[0].key;
+  return ls[(i + delta + ls.length) % ls.length].key;
+}
+
 /** Split `targetKey` into [existing, new] along `orientation`. */
 export function splitLeaf(
   root: Node,

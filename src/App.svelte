@@ -19,6 +19,7 @@
     dividers,
     canSplit,
     neighbor,
+    cycleLeafKey,
     setRatio,
     collectKeys,
     ensureKeyCounterAbove,
@@ -743,6 +744,13 @@
   function focusDir(dir: "left" | "right" | "up" | "down") {
     if (!activeTab) return;
     const n = neighbor(rects, activeTab.focusedLeafKey, dir);
+    if (n) setActiveFocus(n);
+  }
+  // Leader o/O: rotate focus through the active tab's panes in leaf order,
+  // wrapping — geometry-free, so one repeatable chord visits every split.
+  function focusCycle(delta: 1 | -1) {
+    if (!activeTab) return;
+    const n = cycleLeafKey(activeTab.tree, activeTab.focusedLeafKey, delta);
     if (n) setActiveFocus(n);
   }
   // Activate a specific pane anywhere (used by attention cycling, which can
@@ -1966,6 +1974,8 @@
     focusRight: () => focusDir("right"),
     focusUp: () => focusDir("up"),
     focusDown: () => focusDir("down"),
+    focusNextPane: () => focusCycle(1),
+    focusPrevPane: () => focusCycle(-1),
     cycleAttention,
     jumpNewestUnread,
     openNotifications,
