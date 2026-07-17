@@ -11,6 +11,9 @@ import {
   flattenRaised,
   attentionPriority,
   sortByAttentionPriority,
+  attentionKind,
+  combineAttentionKinds,
+  rollupAttentionKind,
   unreadCountForLeaves,
   reorderWorkspaces,
   insertionIndex,
@@ -320,6 +323,60 @@ describe("attentionPriority", () => {
     expect(attentionPriority("error")).toBe(3);
     expect(attentionPriority(null)).toBe(3);
     expect(attentionPriority(undefined)).toBe(3);
+  });
+});
+
+describe("attentionKind", () => {
+  it("maps finished to done and everything else to input", () => {
+    expect(attentionKind("finished")).toBe("done");
+    expect(attentionKind("question")).toBe("input");
+    expect(attentionKind("permission")).toBe("input");
+    // Alert/error/unknown must read urgent, never as a calm completion.
+    expect(attentionKind("alert")).toBe("input");
+    expect(attentionKind("error")).toBe("input");
+    expect(attentionKind(null)).toBe("input");
+    expect(attentionKind(undefined)).toBe("input");
+  });
+});
+
+describe("combineAttentionKinds", () => {
+  it("lets input win over done, and done over nothing", () => {
+    expect(combineAttentionKinds(["done", "input", "done"])).toBe("input");
+    expect(combineAttentionKinds([null, "done", null])).toBe("done");
+    expect(combineAttentionKinds([null, null])).toBe(null);
+    expect(combineAttentionKinds([])).toBe(null);
+  });
+});
+
+describe("rollupAttentionKind", () => {
+  const att = {
+    asking: "raised",
+    stopped: "raised",
+    seen: "acknowledged",
+    quiet: "idle",
+  };
+  const reasons = {
+    asking: "permission" as const,
+    stopped: "finished" as const,
+    seen: "question" as const,
+  };
+
+  it("reports input when any raised leaf is blocked on the user", () => {
+    expect(rollupAttentionKind(["stopped", "asking"], att, reasons)).toBe("input");
+  });
+
+  it("reports done when the only raised leaves finished", () => {
+    expect(rollupAttentionKind(["stopped", "quiet"], att, reasons)).toBe("done");
+  });
+
+  it("ignores non-raised leaves, matching the old boolean dot", () => {
+    // An acknowledged question contributes nothing — you already saw it.
+    expect(rollupAttentionKind(["seen", "quiet"], att, reasons)).toBe(null);
+    expect(rollupAttentionKind([], att, reasons)).toBe(null);
+  });
+
+  it("treats a raised leaf with no recorded reason as input", () => {
+    expect(rollupAttentionKind(["mystery"], { mystery: "raised" }, {})).toBe("input");
   });
 });
 

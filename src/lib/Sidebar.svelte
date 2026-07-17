@@ -10,22 +10,29 @@
   // workspaces.ts (insertionIndex); this component wires it to pointer events,
   // mirroring App.svelte's split-divider `startDrag`. Order persistence is the
   // parent's job — the reorder fires `onReorderWorkspace(from, to)`.
-  import { insertionIndex } from "./workspaces";
+  import { insertionIndex, type AttentionKind } from "./workspaces";
 
   interface SidebarTab {
     id: string;
     title: string;
-    attention: boolean;
+    attention: AttentionKind | null;
     unread: number;
   }
   interface SidebarWorkspace {
     id: string;
     name: string;
-    attention: boolean;
+    attention: AttentionKind | null;
     unread: number;
     muted: boolean;
     tabs: SidebarTab[];
   }
+
+  // The dot's two-way cue (see workspaces.attentionKind): amber = an agent is
+  // blocked on your input; blue = it finished and has a result waiting.
+  const DOT_TITLE: Record<AttentionKind, string> = {
+    input: "an agent needs your input",
+    done: "an agent finished — result ready",
+  };
   type Editing = { kind: "tab" | "ws"; id: string } | null;
 
   interface Props {
@@ -227,7 +234,11 @@
             >
           {/if}
           {#if ws.attention}
-            <span class="dot" title="an agent needs attention"></span>
+            <span
+              class="dot"
+              class:done={ws.attention === "done"}
+              title={DOT_TITLE[ws.attention]}
+            ></span>
           {/if}
           {#if ws.unread > 0}
             <span class="count" title="{ws.unread} unread">{ws.unread}</span>
@@ -278,7 +289,11 @@
                   onSelectTab(ws.id, tab.id)}
               >
                 {#if tab.attention}
-                  <span class="dot" title="an agent needs attention"></span>
+                  <span
+                    class="dot"
+                    class:done={tab.attention === "done"}
+                    title={DOT_TITLE[tab.attention]}
+                  ></span>
                 {:else}
                   <span class="dot-spacer"></span>
                 {/if}
@@ -472,6 +487,9 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  /* Amber = an agent is blocked on your input (question/permission — and any
+     non-finished raise, which must read urgent). Blue = finished, result ready
+     — the calmer cue, matching the notification panel's "finished" tag. */
   .dot {
     width: 7px;
     height: 7px;
@@ -479,6 +497,10 @@
     border-radius: 50%;
     background: #f5a623;
     box-shadow: 0 0 6px #f5a623;
+  }
+  .dot.done {
+    background: #4da3ff;
+    box-shadow: 0 0 6px #4da3ff;
   }
   .dot-spacer {
     width: 7px;

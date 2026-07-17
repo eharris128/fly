@@ -33,6 +33,8 @@
     deleteWorkspaceFrom,
     flattenRaised,
     sortByAttentionPriority,
+    rollupAttentionKind,
+    combineAttentionKinds,
     unreadCountForLeaves,
     sourceLeafForNewTab,
     reorderWorkspaces,
@@ -416,7 +418,9 @@
     homeViewOpen || !activeTab ? [] : leaves(activeTab.tree).map((l) => l.key),
   );
   // View model for the sidebar: names resolved, attention rolled up per tab and
-  // per workspace so a collapsed workspace still surfaces a raised agent.
+  // per workspace so a collapsed workspace still surfaces a raised agent. The
+  // rollup is reason-typed (input vs done, input wins) so the dot can tell
+  // "blocked on you" from "finished a turn" — see workspaces.attentionKind.
   const unreadCounts = $derived(unreadByLeaf(notifications));
   const sidebarWorkspaces = $derived(
     workspaces.map((w) => {
@@ -425,14 +429,14 @@
         return {
           id: t.id,
           title: tabDisplayTitle(t, cwdByLeaf),
-          attention: keys.some((k) => attentionByLeaf[k] === "raised"),
+          attention: rollupAttentionKind(keys, attentionByLeaf, reasonByLeaf),
           unread: unreadCountForLeaves(keys, unreadCounts),
         };
       });
       return {
         id: w.id,
         name: w.name,
-        attention: tabs.some((t) => t.attention),
+        attention: combineAttentionKinds(tabs.map((t) => t.attention)),
         unread: tabs.reduce((n, t) => n + t.unread, 0),
         muted: mutedWorkspaces.has(w.id),
         tabs,

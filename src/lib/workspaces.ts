@@ -210,6 +210,55 @@ export function attentionPriority(reason: AttentionReason | null | undefined): n
 }
 
 /**
+ * What a raised agent wants from you, collapsed to the sidebar's two-way cue:
+ * `"input"` — it is blocked on a response from you (a question or permission
+ * prompt, plus alert/error/unknown, which also mean "come look"); `"done"` — it
+ * finished a turn and returned a result (Stop). The same reason-typed
+ * vocabulary as `attentionPriority` (R7), folded to the coarser split the dot
+ * can draw. Non-finished is conservatively "input": an unknown ask must read
+ * urgent, never as a calm completion.
+ */
+export type AttentionKind = "input" | "done";
+
+export function attentionKind(reason: AttentionReason | null | undefined): AttentionKind {
+  return reason === "finished" ? "done" : "input";
+}
+
+/**
+ * Combine per-member kinds into one rollup cue: `"input"` wins over `"done"`
+ * (a blocked agent is the more actionable), null when nothing is raised. Used
+ * per tab over its leaves and per workspace over its tabs, so a collapsed
+ * workspace still surfaces its most urgent raised agent.
+ */
+export function combineAttentionKinds(
+  kinds: Iterable<AttentionKind | null>,
+): AttentionKind | null {
+  let combined: AttentionKind | null = null;
+  for (const k of kinds) {
+    if (k === "input") return "input";
+    if (k === "done") combined = "done";
+  }
+  return combined;
+}
+
+/**
+ * The rollup cue for a set of leaves: each raised leaf's reason folded through
+ * `attentionKind`, combined with input-beats-done precedence. Non-raised
+ * leaves (idle/acknowledged/absent) contribute nothing, matching the old
+ * boolean `raised`-only dot this replaces.
+ */
+export function rollupAttentionKind(
+  leafKeys: Iterable<string>,
+  attentionByLeaf: Record<string, string>,
+  reasonByLeaf: Record<string, AttentionReason | null>,
+): AttentionKind | null {
+  const kinds: AttentionKind[] = [];
+  for (const k of leafKeys)
+    if (attentionByLeaf[k] === "raised") kinds.push(attentionKind(reasonByLeaf[k]));
+  return combineAttentionKinds(kinds);
+}
+
+/**
  * Reorder an already-positional list of raised entries by triage payoff:
  * question/permission first, then alert (automations R18), then finished, then
  * error/unknown (R7). Within a tier the input (positional) order is preserved —
