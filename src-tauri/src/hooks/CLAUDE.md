@@ -27,7 +27,8 @@ here is mandatory, not a nicety.
   compared in **constant time** (`subtle::ConstantTimeEq`). Never log a token;
   never compare with `==`.
 - **Peer-UID check** (`server.rs`) — the connecting peer's UID must equal the
-  app's UID via `SO_PEERCRED`. Reject otherwise.
+  app's UID via `SO_PEERCRED` (Linux) / `getpeereid(2)` (macOS — same
+  kernel-attested peer euid). Reject otherwise, on error too.
 - **Lockout** (`token.rs`) — repeated invalid presentations trip a registry-wide
   cooldown (`MAX_FAILURES` / `LOCKOUT`) to blunt brute-force and spam.
 - **Bounded I/O** (`server.rs`) — cap a single request (`MAX_MESSAGE`, 64 KiB)

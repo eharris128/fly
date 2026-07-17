@@ -27,6 +27,8 @@ pnpm flavor:dev               # run a dev build ALONGSIDE an installed release (
 pnpm check                    # svelte-check: type-check the frontend
 pnpm test:unit                # vitest: all frontend unit tests
 pnpm tauri build --bundles deb   # standalone .deb (skip AppImage — it needs network at bundle time)
+pnpm build:local              # .deb on the fast release-dev profile (thin LTO — ~2× faster rebuilds)
+pnpm build:mac                # on a Mac: .app + .dmg (best-effort target — see docs/macos-build.md)
 
 cargo test --offline --manifest-path src-tauri/Cargo.toml          # all Rust tests
 cargo test --offline --manifest-path src-tauri/Cargo.toml --test hook_auth   # one integration-test file (src-tauri/tests/<name>.rs)

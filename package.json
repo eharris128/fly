@@ -11,6 +11,7 @@
     "test:unit": "vitest run",
     "tauri": "tauri",
     "build:local": "tauri build --bundles deb -- --profile release-dev",
+    "build:mac": "tauri build --bundles app dmg -- --profile release-dev",
     "flavor:dev": "FLY_APP_NAME=fly-dev tauri dev --config src-tauri/tauri.dev.conf.json"
   },
   "dependencies": {
