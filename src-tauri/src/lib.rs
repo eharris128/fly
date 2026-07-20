@@ -1018,6 +1018,7 @@ pub fn run() {
             session::resume::prune_resume_records,
             session::transcript::continue_target,
             session::transcript::qualifying_session_count,
+            session::transcript::resolve_resume_spawn_cwd,
             session::handoff::resolve_handoff_target,
             session::handoff::list_handoff_candidates,
             usage::usage_snapshot,

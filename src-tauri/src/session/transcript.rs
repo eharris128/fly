@@ -486,6 +486,74 @@ pub fn qualifying_session_count(cwd: String) -> u32 {
     }
 }
 
+// ---- resume spawn-cwd resolution (fix drifted session cwd) -----------------
+
+/// Whether `id` is safe to splice into a transcript filename: non-empty and
+/// uuid-shaped (ASCII alphanumerics and `-` only). The id comes from fly's own
+/// resume store, but it still becomes a path component — anything else (a `/`,
+/// a `.`, a control char) is refused outright rather than joined.
+fn is_pathsafe_session_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// The transcript's own record of its **launch** cwd: the first `cwd` field in
+/// `body` whose [`encode_cwd`] equals the project folder's name. The folder name
+/// can't be decoded directly (`-` is ambiguous — it encodes `/`, `.`, and
+/// itself), but the transcript's entries carry every cwd the session visited,
+/// and exactly the launch cwd round-trips to the folder that holds the file.
+/// `None` when no line matches (abstain rather than guess). Pure.
+pub(crate) fn launch_root_from_str(folder_name: &str, body: &str) -> Option<String> {
+    for line in body.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+            if encode_cwd(cwd) == folder_name {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Root-injected core of [`resolve_resume_spawn_cwd`]: verify-then-relocate.
+/// If `<root>/<encode(recorded_cwd)>/<id>.jsonl` exists, the record already
+/// names the launch dir — return it. Otherwise scan `root` for the project
+/// folder actually holding the transcript and recover the launch cwd from the
+/// transcript body ([`launch_root_from_str`]). `None` when the transcript is
+/// nowhere under `root` or its body never names the folder's cwd.
+fn resolve_spawn_cwd_in_root(root: &Path, session_id: &str, recorded_cwd: &str) -> Option<String> {
+    if !is_pathsafe_session_id(session_id) {
+        return None;
+    }
+    let file = format!("{session_id}.jsonl");
+    if root.join(encode_cwd(recorded_cwd)).join(&file).is_file() {
+        return Some(recorded_cwd.to_string());
+    }
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path().join(&file);
+        if !path.is_file() {
+            continue;
+        }
+        let folder = entry.file_name();
+        let body = std::fs::read_to_string(&path).ok()?;
+        return launch_root_from_str(&folder.to_string_lossy(), &body);
+    }
+    None
+}
+
+/// Command: the directory a `--resume <session_id>` must spawn in for Claude to
+/// find the session. The resume record's `session_cwd` is the hook's **live**
+/// cwd, which drifts when the agent `cd`s away from its launch dir — but Claude
+/// scopes `--resume` to the launch dir's project folder, so replaying in the
+/// drifted cwd fails with "No conversation found". `None` when the transcript
+/// can't be located (the caller keeps the recorded cwd — no worse than before).
+#[tauri::command]
+pub fn resolve_resume_spawn_cwd(session_id: String, recorded_cwd: String) -> Option<String> {
+    let root = claude_projects_root()?;
+    resolve_spawn_cwd_in_root(&root, &session_id, &recorded_cwd)
+}
+
 // ---- agent-run output capture (automations-workspace-and-model U4b) --------
 
 /// The full text of the **last assistant turn** in a transcript (automations-
@@ -1651,6 +1719,57 @@ mod tests {
         // Empty dir → 0 (the benign single/none paths stay unflagged).
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(qualifying_count_in_dir(empty.path()), 0);
+    }
+
+    // ---- resolve_spawn_cwd_in_root (drifted-session-cwd fix) ----------------
+
+    /// A minimal transcript whose session was launched in `/home/u/proj` and
+    /// later `cd`'d into `/home/u/proj/sub` — the drift shape that broke resume.
+    const DRIFTED_TRANSCRIPT: &str = concat!(
+        "{\"type\":\"mode\"}\n",
+        "not json at all\n",
+        "{\"type\":\"user\",\"cwd\":\"/home/u/proj\",\"message\":{}}\n",
+        "{\"type\":\"assistant\",\"cwd\":\"/home/u/proj/sub\",\"message\":{}}\n",
+    );
+
+    #[test]
+    fn launch_root_matches_folder_encoding_and_skips_drifted_cwds() {
+        // The launch cwd is the one whose encoding equals the folder name —
+        // order-independent: even listed after a drifted cwd it's still found.
+        assert_eq!(
+            launch_root_from_str("-home-u-proj", DRIFTED_TRANSCRIPT),
+            Some("/home/u/proj".to_string()),
+        );
+        // No cwd in the body round-trips to the folder → abstain.
+        assert_eq!(launch_root_from_str("-somewhere-else", DRIFTED_TRANSCRIPT), None);
+    }
+
+    #[test]
+    fn resolve_spawn_cwd_verifies_then_relocates() {
+        let root = tempfile::tempdir().unwrap();
+        let launch_dir = root.path().join("-home-u-proj");
+        std::fs::create_dir(&launch_dir).unwrap();
+        std::fs::write(launch_dir.join("sess-1.jsonl"), DRIFTED_TRANSCRIPT).unwrap();
+
+        // Recorded cwd = launch cwd → verified as-is (fast path).
+        assert_eq!(
+            resolve_spawn_cwd_in_root(root.path(), "sess-1", "/home/u/proj"),
+            Some("/home/u/proj".to_string()),
+        );
+        // Recorded cwd drifted to the cd'd subdir (whose project folder holds
+        // no such transcript) → relocated to the transcript's launch cwd.
+        assert_eq!(
+            resolve_spawn_cwd_in_root(root.path(), "sess-1", "/home/u/proj/sub"),
+            Some("/home/u/proj".to_string()),
+        );
+        // Unknown session → None (the caller keeps the recorded cwd).
+        assert_eq!(resolve_spawn_cwd_in_root(root.path(), "sess-9", "/home/u/proj"), None);
+        // A non-uuid-shaped id never touches the filesystem as a path piece.
+        assert_eq!(
+            resolve_spawn_cwd_in_root(root.path(), "../escape", "/home/u/proj"),
+            None,
+        );
+        assert_eq!(resolve_spawn_cwd_in_root(root.path(), "", "/home/u/proj"), None);
     }
 
     // ---- last_assistant_text (automations-workspace-and-model U4b) ----------

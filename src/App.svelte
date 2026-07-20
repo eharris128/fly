@@ -104,6 +104,7 @@
     loadResumeRecords,
     continueTarget,
     qualifyingSessionCount,
+    resolveResumeSpawnCwd,
     resolveHandoffTarget,
     listHandoffCandidates,
     saveSessionPick,
@@ -2145,10 +2146,27 @@
     if (mode === "resume") showNotice(resumeNoticeText(summary, staleDropped, ambiguous));
 
     // KTD-H: resume each agent in its captured session cwd when we have one.
-    for (const key of Object.keys(commands)) {
-      const cwd = records[key]?.sessionCwd;
-      if (cwd) cwds[key] = cwd;
-    }
+    // The captured cwd is the hook's *live* cwd, which drifts when the agent
+    // `cd`s away from its launch dir — but `claude --resume <id>` searches only
+    // the launch dir's project folder, so a drifted record dies with "No
+    // conversation found". For precise leaves, verify-then-relocate the cwd
+    // against the transcript store; a null/failed probe keeps the recorded cwd
+    // (no worse than before). Probes run in parallel and are isolated per leaf.
+    await Promise.all(
+      Object.keys(commands).map(async (key) => {
+        const rec = records[key];
+        const cwd = rec?.sessionCwd;
+        if (!cwd) return;
+        cwds[key] = cwd;
+        if (!rec?.sessionId) return;
+        try {
+          const resolved = await resolveResumeSpawnCwd(rec.sessionId, cwd);
+          if (resolved) cwds[key] = resolved;
+        } catch {
+          // probe failed → keep the recorded cwd
+        }
+      }),
+    );
     return { commands, tierByLeaf };
   }
 

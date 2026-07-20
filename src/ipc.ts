@@ -724,6 +724,25 @@ export interface HandoffTarget {
 }
 
 /**
+ * The directory a `--resume <sessionId>` must spawn in for Claude to find the
+ * session. A resume record's `sessionCwd` is the hook's *live* cwd, which
+ * drifts when the agent `cd`s away from its launch dir — but Claude scopes
+ * `--resume` to the launch dir's project folder, so replaying in the drifted
+ * cwd fails with "No conversation found". Verify-then-relocate against the
+ * transcript store; null when the transcript can't be located (the caller
+ * keeps the recorded cwd).
+ */
+export function resolveResumeSpawnCwd(
+  sessionId: string,
+  recordedCwd: string,
+): Promise<string | null> {
+  return invoke<string | null>("resolve_resume_spawn_cwd", {
+    sessionId,
+    recordedCwd,
+  });
+}
+
+/**
  * Resolve a leaf's previous session into a spawnable handoff target, or null
  * when nothing qualifies — no resume record, no transcript file, or no real
  * conversation turn (feeds the R6 notice). Resolved at chord time from the
