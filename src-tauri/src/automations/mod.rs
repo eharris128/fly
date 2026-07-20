@@ -2750,6 +2750,23 @@ pub fn list_automations(
     }
 }
 
+/// Delete an automation from the dashboard panel — the webview counterpart of
+/// the CLI's `automation/delete` socket op, sharing [`AutomationManager::delete`]
+/// and its R23 teardown (record + stored script removed, open rows closed
+/// failed, an in-flight script group / headless check killed). User-initiated
+/// from the dashboard UI, so the R22 recursion gate doesn't apply: that gate
+/// blocks automation-spawned *panes* mutating over the socket, and the webview
+/// is not a pane. No return payload — the manager emits `automation://changed`
+/// on success and the panel refetches; the Err string (unknown id — a raced
+/// CLI delete) is surfaced as a transient notice.
+#[tauri::command]
+pub fn delete_automation(
+    manager: tauri::State<'_, Arc<AutomationManager>>,
+    id: String,
+) -> Result<(), String> {
+    manager.delete(&id).map(|_| ())
+}
+
 /// R17 pickup validation (monitor-handoff U7): whether a failed monitor's
 /// stored pickup pointers still resolve on disk — the transcript file and
 /// the session cwd. A pure, read-only metadata check (two `stat`s, no file

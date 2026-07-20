@@ -353,6 +353,17 @@ export function listAutomations(): Promise<AutomationsDashboard> {
 }
 
 /**
+ * Delete an automation by id — the dashboard row's ✕, mirroring `fly
+ * automation delete` (R23 teardown: run history removed, an in-flight run
+ * stopped). The manager emits `automation://changed` on success so the panel
+ * refetches itself; rejects with a one-line reason for an unknown id (a raced
+ * CLI delete).
+ */
+export function deleteAutomation(id: string): Promise<void> {
+  return invoke("delete_automation", { id });
+}
+
+/**
  * R17 pickup validation (monitor-handoff U7, mirrors Rust `PickupCheck`):
  * whether a failed monitor's stored transcript path and session cwd still
  * exist on disk. Read-only metadata check — the pickup button decides
@@ -705,25 +716,6 @@ export function qualifyingSessionCount(cwd: string): Promise<number> {
 }
 
 /**
- * A qualified previous session for handoff (mirrors Rust `HandoffTarget`,
- * session-handoff U1). `transcriptPath` is the backend-derived transcript file
- * the stock prompt names; `sessionCwd` is the resume record's cwd — context
- * only, since the spawn dir is pinned to the pane's live cwd
- * (fix-session-pane-attribution KTD8). `lastTurnMs` is the last real turn's
- * Unix ms — always present, since a session only qualifies with at least one
- * real conversation turn (R5). `sessionSource`/`divergencePending` carry the
- * record's trust rank and re-pick signal (fix-attribution U6, KTD2/KTD4).
- */
-export interface HandoffTarget {
-  sessionId: string;
-  transcriptPath: string;
-  sessionCwd: string | null;
-  lastTurnMs: number;
-  sessionSource: SessionSource;
-  divergencePending: boolean;
-}
-
-/**
  * The directory a `--resume <sessionId>` must spawn in for Claude to find the
  * session. A resume record's `sessionCwd` is the hook's *live* cwd, which
  * drifts when the agent `cd`s away from its launch dir — but Claude scopes
@@ -740,6 +732,25 @@ export function resolveResumeSpawnCwd(
     sessionId,
     recordedCwd,
   });
+}
+
+/**
+ * A qualified previous session for handoff (mirrors Rust `HandoffTarget`,
+ * session-handoff U1). `transcriptPath` is the backend-derived transcript file
+ * the stock prompt names; `sessionCwd` is the resume record's cwd — context
+ * only, since the spawn dir is pinned to the pane's live cwd
+ * (fix-session-pane-attribution KTD8). `lastTurnMs` is the last real turn's
+ * Unix ms — always present, since a session only qualifies with at least one
+ * real conversation turn (R5). `sessionSource`/`divergencePending` carry the
+ * record's trust rank and re-pick signal (fix-attribution U6, KTD2/KTD4).
+ */
+export interface HandoffTarget {
+  sessionId: string;
+  transcriptPath: string;
+  sessionCwd: string | null;
+  lastTurnMs: number;
+  sessionSource: SessionSource;
+  divergencePending: boolean;
 }
 
 /**

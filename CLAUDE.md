@@ -309,8 +309,11 @@ next time the account is actually at a limit. Modules:
   R22-gated).
 - Dashboard panel (U10): `lib/automations.ts` is the pure view-model
   (`automationsToRows` — sort next-run asc / paused last, mirroring the CLI —
-  plus `humanSchedule`/`relativeTime`); `HomeView.svelte` renders it read-only
-  below the agent list, with the R6 store-health warning row.
+  plus `humanSchedule`/`relativeTime`); `HomeView.svelte` renders it below the
+  agent list, with the R6 store-health warning row. Interactive controls: the
+  retired-fail monitor pickup (R16) and a per-row delete ✕ — routed through
+  App's shared destructive-confirm into the `delete_automation` command, the
+  webview counterpart of the CLI's `automation/delete` (same R23 teardown).
 
 **Dedicated workspace + per-automation model** (`docs/plans/2026-07-03-002-feat-automations-workspace-and-model-plan.md`
 — its own U1–U10/R1–R15, scoped per that plan). Two Agent-mode follow-ons layered on the above:

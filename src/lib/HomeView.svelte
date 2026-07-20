@@ -27,6 +27,7 @@
     pickupFallback,
     pickupBusy,
     onPickup,
+    onDeleteAutomation,
     onDismissPickupFallback,
     onRefresh,
     onJump,
@@ -42,8 +43,8 @@
     /** One-line reason the usage fetch failed (not signed in, offline, …). */
     usageError: string | null;
     usageLoading: boolean;
-    /** Sorted, humanized automation rows (U10, R25). Read-only — no selection or
-     *  jump, unlike the agent rows. */
+    /** Sorted, humanized automation rows (U10, R25). No selection or jump,
+     *  unlike the agent rows. */
     automations: AutomationRow[];
     /** Store health degraded (corrupt file or failing flush) — shows the R6
      *  warning row. */
@@ -65,6 +66,9 @@
     /** Spawn a failed monitor's recovery session (monitor-handoff R16) — the
      *  automations panel's first interactive control. */
     onPickup: (row: AutomationRow) => void;
+    /** Delete an automation (the per-row ✕): App routes it through the shared
+     *  destructive-confirm overlay before anything is removed. */
+    onDeleteAutomation: (row: AutomationRow) => void;
     /** Dismiss the R17 fallback block. */
     onDismissPickupFallback: () => void;
     /** Re-fetch the usage gauges on demand (the panel's refresh button). */
@@ -250,9 +254,10 @@
   {/if}
 
   <!-- Automations panel (U10, R25; monitor-handoff U7): stacked below the
-       agent list in the same left column. Rows are static — no keyboard
-       selection or jump — with one exception: a retired-fail monitor row
-       carries the R16 pickup button (the panel's first interactive control). -->
+       agent list in the same left column. Rows have no keyboard selection or
+       jump; their interactive controls are the R16 pickup button on a
+       retired-fail monitor row and the per-row delete ✕ (confirmed by App's
+       shared destructive-confirm before anything is removed). -->
   <section class="automations" aria-label="Automations">
     <header class="auto-head">
       <h2>Automations</h2>
@@ -294,6 +299,20 @@
                   title="Spawn a recovery session pointed at the failure bundle and the parent transcript"
                 >pick up</button>
               {/if}
+              <!-- Per-row delete: hands the row to App's destructive-confirm
+                   (nothing is removed on this click). Focus moves back to the
+                   selected agent row first, so when a confirmed delete drops
+                   this button from the DOM the dashboard's keys stay live. -->
+              <button
+                type="button"
+                class="a-delete"
+                onclick={() => {
+                  if (selectedKey) rowEls[selectedKey]?.focus();
+                  onDeleteAutomation(a);
+                }}
+                title="Delete this automation (removes its run history; stops an in-flight run)"
+                aria-label={`Delete automation ${a.name}`}
+              >✕</button>
             </span>
           </li>
           {#if pickupFallback?.automationId === a.id}
@@ -682,7 +701,7 @@
   }
 
   /* Automations panel — stacked below the agent list in the same left column,
-     with a divider so the two regions read as distinct. Static text only. */
+     with a divider so the two regions read as distinct. */
   .automations {
     max-width: 720px;
     margin-top: 28px;
@@ -850,6 +869,25 @@
   .a-pickup:disabled {
     cursor: default;
     opacity: 0.6;
+  }
+  /* Per-row delete ✕: quiet at rest, destructive-red on hover — the actual
+     removal sits behind App's confirm overlay, so the button itself can stay
+     unceremonious. */
+  .a-delete {
+    font: inherit;
+    font-size: 11px;
+    line-height: 1;
+    color: #7b84a3;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 1px 6px;
+    cursor: pointer;
+  }
+  .a-delete:hover {
+    color: #fda4af;
+    background: #45182b;
+    border-color: #6b2440;
   }
   /* R17 fallback block: the explanation + raw bundle text shown under the
      retired-fail row when a recovery spawn would break. Modest — an inline

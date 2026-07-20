@@ -115,6 +115,7 @@
     onAgentRun,
     automationsFrontendReady,
     listAutomations,
+    deleteAutomation,
     monitorPickupCheck,
     readMonitorBundle,
     onAutomationChanged,
@@ -1100,6 +1101,27 @@
     } else {
       doDeleteWorkspace(wsId);
     }
+  }
+  // Automations-panel delete (the dashboard row's ✕): always routes through
+  // the shared destructive-confirm — a delete removes the record + its run
+  // history and stops an in-flight run (R23), so unlike tab close there is no
+  // "small enough to skip the ask" case. On confirm the backend emits
+  // automation://changed, which refetches the panel; a failure (the automation
+  // was already deleted — a raced CLI delete) surfaces as the transient notice.
+  // The name is control-char-sanitized for the overlay, same as the pickup
+  // notice — it is CLI-supplied text.
+  function requestDeleteAutomation(row: AutomationRow) {
+    menuOpen = false;
+    paletteOpen = false;
+    pendingConfirm = {
+      message: `Delete automation “${sanitizeTranscriptPath(row.name)}” and its run history?`,
+      onConfirm: () => {
+        void deleteAutomation(row.id).catch((e) => {
+          showNotice(`Couldn't delete the automation: ${String(e)}`);
+          void frontendLog(`[fly-webview] delete_automation failed: ${String(e)}`);
+        });
+      },
+    };
   }
   function confirmPending() {
     const p = pendingConfirm;
@@ -2501,6 +2523,7 @@
         pickupFallback={pickupFallback}
         pickupBusy={pickupInFlight}
         onPickup={(row) => void handleMonitorPickup(row)}
+        onDeleteAutomation={requestDeleteAutomation}
         onDismissPickupFallback={() => (pickupFallback = null)}
         onRefresh={() => void refreshUsage()}
         onJump={jumpFromHome}
