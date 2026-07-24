@@ -184,10 +184,60 @@ token really is wrong.
 
 ---
 
+# U8 live check — backend path, from this machine (2026-07-25)
+
+Run against a `pnpm flavor:dev` build (feed on `127.0.0.1:4940`), driving a real
+`claude --dangerously-skip-permissions` pane. This covers everything except the
+iOS-specific questions: in particular it exercises the `lib.rs` delivery
+closure, which is the one piece with no unit coverage.
+
+**Result: the full path works.** A drop to a live agent returned
+`200 {"ok":true,"path":…}`, the image landed `0600` in a `0700` directory with
+bytes identical to the source, the composed prompt appeared in the composer, and
+Claude **read the image with no permission prompt** and reported its contents —
+`Read image (789 bytes)` → "The image reads GRAPEFRUIT-773". The triage nudge
+fired too, so the delivered drop clears pane attention as intended.
+
+Also confirmed live:
+
+| check | result |
+|---|---|
+| `GET /` unauthenticated | 200, `text/html`, 22984 bytes |
+| shell inertness (R19) | zero occurrences of the token or any agent key |
+| `paneId` on the roster (U4) | present — `paneId=4` for the live agent |
+| `publishedAt` on the frame (U4) | present and advancing |
+| wrong `pane` → guard one | `409 {"error":"paneChanged"}` |
+| unknown agent | `404 {"error":"unknownAgent"}` |
+| non-image body | `415 {"error":"badFormat"}` |
+| no token | bare `401`, empty body |
+| directory after four refusals | **empty** — no residue, no temp files |
+
+## Finding: a drop during agent startup is accepted but silently discarded
+
+The first attempt was sent while the pane's `claude` was still initializing. It
+returned **200** and the image was stored, but nothing ever appeared in the
+composer — Claude Code discards input that arrives before its composer is
+ready.
+
+Neither guard can catch this and neither is wrong to miss it: the pane id
+matches, and the foreground process genuinely *is* an agent. The roster's status
+was `working`, which is the same value a mid-turn agent shows, and KTD5
+deliberately does not block on `working` because Claude queues mid-turn input.
+The difference between "queues it" and "discards it" is not visible in anything
+fly currently observes.
+
+Impact is small — the window is the few seconds between spawn and a ready
+composer, and a user picking an agent from a roster is unlikely to hit it — but
+the failure is **silent and reports success**, which is the shape this plan
+otherwise works hard to avoid. Not fixed here; recorded as the honest boundary
+of the 200. A follow-up would need a readiness signal distinct from `working`.
+
+---
+
 ## Still to verify live (needs a phone)
 
-U0 settled the two premises that governed the design. These three need the built
-surface plus an actual phone, and are **not yet done**:
+The backend path above is verified. These three are iOS-specific and remain
+**not done**:
 
 1. **iOS delivers a camera-roll screenshot as PNG, not HEIC.** The page warns on
    a HEIC selection rather than blocking it, so the failure mode is a warning
