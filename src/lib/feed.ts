@@ -40,6 +40,21 @@ export interface AgentEntry {
    * question. The pushed roster always carries null.
    */
   questionPendingAt: number | null;
+  /**
+   * The pane currently backing this leaf, or null while one is still being
+   * assigned (phone-screenshot-drop U4, R14/KTD6).
+   *
+   * Unlike `leafKey` this is *identity*, not addressing. Leaf keys are stable
+   * across respawn by design — the backend resolves a key to the newest live
+   * pane — so a leaf whose agent exited and was replaced silently resolves to
+   * the replacement. Pane ids are monotonic and never reused, so a consumer
+   * that echoes this back on a mutation can be told it targeted a session that
+   * no longer exists.
+   *
+   * Unlike `lastReplyAt`/`questionPendingAt`, this one IS pushed: the leaf→pane
+   * mapping lives in the webview, which is the only place that knows it.
+   */
+  paneId: number | null;
 }
 
 /**
@@ -172,6 +187,21 @@ export interface AutomationEntry {
 export interface FeedSnapshot {
   version: number;
   emittedAt: number;
+  /**
+   * Epoch ms of the webview's last roster push — *not* when this frame was
+   * emitted (phone-screenshot-drop U4, KTD6); null before the first push.
+   *
+   * `emittedAt` only proves the backend is alive: frames keep flowing on the
+   * SSE keepalive even if the webview has frozen, and the backend never clears
+   * its roster cache on webview teardown. A consumer that acts on roster
+   * contents must therefore check *this* stamp for staleness, or it will keep
+   * targeting panes that stopped existing some time ago.
+   *
+   * It advances on every push, including one whose roster is unchanged (which
+   * deliberately does not bump `version`) — that is what separates an idle-live
+   * webview from a dead one.
+   */
+  publishedAt: number | null;
   agents: AgentEntry[];
   automations: AutomationEntry[];
 }
@@ -185,8 +215,17 @@ export interface FeedPublishPayload {
  * Flatten the dashboard's grouped model into the flat `AgentEntry[]` the wire
  * carries. Pure: the same rows the HomeView renders, one entry per agent pane,
  * carrying its owning workspace name + tab title for the consumer's grouping.
+ *
+ * `paneByLeaf` is the app's live leaf→pane map, passed in rather than reached
+ * for so this module stays framework-free and testable (phone-screenshot-drop
+ * U4). A leaf missing from it yields `paneId: null` — the entry is still
+ * published, because dropping it would make a starting agent vanish from the
+ * roster rather than merely be untargetable.
  */
-export function buildFeedPayload(model: HomeWorkspaceGroup[]): FeedPublishPayload {
+export function buildFeedPayload(
+  model: HomeWorkspaceGroup[],
+  paneByLeaf: Readonly<Record<string, number>> = {},
+): FeedPublishPayload {
   const agents: AgentEntry[] = [];
   for (const ws of model) {
     for (const tab of ws.tabs) {
@@ -204,6 +243,7 @@ export function buildFeedPayload(model: HomeWorkspaceGroup[]): FeedPublishPayloa
           num: row.num ?? null,
           lastReplyAt: null, // backend-stamped at emit; never pushed
           questionPendingAt: null, // backend-stamped at emit; never pushed
+          paneId: paneByLeaf[row.leafKey] ?? null,
         });
       }
     }

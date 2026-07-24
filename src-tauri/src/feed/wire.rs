@@ -57,6 +57,24 @@ pub struct AgentEntry {
     /// value means a new question. The pushed roster never carries it.
     #[serde(default)]
     pub question_pending_at: Option<u64>,
+    /// The pane currently backing this leaf, or null while one is still being
+    /// assigned (phone-screenshot-drop U4, R14/KTD6).
+    ///
+    /// Unlike `leafKey`, this is **identity, not addressing**: pane ids are
+    /// monotonic and never reused, so a consumer that echoes it back on a
+    /// mutation can be told "that is not the session you picked". Leaf keys are
+    /// deliberately stable across respawn — `pane_by_leaf` resolves a key to the
+    /// newest *live* pane — so a leaf whose agent exited and was replaced
+    /// resolves to the replacement, and only the pane id can tell them apart.
+    ///
+    /// Null is transient (the webview populates the map on spawn) but reachable,
+    /// so a consumer must treat a null-`paneId` row as not-yet-targetable rather
+    /// than sending to it and taking a guaranteed refusal.
+    ///
+    /// Additive and nullable like `lastReplyAt`/`questionPendingAt` before it:
+    /// `default` keeps both an older stored payload and an older consumer valid.
+    #[serde(default)]
+    pub pane_id: Option<u32>,
 }
 
 /// One selectable option of a pending question, as the wire carries it
@@ -267,6 +285,25 @@ pub struct AgentOutputBody {
 pub struct FeedSnapshot {
     pub version: u64,
     pub emitted_at: u64,
+    /// When the webview last pushed a roster, epoch ms — **not** when this
+    /// frame was emitted (phone-screenshot-drop U4, KTD6). Null before the
+    /// first push.
+    ///
+    /// The two stamps answer different questions, and conflating them hides a
+    /// real failure. `emittedAt` says the *backend* is alive; frames keep
+    /// flowing on the keepalive regardless. But the roster is webview-pushed and
+    /// `FeedState` never clears its cache on webview teardown, so a frozen
+    /// webview yields fresh-looking frames over a dead agent list — every drop
+    /// would then echo a pane id that no longer exists and be refused
+    /// `paneChanged` forever, with nothing in the frame to diagnose it.
+    ///
+    /// This stamp advances on **every** publish call, including one whose roster
+    /// is byte-identical to the last (which deliberately does not bump
+    /// `version`). That is the point: an idle-but-live webview must remain
+    /// distinguishable from a frozen one, and only a stamp that moves without a
+    /// content change can do that.
+    #[serde(default)]
+    pub published_at: Option<u64>,
     pub agents: Vec<AgentEntry>,
     pub automations: Vec<AutomationEntry>,
 }
@@ -334,6 +371,7 @@ mod tests {
         let snap = FeedSnapshot {
             version: 7,
             emitted_at: 1_700_000_000_000,
+            published_at: Some(1_699_999_999_900),
             agents: vec![AgentEntry {
                 leaf_key: "ws-1/tab-1/leaf-1".into(),
                 workspace: "home".into(),
@@ -347,6 +385,7 @@ mod tests {
                 num: Some(1),
                 last_reply_at: Some(1_699_999_999_000),
                 question_pending_at: Some(1_700_000_000_500),
+                pane_id: Some(42),
             }],
             automations: vec![AutomationEntry {
                 id: "a1".into(),
@@ -857,11 +896,72 @@ mod tests {
         assert!(back.turns.is_empty());
     }
 
+    /// Back-compat for the additive `paneId` (phone-screenshot-drop U4): a
+    /// payload minted by an older webview — or one replayed from an older
+    /// stored frame — still deserializes, with the pane id simply absent.
+    #[test]
+    fn agent_entry_without_pane_id_deserializes_as_none() {
+        let old = serde_json::json!({
+            "leafKey": "ws-1/tab-1/leaf-1",
+            "workspace": "home",
+            "tab": "fly",
+            "cwd": null,
+            "status": "working",
+            "needsAttention": false,
+            "reason": null,
+            "workingForMs": null,
+            "liveTaskCount": 0,
+            "num": 1
+        });
+        let back: AgentEntry = serde_json::from_value(old).unwrap();
+        assert_eq!(back.pane_id, None);
+        // The two fields added by earlier plans stay absent too — this is the
+        // same additive-nullable convention, and it must keep holding.
+        assert_eq!(back.last_reply_at, None);
+        assert_eq!(back.question_pending_at, None);
+    }
+
+    /// A snapshot predating `publishedAt` deserializes with it absent, so a
+    /// consumer reading an older frame sees "unknown", not "stale".
+    #[test]
+    fn snapshot_without_published_at_deserializes_as_none() {
+        let old = serde_json::json!({
+            "version": 1,
+            "emittedAt": 5,
+            "agents": [],
+            "automations": []
+        });
+        let back: FeedSnapshot = serde_json::from_value(old).unwrap();
+        assert_eq!(back.published_at, None);
+    }
+
+    #[test]
+    fn pane_id_rides_the_wire_as_camel_case() {
+        let json = serde_json::to_value(AgentEntry {
+            leaf_key: "l".into(),
+            workspace: "w".into(),
+            tab: "t".into(),
+            cwd: None,
+            status: "working".into(),
+            needs_attention: false,
+            reason: None,
+            working_for_ms: None,
+            live_task_count: 0,
+            num: None,
+            last_reply_at: None,
+            question_pending_at: None,
+            pane_id: Some(17),
+        })
+        .unwrap();
+        assert_eq!(json["paneId"], 17);
+    }
+
     #[test]
     fn empty_roster_serializes_to_empty_arrays() {
         let snap = FeedSnapshot {
             version: 0,
             emitted_at: 0,
+            published_at: None,
             agents: vec![],
             automations: vec![],
         };

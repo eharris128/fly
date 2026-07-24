@@ -1451,6 +1451,10 @@
     // late-arriving paneId (async spawn) — re-push so a freshly-spawned visible
     // pane is included (else it would transiently over-banner a looked-at pane).
     pushVisiblePanes();
+    // Same reason, for the feed roster: republish so the new pane's id reaches
+    // the wire immediately rather than waiting on the next homeModel recompute
+    // (phone-screenshot-drop U4 — a null paneId is untargetable by a drop).
+    publishFeed();
     // Register the pane's workspace so a per-workspace mute can scope to it.
     const wsId = workspaceIdForLeaf(key);
     if (wsId) void setPaneWorkspace(paneId, wsId);
@@ -1688,10 +1692,19 @@
   // never drift from what fly shows. The backend dedups (a no-op publish when
   // the roster is unchanged never bumps the SSE stream), so pushing on every
   // recompute is cheap. Gated on `feedEnabled` so a disabled feed adds no IPC.
-  $effect(() => {
+  // The roster push itself, callable outside the effect. `paneIdByLeaf` isn't
+  // $state, so a late-arriving paneId (async spawn) can't re-trigger the effect
+  // — `onSpawned` re-pushes explicitly, exactly as it does for the visible-pane
+  // set above. Without that a just-spawned agent would publish `paneId: null`
+  // and stay untargetable by the phone drop until the next homeModel recompute.
+  function publishFeed() {
     if (!feedEnabled) return;
-    const payload = buildFeedPayload(homeModel);
-    void publishAgentFeed(payload);
+    void publishAgentFeed(buildFeedPayload(homeModel, paneIdByLeaf));
+  }
+  $effect(() => {
+    // Read `homeModel` inside the effect so it stays the tracked dependency.
+    void homeModel;
+    publishFeed();
   });
   // Fetch the live `/usage` gauges once per dashboard open (no timer): this
   // effect re-runs only when `homeViewOpen` flips, so reopening re-fetches while

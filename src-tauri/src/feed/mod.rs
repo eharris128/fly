@@ -46,6 +46,10 @@ pub struct FeedState {
 struct Inner {
     agents: Vec<AgentEntry>,
     version: u64,
+    /// Epoch ms of the last [`FeedState::publish`] call, regardless of whether
+    /// it changed anything (phone-screenshot-drop U4). See
+    /// [`FeedSnapshot::published_at`].
+    published_at: Option<u64>,
     shutting_down: bool,
 }
 
@@ -78,6 +82,7 @@ impl FeedState {
             inner: Mutex::new(Inner {
                 agents: Vec::new(),
                 version: 0,
+                published_at: None,
                 shutting_down: false,
             }),
             changed: Condvar::new(),
@@ -87,8 +92,18 @@ impl FeedState {
     /// Replace the cached roster. Bumps `version` and wakes readers **only when
     /// the roster actually differs** (KTD5) — an idle agent re-published every
     /// poll tick must not churn the stream. Returns whether it changed.
-    pub fn publish(&self, agents: Vec<AgentEntry>) -> bool {
+    ///
+    /// `published_at` (epoch ms) is recorded on **every** call, including the
+    /// unchanged-roster early return that skips the version bump. That
+    /// asymmetry is deliberate and is the whole liveness signal
+    /// (phone-screenshot-drop U4, KTD6): an idle-but-live webview publishes an
+    /// identical roster every poll tick, and only a stamp that advances without
+    /// a content change distinguishes it from a webview that has stopped
+    /// publishing altogether. Time is passed in rather than read here, matching
+    /// the injected-clock discipline the rest of this module keeps.
+    pub fn publish(&self, agents: Vec<AgentEntry>, published_at: u64) -> bool {
         let mut inner = self.inner.lock().unwrap();
+        inner.published_at = Some(published_at);
         if inner.agents == agents {
             return false;
         }
@@ -149,6 +164,7 @@ impl FeedState {
         FeedSnapshot {
             version: inner.version,
             emitted_at,
+            published_at: inner.published_at,
             agents: inner.agents.clone(),
             automations,
         }
@@ -196,7 +212,21 @@ pub fn publish_agent_feed(
     payload: FeedPublishPayload,
     state: tauri::State<'_, Arc<FeedState>>,
 ) -> bool {
-    state.publish(payload.agents)
+    state.publish(payload.agents, now_ms())
+}
+
+/// Epoch ms, saturating at 0 if the clock is before the epoch.
+///
+/// The publish stamp is taken **here, at receipt**, rather than being carried in
+/// the payload from the webview. Both detect a frozen webview identically (a
+/// webview that has stopped publishing stops advancing the stamp either way),
+/// and stamping backend-side avoids trusting a client-supplied clock for a value
+/// the drop route's staleness gate depends on.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -217,6 +247,7 @@ mod tests {
             num: None,
             last_reply_at: None,
             question_pending_at: None,
+            pane_id: None,
         }
     }
 
@@ -228,7 +259,7 @@ mod tests {
         // fallback's working-pane suppressor). A gone agent is unknown again.
         let s = FeedState::new();
         assert_eq!(s.agent_gate("l1"), None);
-        s.publish(vec![agent("l1", "working")]);
+        s.publish(vec![agent("l1", "working")], 0);
         assert_eq!(
             s.agent_gate("l1"),
             Some(AgentGate {
@@ -239,7 +270,7 @@ mod tests {
         assert_eq!(s.agent_gate("l2"), None);
         let mut raised = agent("l2", "waiting");
         raised.reason = Some("permission".into());
-        s.publish(vec![raised]);
+        s.publish(vec![raised], 0);
         assert_eq!(
             s.agent_gate("l2"),
             Some(AgentGate {
@@ -248,7 +279,7 @@ mod tests {
             })
         );
         assert_eq!(s.agent_gate("l1"), None, "gone from the roster again");
-        s.publish(vec![]);
+        s.publish(vec![], 0);
         assert_eq!(s.agent_gate("l2"), None, "empty roster → unknown");
     }
 
@@ -257,22 +288,22 @@ mod tests {
         let s = FeedState::new();
         assert_eq!(s.current_version(), 0);
 
-        assert!(s.publish(vec![agent("l1", "working")]));
+        assert!(s.publish(vec![agent("l1", "working")], 0));
         assert_eq!(s.current_version(), 1);
 
         // Identical roster → no bump (KTD5).
-        assert!(!s.publish(vec![agent("l1", "working")]));
+        assert!(!s.publish(vec![agent("l1", "working")], 0));
         assert_eq!(s.current_version(), 1);
 
         // A real change → bump.
-        assert!(s.publish(vec![agent("l1", "idle")]));
+        assert!(s.publish(vec![agent("l1", "idle")], 0));
         assert_eq!(s.current_version(), 2);
     }
 
     #[test]
     fn snapshot_merges_agents_and_passed_automations() {
         let s = FeedState::new();
-        s.publish(vec![agent("l1", "working")]);
+        s.publish(vec![agent("l1", "working")], 0);
         let autos = vec![AutomationEntry {
             id: "a1".into(),
             name: "n".into(),
@@ -293,10 +324,45 @@ mod tests {
         assert_eq!(snap.automations.len(), 1);
     }
 
+    /// The liveness signal behind KTD6. An idle-but-live webview republishes an
+    /// identical roster forever, which deliberately does *not* bump `version` —
+    /// so if `publishedAt` only advanced on change, a healthy idle app would be
+    /// indistinguishable from a frozen one and every drop would be refused
+    /// `paneChanged` with no way to diagnose it.
+    #[test]
+    fn published_at_advances_on_every_publish_even_without_a_roster_change() {
+        let s = FeedState::new();
+        assert_eq!(s.snapshot(vec![], 0).published_at, None, "none before any push");
+
+        assert!(s.publish(vec![agent("l1", "working")], 1_000));
+        assert_eq!(s.snapshot(vec![], 0).published_at, Some(1_000));
+
+        // Identical roster: no version bump...
+        assert!(!s.publish(vec![agent("l1", "working")], 2_000));
+        assert_eq!(s.current_version(), 1, "version stayed put");
+        // ...but the liveness stamp still moved.
+        assert_eq!(s.snapshot(vec![], 0).published_at, Some(2_000));
+    }
+
+    /// `publishedAt` describes the *push*; `emittedAt` describes the *frame*.
+    /// Two frames emitted from one push share the former and differ in the
+    /// latter — which is exactly what lets a consumer tell "the backend is
+    /// alive" apart from "the roster is current".
+    #[test]
+    fn published_at_is_per_push_while_emitted_at_is_per_frame() {
+        let s = FeedState::new();
+        s.publish(vec![agent("l1", "working")], 500);
+        let first = s.snapshot(vec![], 10_000);
+        let second = s.snapshot(vec![], 20_000);
+        assert_eq!(first.published_at, second.published_at);
+        assert_eq!(first.published_at, Some(500));
+        assert_ne!(first.emitted_at, second.emitted_at);
+    }
+
     #[test]
     fn bump_forces_a_version_move_without_roster_change() {
         let s = FeedState::new();
-        s.publish(vec![agent("l1", "working")]);
+        s.publish(vec![agent("l1", "working")], 0);
         assert_eq!(s.current_version(), 1);
         s.bump();
         assert_eq!(s.current_version(), 2);
@@ -312,7 +378,7 @@ mod tests {
         });
         // Give the reader a moment to park, then publish.
         std::thread::sleep(Duration::from_millis(50));
-        s.publish(vec![agent("l1", "working")]);
+        s.publish(vec![agent("l1", "working")], 0);
         let res = handle.join().unwrap();
         assert_eq!(res.version, 1);
         assert!(!res.shutting_down);
