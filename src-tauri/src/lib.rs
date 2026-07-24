@@ -947,6 +947,81 @@ pub fn run() {
                                 }
                             })
                         };
+                        // Phone-drop delivery (phone-screenshot-drop U5/U6).
+                        // The guard sequence itself lives in
+                        // `feed::drop::deliver_with_guards`, which is unit
+                        // tested; this closure only supplies the real
+                        // implementations of its four seams. The order it
+                        // enforces — resolve, identity, foreground probe,
+                        // publish, paste, re-probe, Enter — is load-bearing:
+                        // the image must be published after every refusal
+                        // check (so a refusal leaves no residue) but before any
+                        // text reaches the pane (so the agent is never told to
+                        // read a path that has not been renamed into place).
+                        // Like the input seam, the sleep rides the HTTP
+                        // connection thread, never a dispatch/PTY thread, and a
+                        // delivered drop clears pane attention exactly as local
+                        // typing does.
+                        let drop_fn: feed::server::DropFn = {
+                            let pty = app.state::<Arc<PtyManager>>().inner().clone();
+                            let attention = app.state::<Arc<AttentionManager>>().inner().clone();
+                            let drop_handle = app.handle().clone();
+                            Arc::new(move |leaf_key, delivery| {
+                                let outcome = feed::drop::deliver_with_guards(
+                                    delivery.expect_pane,
+                                    delivery.text,
+                                    || pty.pane_by_leaf(leaf_key).map(|p| p.0),
+                                    |pane| pty.is_agent(crate::pty::PaneId(pane)),
+                                    |pane, bytes| pty.write(crate::pty::PaneId(pane), bytes),
+                                    || std::thread::sleep(feed::io::SUBMIT_DELAY),
+                                    delivery.commit,
+                                );
+                                // The drop was answered into the pane, so its
+                                // ring must drop just as a typed reply's would.
+                                if matches!(outcome, feed::drop::DropOutcome::Delivered) {
+                                    if let Some(pane) = pty.pane_by_leaf(leaf_key) {
+                                        if let Some(o) = attention.on_input(pane) {
+                                            stream::emit_attention(&drop_handle, pane, &o);
+                                        }
+                                    }
+                                }
+                                outcome
+                            })
+                        };
+                        // The drop directory, prepared once. A failure here is
+                        // retained as `None` and reported per request as
+                        // `storageFailed` — it must never keep the feed (and
+                        // the dashboard that reads it) from starting (AE8).
+                        let drop_store = {
+                            let raw = feed_cfg.drop_dir.clone();
+                            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                            match feed::drop::resolve_drop_dir(
+                                raw.as_deref(),
+                                home.as_deref(),
+                                &session::data_dir(),
+                            ) {
+                                Ok(dir) => match feed::drop::DropStore::new(&dir) {
+                                    Ok(s) => Some(Arc::new(s)),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "phone drop directory {} unusable: {e}",
+                                            dir.display()
+                                        );
+                                        None
+                                    }
+                                },
+                                Err(e) => {
+                                    log::warn!("feed.dropDir is not usable: {e}");
+                                    None
+                                }
+                            }
+                        };
+                        let drop_cfg = feed::server::DropConfig {
+                            deliver: drop_fn,
+                            store: drop_store,
+                            max_bytes: u64::from(feed_cfg.drop_max_bytes),
+                            expected_tailnet_login: feed_cfg.expected_tailnet_login.clone(),
+                        };
                         // Live read of the keys-answer permission opt-in
                         // (KTD6, default off) — a settings change applies to
                         // the next request without a restart.
@@ -962,6 +1037,7 @@ pub fn run() {
                             now_fn,
                             io_fn,
                             input_fn,
+                            drop_cfg,
                             permission_answers_fn,
                         ) {
                             Ok(server) => {

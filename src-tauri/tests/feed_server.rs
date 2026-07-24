@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fly_lib::feed::io::{ReplyResolver, ResolvedIo};
-use fly_lib::feed::server::{FeedServer, InputAction, InputOutcome, IoFn};
+use fly_lib::feed::drop::{DropOutcome, DropStore};
+use fly_lib::feed::server::{
+    DropConfig, DropDelivery, FeedServer, InputAction, InputOutcome, IoFn,
+};
 use fly_lib::feed::wire::{AgentEntry, QuestionBody, QuestionOption, QuestionSpec, TurnEntry};
 use fly_lib::feed::FeedState;
 use fly_lib::session::transcript::LastReply;
@@ -217,6 +220,17 @@ fn fake_io() -> IoFn {
     })
 }
 
+/// A drop config that can never deliver — for the servers in this file whose
+/// tests predate the phone-drop route and never exercise it.
+fn no_drop() -> DropConfig {
+    DropConfig {
+        deliver: Arc::new(|_: &str, _: DropDelivery<'_>| DropOutcome::UnknownPane),
+        store: None,
+        max_bytes: 25 * 1024 * 1024,
+        expected_tailnet_login: None,
+    }
+}
+
 /// Start a server whose input seam records deliveries into the returned log
 /// as `("leaf", "submit:<text>" | "keys:<bytes>")`; any leaf except
 /// `leaf-gone` (roster-listed but its pane just exited) delivers. Keys-mode
@@ -260,6 +274,7 @@ fn start_with(
             log.lock().unwrap().push((leaf_key.to_string(), describe));
             InputOutcome::Delivered
         }),
+        no_drop(),
         Arc::new(move || allow_permission_answers),
     )
     .unwrap();
@@ -268,6 +283,579 @@ fn start_with(
 
 fn start() -> (Arc<FeedState>, FeedServer, Arc<Mutex<Vec<(String, String)>>>) {
     start_with(false)
+}
+
+// ---- phone-screenshot-drop U6: the upload route -----------------------------
+
+/// How a scripted drop seam should behave for a given leaf.
+#[derive(Clone, Copy)]
+enum DropBehavior {
+    Deliver,
+    PaneChanged,
+    NotAgent,
+    Unknown,
+    PasteFails,
+    SubmitFails,
+}
+
+struct DropHarness {
+    _dir: tempfile::TempDir,
+    drop_dir: std::path::PathBuf,
+    state: Arc<FeedState>,
+    server: FeedServer,
+    /// Prompts that reached the fake PTY, in order.
+    delivered: Arc<Mutex<Vec<String>>>,
+}
+
+impl DropHarness {
+    fn addr(&self) -> SocketAddr {
+        self.server.local_addr()
+    }
+    /// Files published into the drop directory (temp files excluded).
+    fn stored(&self) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(&self.drop_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with(".fly-drop-tmp-"))
+            .collect();
+        v.sort();
+        v
+    }
+    /// Everything in the drop directory, temp files included — the leak check.
+    fn entries(&self) -> Vec<String> {
+        std::fs::read_dir(&self.drop_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+}
+
+/// Start a server with a real `DropStore` over a temp dir and a scripted drop
+/// seam. The seam mirrors the real one's ordering — it commits only when the
+/// guards would have passed — so the route's retain/unlink behavior is
+/// exercised for real rather than assumed.
+fn start_drop(behavior: DropBehavior, expected_login: Option<&str>) -> DropHarness {
+    start_drop_capped(behavior, expected_login, 25 * 1024 * 1024)
+}
+
+fn start_drop_capped(
+    behavior: DropBehavior,
+    expected_login: Option<&str>,
+    max_bytes: u64,
+) -> DropHarness {
+    let dir = tempfile::tempdir().unwrap();
+    let drop_dir = dir.path().join("inbox");
+    let store = Arc::new(DropStore::new(&drop_dir).unwrap());
+    let drop_dir = store.dir().to_path_buf();
+    let delivered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&delivered);
+
+    let deliver: Arc<dyn Fn(&str, DropDelivery<'_>) -> DropOutcome + Send + Sync> =
+        Arc::new(move |_leaf, d: DropDelivery<'_>| match behavior {
+            DropBehavior::Unknown => DropOutcome::UnknownPane,
+            DropBehavior::PaneChanged => DropOutcome::PaneChanged,
+            DropBehavior::NotAgent => DropOutcome::NotAgent,
+            // The real seam publishes before writing, so these two must too —
+            // otherwise the retain/unlink assertions would be testing the
+            // fake rather than the route.
+            DropBehavior::PasteFails => DropOutcome::PasteFailed("EIO".into()),
+            DropBehavior::SubmitFails => {
+                let _ = (d.commit)();
+                DropOutcome::SubmitIncomplete("EIO".into())
+            }
+            DropBehavior::Deliver => match (d.commit)() {
+                Ok(()) => {
+                    log.lock().unwrap().push(d.text.to_string());
+                    DropOutcome::Delivered
+                }
+                Err(e) => DropOutcome::CommitFailed(e),
+            },
+        });
+
+    let state = Arc::new(FeedState::new());
+    let server = FeedServer::start(
+        0,
+        TOKEN.to_string(),
+        Arc::clone(&state),
+        Arc::new(Vec::new),
+        Arc::new(|| 42),
+        fake_io(),
+        Arc::new(|_: &str, _: InputAction| InputOutcome::Delivered),
+        DropConfig {
+            deliver,
+            store: Some(store),
+            max_bytes,
+            expected_tailnet_login: expected_login.map(str::to_string),
+        },
+        Arc::new(|| false),
+    )
+    .unwrap();
+    // `leaf-replied` has a reply but no pending question — the deliverable one.
+    state.publish(vec![agent("leaf-replied", "idle")], 0);
+    DropHarness {
+        _dir: dir,
+        drop_dir,
+        state,
+        server,
+        delivered,
+    }
+}
+
+fn png() -> Vec<u8> {
+    std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/images/sample.png"),
+    )
+    .unwrap()
+}
+
+/// A raw request with a binary body, an explicit `Content-Length` (which may
+/// deliberately disagree with the body — the KTD1 case), and optional extra
+/// headers.
+fn drop_request(
+    addr: SocketAddr,
+    query: &str,
+    auth: Option<&str>,
+    body: &[u8],
+    declared_len: Option<usize>,
+    extra_headers: &[(&str, &str)],
+) -> (String, String) {
+    use std::io::Write as _;
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut head = format!("POST /drop?{query} HTTP/1.1\r\nHost: localhost\r\n");
+    if let Some(a) = auth {
+        head.push_str(&format!("Authorization: Bearer {a}\r\n"));
+    }
+    for (k, v) in extra_headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str(&format!(
+        "Content-Type: application/octet-stream\r\nContent-Length: {}\r\n",
+        declared_len.unwrap_or(body.len())
+    ));
+    head.push_str("Connection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.write_all(body).unwrap();
+    stream.flush().unwrap();
+    let mut buf = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut stream, &mut buf);
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    match text.split_once("\r\n\r\n") {
+        Some((h, b)) => (h.to_string(), b.to_string()),
+        None => (text, String::new()),
+    }
+}
+
+/// A drop sent with `Transfer-Encoding: chunked` — no declared length, so the
+/// route's early size check cannot fire and the streaming bound is what holds.
+fn chunked_drop_request(addr: SocketAddr, query: &str, body: &[u8]) -> (String, String) {
+    use std::io::Write as _;
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let head = format!(
+        "POST /drop?{query} HTTP/1.1\r\nHost: localhost\r\n\
+         Authorization: Bearer {TOKEN}\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    for part in body.chunks(4096) {
+        let _ = write!(stream, "{:x}\r\n", part.len());
+        let _ = stream.write_all(part);
+        let _ = stream.write_all(b"\r\n");
+    }
+    let _ = stream.write_all(b"0\r\n\r\n");
+    let _ = stream.flush();
+    let mut buf = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut stream, &mut buf);
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    match text.split_once("\r\n\r\n") {
+        Some((h, b)) => (h.to_string(), b.to_string()),
+        None => (text, String::new()),
+    }
+}
+
+fn ok_drop(addr: SocketAddr, query: &str) -> (String, String) {
+    drop_request(addr, query, Some(TOKEN), &png(), None, &[])
+}
+
+fn status_of(head: &str) -> u16 {
+    head.lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn error_code(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"].as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_well_formed_drop_lands_stores_the_image_and_delivers_the_prompt() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let (head, body) = ok_drop(h.addr(), "agent=leaf-replied&pane=7&caption=login%20is%20broken");
+    assert_eq!(status_of(&head), 200, "{head}");
+
+    let stored = h.stored();
+    assert_eq!(stored.len(), 1, "exactly one image published");
+    assert!(stored[0].ends_with(".png"), "{stored:?}");
+    assert!(body.contains("\"ok\":true"), "{body}");
+    assert!(body.contains(&stored[0]), "the response names the path: {body}");
+
+    let sent = h.delivered.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].starts_with("Read the image at "), "{}", sent[0]);
+    assert!(sent[0].contains(&stored[0]), "{}", sent[0]);
+    assert!(sent[0].contains("login is broken"), "{}", sent[0]);
+}
+
+#[test]
+fn a_drop_without_a_caption_still_lands() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let (head, _) = ok_drop(h.addr(), "agent=leaf-replied&pane=7");
+    assert_eq!(status_of(&head), 200);
+    assert_eq!(h.stored().len(), 1);
+}
+
+/// AE10: an unauthenticated request must be refused identically for a known and
+/// an unknown agent key, so the response cannot be used to probe which agents
+/// exist. Bare 401, no body, both times.
+#[test]
+fn unauthenticated_drops_are_indistinguishable_for_known_and_unknown_agents() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let known = drop_request(h.addr(), "agent=leaf-replied&pane=7", None, &png(), None, &[]);
+    let unknown = drop_request(h.addr(), "agent=leaf-nope&pane=7", None, &png(), None, &[]);
+    let wrong = drop_request(
+        h.addr(),
+        "agent=leaf-replied&pane=7",
+        Some("wrong-token"),
+        &png(),
+        None,
+        &[],
+    );
+    for (head, body) in [&known, &unknown, &wrong] {
+        assert_eq!(status_of(head), 401, "{head}");
+        assert!(body.is_empty(), "401 must carry no body, got {body:?}");
+    }
+    assert_eq!(status_of(&known.0), status_of(&unknown.0));
+    assert!(h.entries().is_empty(), "nothing stored");
+}
+
+#[test]
+fn a_mismatched_tailnet_identity_is_refused_and_a_matching_one_passes() {
+    let h = start_drop(DropBehavior::Deliver, Some("evan@example.com"));
+    let (head, body) = drop_request(
+        h.addr(),
+        "agent=leaf-replied&pane=7",
+        Some(TOKEN),
+        &png(),
+        None,
+        &[("Tailscale-User-Login", "someone-else@example.com")],
+    );
+    assert_eq!(status_of(&head), 401, "{head}");
+    assert!(
+        body.is_empty(),
+        "deliberately indistinguishable from a bad token"
+    );
+    assert!(h.entries().is_empty());
+
+    let (head, _) = drop_request(
+        h.addr(),
+        "agent=leaf-replied&pane=7",
+        Some(TOKEN),
+        &png(),
+        None,
+        &[("Tailscale-User-Login", "evan@example.com")],
+    );
+    assert_eq!(status_of(&head), 200, "{head}");
+}
+
+/// Absence of the header is not a refusal — the token stays the boundary.
+#[test]
+fn an_absent_identity_header_still_passes_when_an_expectation_is_configured() {
+    let h = start_drop(DropBehavior::Deliver, Some("evan@example.com"));
+    let (head, _) = ok_drop(h.addr(), "agent=leaf-replied&pane=7");
+    assert_eq!(status_of(&head), 200, "{head}");
+}
+
+#[test]
+fn an_unknown_agent_key_is_404_and_stores_nothing() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let (head, body) = ok_drop(h.addr(), "agent=leaf-nope&pane=7");
+    assert_eq!(status_of(&head), 404, "{head}");
+    assert_eq!(error_code(&body), "unknownAgent");
+    assert!(h.entries().is_empty());
+}
+
+#[test]
+fn a_missing_pane_parameter_is_400() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let (head, body) = ok_drop(h.addr(), "agent=leaf-replied");
+    assert_eq!(status_of(&head), 400, "{head}");
+    assert_eq!(error_code(&body), "badRequest");
+    assert!(h.entries().is_empty());
+}
+
+#[test]
+fn an_invalid_percent_encoded_caption_is_400_rather_than_repaired() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let (head, body) = ok_drop(h.addr(), "agent=leaf-replied&pane=7&caption=%ZZ");
+    assert_eq!(status_of(&head), 400, "{head}");
+    assert_eq!(error_code(&body), "badRequest");
+}
+
+#[test]
+fn an_over_cap_caption_is_refused_rather_than_truncated() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let long = "x".repeat(600);
+    let (head, body) = ok_drop(h.addr(), &format!("agent=leaf-replied&pane=7&caption={long}"));
+    assert_eq!(status_of(&head), 400, "{head}");
+    assert_eq!(error_code(&body), "captionTooLong");
+    assert!(h.entries().is_empty());
+}
+
+#[test]
+fn a_declared_content_length_over_the_cap_is_413_and_writes_nothing() {
+    let h = start_drop_capped(DropBehavior::Deliver, None, 1024);
+    let big = vec![0u8; 4096];
+    let (head, body) = drop_request(
+        h.addr(),
+        "agent=leaf-replied&pane=7",
+        Some(TOKEN),
+        &big,
+        None,
+        &[],
+    );
+    assert_eq!(status_of(&head), 413, "{head}");
+    assert_eq!(error_code(&body), "oversize");
+    assert!(h.entries().is_empty(), "no file written");
+}
+
+/// KTD8's second enforcement, exercised against the case that actually reaches
+/// it: **chunked** transfer encoding.
+///
+/// Note what this test is *not*. The plan imagined a small declared
+/// `Content-Length` with a larger body, but that is unsatisfiable with
+/// `tiny_http`: under `Content-Length` framing the body reader is an
+/// `EqualReader` bounded at the declared length, so the route can never see
+/// more bytes than were declared and the early check is total. Chunked requests
+/// declare no length at all — `body_length()` is `None`, the early check cannot
+/// fire, and the streaming `take(cap + 1)` bound is the only thing standing
+/// between a hostile upload and the disk. That makes this the enforcement that
+/// matters, not a redundant second one.
+#[test]
+fn a_chunked_body_exceeding_the_cap_is_413_and_leaves_no_file() {
+    let h = start_drop_capped(DropBehavior::Deliver, None, 2048);
+    let mut body = png();
+    body.resize(64 * 1024, 0);
+    let (head, resp) = chunked_drop_request(h.addr(), "agent=leaf-replied&pane=7", &body);
+    assert_eq!(status_of(&head), 413, "{head}");
+    assert_eq!(error_code(&resp), "oversize");
+    assert!(h.entries().is_empty(), "no partial file survived");
+}
+
+/// The same path under the cap still succeeds, so the bound above is the cap
+/// and not chunked encoding itself being rejected.
+#[test]
+fn a_chunked_body_under_the_cap_lands_normally() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let (head, _) = chunked_drop_request(h.addr(), "agent=leaf-replied&pane=7", &png());
+    assert_eq!(status_of(&head), 200, "{head}");
+    assert_eq!(h.stored().len(), 1);
+}
+
+#[test]
+fn a_non_image_body_is_415_and_stores_nothing() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let (head, body) = drop_request(
+        h.addr(),
+        "agent=leaf-replied&pane=7",
+        Some(TOKEN),
+        b"this is not an image at all, no matter what the content type says",
+        None,
+        &[],
+    );
+    assert_eq!(status_of(&head), 415, "{head}");
+    assert_eq!(error_code(&body), "badFormat");
+    assert!(h.entries().is_empty());
+}
+
+/// AE1/AE4: any pending question blocks, and no image is retained. `leaf-choice`
+/// is a *choice* picker — the case the input route's permission-only gate would
+/// let through, and whose silent cancellation this plan exists to prevent.
+#[test]
+fn a_drop_onto_a_pending_choice_picker_is_refused_and_retains_nothing() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    h.state
+        .publish(vec![agent_with_reason("leaf-choice", "waiting", "question")], 0);
+    let (head, body) = ok_drop(h.addr(), "agent=leaf-choice&pane=7");
+    assert_eq!(status_of(&head), 409, "{head}");
+    assert_eq!(error_code(&body), "askPending");
+    assert!(h.entries().is_empty(), "no residue from a refusal");
+    assert!(h.delivered.lock().unwrap().is_empty(), "nothing was typed");
+}
+
+#[test]
+fn a_drop_onto_a_pending_permission_dialog_is_refused() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    h.state.publish(
+        vec![agent_with_reason("leaf-permission", "waiting", "permission")],
+        0,
+    );
+    let (head, body) = ok_drop(h.addr(), "agent=leaf-permission&pane=7");
+    assert_eq!(status_of(&head), 409, "{head}");
+    assert_eq!(error_code(&body), "askPending");
+    assert!(h.entries().is_empty());
+}
+
+/// AE2 — each guard refusal keeps its own code and leaves nothing behind.
+#[test]
+fn each_delivery_guard_refusal_has_its_own_code_and_retains_nothing() {
+    for (behavior, want_status, want_code) in [
+        (DropBehavior::PaneChanged, 409, "paneChanged"),
+        (DropBehavior::NotAgent, 409, "notAgent"),
+        (DropBehavior::Unknown, 404, "unknownAgent"),
+    ] {
+        let h = start_drop(behavior, None);
+        let (head, body) = ok_drop(h.addr(), "agent=leaf-replied&pane=7");
+        assert_eq!(status_of(&head), want_status, "{want_code}: {head}");
+        assert_eq!(error_code(&body), want_code);
+        assert!(h.entries().is_empty(), "{want_code} left residue");
+    }
+}
+
+/// AE9 first half: the paste failed, so nothing reached the pane and no
+/// orphaned file is left behind.
+#[test]
+fn a_failed_paste_reports_delivery_failure_and_leaves_no_file() {
+    let h = start_drop(DropBehavior::PasteFails, None);
+    let (head, body) = ok_drop(h.addr(), "agent=leaf-replied&pane=7");
+    assert_eq!(status_of(&head), 500, "{head}");
+    assert_eq!(error_code(&body), "deliveryFailed");
+    assert!(h.entries().is_empty());
+}
+
+/// AE9 second half: the paste landed but the Enter did not, so the image is
+/// **kept** — unlinking would strand a path the user is about to act on.
+#[test]
+fn a_failed_submit_keeps_the_image_and_says_the_text_is_pre_typed() {
+    let h = start_drop(DropBehavior::SubmitFails, None);
+    let (head, body) = ok_drop(h.addr(), "agent=leaf-replied&pane=7");
+    assert_eq!(status_of(&head), 500, "{head}");
+    assert_eq!(error_code(&body), "deliverySubmitFailed");
+    assert_eq!(h.stored().len(), 1, "the image is retained");
+}
+
+/// AE8: an unusable drop directory is reported per request and is
+/// distinguishable from a refusal — it never keeps the feed from serving.
+#[test]
+fn an_unavailable_drop_store_reports_storage_failure_while_the_feed_still_serves() {
+    let state = Arc::new(FeedState::new());
+    let server = FeedServer::start(
+        0,
+        TOKEN.to_string(),
+        Arc::clone(&state),
+        Arc::new(Vec::new),
+        Arc::new(|| 42),
+        fake_io(),
+        Arc::new(|_: &str, _: InputAction| InputOutcome::Delivered),
+        DropConfig {
+            deliver: Arc::new(|_, _| DropOutcome::Delivered),
+            store: None, // construction failed at startup
+            max_bytes: 25 * 1024 * 1024,
+            expected_tailnet_login: None,
+        },
+        Arc::new(|| false),
+    )
+    .unwrap();
+    state.publish(vec![agent("leaf-replied", "idle")], 0);
+    let addr = server.local_addr();
+
+    let (head, body) = drop_request(
+        addr,
+        "agent=leaf-replied&pane=7",
+        Some(TOKEN),
+        &png(),
+        None,
+        &[],
+    );
+    assert_eq!(status_of(&head), 500, "{head}");
+    assert_eq!(error_code(&body), "storageFailed");
+
+    // The rest of the feed is unaffected.
+    let (head, _) = request(
+        addr,
+        "GET",
+        "/agents/leaf-replied/output",
+        Some(TOKEN),
+        None,
+        Duration::from_secs(2),
+    );
+    assert_eq!(status_of(&head), 200, "the feed still serves: {head}");
+}
+
+#[test]
+fn a_get_on_the_drop_route_is_405() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let (head, _) = request(
+        h.addr(),
+        "GET",
+        "/drop?agent=leaf-replied&pane=7",
+        Some(TOKEN),
+        None,
+        Duration::from_secs(2),
+    );
+    assert_eq!(status_of(&head), 405, "{head}");
+}
+
+/// AE11: nothing latches per-leaf, so a second drop right after a landed one
+/// succeeds.
+#[test]
+fn a_repeat_drop_to_the_same_agent_succeeds() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    for _ in 0..2 {
+        let (head, _) = ok_drop(h.addr(), "agent=leaf-replied&pane=7&caption=again");
+        assert_eq!(status_of(&head), 200, "{head}");
+    }
+    assert_eq!(h.stored().len(), 2, "two distinct images");
+}
+
+/// KTD1's drain requirement, observed from the outside: after a refusal that
+/// leaves body bytes unread, the server must have consumed them — otherwise
+/// `tiny_http` sizes a drop-time buffer from the client-declared length. A
+/// declared length far above the real body would then park on a huge
+/// allocation; here we assert the refusal returns promptly and the server keeps
+/// serving afterwards.
+#[test]
+fn a_refusal_drains_the_body_and_the_server_keeps_serving() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let body = png();
+    // Refused at the query stage (no `pane`), with the body still unread.
+    let (head, _) = drop_request(
+        h.addr(),
+        "agent=leaf-replied",
+        Some(TOKEN),
+        &body,
+        None,
+        &[],
+    );
+    assert_eq!(status_of(&head), 400, "{head}");
+
+    // A subsequent well-formed drop still works — the accept loop and the
+    // connection thread both survived the refusal.
+    let (head, _) = ok_drop(h.addr(), "agent=leaf-replied&pane=7");
+    assert_eq!(status_of(&head), 200, "{head}");
+    assert_eq!(h.stored().len(), 1);
 }
 
 /// Send a raw HTTP/1.1 request and return (status line + headers, body read
@@ -595,6 +1183,7 @@ fn a_delegating_tool_pending_abstains_end_to_end() {
         Arc::new(|| 42),
         io_fn,
         Arc::new(|_: &str, _: InputAction| InputOutcome::Delivered),
+        no_drop(),
         Arc::new(|| true), // even fully opted in, the abstention holds
     )
     .unwrap();
@@ -765,6 +1354,7 @@ fn a_transcript_takeover_makes_a_screen_stamped_answer_409() {
         Arc::new(|| 42),
         io_fn,
         Arc::new(|_: &str, _: InputAction| InputOutcome::Delivered),
+        no_drop(),
         Arc::new(|| true),
     )
     .unwrap();

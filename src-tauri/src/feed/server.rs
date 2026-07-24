@@ -32,6 +32,10 @@ use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tiny_http::{Method, Response, Server};
 
+use super::drop::{
+    compose_drop_prompt, parse_drop_query, tailnet_identity_ok, DropError, DropOutcome, DropStore,
+    QueryError,
+};
 use super::io::ResolvedIo;
 use super::wire::{AgentOutputBody, AutomationEntry, QuestionBody};
 use super::FeedState;
@@ -66,6 +70,43 @@ pub type IoFn = Arc<dyn Fn(&str, Option<&str>, &str) -> ResolvedIo + Send + Sync
 /// just answered), which also keeps a `reason: permission` from going stale
 /// after a remote answer (KTD6/R9).
 pub type InputFn = Arc<dyn Fn(&str, InputAction) -> InputOutcome + Send + Sync>;
+
+/// Delivers one phone drop to a leaf's pane (phone-screenshot-drop U5/U6) —
+/// injected for the same reason as [`InputFn`]: delivery needs the PTY registry
+/// and the attention manager, neither of which this module should know.
+///
+/// The seam owns the *whole* guarded sequence (guards → publish → paste →
+/// re-probe → Enter) rather than exposing the steps separately, because their
+/// order is load-bearing and splitting them across the boundary would let a
+/// future caller get it wrong. See
+/// [`crate::feed::drop::deliver_with_guards`].
+pub type DropFn = Arc<dyn Fn(&str, DropDelivery<'_>) -> DropOutcome + Send + Sync>;
+
+/// Everything the phone-drop route needs, grouped so [`FeedServer::start`]
+/// takes one parameter rather than four (phone-screenshot-drop U6).
+pub struct DropConfig {
+    /// The delivery seam.
+    pub deliver: DropFn,
+    /// Where images land. `None` when the directory could not be prepared —
+    /// every drop then reports `storageFailed`, but the feed still serves
+    /// (AE8).
+    pub store: Option<Arc<DropStore>>,
+    /// Largest accepted body, in bytes (`feed.dropMaxBytes`).
+    pub max_bytes: u64,
+    /// Expected tailnet login, or `None` to disable the identity check (KTD2).
+    pub expected_tailnet_login: Option<String>,
+}
+
+/// One drop handed across the [`DropFn`] seam.
+pub struct DropDelivery<'a> {
+    /// The pane id the phone echoed back from the roster (guard one).
+    pub expect_pane: u64,
+    /// The composed prompt.
+    pub text: &'a str,
+    /// Publishes the stored image, called after the guards pass and before any
+    /// text reaches the pane. Returns the rename error on failure.
+    pub commit: &'a mut dyn FnMut() -> Result<(), String>,
+}
 
 /// Reads the live "may keys-mode answer a *permission* dialog?" opt-in
 /// (feed-pending-question KTD6, Open Question resolved as config opt-in,
@@ -125,6 +166,16 @@ struct HandlerCtx {
     now: NowFn,
     io: IoFn,
     input: InputFn,
+    /// Phone-drop delivery (phone-screenshot-drop U5/U6).
+    drop: DropFn,
+    /// Where drops land, or `None` when the directory could not be prepared —
+    /// reported per request as `storageFailed` rather than blocking the
+    /// listener from starting (AE8).
+    drop_store: Option<Arc<DropStore>>,
+    /// Largest accepted drop body, in bytes.
+    drop_max_bytes: u64,
+    /// Expected tailnet login, or `None` to disable the KTD2 identity check.
+    expected_tailnet_login: Option<String>,
     permission_answers: PermissionAnswersFn,
     /// The per-leaf answered latch (feed-pending-question U6/R11): the
     /// `askedAt` of the last guarded delivery per leaf. A second delivery
@@ -157,6 +208,7 @@ impl FeedServer {
         now: NowFn,
         io: IoFn,
         input: InputFn,
+        drop: DropConfig,
         permission_answers: PermissionAnswersFn,
     ) -> io::Result<Self> {
         // tiny_http returns a boxed error; normalize to io::Error for the caller.
@@ -178,6 +230,10 @@ impl FeedServer {
                 now,
                 io,
                 input,
+                drop: drop.deliver,
+                drop_store: drop.store,
+                drop_max_bytes: drop.max_bytes,
+                expected_tailnet_login: drop.expected_tailnet_login,
                 permission_answers,
                 latch: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
@@ -246,7 +302,12 @@ fn accept_loop(server: Server, shutdown: Arc<AtomicBool>, ctx: Arc<HandlerCtx>) 
 const MAX_INPUT_BODY: usize = 64 * 1024;
 
 fn handle(mut req: tiny_http::Request, ctx: &HandlerCtx) {
-    let path = req.url().split('?').next().unwrap_or("").to_string();
+    let url = req.url().to_string();
+    let mut parts = url.splitn(2, '?');
+    let path = parts.next().unwrap_or("").to_string();
+    // The dispatcher has always discarded the query; `POST /drop` is the first
+    // route that needs it (U6), so it is captured rather than dropped.
+    let query = parts.next().unwrap_or("").to_string();
 
     // Liveness probe — no auth, leaks nothing.
     if path == "/healthz" && *req.method() == Method::Get {
@@ -273,6 +334,15 @@ fn handle(mut req: tiny_http::Request, ctx: &HandlerCtx) {
             // is exactly SSE-over-HTTP/1.1: the client reads until close.
             let writer = req.into_writer();
             stream_sse(writer, ctx);
+        }
+        (Method::Post, "/drop") => {
+            let resp = drop_response(ctx, &query, &mut req);
+            let _ = req.respond(resp);
+        }
+        // A known route with the wrong verb is a method error, matching the
+        // per-agent routes below.
+        (_, "/drop") => {
+            let _ = req.respond(Response::empty(405));
         }
         (method, p) => match (method, agent_route(p)) {
             (Method::Get, Some((key, AgentEndpoint::Output))) => {
@@ -341,6 +411,84 @@ fn json_status(status: u16, body: &str) -> Response<io::Cursor<Vec<u8>>> {
         .with_status_code(status)
 }
 
+/// A JSON body carrying only an `error` discriminator, so every refusal code is
+/// minted one way (phone-screenshot-drop U6). The page renders a distinct
+/// message per code (R5).
+fn json_error(status: u16, code: &str) -> Response<io::Cursor<Vec<u8>>> {
+    json_status(status, &format!("{{\"error\":\"{code}\"}}"))
+}
+
+/// Buffer used to drain an abandoned request body. Fixed size is the whole
+/// point — see [`drain_body`].
+const DRAIN_CHUNK: usize = 64 * 1024;
+
+/// Ceiling on how much of an abandoned body we will read before giving up.
+/// Generous relative to any legitimate cap; see [`drain_body`] for what
+/// exceeding it costs.
+const DRAIN_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// Read and discard whatever remains of a request body, through a fixed-size
+/// buffer (KTD1).
+///
+/// **This is a correctness requirement, not an optimization**, and the reason is
+/// specific to `tiny_http`. A body over 1 KiB is wrapped in an `EqualReader`
+/// whose `Drop` impl reads the remainder — and does so with
+/// `vec![0; remaining_to_read]`, where `remaining_to_read` starts at the
+/// *client-declared* `Content-Length` that the crate parses with no cap of its
+/// own (verified in `tiny_http-0.12.0/src/util/equal_reader.rs`). Responding
+/// early therefore does not skip the upload: it defers it to drop time and sizes
+/// a buffer from a number the client chose. Because `EqualReader::read`
+/// decrements that counter as we consume, draining first leaves the drop-time
+/// loop with nothing to do and nothing to allocate.
+///
+/// Routing every refusal through one helper is what keeps this from being
+/// forgotten on the path added next year.
+///
+/// **Residual, stated rather than papered over.** Draining converts an
+/// immediate allocation into a socket read, which is a strict improvement but
+/// not a closed hole: a client that declares an enormous length and then stalls
+/// parks a connection thread (bounded by the existing 64-slot cap), and one that
+/// declares more than [`DRAIN_LIMIT`] leaves a remainder the drop path will
+/// still size a buffer from. `tiny_http` exposes no way to discard a body reader
+/// without consuming it, so closing that fully would mean replacing the server.
+fn drain_body(req: &mut tiny_http::Request) {
+    let mut buf = vec![0u8; DRAIN_CHUNK];
+    let mut drained: u64 = 0;
+    let reader = req.as_reader();
+    while drained < DRAIN_LIMIT {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => drained = drained.saturating_add(n as u64),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Drain the body, then refuse with a discriminated JSON error. Every `POST
+/// /drop` refusal that leaves bytes unread goes through here.
+fn drain_and_refuse(
+    req: &mut tiny_http::Request,
+    status: u16,
+    code: &str,
+) -> Response<io::Cursor<Vec<u8>>> {
+    drain_body(req);
+    json_error(status, code)
+}
+
+/// The header `tailscale serve` injects, naming the tailnet user who owns the
+/// originating device. The proxy deletes any inbound copy first, so a value
+/// arriving *through the proxy* is authentic — but a local process writing
+/// straight to the loopback listener can forge it freely, which is exactly why
+/// this is additive to the token and never a replacement (KTD2).
+const TAILNET_LOGIN_HEADER: &str = "Tailscale-User-Login";
+
+fn header_value<'a>(req: &'a tiny_http::Request, name: &'static str) -> Option<&'a str> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str())
+}
+
 /// The KTD3/KTD4 exposure gate, shared verbatim by the frame stamp and the
 /// `/output` body so the two surfaces cannot apply different rules: a
 /// **choice** question is always exposed (an AskUserQuestion never "executes",
@@ -386,11 +534,178 @@ fn gated_question(question: Option<QuestionBody>, reason: Option<&str>) -> Optio
 /// the gate inherits [`gated_question`]'s abstain-on-surprise posture, so a
 /// question fly cannot corroborate **fails open** and the drop is delivered —
 /// detection is best-effort (AE1), and the plan documents the consequence.
-// Consumed by the `POST /drop` route (U6); tested on its own here because the
-// widening is the behavior this plan exists to add.
-#[allow(dead_code)]
 fn drop_blocked_by_question(question: Option<QuestionBody>, reason: Option<&str>) -> bool {
     gated_question(question, reason).is_some()
+}
+
+/// `POST /drop?agent=<leafKey>&pane=<paneId>&caption=<...>`: accept a phone
+/// screenshot, store it, and deliver its path plus the caption into the target
+/// agent's pane as one bracketed-paste submit (phone-screenshot-drop U6).
+///
+/// The image is the **raw request body**, not `multipart/form-data`: multipart
+/// would mean a boundary-scanning state machine (or a new dependency) inside
+/// fly's most security-sensitive listener to carry exactly one file whose
+/// metadata fits in a query string. The caption rides the query rather than a
+/// header because headers are byte-oriented — an emoji or newline would need
+/// percent-encoding anyway, and a raw newline in a hand-parsed header value is a
+/// header-injection shape.
+///
+/// **Refusal precedence**, cheapest and least-disclosing first, and nothing
+/// written before a decision that does not need the bytes:
+///
+/// | # | condition | response |
+/// |---|-----------|----------|
+/// | 1 | bad/absent token | bare `401`, no body (upstream) |
+/// | 2 | identity header present and wrong | bare `401`, no body |
+/// | 3 | query unparseable / no `agent` / no `pane` / caption over cap | `400 badRequest` |
+/// | 4 | agent key not in the roster | `404 unknownAgent` |
+/// | 5 | declared `Content-Length` over the cap | `413 oversize` |
+/// | 6 | drop store unavailable | `500 storageFailed` |
+/// | 7 | body is not a recognized image | `415 badFormat` |
+/// | 8 | body exceeds the cap mid-stream | `413 oversize` |
+/// | 9 | any pending question | `409 askPending` |
+/// | 10 | leaf has no live pane | `404 unknownAgent` |
+/// | 11 | pane id no longer matches | `409 paneChanged` |
+/// | 12 | pane is no longer running an agent | `409 notAgent` |
+/// | 13 | publishing the image failed | `500 storageFailed` |
+/// | 14 | the paste write failed | `500 deliveryFailed` |
+/// | 15 | the submit did not land | `500 deliverySubmitFailed` |
+/// | — | otherwise | `200 {"ok":true,"path":…}` |
+///
+/// Rows 7 and 8 are inverted relative to the plan's flowchart, deliberately:
+/// the sniff needs only the first 16 bytes, so running it first means a
+/// non-image body never creates a file at all — the plan's own "nothing is
+/// written before a decision that does not need the bytes" principle. The
+/// visible consequence is that an oversize *non-image* reports `badFormat`
+/// rather than `oversize`. Row 5 still catches the common oversize case before
+/// a single byte is streamed.
+///
+/// The `401`s stay bare and bodyless, including the identity refusal — it is
+/// deliberately indistinguishable on the wire from a bad token. That makes a
+/// mistyped `expectedTailnetLogin` look exactly like a wrong token, so the
+/// identity refusal emits a server-side log line naming both values, and the
+/// operator docs point at it when the page loops on token entry.
+fn drop_response(
+    ctx: &HandlerCtx,
+    query: &str,
+    req: &mut tiny_http::Request,
+) -> Response<io::Cursor<Vec<u8>>> {
+    // 2. Tailnet identity, before anything is read.
+    let got = header_value(req, TAILNET_LOGIN_HEADER);
+    if !tailnet_identity_ok(got, ctx.expected_tailnet_login.as_deref()) {
+        // The wire response is deliberately identical to a bad token, so this
+        // log line is the *only* way to tell a misconfiguration from one.
+        log::warn!(
+            "phone drop refused: tailnet login {:?} does not match the configured {:?}",
+            got.unwrap_or(""),
+            ctx.expected_tailnet_login.as_deref().unwrap_or("")
+        );
+        drain_body(req);
+        return empty_response(401);
+    }
+
+    // 3. Query.
+    let q = match parse_drop_query(query) {
+        Ok(q) => q,
+        Err(e) => {
+            let code = match e {
+                QueryError::CaptionTooLong => "captionTooLong",
+                QueryError::TooLong => "queryTooLong",
+                _ => "badRequest",
+            };
+            return drain_and_refuse(req, 400, code);
+        }
+    };
+
+    // 4. Existence, from the published roster — the same 404 authority every
+    // other per-agent route uses.
+    let Some(gate) = ctx.state.agent_gate(&q.agent) else {
+        return drain_and_refuse(req, 404, "unknownAgent");
+    };
+
+    // 5. Declared length. Saves the disk write, not the transfer: because the
+    // refusal path drains, an oversize upload still crosses the wire before the
+    // phone sees its 413. Failing before the bytes move would need a
+    // 100-continue negotiation tiny_http does not expose, so the page's own
+    // pre-send size check is what actually spares the user the upload.
+    let cap = ctx.drop_max_bytes;
+    if req.body_length().is_some_and(|n| n as u64 > cap) {
+        return drain_and_refuse(req, 413, "oversize");
+    }
+
+    // 6. Store availability. A construction failure is reported per request and
+    // never blocks the listener from starting (AE8).
+    let Some(store) = ctx.drop_store.as_ref() else {
+        return drain_and_refuse(req, 500, "storageFailed");
+    };
+
+    // 7/8. Stream to a temp file. The image never lands in memory.
+    let stored = {
+        // `as_reader` borrows the request, so scope it before any refusal path
+        // needs `req` back to drain.
+        let mut reader = req.as_reader();
+        store.store(&mut reader, cap)
+    };
+    let stored = match stored {
+        Ok(s) => s,
+        Err(DropError::BadFormat) => return drain_and_refuse(req, 415, "badFormat"),
+        Err(DropError::Oversize) => return drain_and_refuse(req, 413, "oversize"),
+        Err(DropError::Storage(e)) => {
+            log::warn!("phone drop storage failed: {e}");
+            return drain_and_refuse(req, 500, "storageFailed");
+        }
+    };
+    // Past here the body is consumed, so refusals no longer need to drain — but
+    // they DO need the temp file gone, which `StoredImage`'s drop handles.
+
+    // 9. Any pending question blocks (KTD5) — wider than the input route's
+    // permission-only rule, because the paste's leading ESC would silently
+    // cancel a picker.
+    let resolved = (ctx.io)(&q.agent, gate.reason.as_deref(), &gate.status);
+    if drop_blocked_by_question(resolved.question, gate.reason.as_deref()) {
+        return json_error(409, "askPending");
+    }
+
+    // 10–15. Guards, publish, deliver — one seam, because the order matters.
+    let text = compose_drop_prompt(stored.dest(), q.caption.as_deref());
+    let dest = stored.dest().to_path_buf();
+    let mut stored = Some(stored);
+    let mut commit = || match stored.take() {
+        Some(s) => s.commit().map(|_| ()).map_err(|e| e.to_string()),
+        None => Err("image already consumed".into()),
+    };
+    let outcome = (ctx.drop)(
+        &q.agent,
+        DropDelivery {
+            expect_pane: q.pane,
+            text: &text,
+            commit: &mut commit,
+        },
+    );
+
+    match outcome {
+        DropOutcome::Delivered => json_response(
+            serde_json::json!({ "ok": true, "path": dest.display().to_string() }).to_string(),
+        ),
+        DropOutcome::UnknownPane => json_error(404, "unknownAgent"),
+        DropOutcome::PaneChanged => json_error(409, "paneChanged"),
+        DropOutcome::NotAgent => json_error(409, "notAgent"),
+        DropOutcome::CommitFailed(e) => {
+            log::warn!("phone drop could not be published: {e}");
+            json_error(500, "storageFailed")
+        }
+        DropOutcome::PasteFailed(e) => {
+            log::warn!("phone drop delivery failed: {e}");
+            json_error(500, "deliveryFailed")
+        }
+        // The paste landed, so the image stays: unlinking now would leave the
+        // user hitting Enter at the desk against a path that no longer exists
+        // (KTD7). `commit` already ran, so nothing here needs to retain it.
+        DropOutcome::SubmitIncomplete(e) => {
+            log::warn!("phone drop pasted but not submitted: {e}");
+            json_error(500, "deliverySubmitFailed")
+        }
+    }
 }
 
 /// `GET /agents/{key}/output`: the latest reply plus the gated pending

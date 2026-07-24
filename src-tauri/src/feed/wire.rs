@@ -74,7 +74,7 @@ pub struct AgentEntry {
     /// Additive and nullable like `lastReplyAt`/`questionPendingAt` before it:
     /// `default` keeps both an older stored payload and an older consumer valid.
     #[serde(default)]
-    pub pane_id: Option<u32>,
+    pub pane_id: Option<u64>,
 }
 
 /// One selectable option of a pending question, as the wire carries it

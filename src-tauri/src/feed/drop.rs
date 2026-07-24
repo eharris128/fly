@@ -467,6 +467,141 @@ pub fn compose_drop_prompt(path: &Path, caption: Option<&str>) -> String {
     }
 }
 
+/// Ceiling on the raw (still percent-encoded) query string, in bytes, applied
+/// **before** decoding (KTD1).
+///
+/// Decoding is the one place client text becomes a Rust `String`, so it is
+/// bounded first rather than after. The allowance is generous relative to
+/// [`CAPTION_MAX_CHARS`] because one caption char can occupy up to 4 UTF-8
+/// bytes and each of those up to 3 encoded bytes; the decoded char count is
+/// then checked exactly.
+pub const QUERY_RAW_MAX_BYTES: usize = 8192;
+
+/// The parsed `POST /drop` query (phone-screenshot-drop U6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropQuery {
+    /// The roster `leafKey` being targeted.
+    pub agent: String,
+    /// The pane id the phone saw on the roster, echoed back for guard one.
+    pub pane: u64,
+    /// The caption, already percent-decoded; `None` when absent or empty.
+    pub caption: Option<String>,
+}
+
+/// Why a `POST /drop` query was rejected. All map to `400 badRequest` — they
+/// are split for the log line and the tests, not for the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryError {
+    /// Over [`QUERY_RAW_MAX_BYTES`] before decoding.
+    TooLong,
+    /// `agent` absent or empty.
+    MissingAgent,
+    /// `pane` absent, empty, or not a `u32`.
+    MissingOrBadPane,
+    /// A `%` escape that is truncated or not hex, or bytes that do not form
+    /// UTF-8 once decoded. **Rejected, never lossily repaired** — a caption
+    /// silently mangled into replacement characters is worse than a refusal the
+    /// user can act on.
+    BadEncoding,
+    /// The decoded caption exceeds [`CAPTION_MAX_CHARS`]. Refused rather than
+    /// truncated: a caption clipped mid-sentence changes what the user asked.
+    CaptionTooLong,
+}
+
+/// Parse the `POST /drop` query string (everything after `?`, exclusive).
+///
+/// Hand-rolled rather than pulled from a crate: this is one small grammar at
+/// fly's most security-sensitive listener, and the decode rules below are
+/// deliberate rather than inherited.
+///
+/// **`+` is a literal plus, not a space.** The `application/x-www-form-urlencoded`
+/// convention would decode it as a space, but the page builds this query with
+/// `encodeURIComponent`, which emits `%20` for a space and leaves `+` untouched.
+/// Honoring the form convention would silently turn every plus in a caption into
+/// a space.
+pub fn parse_drop_query(raw: &str) -> Result<DropQuery, QueryError> {
+    if raw.len() > QUERY_RAW_MAX_BYTES {
+        return Err(QueryError::TooLong);
+    }
+    let (mut agent, mut pane, mut caption) = (None, None, None);
+    for pair in raw.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        match k {
+            "agent" => agent = Some(percent_decode(v)?),
+            "pane" => pane = Some(percent_decode(v)?),
+            "caption" => caption = Some(percent_decode(v)?),
+            // Unknown parameters are ignored, not refused — a future page
+            // revision adding one must not break against an older fly.
+            _ => {}
+        }
+    }
+
+    let agent = agent.filter(|a| !a.is_empty()).ok_or(QueryError::MissingAgent)?;
+    let pane = pane
+        .ok_or(QueryError::MissingOrBadPane)?
+        .parse::<u64>()
+        .map_err(|_| QueryError::MissingOrBadPane)?;
+    let caption = match caption {
+        Some(c) if c.chars().count() > CAPTION_MAX_CHARS => {
+            return Err(QueryError::CaptionTooLong)
+        }
+        Some(c) if c.trim().is_empty() => None,
+        other => other,
+    };
+    Ok(DropQuery {
+        agent,
+        pane,
+        caption,
+    })
+}
+
+/// Strict percent-decoding to UTF-8. Rejects a truncated or non-hex escape and
+/// any byte sequence that is not valid UTF-8, rather than substituting
+/// replacement characters.
+fn percent_decode(s: &str) -> Result<String, QueryError> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3).ok_or(QueryError::BadEncoding)?;
+            let hi = (hex[0] as char).to_digit(16).ok_or(QueryError::BadEncoding)?;
+            let lo = (hex[1] as char).to_digit(16).ok_or(QueryError::BadEncoding)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| QueryError::BadEncoding)
+}
+
+/// Decide whether a request's tailnet identity header is acceptable (KTD2).
+///
+/// Three-valued by design:
+/// - no expectation configured ⇒ allow (the shipped default — the check is off
+///   until `feed.expectedTailnetLogin` is set);
+/// - expectation configured, header absent ⇒ **allow**. `tailscale serve`
+///   injects the header, but a request that never crossed the proxy simply has
+///   none, and the bearer token — not this — is the boundary;
+/// - expectation configured, header present and different ⇒ refuse.
+///
+/// Comparison is case-insensitive and whitespace-trimmed: logins are email-like
+/// and the value may arrive with incidental spacing.
+pub fn tailnet_identity_ok(header: Option<&str>, expected: Option<&str>) -> bool {
+    let Some(expected) = expected.map(str::trim).filter(|e| !e.is_empty()) else {
+        return true;
+    };
+    match header.map(str::trim).filter(|h| !h.is_empty()) {
+        None => true,
+        Some(got) => got.eq_ignore_ascii_case(expected),
+    }
+}
+
 /// What became of one drop delivery attempt (phone-screenshot-drop U5).
 ///
 /// The two failure variants are split rather than collapsed into one boolean
@@ -487,6 +622,10 @@ pub enum DropOutcome {
     /// The right pane, but its foreground process is no longer an agent — a
     /// bare shell, most likely (409 `notAgent`, AE5).
     NotAgent,
+    /// Every guard passed but publishing the image failed — an unwritable
+    /// directory, a full disk, a failed rename (500 `storageFailed`, AE8).
+    /// Nothing reached the pane.
+    CommitFailed(String),
     /// The paste write failed; nothing reached the pane. Caller unlinks.
     PasteFailed(String),
     /// The paste landed but the submit did not — either the Enter write failed
@@ -527,13 +666,23 @@ pub enum DropOutcome {
 /// abandoned if it now fails. The guards narrow the exposure from the roster
 /// poll interval to that gap; they do not close it, and AE5 is worded
 /// accordingly.
+/// **Why `commit` is a parameter rather than the caller's business.** The
+/// ordering it enforces is not stylistic. Every refusal check must run before
+/// the image is published (KTD7 — a refusal must leave no residue), but the
+/// image must exist before any text reaches the pane, because the pasted prompt
+/// names a path the agent is about to be asked to read. Committing after the
+/// writes would race the agent against the rename; committing before the guards
+/// would leave a published image behind every `paneChanged`. So the publish
+/// happens *between* them, and the only way to guarantee that is to own the
+/// sequence here.
 pub fn deliver_with_guards(
-    expect_pane: u32,
+    expect_pane: u64,
     text: &str,
-    resolve_pane: impl Fn() -> Option<u32>,
-    is_agent: impl Fn(u32) -> bool,
-    mut write: impl FnMut(u32, &[u8]) -> Result<(), String>,
+    resolve_pane: impl Fn() -> Option<u64>,
+    is_agent: impl Fn(u64) -> bool,
+    mut write: impl FnMut(u64, &[u8]) -> Result<(), String>,
     settle: impl Fn(),
+    commit: impl FnOnce() -> Result<(), String>,
 ) -> DropOutcome {
     let Some(pane) = resolve_pane() else {
         return DropOutcome::UnknownPane;
@@ -543,6 +692,12 @@ pub fn deliver_with_guards(
     }
     if !is_agent(pane) {
         return DropOutcome::NotAgent;
+    }
+
+    // Last point at which nothing has been published and nothing has been
+    // typed. Past here the image is on disk under its final name.
+    if let Err(e) = commit() {
+        return DropOutcome::CommitFailed(e);
     }
 
     if let Err(e) = write(pane, &crate::feed::io::paste_payload(text)) {
@@ -1145,6 +1300,155 @@ mod tests {
         assert!(found.ends_with(&name), "{found}");
     }
 
+    // ---- U6: query parsing ----
+
+    #[test]
+    fn a_well_formed_query_parses_all_three_parameters() {
+        let q = parse_drop_query("agent=leaf-12&pane=7&caption=login%20button%20overlaps").unwrap();
+        assert_eq!(q.agent, "leaf-12");
+        assert_eq!(q.pane, 7);
+        assert_eq!(q.caption.as_deref(), Some("login button overlaps"));
+    }
+
+    #[test]
+    fn a_caption_is_optional_and_blank_is_absent() {
+        assert_eq!(parse_drop_query("agent=l&pane=1").unwrap().caption, None);
+        assert_eq!(parse_drop_query("agent=l&pane=1&caption=").unwrap().caption, None);
+        assert_eq!(
+            parse_drop_query("agent=l&pane=1&caption=%20%20").unwrap().caption,
+            None,
+            "whitespace-only is absent, matching compose_drop_prompt"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unparseable_pane_is_refused() {
+        // R14 depends on the echo being present — defaulting it would silently
+        // disable guard one.
+        assert_eq!(
+            parse_drop_query("agent=l"),
+            Err(QueryError::MissingOrBadPane)
+        );
+        assert_eq!(
+            parse_drop_query("agent=l&pane="),
+            Err(QueryError::MissingOrBadPane)
+        );
+        assert_eq!(
+            parse_drop_query("agent=l&pane=abc"),
+            Err(QueryError::MissingOrBadPane)
+        );
+        assert_eq!(
+            parse_drop_query("agent=l&pane=-1"),
+            Err(QueryError::MissingOrBadPane)
+        );
+    }
+
+    #[test]
+    fn a_missing_agent_is_refused() {
+        assert_eq!(parse_drop_query("pane=1"), Err(QueryError::MissingAgent));
+        assert_eq!(
+            parse_drop_query("agent=&pane=1"),
+            Err(QueryError::MissingAgent)
+        );
+    }
+
+    #[test]
+    fn invalid_percent_encoding_is_refused_not_repaired() {
+        for bad in [
+            "agent=l&pane=1&caption=%",
+            "agent=l&pane=1&caption=%A",
+            "agent=l&pane=1&caption=%ZZ",
+            "agent=l&pane=1&caption=%FF%FE", // decodes to invalid UTF-8
+        ] {
+            assert_eq!(parse_drop_query(bad), Err(QueryError::BadEncoding), "{bad}");
+        }
+    }
+
+    #[test]
+    fn multibyte_captions_survive_the_round_trip() {
+        let q = parse_drop_query("agent=l&pane=1&caption=caf%C3%A9%20%F0%9F%93%B7").unwrap();
+        assert_eq!(q.caption.as_deref(), Some("café 📷"));
+    }
+
+    /// `+` is a literal plus here, not a space: the page uses
+    /// `encodeURIComponent`, which emits `%20` for a space and leaves `+` alone.
+    #[test]
+    fn plus_stays_a_plus_rather_than_becoming_a_space() {
+        let q = parse_drop_query("agent=l&pane=1&caption=a+b").unwrap();
+        assert_eq!(q.caption.as_deref(), Some("a+b"));
+    }
+
+    #[test]
+    fn an_over_cap_caption_is_refused_rather_than_truncated() {
+        let long = "x".repeat(CAPTION_MAX_CHARS + 1);
+        let q = format!("agent=l&pane=1&caption={long}");
+        assert_eq!(parse_drop_query(&q), Err(QueryError::CaptionTooLong));
+
+        // Exactly at the cap is fine.
+        let at = "x".repeat(CAPTION_MAX_CHARS);
+        let q = format!("agent=l&pane=1&caption={at}");
+        assert_eq!(
+            parse_drop_query(&q).unwrap().caption.unwrap().chars().count(),
+            CAPTION_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn an_oversized_raw_query_is_refused_before_decoding() {
+        let q = format!("agent=l&pane=1&caption={}", "%20".repeat(4000));
+        assert!(q.len() > QUERY_RAW_MAX_BYTES);
+        assert_eq!(parse_drop_query(&q), Err(QueryError::TooLong));
+    }
+
+    #[test]
+    fn unknown_parameters_are_ignored_for_forward_compatibility() {
+        let q = parse_drop_query("agent=l&pane=1&future=whatever").unwrap();
+        assert_eq!(q.agent, "l");
+    }
+
+    #[test]
+    fn a_leaf_key_containing_encoded_characters_decodes() {
+        let q = parse_drop_query("agent=ws-1%2Ftab-1%2Fleaf-1&pane=1").unwrap();
+        assert_eq!(q.agent, "ws-1/tab-1/leaf-1");
+    }
+
+    // ---- U6: tailnet identity (KTD2) ----
+
+    #[test]
+    fn identity_check_is_off_until_an_expectation_is_configured() {
+        assert!(tailnet_identity_ok(None, None));
+        assert!(tailnet_identity_ok(Some("anyone@example.com"), None));
+        assert!(tailnet_identity_ok(Some("anyone@example.com"), Some("  ")));
+    }
+
+    #[test]
+    fn a_matching_identity_passes_and_a_mismatched_one_is_refused() {
+        assert!(tailnet_identity_ok(
+            Some("evan@example.com"),
+            Some("evan@example.com")
+        ));
+        assert!(!tailnet_identity_ok(
+            Some("someone-else@example.com"),
+            Some("evan@example.com")
+        ));
+    }
+
+    /// Absence is not a refusal: the token remains the boundary, and a request
+    /// that never crossed the proxy simply carries no header.
+    #[test]
+    fn an_absent_identity_header_is_allowed_even_when_configured() {
+        assert!(tailnet_identity_ok(None, Some("evan@example.com")));
+        assert!(tailnet_identity_ok(Some(""), Some("evan@example.com")));
+    }
+
+    #[test]
+    fn identity_comparison_ignores_case_and_surrounding_space() {
+        assert!(tailnet_identity_ok(
+            Some(" Evan@Example.COM "),
+            Some("evan@example.com")
+        ));
+    }
+
     // ---- U5: delivery guards ----
     //
     // Written before the delivery path itself (the plan's execution note):
@@ -1158,7 +1462,7 @@ mod tests {
     /// failures.
     #[derive(Default)]
     struct FakePane {
-        resolved: Option<u32>,
+        resolved: Option<u64>,
         /// Answers for successive `is_agent` probes, consumed front to back;
         /// the last value repeats once exhausted.
         agent_probes: std::cell::RefCell<Vec<bool>>,
@@ -1166,17 +1470,21 @@ mod tests {
         fail_write: Option<usize>,
         writes: std::cell::RefCell<Vec<Vec<u8>>>,
         settles: std::cell::Cell<usize>,
+        /// Set when `commit` runs, recording how many writes had happened by
+        /// then — the ordering assertion.
+        committed_after_writes: std::cell::Cell<Option<usize>>,
+        commit_fails: bool,
     }
 
     impl FakePane {
-        fn agent(resolved: u32) -> Self {
+        fn agent(resolved: u64) -> Self {
             Self {
                 resolved: Some(resolved),
                 agent_probes: std::cell::RefCell::new(vec![true]),
                 ..Default::default()
             }
         }
-        fn probe(&self, _pane: u32) -> bool {
+        fn probe(&self, _pane: u64) -> bool {
             let mut p = self.agent_probes.borrow_mut();
             if p.len() > 1 {
                 p.remove(0)
@@ -1184,7 +1492,7 @@ mod tests {
                 *p.first().unwrap_or(&false)
             }
         }
-        fn write(&self, _pane: u32, bytes: &[u8]) -> Result<(), String> {
+        fn write(&self, _pane: u64, bytes: &[u8]) -> Result<(), String> {
             let mut w = self.writes.borrow_mut();
             let idx = w.len();
             if self.fail_write == Some(idx) {
@@ -1193,7 +1501,7 @@ mod tests {
             w.push(bytes.to_vec());
             Ok(())
         }
-        fn run(&self, expect_pane: u32, text: &str) -> DropOutcome {
+        fn run(&self, expect_pane: u64, text: &str) -> DropOutcome {
             deliver_with_guards(
                 expect_pane,
                 text,
@@ -1202,6 +1510,15 @@ mod tests {
                 |p, b| self.write(p, b),
                 || {
                     self.settles.set(self.settles.get() + 1);
+                },
+                || {
+                    self.committed_after_writes
+                        .set(Some(self.writes.borrow().len()));
+                    if self.commit_fails {
+                        Err("ENOSPC".into())
+                    } else {
+                        Ok(())
+                    }
                 },
             )
         }
@@ -1222,6 +1539,60 @@ mod tests {
         );
         assert_eq!(w[1], crate::feed::io::SUBMIT, "second write is the Enter");
         assert_eq!(f.settles.get(), 1, "one settle gap between them");
+    }
+
+    /// The ordering KTD7 forces, and the reason it is owned by
+    /// `deliver_with_guards` rather than left to the caller: the image must be
+    /// published *after* every refusal check (so a refusal leaves no residue)
+    /// but *before* any text reaches the pane (so the agent is never told to
+    /// read a path that has not been renamed into place yet).
+    #[test]
+    fn the_image_is_committed_after_the_guards_and_before_the_first_write() {
+        let f = FakePane::agent(7);
+        assert_eq!(f.run(7, "hello"), DropOutcome::Delivered);
+        assert_eq!(
+            f.committed_after_writes.get(),
+            Some(0),
+            "commit ran with zero writes behind it"
+        );
+    }
+
+    #[test]
+    fn a_refused_drop_never_commits_the_image() {
+        for f in [
+            FakePane::agent(9), // pane changed
+            FakePane {
+                resolved: None,
+                ..Default::default()
+            }, // unknown
+            FakePane {
+                resolved: Some(7),
+                agent_probes: std::cell::RefCell::new(vec![false]),
+                ..Default::default()
+            }, // not an agent
+        ] {
+            f.run(7, "hello");
+            assert_eq!(
+                f.committed_after_writes.get(),
+                None,
+                "a refusal must leave no published image"
+            );
+        }
+    }
+
+    /// AE8: publishing failed after the guards passed. Nothing was typed, and
+    /// the outcome is distinguishable from a refusal.
+    #[test]
+    fn a_failed_commit_reports_storage_failure_and_types_nothing() {
+        let f = FakePane {
+            resolved: Some(7),
+            agent_probes: std::cell::RefCell::new(vec![true]),
+            commit_fails: true,
+            ..Default::default()
+        };
+        let out = f.run(7, "hello");
+        assert!(matches!(out, DropOutcome::CommitFailed(_)), "got {out:?}");
+        assert!(f.writes().is_empty(), "nothing reached the pane");
     }
 
     /// AE2 — the session was replaced in the same leaf slot. Pane ids are
