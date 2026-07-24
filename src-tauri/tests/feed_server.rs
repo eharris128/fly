@@ -1006,6 +1006,253 @@ fn binds_loopback_only() {
     );
 }
 
+/// The phone-drop plan adds *reachability* (through `tailscale serve`) without
+/// adding a bind, and this is the guard on that claim (U8). If the drop route
+/// ever tempted someone to bind `0.0.0.0`, the whole "the token is the boundary
+/// because only local processes can reach us" argument changes shape.
+#[test]
+fn the_drop_routes_add_reachability_without_adding_a_bind() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let addr = h.addr();
+    assert!(
+        addr.ip().is_loopback(),
+        "the drop route must not have widened the bind, bound {addr}"
+    );
+
+    // Both new routes answer on loopback...
+    let (head, _) = request(addr, "GET", "/", None, None, Duration::from_secs(2));
+    assert_eq!(status_of(&head), 200);
+    let (head, _) = ok_drop(addr, "agent=leaf-replied&pane=7");
+    assert_eq!(status_of(&head), 200);
+
+    // ...and the listener is not reachable on any non-loopback local address.
+    for ip in local_non_loopback_ips() {
+        let target = SocketAddr::new(ip, addr.port());
+        let reached = TcpStream::connect_timeout(&target, Duration::from_millis(300)).is_ok();
+        assert!(!reached, "feed answered on non-loopback {target}");
+    }
+}
+
+/// Non-loopback IPv4 addresses of this machine, read from `/proc/net/route`-free
+/// sources. Empty on a host with no external interface, in which case the
+/// assertion above is vacuous but never wrong.
+fn local_non_loopback_ips() -> Vec<std::net::IpAddr> {
+    // A UDP connect to a public address picks the default-route source address
+    // without sending anything.
+    let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+        return Vec::new();
+    };
+    if sock.connect("203.0.113.1:9").is_err() {
+        return Vec::new();
+    }
+    match sock.local_addr() {
+        Ok(a) if !a.ip().is_loopback() && !a.ip().is_unspecified() => vec![a.ip()],
+        _ => Vec::new(),
+    }
+}
+
+/// The consolidated status contract (U8): one case per terminal node of the
+/// plan's refusal flowchart, asserting **both** the status and the `error`
+/// discriminator, so a future change that reorders precedence fails a test that
+/// reads like the flowchart.
+///
+/// Two nodes are covered by their own tests above rather than here, because
+/// they need a differently-configured server: `storageFailed` from an
+/// unavailable store, and the mid-stream `oversize` that only a chunked body can
+/// reach.
+#[test]
+fn the_refusal_precedence_table_holds_end_to_end() {
+    // (behavior, query, body, declared length, headers, expected status, code)
+    struct Case {
+        name: &'static str,
+        behavior: DropBehavior,
+        expect_login: Option<&'static str>,
+        query: &'static str,
+        auth: bool,
+        header: Option<(&'static str, &'static str)>,
+        body: Option<&'static [u8]>,
+        status: u16,
+        code: &'static str,
+    }
+    const NOT_IMAGE: &[u8] = b"plainly not an image, whatever the content type claims";
+
+    let cases = [
+        Case {
+            name: "no token",
+            behavior: DropBehavior::Deliver, expect_login: None,
+            query: "agent=leaf-replied&pane=7", auth: false, header: None, body: None,
+            status: 401, code: "",
+        },
+        Case {
+            name: "wrong tailnet identity",
+            behavior: DropBehavior::Deliver, expect_login: Some("evan@example.com"),
+            query: "agent=leaf-replied&pane=7", auth: true,
+            header: Some(("Tailscale-User-Login", "nope@example.com")), body: None,
+            status: 401, code: "",
+        },
+        Case {
+            name: "no pane parameter",
+            behavior: DropBehavior::Deliver, expect_login: None,
+            query: "agent=leaf-replied", auth: true, header: None, body: None,
+            status: 400, code: "badRequest",
+        },
+        Case {
+            name: "unknown agent",
+            behavior: DropBehavior::Deliver, expect_login: None,
+            query: "agent=leaf-nope&pane=7", auth: true, header: None, body: None,
+            status: 404, code: "unknownAgent",
+        },
+        Case {
+            name: "not an image",
+            behavior: DropBehavior::Deliver, expect_login: None,
+            query: "agent=leaf-replied&pane=7", auth: true, header: None,
+            body: Some(NOT_IMAGE),
+            status: 415, code: "badFormat",
+        },
+        Case {
+            name: "pane replaced",
+            behavior: DropBehavior::PaneChanged, expect_login: None,
+            query: "agent=leaf-replied&pane=7", auth: true, header: None, body: None,
+            status: 409, code: "paneChanged",
+        },
+        Case {
+            name: "pane is no longer an agent",
+            behavior: DropBehavior::NotAgent, expect_login: None,
+            query: "agent=leaf-replied&pane=7", auth: true, header: None, body: None,
+            status: 409, code: "notAgent",
+        },
+        Case {
+            name: "pane gone",
+            behavior: DropBehavior::Unknown, expect_login: None,
+            query: "agent=leaf-replied&pane=7", auth: true, header: None, body: None,
+            status: 404, code: "unknownAgent",
+        },
+        Case {
+            name: "paste failed",
+            behavior: DropBehavior::PasteFails, expect_login: None,
+            query: "agent=leaf-replied&pane=7", auth: true, header: None, body: None,
+            status: 500, code: "deliveryFailed",
+        },
+        Case {
+            name: "submit failed",
+            behavior: DropBehavior::SubmitFails, expect_login: None,
+            query: "agent=leaf-replied&pane=7", auth: true, header: None, body: None,
+            status: 500, code: "deliverySubmitFailed",
+        },
+        Case {
+            name: "landed",
+            behavior: DropBehavior::Deliver, expect_login: None,
+            query: "agent=leaf-replied&pane=7", auth: true, header: None, body: None,
+            status: 200, code: "",
+        },
+    ];
+
+    let mut seen_codes = std::collections::BTreeSet::new();
+    for c in cases {
+        let h = start_drop(c.behavior, c.expect_login);
+        let img = png();
+        let headers: Vec<(&str, &str)> = c.header.into_iter().collect();
+        let (head, body) = drop_request(
+            h.addr(),
+            c.query,
+            c.auth.then_some(TOKEN),
+            c.body.unwrap_or(&img),
+            None,
+            &headers,
+        );
+        assert_eq!(status_of(&head), c.status, "{}: {head}", c.name);
+        if c.code.is_empty() {
+            if c.status == 401 {
+                assert!(body.is_empty(), "{}: a 401 must be bare", c.name);
+            }
+        } else {
+            assert_eq!(error_code(&body), c.code, "{}: {body}", c.name);
+            seen_codes.insert(c.code);
+        }
+        // Only the two post-paste outcomes may leave a file behind.
+        let retained = !h.stored().is_empty();
+        let may_retain = matches!(
+            c.behavior,
+            DropBehavior::Deliver | DropBehavior::SubmitFails
+        ) && c.status != 400
+            && c.status != 404
+            && c.status != 415
+            && c.status != 401;
+        assert_eq!(retained, may_retain, "{}: retention mismatch", c.name);
+        assert!(
+            h.entries().len() == h.stored().len(),
+            "{}: a temp file leaked",
+            c.name
+        );
+    }
+
+    // Every discriminator the page renders a message for is exercised somewhere
+    // in this file; these are the ones this table itself must cover.
+    for code in [
+        "badRequest",
+        "unknownAgent",
+        "badFormat",
+        "paneChanged",
+        "notAgent",
+        "deliveryFailed",
+        "deliverySubmitFailed",
+    ] {
+        assert!(seen_codes.contains(code), "precedence table missed {code}");
+    }
+}
+
+/// Two drops in flight to the same agent must never splice a line into the
+/// composer: the paste and the Enter are separate writes, so a second drop's
+/// paste arriving between them is the hazard. Each delivery here must appear as
+/// one whole, well-formed prompt.
+#[test]
+fn concurrent_drops_to_one_agent_never_splice_the_composer() {
+    let h = Arc::new(start_drop(DropBehavior::Deliver, None));
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let h = Arc::clone(&h);
+        handles.push(std::thread::spawn(move || {
+            ok_drop(
+                h.addr(),
+                &format!("agent=leaf-replied&pane=7&caption=marker{i}"),
+            )
+        }));
+    }
+    let mut ok = 0;
+    for jh in handles {
+        let (head, _) = jh.join().unwrap();
+        let status = status_of(&head);
+        assert!(
+            status == 200 || status == 409,
+            "a concurrent drop must land or be refused, got {status}"
+        );
+        if status == 200 {
+            ok += 1;
+        }
+    }
+    assert!(ok >= 1, "at least one concurrent drop should land");
+
+    // Every delivered prompt is intact: correct framing, exactly one path, and
+    // exactly one caption — no interleaving of two drops' text.
+    let sent = h.delivered.lock().unwrap().clone();
+    assert_eq!(sent.len(), ok, "one delivery per landed drop");
+    for text in &sent {
+        assert!(text.starts_with("Read the image at "), "spliced: {text:?}");
+        assert_eq!(
+            text.matches("Read the image at ").count(),
+            1,
+            "two prompts merged: {text:?}"
+        );
+        // "marker", not "shot" — the framing itself says "screenshot".
+        assert_eq!(
+            text.matches("marker").count(),
+            1,
+            "two captions merged: {text:?}"
+        );
+    }
+    assert_eq!(h.stored().len(), ok, "one stored image per landed drop");
+}
+
 #[test]
 fn healthz_needs_no_auth() {
     let (_state, server, _) = start();

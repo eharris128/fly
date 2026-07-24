@@ -102,3 +102,99 @@ step. Remove with `tailscale serve --https=8443 off`.
 ## Verdict
 
 Both premises hold. No plan changes required; U1 proceeds as written.
+
+---
+
+# Operator setup (U8)
+
+Three steps, all required. The feature does not work with any of them skipped,
+and two of them fail *silently* if you skip them.
+
+## 1. Put `tailscale serve` in front of the feed port
+
+```
+tailscale serve --bg --https=8443 http://127.0.0.1:4939
+```
+
+- **`--bg` is mandatory.** Without it the mount is a foreground session that
+  dies with the terminal, and the phone silently stops being able to connect.
+- **A dedicated port, not `--set-path` on 443.** On this machine 443's root
+  mount is already taken by another service. Beyond that, a `--set-path` mount
+  **strips the prefix** before proxying, which would break any root-absolute URL
+  in the page. A root mount on its own port removes that whole class of bug.
+- MagicDNS and HTTPS certificates must be enabled for the tailnet.
+- Your machine and tailnet names appear in **public Certificate Transparency
+  logs** as a consequence of issuing the certificate. That is inherent to
+  tailnet HTTPS, not to this feature.
+- Remove with `tailscale serve --https=8443 off`.
+
+**Never use `tailscale funnel`.** The same port cannot be Serve and Funnel at
+once, last command wins, and a stray funnel invocation converts this private
+mount — which writes into your agents' terminals — into a publicly reachable
+one. It must not appear in any script or note about this feature.
+
+fly neither configures nor detects the mount. If it is absent the phone simply
+cannot connect, with no diagnostic from fly.
+
+## 2. Retrieve the bearer token
+
+No in-app surface displays it. Read it from the config file:
+
+```
+python3 -c "import json;print(json.load(open('$HOME/.config/fly/config.json'))['feed']['token'])"
+```
+
+(For a dev-flavor build, `~/.config/fly-dev/config.json`.) Paste it into the
+page once; it is kept in `localStorage`. WebKit purges script-writable storage
+after roughly seven days without interaction, so expect to re-paste
+occasionally.
+
+There is currently **no rotate path** anywhere in the codebase. Removing the
+device from the tailnet is the real revocation.
+
+## 3. Set `feed.expectedTailnetLogin`
+
+```jsonc
+// ~/.config/fly/config.json
+{ "feed": { "expectedTailnetLogin": "you@example.com" } }
+```
+
+**The identity check is off until this is set**, so following steps 1–2 alone
+ships it inert. Be precise about what it buys, because it is less than it looks:
+`tailscale serve` stamps the *tailnet user* who owns the device, not the device,
+so on a personal single-user tailnet the realistic leak path — the token pasted
+into one of your own phones — passes the check unchanged. It defends against a
+token used from a device belonging to a *different* tailnet user, and does
+nothing about a local process forging the header. The bearer token remains the
+boundary.
+
+## Diagnosing a token-entry loop
+
+If the page keeps asking for the token even though the token is right, the
+likely cause is a mistyped `expectedTailnetLogin`. **The wire response is
+deliberately identical to a bad token** — a bare 401 with no body — so the only
+way to tell them apart is fly's stderr:
+
+```
+phone drop refused: tailnet login "..." does not match the configured "..."
+```
+
+Grep app stderr for `does not match the configured`. If that line is absent, the
+token really is wrong.
+
+---
+
+## Still to verify live (needs a phone)
+
+U0 settled the two premises that governed the design. These three need the built
+surface plus an actual phone, and are **not yet done**:
+
+1. **iOS delivers a camera-roll screenshot as PNG, not HEIC.** The page warns on
+   a HEIC selection rather than blocking it, so the failure mode is a warning
+   and a possibly-unreadable image, not a broken flow. Worth confirming because
+   it determines whether the warning is rare or constant.
+2. **The whole path end to end from a phone** — pick, caption, send, and the
+   prompt appearing in the pane.
+3. **A refusal renders legibly on a small screen outdoors.** Each refusal code
+   has its own message; the question is whether they read clearly at arm's
+   length in daylight.

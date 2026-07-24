@@ -169,7 +169,7 @@ time/inputs as arguments so they're tested without a running app.
 - `feed/` — the loopback HTTP surface for an external local consumer
   (feat-agent-state-local-feed + feed-agent-reply-io + feed-pending-question +
   feed-conversation-tail + feed-question-screen-fallback + hook-ask-channel +
-  feed-monitor-enrichment):
+  feed-monitor-enrichment + phone-screenshot-drop):
   bearer-token auth (constant-time, silent 401; **the token is the whole
   boundary** — loopback TCP has no `SO_PEERCRED`), SSE `/feed` (webview-pushed
   roster + backend automations; `lastReplyAt` **and** `questionPendingAt`
@@ -205,6 +205,42 @@ time/inputs as arguments so they're tested without a running app.
   *permission* dialog (any mode incl. decision) — or any *screen-derived*
   question while the live reason is `permission` — requires
   `feed.allowPermissionAnswers`, default off).
+  **The phone screenshot drop** (phone-screenshot-drop) adds the second
+  mutation route and the feed's only HTML: `POST /drop?agent=&pane=&caption=`
+  takes the image as the **raw body** (multipart would mean a boundary parser
+  in the security-sensitive listener; the caption rides the query because a
+  header cannot hold a newline or emoji unencoded), and `GET /` serves an inert
+  `include_str!`-embedded page (`feed/drop-page.html`) **unauthenticated** —
+  the second and last exception to auth-precedes-routing after `/healthz`,
+  unavoidable because a browser navigation sends no `Authorization` header, and
+  safe because the shell carries no roster/agent data/token (pinned by a
+  byte-identical-across-rosters test). The phone reaches it through
+  `tailscale serve` in front of the same loopback port; fly adds **no** bind
+  (`the_drop_routes_add_reachability_without_adding_a_bind` guards that).
+  `feed/drop.rs` owns sniffing (bytes decide the format, never the declared
+  content type; extension from a fixed literal set, filename fully fly-minted),
+  streaming storage (temp-then-rename, 0600 in 0700, unlink-on-drop so a
+  refusal leaves no residue, startup sweep for crash residue), the prompt
+  composition, and `deliver_with_guards`. That last owns the whole ordering
+  because it is load-bearing: guards → **publish** → paste → re-probe → Enter.
+  The image must be published after every refusal check (residue) but before
+  any text reaches the pane (the agent is about to read that path). Two
+  check-then-act guards, honestly bounded: pane **identity** (`paneId` echoed
+  from the roster — ids are monotonic and never reused, so this is identity not
+  freshness, unlike the stamp that burned `feed-askedat-restamp-409`) and a
+  `/proc` foreground probe re-run before the Enter, since `claude` exiting mid
+  paste-to-Enter would otherwise **execute** the caption in a shell. The
+  question gate is **wider here than on the input route** — *any* pending
+  question refuses, because `paste_payload`'s leading ESC silently cancels an
+  unfocused picker; the input route is deliberately unchanged. Every refusal
+  drains the body first: `tiny_http` otherwise drains at drop time through a
+  buffer sized from the *client-declared* `Content-Length`
+  (`equal_reader.rs`), so responding early defers the read and sizes an
+  allocation from an attacker's number. Knobs: `feed.dropDir` (raw string, tilde
+  expanded at use — never at deserialization, or `set_config`'s round-trip
+  would persist an absolute path over the user's `~`), `feed.dropMaxBytes`,
+  `feed.expectedTailnetLogin` (additive identity check, **off by default**;
+  a local process can forge the header, so the token stays the boundary).
   **Pending-question detection is now event-first** (hook-ask-channel): the
   `PermissionRequest` hook fires at ask time for every dialog — incl.
   AskUserQuestion, incl. bypassPermissions (live-verified 2.1.207) — and
