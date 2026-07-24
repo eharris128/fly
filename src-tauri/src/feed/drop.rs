@@ -421,6 +421,52 @@ impl Drop for StoredImage {
     }
 }
 
+/// Cap on a drop caption, in chars — the `OTHER_MAX_CHARS` precedent. A caption
+/// is a sentence or two typed on a phone; nothing legitimate approaches this.
+///
+/// Enforced in **two** places, deliberately. The route (U6) bounds the query
+/// and refuses an over-cap caption with a 400 rather than silently delivering a
+/// truncated one, because a caption clipped mid-sentence changes what the user
+/// asked for. This cap is the composer's own backstop, applied through
+/// [`crate::feed::io::clean`], so the composed prompt is bounded even if a
+/// future caller forgets. In practice the route's refusal fires first.
+pub const CAPTION_MAX_CHARS: usize = 512;
+
+/// The fixed framing wrapped around a dropped image (R3).
+///
+/// The wording is not arbitrary: it must make the agent *open* the file, not
+/// treat the path as a string to talk about — a bare path followed by a caption
+/// reads ambiguously and would make the whole feature silently useless. This
+/// exact phrasing was verified against a live bypass-permissions pane during the
+/// U0 premise spike (Claude Code 2.1.219): the agent read the file and reported
+/// its contents with no permission prompt. See
+/// `docs/notes/2026-07-24-phone-drop-live-check.md`.
+///
+/// `{path}` is fly-minted (see [`mint_filename`]) and contains no whitespace, so
+/// it cannot be split by the surrounding prose.
+const PROMPT_FRAMING: &str = "Read the image at {path} — it's a screenshot I dropped from my phone.";
+
+/// Compose the text delivered to the pane: the framing naming the stored image,
+/// then the caption if there is one (R1, R3).
+///
+/// The caption is untrusted text bound for a PTY, so it goes through the
+/// existing sanitize → scrub → truncate pipeline
+/// ([`crate::feed::io::clean`]) *in that order* before composition — scrubbing
+/// before sanitizing would let a zero-width char inside a token-shaped string
+/// defeat the prefix match. `clean` returns `None` for a blank result, so a
+/// whitespace-only caption is indistinguishable from no caption at all (AE3).
+///
+/// The result is handed to [`crate::feed::io::paste_payload`], which strips the
+/// remaining control characters including ESC — so a caption cannot forge paste
+/// markers regardless of what survives here.
+pub fn compose_drop_prompt(path: &Path, caption: Option<&str>) -> String {
+    let framed = PROMPT_FRAMING.replace("{path}", &path.display().to_string());
+    match caption.and_then(|c| crate::feed::io::clean(c, CAPTION_MAX_CHARS)) {
+        Some(c) => format!("{framed}\n\n{c}"),
+        None => framed,
+    }
+}
+
 /// Fill 8 bytes from the thread CSPRNG (the `hooks::token` / `config` idiom).
 fn random_bytes() -> [u8; 8] {
     use rand::RngCore;
@@ -907,6 +953,101 @@ mod tests {
             tv_sec: secs as libc::time_t,
             tv_usec: 0,
         }
+    }
+
+    // ---- U3: prompt composition ----
+
+    fn prompt(caption: Option<&str>) -> String {
+        compose_drop_prompt(
+            Path::new("/home/tester/inbox/20260725T003107Z-deadbeef01020304.png"),
+            caption,
+        )
+    }
+
+    #[test]
+    fn prompt_names_the_path_as_an_image_to_read_and_carries_the_caption() {
+        let out = prompt(Some("the login button overlaps the header on iOS"));
+        assert!(out.contains("20260725T003107Z-deadbeef01020304.png"), "{out}");
+        assert!(
+            out.contains("the login button overlaps the header on iOS"),
+            "{out}"
+        );
+        // The framing must direct the agent to *open* the file, not merely
+        // mention a path — this is the whole feature (R3, verified in U0).
+        assert!(out.starts_with("Read the image at "), "{out}");
+    }
+
+    #[test]
+    fn prompt_without_a_caption_is_the_framing_alone() {
+        let out = prompt(None);
+        assert!(out.starts_with("Read the image at "), "{out}");
+        assert!(!out.trim().is_empty());
+        assert!(!out.contains("\n\n"), "no dangling blank line: {out:?}");
+    }
+
+    /// AE3: a caption of only whitespace must be treated as no caption, not as
+    /// an empty line the agent has to interpret.
+    #[test]
+    fn whitespace_only_caption_matches_the_no_caption_case() {
+        assert_eq!(prompt(Some("   \n\t  ")), prompt(None));
+        assert_eq!(prompt(Some("")), prompt(None));
+    }
+
+    /// The caption reaches a PTY, so no ESC may survive — otherwise it could
+    /// forge the bracketed-paste end marker or smuggle a terminal sequence.
+    #[test]
+    fn caption_escape_bytes_do_not_survive() {
+        let out = prompt(Some("before\x1b[201~after\x07end"));
+        assert!(!out.contains('\x1b'), "{out:?}");
+        assert!(!out.contains('\x07'), "{out:?}");
+        assert!(out.contains("beforeafter") || out.contains("before"), "{out:?}");
+    }
+
+    #[test]
+    fn caption_secrets_are_scrubbed() {
+        let out = prompt(Some("token is sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+        assert!(
+            !out.contains("sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "{out}"
+        );
+    }
+
+    /// Truncation runs *after* scrubbing, so a secret straddling the cap is
+    /// masked before its tail is cut (the `io::clean` ordering contract).
+    #[test]
+    fn overlong_caption_is_truncated_after_scrubbing() {
+        let long = "x".repeat(CAPTION_MAX_CHARS + 500);
+        let out = prompt(Some(&long));
+        assert!(out.contains('…'), "truncation marker present: {out:?}");
+        assert!(out.chars().count() < long.chars().count());
+
+        // A secret placed right at the boundary is scrubbed, not half-cut.
+        let mut straddle = "y".repeat(CAPTION_MAX_CHARS - 10);
+        straddle.push_str("sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+        let out = prompt(Some(&straddle));
+        assert!(!out.contains("sk-ant-api03-BBBB"), "{out}");
+    }
+
+    /// Bracketed paste exists precisely so a multi-line caption lands as one
+    /// composer message — newlines must survive composition.
+    #[test]
+    fn multiline_caption_keeps_its_newlines() {
+        let out = prompt(Some("line one\nline two"));
+        assert!(out.contains("line one\nline two"), "{out:?}");
+    }
+
+    /// The path is emitted unquoted, so a minted name containing whitespace
+    /// would be split by the surrounding prose. `mint_filename` guarantees it
+    /// cannot; this pins the dependency between the two.
+    #[test]
+    fn composed_path_is_a_single_whitespace_free_token() {
+        let name = mint_filename(at("2026-07-25T00:31:07Z"), [0x5a; 8], ImageKind::Png);
+        let out = compose_drop_prompt(&PathBuf::from("/home/tester/inbox").join(&name), None);
+        let found = out
+            .split_whitespace()
+            .find(|t| t.contains(&name))
+            .expect("the path appears as one token");
+        assert!(found.ends_with(&name), "{found}");
     }
 
     // ---- test readers ----
