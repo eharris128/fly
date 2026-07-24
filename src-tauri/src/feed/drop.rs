@@ -467,6 +467,101 @@ pub fn compose_drop_prompt(path: &Path, caption: Option<&str>) -> String {
     }
 }
 
+/// What became of one drop delivery attempt (phone-screenshot-drop U5).
+///
+/// The two failure variants are split rather than collapsed into one boolean
+/// because delivery is **two** writes, and the caller must treat them
+/// differently (KTD7): a failed paste means nothing reached the pane and the
+/// image should be unlinked, while a failed submit means the composed prompt is
+/// already sitting in the composer — unlinking then would leave the user
+/// hitting Enter at the desk against a path that no longer exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropOutcome {
+    /// Pasted and submitted.
+    Delivered,
+    /// The leaf resolves to no live pane at all — the agent is gone (404).
+    UnknownPane,
+    /// A live pane exists, but it is not the one the phone targeted: the
+    /// session was replaced in the same leaf slot (409 `paneChanged`, AE2).
+    PaneChanged,
+    /// The right pane, but its foreground process is no longer an agent — a
+    /// bare shell, most likely (409 `notAgent`, AE5).
+    NotAgent,
+    /// The paste write failed; nothing reached the pane. Caller unlinks.
+    PasteFailed(String),
+    /// The paste landed but the submit did not — either the Enter write failed
+    /// or the pre-Enter re-probe found the pane is no longer an agent. The text
+    /// is pre-typed and needs an Enter at the machine. **Caller commits the
+    /// image**, and says so.
+    SubmitIncomplete(String),
+}
+
+/// Run the two delivery guards and, if they pass, paste + submit.
+///
+/// Every dependency is injected so the guard sequence — the part whose failure
+/// modes are silent and destructive — is unit-testable without a `PtyManager`,
+/// an `AppHandle`, or a running app. `lib.rs` supplies the real implementations.
+///
+/// **Guard one, pane identity.** `pane_by_leaf` resolves a leaf key to the
+/// newest *live* pane, and leaf keys are deliberately stable across respawn, so
+/// a leaf whose agent exited and was replaced resolves to the replacement. The
+/// phone echoes the pane id it saw on the roster and we compare. Pane ids are
+/// monotonic and never reused, so this is *identity*, not freshness — it never
+/// moves, and a slow phone flow cannot invalidate it. (That distinction is why
+/// this is not the shape that burned `feed-askedat-restamp-409`, which was a
+/// freshness stamp the server kept re-stamping under an open dialog.)
+///
+/// **Guard two, the foreground probe.** Guard one cannot catch the worse case:
+/// `claude` exits and leaves a bash prompt in the *same* pane. The id is
+/// unchanged and the roster keeps listing it as an agent for up to a poll
+/// interval, and since delivery ends in Enter, the path and caption would be
+/// **executed as a shell command**.
+///
+/// **Both are check-then-act, and this does not pretend otherwise.** Neither can
+/// run atomically with the write — the foreground probe reads `/proc` with no
+/// registry lock held, which is a deliberate lock-discipline invariant in the
+/// pty layer, not an oversight to fix here. Worse, delivery is two writes
+/// separated by a settle gap: if `claude` exits in that window, bytes already in
+/// the tty buffer are inherited by the shell and a delayed Enter would run them.
+/// So the probe runs **again** immediately before the Enter and the submit is
+/// abandoned if it now fails. The guards narrow the exposure from the roster
+/// poll interval to that gap; they do not close it, and AE5 is worded
+/// accordingly.
+pub fn deliver_with_guards(
+    expect_pane: u32,
+    text: &str,
+    resolve_pane: impl Fn() -> Option<u32>,
+    is_agent: impl Fn(u32) -> bool,
+    mut write: impl FnMut(u32, &[u8]) -> Result<(), String>,
+    settle: impl Fn(),
+) -> DropOutcome {
+    let Some(pane) = resolve_pane() else {
+        return DropOutcome::UnknownPane;
+    };
+    if pane != expect_pane {
+        return DropOutcome::PaneChanged;
+    }
+    if !is_agent(pane) {
+        return DropOutcome::NotAgent;
+    }
+
+    if let Err(e) = write(pane, &crate::feed::io::paste_payload(text)) {
+        return DropOutcome::PasteFailed(e);
+    }
+    settle();
+    // The residual-race mitigation. Abandoning here leaves unsubmitted text in
+    // a shell, which is recoverable; sending the Enter anyway would execute it.
+    if !is_agent(pane) {
+        return DropOutcome::SubmitIncomplete(
+            "the pane stopped running an agent before the text could be submitted".into(),
+        );
+    }
+    match write(pane, crate::feed::io::SUBMIT) {
+        Ok(()) => DropOutcome::Delivered,
+        Err(e) => DropOutcome::SubmitIncomplete(e),
+    }
+}
+
 /// Fill 8 bytes from the thread CSPRNG (the `hooks::token` / `config` idiom).
 fn random_bytes() -> [u8; 8] {
     use rand::RngCore;
@@ -1048,6 +1143,189 @@ mod tests {
             .find(|t| t.contains(&name))
             .expect("the path appears as one token");
         assert!(found.ends_with(&name), "{found}");
+    }
+
+    // ---- U5: delivery guards ----
+    //
+    // Written before the delivery path itself (the plan's execution note):
+    // both guards fail *silently and destructively* — a missed pane-identity
+    // check delivers into a stranger's session, a missed foreground check
+    // executes the caption as a shell command — so a regression that skips one
+    // must fail loudly here rather than being discovered in a pane.
+
+    /// A recording fake for the delivery seam: logs every PTY write and lets a
+    /// test script the pane resolution, the agent probe per call, and write
+    /// failures.
+    #[derive(Default)]
+    struct FakePane {
+        resolved: Option<u32>,
+        /// Answers for successive `is_agent` probes, consumed front to back;
+        /// the last value repeats once exhausted.
+        agent_probes: std::cell::RefCell<Vec<bool>>,
+        /// Write index (0-based) that should fail, if any.
+        fail_write: Option<usize>,
+        writes: std::cell::RefCell<Vec<Vec<u8>>>,
+        settles: std::cell::Cell<usize>,
+    }
+
+    impl FakePane {
+        fn agent(resolved: u32) -> Self {
+            Self {
+                resolved: Some(resolved),
+                agent_probes: std::cell::RefCell::new(vec![true]),
+                ..Default::default()
+            }
+        }
+        fn probe(&self, _pane: u32) -> bool {
+            let mut p = self.agent_probes.borrow_mut();
+            if p.len() > 1 {
+                p.remove(0)
+            } else {
+                *p.first().unwrap_or(&false)
+            }
+        }
+        fn write(&self, _pane: u32, bytes: &[u8]) -> Result<(), String> {
+            let mut w = self.writes.borrow_mut();
+            let idx = w.len();
+            if self.fail_write == Some(idx) {
+                return Err("EIO".into());
+            }
+            w.push(bytes.to_vec());
+            Ok(())
+        }
+        fn run(&self, expect_pane: u32, text: &str) -> DropOutcome {
+            deliver_with_guards(
+                expect_pane,
+                text,
+                || self.resolved,
+                |p| self.probe(p),
+                |p, b| self.write(p, b),
+                || {
+                    self.settles.set(self.settles.get() + 1);
+                },
+            )
+        }
+        fn writes(&self) -> Vec<Vec<u8>> {
+            self.writes.borrow().clone()
+        }
+    }
+
+    #[test]
+    fn delivery_with_matching_pane_and_agent_foreground_succeeds() {
+        let f = FakePane::agent(7);
+        assert_eq!(f.run(7, "hello"), DropOutcome::Delivered);
+        let w = f.writes();
+        assert_eq!(w.len(), 2, "paste and Enter are two separate writes");
+        assert!(
+            String::from_utf8_lossy(&w[0]).contains("hello"),
+            "first write carries the text"
+        );
+        assert_eq!(w[1], crate::feed::io::SUBMIT, "second write is the Enter");
+        assert_eq!(f.settles.get(), 1, "one settle gap between them");
+    }
+
+    /// AE2 — the session was replaced in the same leaf slot. Pane ids are
+    /// monotonic, so the resolved id is *higher* than the one the phone echoed.
+    #[test]
+    fn a_replaced_pane_is_refused_as_pane_changed_with_no_write() {
+        let f = FakePane::agent(9);
+        assert_eq!(f.run(7, "hello"), DropOutcome::PaneChanged);
+        assert!(f.writes().is_empty(), "nothing reached the PTY");
+    }
+
+    #[test]
+    fn a_leaf_with_no_live_pane_is_unknown_not_pane_changed() {
+        // These must stay distinguishable: "the agent is gone" (404) and "a
+        // different agent is here now" (409) mean different things to the user.
+        let f = FakePane {
+            resolved: None,
+            ..Default::default()
+        };
+        assert_eq!(f.run(7, "hello"), DropOutcome::UnknownPane);
+        assert!(f.writes().is_empty());
+    }
+
+    /// AE5 — `claude` exited leaving a bash prompt in the *same* pane, so the
+    /// pane id still matches. Without this guard the paste plus Enter executes
+    /// the caption as a shell command.
+    #[test]
+    fn a_pane_whose_foreground_is_not_an_agent_is_refused_with_no_write() {
+        let f = FakePane {
+            resolved: Some(7),
+            agent_probes: std::cell::RefCell::new(vec![false]),
+            ..Default::default()
+        };
+        assert_eq!(f.run(7, "hello"), DropOutcome::NotAgent);
+        assert!(f.writes().is_empty(), "nothing typed into the shell");
+    }
+
+    /// The residual-race mitigation (KTD6): the guards are check-then-act, and
+    /// delivery is two writes 150ms apart. If `claude` exits in that window the
+    /// re-probe catches it and the Enter is abandoned — leaving unsubmitted
+    /// text in a shell rather than an executed command.
+    #[test]
+    fn an_exit_between_paste_and_enter_abandons_the_submit() {
+        let f = FakePane {
+            resolved: Some(7),
+            // agent at the first probe, gone by the pre-Enter re-probe
+            agent_probes: std::cell::RefCell::new(vec![true, false]),
+            ..Default::default()
+        };
+        let out = f.run(7, "hello");
+        assert!(
+            matches!(out, DropOutcome::SubmitIncomplete(_)),
+            "got {out:?}"
+        );
+        let w = f.writes();
+        assert_eq!(w.len(), 1, "the paste landed, the Enter did not");
+        assert_ne!(w[0], crate::feed::io::SUBMIT);
+    }
+
+    /// AE9 first half: the paste failed, so nothing reached the pane and the
+    /// caller may unlink.
+    #[test]
+    fn a_failed_paste_reports_paste_failed_and_never_attempts_the_enter() {
+        let f = FakePane {
+            resolved: Some(7),
+            agent_probes: std::cell::RefCell::new(vec![true]),
+            fail_write: Some(0),
+            ..Default::default()
+        };
+        let out = f.run(7, "hello");
+        assert!(matches!(out, DropOutcome::PasteFailed(_)), "got {out:?}");
+        assert!(f.writes().is_empty());
+    }
+
+    /// AE9 second half: the paste landed but the Enter did not. The composed
+    /// prompt is sitting in the composer, so the caller must **keep** the image
+    /// — unlinking would strand a path the user is about to hit Enter on.
+    #[test]
+    fn a_failed_enter_reports_submit_incomplete_so_the_image_is_kept() {
+        let f = FakePane {
+            resolved: Some(7),
+            agent_probes: std::cell::RefCell::new(vec![true]),
+            fail_write: Some(1),
+            ..Default::default()
+        };
+        let out = f.run(7, "hello");
+        assert!(
+            matches!(out, DropOutcome::SubmitIncomplete(_)),
+            "got {out:?}"
+        );
+        assert_eq!(f.writes().len(), 1, "the paste is on screen");
+    }
+
+    /// The paste goes through `paste_payload`, so a caption that tries to forge
+    /// the bracketed-paste end marker cannot.
+    #[test]
+    fn the_pasted_payload_is_bracketed_and_strips_escapes() {
+        let f = FakePane::agent(7);
+        f.run(7, "cap\x1b[201~tion");
+        let first = f.writes().remove(0);
+        let s = String::from_utf8_lossy(&first).into_owned();
+        assert!(s.starts_with("\x1b[200~"), "{s:?}");
+        assert!(s.ends_with("\x1b[201~"), "{s:?}");
+        assert_eq!(s.matches("\x1b[201~").count(), 1, "no forged end marker");
     }
 
     // ---- test readers ----

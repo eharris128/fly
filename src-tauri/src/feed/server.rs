@@ -362,6 +362,37 @@ fn gated_question(question: Option<QuestionBody>, reason: Option<&str>) -> Optio
     })
 }
 
+/// Whether a pending question blocks a **drop** (phone-screenshot-drop U5,
+/// KTD5). Deliberately wider than the input route's rule, which refuses only on
+/// `kind == "permission"`.
+///
+/// The line is in the wrong place there for a mechanical reason:
+/// [`crate::feed::io::paste_payload`] produces a payload that *begins* with
+/// `ESC[200~`, and at an unfocused Claude picker that leading ESC reads as a
+/// bare Escape and cancels the dialog. The caption then lands in the composer as
+/// an ordinary message. So a drop onto a choice picker does not fail — it
+/// silently destroys a question the user never saw, and the agent proceeds as
+/// though it was never asked. A refusal is visible and recoverable; silent
+/// picker destruction is neither (AE4).
+///
+/// This is a **drop-route rule**. The input route's behavior is deliberately
+/// left alone — the same hazard applies there, but changing it is a behavior
+/// change for an existing consumer and belongs in its own change (the plan's
+/// deferred list).
+///
+/// Note what stays un-blocked. An agent that is merely *working* still receives
+/// the drop: Claude's composer queues mid-turn input, which is normal and is
+/// presumably what the user wants when they deliberately pick a busy agent. And
+/// the gate inherits [`gated_question`]'s abstain-on-surprise posture, so a
+/// question fly cannot corroborate **fails open** and the drop is delivered —
+/// detection is best-effort (AE1), and the plan documents the consequence.
+// Consumed by the `POST /drop` route (U6); tested on its own here because the
+// widening is the behavior this plan exists to add.
+#[allow(dead_code)]
+fn drop_blocked_by_question(question: Option<QuestionBody>, reason: Option<&str>) -> bool {
+    gated_question(question, reason).is_some()
+}
+
 /// `GET /agents/{key}/output`: the latest reply plus the gated pending
 /// question and the conversation tail (feed-conversation-tail R1 — ungated:
 /// turns are completed history, already scrubbed/capped by the resolver),
@@ -805,6 +836,44 @@ mod tests {
             request: Some("cargo build".into()),
             source: None,
         }
+    }
+
+    /// The widening this plan exists to make (KTD5). The contrast with the
+    /// input route is the point, so both rules are asserted side by side.
+    #[test]
+    fn a_drop_is_blocked_by_any_pending_question_not_only_a_permission() {
+        // A permission ask blocks both routes — no change there.
+        let q = permission(1);
+        assert!(drop_blocked_by_question(Some(q.clone()), Some("permission")));
+        assert_eq!(q.kind, "permission", "the input route blocks on this too");
+
+        // A CHOICE picker blocks the drop route. The input route's
+        // `kind == "permission"` test would fall straight through it, and the
+        // paste's leading ESC would then cancel the picker silently (AE4).
+        let c = choice(1, true);
+        assert_ne!(c.kind, "permission", "the input route would NOT block here");
+        assert!(
+            drop_blocked_by_question(Some(c), None),
+            "a choice picker must block a drop"
+        );
+    }
+
+    #[test]
+    fn a_drop_is_not_blocked_when_nothing_is_pending() {
+        assert!(!drop_blocked_by_question(None, None));
+        assert!(!drop_blocked_by_question(None, Some("permission")));
+    }
+
+    /// Fail-open, matching the abstain-on-surprise posture: a permission body
+    /// fly cannot corroborate is not exposed, so it does not block. Detection is
+    /// best-effort and AE1 says so.
+    #[test]
+    fn an_uncorroborated_permission_question_does_not_block_the_drop() {
+        assert!(!drop_blocked_by_question(Some(permission(1)), None));
+        assert!(!drop_blocked_by_question(
+            Some(permission(1)),
+            Some("question")
+        ));
     }
 
     #[test]
