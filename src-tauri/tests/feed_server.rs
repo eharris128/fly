@@ -830,6 +830,63 @@ fn a_repeat_drop_to_the_same_agent_succeeds() {
     assert_eq!(h.stored().len(), 2, "two distinct images");
 }
 
+// ---- phone-screenshot-drop U7: the page shell -------------------------------
+
+/// R19/KTD3: the shell is served without a token, because a browser navigation
+/// cannot carry one.
+#[test]
+fn the_drop_page_is_served_unauthenticated_as_html() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    let (head, body) = request(h.addr(), "GET", "/", None, None, Duration::from_secs(2));
+    assert_eq!(status_of(&head), 200, "{head}");
+    assert!(
+        head.to_lowercase().contains("content-type: text/html"),
+        "{head}"
+    );
+    assert!(body.contains("<html"), "served the page");
+    // The page holds a live token and a PTY-writing action, so framing it must
+    // be refused.
+    assert!(
+        head.to_lowercase().contains("frame-ancestors 'none'"),
+        "CSP is set: {head}"
+    );
+}
+
+/// The inertness clause of R19, asserted rather than assumed: the shell must
+/// carry no roster, no agent data, and no token — that is the entire reason
+/// serving it unauthenticated is safe.
+#[test]
+fn the_drop_page_shell_carries_no_token_and_no_agent_data() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    h.state.publish(
+        vec![
+            agent("leaf-replied", "idle"),
+            agent_with_reason("leaf-choice", "waiting", "question"),
+        ],
+        0,
+    );
+    let (_, body) = request(h.addr(), "GET", "/", None, None, Duration::from_secs(2));
+    assert!(!body.contains(TOKEN), "the token must never be templated in");
+    assert!(!body.contains("leaf-replied"), "no agent keys in the shell");
+    assert!(!body.contains("leaf-choice"), "no agent keys in the shell");
+}
+
+/// The strongest form of the same claim: the bytes do not depend on state at
+/// all, so no roster can ever leak through the shell.
+#[test]
+fn the_drop_page_is_byte_identical_with_an_empty_and_a_populated_roster() {
+    let h = start_drop(DropBehavior::Deliver, None);
+    h.state.publish(vec![], 0);
+    let (_, empty) = request(h.addr(), "GET", "/", None, None, Duration::from_secs(2));
+    h.state.publish(
+        vec![agent("leaf-replied", "working"), agent("leaf-two", "idle")],
+        0,
+    );
+    let (_, populated) = request(h.addr(), "GET", "/", None, None, Duration::from_secs(2));
+    assert_eq!(empty, populated, "the shell is not templated with state");
+    assert!(!empty.is_empty());
+}
+
 /// KTD1's drain requirement, observed from the outside: after a refusal that
 /// leaves body bytes unread, the server must have consumed them — otherwise
 /// `tiny_http` sizes a drop-time buffer from the client-declared length. A

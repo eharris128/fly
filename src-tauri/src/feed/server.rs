@@ -315,6 +315,19 @@ fn handle(mut req: tiny_http::Request, ctx: &HandlerCtx) {
         return;
     }
 
+    // The phone drop page (U7, KTD3) — the second and last deliberate exception
+    // to auth-precedes-routing, and it exists because the exception is
+    // unavoidable: a browser navigation cannot send an `Authorization` header,
+    // so a page reachable from a phone must be served unauthenticated or not at
+    // all. It is safe on the same terms as `/healthz`: the shell is inert — no
+    // roster, no agent data, no token, not templated with any state — so
+    // serving it discloses nothing. Everything it then *fetches* authenticates
+    // normally, which is what keeps R9 intact.
+    if (path == "/" || path == "/drop-page") && *req.method() == Method::Get {
+        let _ = req.respond(html_response(DROP_PAGE));
+        return;
+    }
+
     // Auth precedes routing on everything else: a caller without the token
     // gets the same bare 401 for every path and method, so it can't even map
     // which routes exist (KTD3 silent-rejection posture).
@@ -409,6 +422,32 @@ fn json_status(status: u16, body: &str) -> Response<io::Cursor<Vec<u8>>> {
     Response::from_string(body)
         .with_header(content_type)
         .with_status_code(status)
+}
+
+/// The phone drop page, embedded at compile time (KTD10, U7).
+///
+/// One self-contained file with inline CSS and JS — no build step, no bundler
+/// entry, and deliberately no dependency on the Vite pipeline that builds fly's
+/// own webview. That keeps it versioned with the server it talks to and needs no
+/// runtime asset lookup.
+const DROP_PAGE: &str = include_str!("drop-page.html");
+
+/// A 200 serving the drop page.
+///
+/// `frame-ancestors 'none'` because the page holds a live token and a
+/// PTY-writing action, and nothing else stops another site the phone has open
+/// from framing it.
+fn html_response(body: &'static str) -> Response<io::Cursor<Vec<u8>>> {
+    let content_type = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+        .expect("static header is valid");
+    let csp = tiny_http::Header::from_bytes(
+        &b"Content-Security-Policy"[..],
+        &b"frame-ancestors 'none'"[..],
+    )
+    .expect("static header is valid");
+    Response::from_string(body)
+        .with_header(content_type)
+        .with_header(csp)
 }
 
 /// A JSON body carrying only an `error` discriminator, so every refusal code is
