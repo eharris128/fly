@@ -17,6 +17,7 @@
 //! leaf's latest reply and builds the injected input payload.
 
 pub mod ask;
+pub mod drop;
 pub mod fallback;
 pub mod io;
 pub mod pending;

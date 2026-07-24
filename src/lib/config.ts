@@ -32,6 +32,17 @@ export interface FeedConfig {
    * pick a durable "don't ask again", so remote permission approval is opt-in.
    * AskUserQuestion choice answering is not gated by this. */
   allowPermissionAnswers: boolean;
+  /** Directory phone-dropped screenshots land in (phone-screenshot-drop U1,
+   * KTD4); null ⇒ `<data root>/inbox`. Carried as the **raw** user string with
+   * any `~` unexpanded — expanding it here would let a settings save persist an
+   * absolute path over the user's tilde. */
+  dropDir: string | null;
+  /** Largest accepted phone-drop image, in bytes. Default 25 MiB (KTD8). */
+  dropMaxBytes: number;
+  /** Tailnet login a phone-drop request must match when it presents one; null
+   * (default) disables the check. Additive only — the bearer token stays the
+   * boundary, since a local process can forge the header (KTD2). */
+  expectedTailnetLogin: string | null;
 }
 
 /** Shared defaults for automation agent runs (mirrors Rust AutomationDefaults,

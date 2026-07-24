@@ -144,6 +144,54 @@ pub struct FeedConfig {
     /// into a remote permission-approval credential. AskUserQuestion *choice*
     /// answering is not gated by this — it needs no flag.
     pub allow_permission_answers: bool,
+    /// Directory phone-dropped screenshots land in (phone-screenshot-drop U1,
+    /// KTD4). `None` ⇒ `<data root>/inbox`.
+    ///
+    /// **Stored as the raw user string, deliberately unexpanded.** This is the
+    /// one config field where a tilde survives deserialization, and it must:
+    /// `set_config` round-trips the whole [`Config`] back to disk, so an
+    /// expansion baked in here would be *persisted* the first time the settings
+    /// menu saves anything — silently rewriting `~/projects/inbox` to an
+    /// absolute path and freezing `$HOME` into the user's config file.
+    ///
+    /// Shape validation and tilde expansion therefore both live in
+    /// [`crate::feed::drop::expand_drop_dir`], applied where `lib.rs` builds the
+    /// store. A bare relative path is *rejected* there rather than silently
+    /// resolved against the process cwd — which for a GUI launched from a
+    /// desktop file is `/`, not anywhere the user meant.
+    ///
+    /// Note this diverges from every other durable store fly owns, which live
+    /// under the `FLY_APP_NAME` data root so a dev flavor stays isolated. That
+    /// is deliberate (KTD4): there is no retention policy, so the user prunes by
+    /// hand, and a directory they already browse is far likelier to actually get
+    /// pruned than one buried in `~/.local/share`. Sharing the directory between
+    /// the stable and dev flavors is safe because filenames are globally unique
+    /// by construction (see `drop::mint_filename`).
+    pub drop_dir: Option<String>,
+    /// Largest accepted phone-drop image, in bytes (KTD8). Default 25 MiB —
+    /// comfortably above a full-resolution phone screenshot (a 2–5 MB PNG) and
+    /// low enough that a runaway upload cannot fill the disk.
+    ///
+    /// `u32`, not a float, because [`Config`] derives `Eq`.
+    pub drop_max_bytes: u32,
+    /// Tailnet login (`Tailscale-User-Login`) a phone-drop request must present
+    /// when it presents one at all (KTD2). `None` (the default) disables the
+    /// check entirely.
+    ///
+    /// **Additive only — the bearer token remains the boundary.** `tailscaled`
+    /// proxies *to* loopback and loopback TCP carries no peer credentials, so a
+    /// proxied request and one from an arbitrary local process are
+    /// indistinguishable at the socket: any local process could hand-write this
+    /// header. Absence of the header is therefore not a refusal.
+    ///
+    /// Be precise about what setting it buys, because it is less than it looks.
+    /// `tailscale serve` stamps the *tailnet user* who owns the device, not the
+    /// device — so on a personal single-user tailnet the realistic leak path
+    /// (the token pasted into one of the user's own phones) passes the check
+    /// unchanged. It defends against a token used from a device belonging to a
+    /// *different* tailnet user, and does nothing about a forged header from a
+    /// local process.
+    pub expected_tailnet_login: Option<String>,
 }
 
 impl Default for FeedConfig {
@@ -153,6 +201,9 @@ impl Default for FeedConfig {
             port: 4939,
             token: None,
             allow_permission_answers: false,
+            drop_dir: None,
+            drop_max_bytes: 25 * 1024 * 1024,
+            expected_tailnet_login: None,
         }
     }
 }
@@ -336,6 +387,17 @@ mod tests {
         assert!(!cfg.feed.allow_permission_answers);
     }
 
+    /// A config written before the phone-drop block (phone-screenshot-drop U1)
+    /// still parses, with the drop directory unconfigured (⇒ `<data root>/inbox`),
+    /// the 25 MiB cap in force, and the tailnet identity check disabled.
+    #[test]
+    fn empty_config_has_drop_defaults() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.feed.drop_dir, None);
+        assert_eq!(cfg.feed.drop_max_bytes, 26_214_400);
+        assert_eq!(cfg.feed.expected_tailnet_login, None);
+    }
+
     /// The nested-serde gotcha: a *partial* `feed` object keeps omitted siblings
     /// at their defaults (enabled stays true) rather than dropping them.
     #[test]
@@ -344,6 +406,25 @@ mod tests {
         assert_eq!(cfg.feed.port, 5000);
         assert!(cfg.feed.enabled, "omitted sibling kept its default");
         assert_eq!(cfg.feed.token, None);
+        // The drop knobs are siblings too — a pre-existing `{"feed":{"port":…}}`
+        // must not lose the size cap and land at `drop_max_bytes: 0`, which
+        // would refuse every upload.
+        assert_eq!(cfg.feed.drop_max_bytes, 26_214_400);
+        assert_eq!(cfg.feed.drop_dir, None);
+        assert_eq!(cfg.feed.expected_tailnet_login, None);
+    }
+
+    /// A configured `dropDir` survives deserialization **unexpanded**. This is
+    /// the invariant behind `set_config`'s round-trip: expanding at parse would
+    /// persist an absolute path over the user's `~` the next time anything
+    /// saves. Expansion belongs to `feed::drop::expand_tilde`.
+    #[test]
+    fn drop_dir_keeps_its_tilde_through_a_round_trip() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"feed":{"dropDir":"~/projects/inbox"}}"#).unwrap();
+        assert_eq!(cfg.feed.drop_dir.as_deref(), Some("~/projects/inbox"));
+        let back = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(back["feed"]["dropDir"], "~/projects/inbox");
     }
 
     /// An explicit `enabled: false` is preserved across a load (the disable
@@ -363,6 +444,21 @@ mod tests {
         let v = serde_json::to_value(&c).unwrap();
         assert_eq!(v["feed"]["port"], 5050);
         assert_eq!(v["feed"]["token"], "abc123");
+        let back: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(back, c);
+    }
+
+    /// All three drop fields survive a camelCase round trip together.
+    #[test]
+    fn drop_fields_round_trip_camel_case() {
+        let mut c = Config::default();
+        c.feed.drop_dir = Some("~/projects/inbox".into());
+        c.feed.drop_max_bytes = 1024;
+        c.feed.expected_tailnet_login = Some("evan@example.com".into());
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["feed"]["dropDir"], "~/projects/inbox");
+        assert_eq!(v["feed"]["dropMaxBytes"], 1024);
+        assert_eq!(v["feed"]["expectedTailnetLogin"], "evan@example.com");
         let back: Config = serde_json::from_value(v).unwrap();
         assert_eq!(back, c);
     }
