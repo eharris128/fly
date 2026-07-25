@@ -2518,7 +2518,13 @@ fn over_cap_connections_are_dropped_and_a_freed_slot_is_reusable() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut served = false;
     while std::time::Instant::now() < deadline {
-        state.publish(vec![agent("l1", "waiting")], 0); // version bump → dead-peer write
+        // `bump`, not `publish`: publishing an identical roster is deduped and
+        // does NOT move the version, so a loop of identical publishes wakes the
+        // readers exactly once — and one write to a just-closed peer usually
+        // still succeeds (the RST lands after it), leaving the slot held until
+        // the 15s keepalive. `bump` moves the version every pass, so the second
+        // write fails and the thread (and slot) is reclaimed.
+        state.bump();
         let (head, _) = get(addr, "/healthz", None, Duration::from_millis(300));
         if head.starts_with("HTTP/1.1 200") {
             served = true;
