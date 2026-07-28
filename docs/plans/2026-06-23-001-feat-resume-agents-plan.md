@@ -2,7 +2,7 @@
 title: "feat: Resume Claude agents on relaunch (`fly resume`)"
 type: feat
 date: 2026-06-23
-status: planned
+status: implemented
 depth: deep
 ---
 

@@ -11,8 +11,14 @@ transcript re-read/re-parse per 1.5s tick while an agent streams
 (`session/transcript.rs::transcript_io` full-read + two forward full-parses;
 fix = bounded backward tail read + merged single pass) and the coupled
 `feed/io.rs` deep-clone of `ResolvedIo` per frame (fix = `Arc<ResolvedIo>` or
-a stamps-only accessor) — which is being pursued immediately. T13 below is a
+a stamps-only accessor) — which was to be pursued immediately. T13 below is a
 rider that falls out of that work.
+
+**Status as of 2026-07-28: that #1 fix did not land.** `transcript_io`
+(`session/transcript.rs`) still full-reads and runs three forward parses per
+call, and `feed/io.rs` still deep-clones. It is un-owned work, not
+in-progress work — treat it as the top item of this list rather than as
+already-handled.
 
 Priority tiers: **P1** = measurable steady-state cost, worth scheduling.
 **P2** = real but situational. **P3** = polish, batch opportunistically.
@@ -37,10 +43,27 @@ Priority tiers: **P1** = measurable steady-state cost, worth scheduling.
   channel). Collapses spinner storms to a few messages/sec and pushes most
   traffic onto the ≥ 1 KiB raw path.
 - **Caveat:** this contradicts the foundation plan's KTD3 / CLAUDE.md claim
-  "raw bytes end-to-end, no transcoding" — re-verify the vendored-source
-  reading first, then correct that doc text in the same change.
+  "raw bytes end-to-end, no transcoding". ~~re-verify the vendored-source
+  reading first, then correct that doc text in the same change.~~
+  **Done 2026-07-28** — re-verified against the vendored source and corrected
+  at all four sites (foundation-plan KTD3 addendum + U4, `CLAUDE.md`,
+  `stream/mod.rs`). The doc fix no longer blocks this task.
+- **Re-measured 2026-07-28** (the magnitude the original entry left open):
+  - Expansion of the JSON-number-array form on real captured Claude Code
+    renders (`tests/fixtures/screen/*.raw`, 67 KB): **3.39×**, not ~3.7×.
+  - The small path is not an edge case. A PTY read loop mirroring
+    `pty/pane.rs` saw **60/60 reads under 1024 bytes** (median 49 B) during
+    20 Hz spinner repaints — i.e. *every* interactive frame transcodes and
+    evals. Under a 512 KiB flood, 92% of bytes rode the raw ≥1 KiB path, so
+    the batcher's win is concentrated in the idle/thinking case, not the
+    flood case the entry originally framed.
+  - Also measured: `READ_BUF`'s 64 KiB never fills. A 1 MiB single `write()`
+    came back as reads of median 2048 / max 8193 bytes (Linux 6.8) — the
+    kernel PTY buffer, not fly's buffer, sets the chunk size. Batching must
+    therefore happen in fly's sink; enlarging `READ_BUF` cannot help.
 - **Impact:** high (core-surface throughput + latency). Confidence: mechanism
-  high, magnitude medium (not yet measured).
+  and magnitude both high as of the 2026-07-28 measurements; end-to-end
+  user-visible latency gain still unmeasured.
 
 ### T2 — Batch the per-pane 1.5s polls; kill the /proc and readdir storms
 Three audits converged here; this is the idle-power story. One task, three

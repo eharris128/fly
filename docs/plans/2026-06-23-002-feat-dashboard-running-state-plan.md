@@ -2,7 +2,7 @@
 title: "feat: Dashboard `running · N tasks` state for busy-but-quiet agents"
 type: feat
 date: 2026-06-23
-status: planned
+status: implemented
 depth: standard
 ---
 

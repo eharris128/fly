@@ -2,7 +2,7 @@
 title: "feat: Agent dashboard home view"
 type: feat
 date: 2026-06-22
-status: planned
+status: implemented
 depth: standard
 ---
 

@@ -23,9 +23,16 @@ use super::{ExitCallback, OutputSink, PaneId, SpawnConfig};
 use crate::state::activity;
 use crate::state::lifecycle::LifecycleState;
 
-/// PTY read buffer. A large buffer gives natural coalescing under load (a
-/// single `read` returns a big chunk during a flood) while staying low-latency
-/// when idle (it returns immediately with whatever's there) — KTD4.
+/// PTY read buffer. Sized to never be the limiting factor: a `read` returns
+/// whatever is there, immediately when idle (low latency) and a full chunk
+/// under load (natural coalescing) — KTD4.
+///
+/// Measured 2026-07-28 (Linux 6.8, this box): the *kernel* caps delivery well
+/// below this — a single 1 MiB `write()` into the slave came back as reads of
+/// median 2048 and max 8193 bytes, so 64 KiB never fills and an 8 KiB buffer
+/// would behave identically. The size is harmless headroom, not the source of
+/// the coalescing. What matters downstream is that flood reads stay ≥ 1 KiB,
+/// which keeps them on Tauri's raw channel path (see `stream/mod.rs`).
 const READ_BUF: usize = 64 * 1024;
 /// How long to wait after SIGHUP before escalating to SIGKILL on close.
 const GRACE: Duration = Duration::from_millis(200);

@@ -7,6 +7,26 @@ deepened: 2026-06-16
 
 # feat: Build fly, a Tauri agent-aware terminal for Ubuntu
 
+> **Addendum (2026-07-28) — KTD3's "never transcode" holds only above 1 KiB.**
+> Verified against the vendored tauri 2.11.3 source (`src/ipc/channel.rs`):
+> `InvokeResponseBody::Raw` is delivered two different ways. A chunk **≥ 1024
+> bytes** (`MAX_RAW_DIRECT_EXECUTE_THRESHOLD`, `:39`) rides the fetch path as
+> real bytes — KTD3 as written. A chunk **< 1024 bytes** (`:163`) is
+> `serde_json::to_string`'d into a JSON array of decimal numbers and embedded in
+> an `eval()` as `new Uint8Array([…]).buffer`. That path is **lossless** — the
+> bytes round-trip exactly, so KTD3's *reason* (transcoding "would corrupt UTF-8
+> and escape sequences") is not violated — but it is not free: measured on real
+> captured Claude Code renders (`tests/fixtures/screen/*.raw`), the JSON-array
+> form is **3.39×** the raw bytes, plus one `eval` per chunk on the webview main
+> thread. And it is the *common* path for interactive output: a PTY read loop
+> mirroring `pty/pane.rs` saw **60/60 reads under 1024 bytes** (median 49 B)
+> during 20 Hz spinner repaints, against 92% of bytes on the raw path during a
+> flood. So: raw bytes are lossless end-to-end as designed, and "no transcoding"
+> is true for bursts and false for the idle-agent-thinking case. The fix is
+> `T1` in `docs/notes/2026-07-23-performance-audit-follow-ups.md` (coalesce
+> chunks in fly's own sink to push traffic over the threshold); this addendum
+> stands until that lands.
+
 ## Summary
 
 Build **fly**, a desktop "terminal for AI coding agents" for Ubuntu/Linux, inspired by cmux but rebuilt clean-room on a Linux-native stack (cmux is a native macOS Swift app and does not port). The first version is terminal-first with a minimal GUI: a real terminal pane, tab/split multiplexing with one agent per pane, agent-attention notifications when an agent needs the user, and lossy session restore. Stack is Tauri v2 (Rust backend, Svelte web frontend) with xterm.js for rendering.
@@ -69,7 +89,7 @@ Running several AI coding agents (Claude Code, Codex, Gemini CLI, …) at once m
 
 - KTD1. **Stack: Tauri v2 (Rust + Svelte web frontend), xterm.js rendering.** User-chosen; yields a real desktop app with native OS notifications at a solo-tractable surface, and stays cross-platform for later. Svelte is a lightweight reactive layer well-suited to split-tree/pane state; it is swappable, since the load-bearing logic lives in Rust and xterm.js.
 - KTD2. **PTY via `portable-pty` 0.9, one dedicated OS thread per pane for blocking reads; drop the slave fd after spawn; reap with `wait()`.** Battle-tested (extracted from WezTerm). The slave-drop (else the master never sees EOF) and the reap (else zombies) are the two classic PTY bugs.
-- KTD3. **Output streams over `tauri::ipc::Channel` carrying raw bytes (`InvokeResponseBody::Raw`); control-plane (spawn/resize/write/kill) over commands.** Channel is Tauri v2's documented high-throughput path; events are JSON-only and explicitly not for throughput. Raw bytes avoid base64/JSON bloat and never transcode (which would corrupt UTF-8 and escape sequences). The Channel is the single ordered data path per pane; control commands are not ordered against Channel bytes, so the design tolerates reorder. The one boundary that must be reconciled is resize, handled on the read thread (see KTD13, U4).
+- KTD3. **Output streams over `tauri::ipc::Channel` carrying raw bytes (`InvokeResponseBody::Raw`); control-plane (spawn/resize/write/kill) over commands.** Channel is Tauri v2's documented high-throughput path; events are JSON-only and explicitly not for throughput. Raw bytes avoid base64/JSON bloat and never transcode (which would corrupt UTF-8 and escape sequences). *(See the 2026-07-28 addendum at the top: the no-transcoding half holds only for chunks ≥ 1 KiB; smaller chunks are re-encoded as a JSON number array — losslessly, but at 3.39× and one `eval` each.)* The Channel is the single ordered data path per pane; control commands are not ordered against Channel bytes, so the design tolerates reorder. The one boundary that must be reconciled is resize, handled on the read thread (see KTD13, U4).
 - KTD4. **Backpressure: coalesce PTY reads, watermark/ACK via the xterm.js `write()` callback to pause/resume PTY reads, cap scrollback (~10k lines).** xterm.js throughput is ~5–35 MB/s with a hard 50 MB buffer cap; agent log bursts freeze or OOM the webview without this. Pause signals the persistent read thread to stop issuing reads (never tears it down — see KTD13), so the kernel PTY buffer backpressures the producer losslessly. Coalescing is low-latency-first: flush small buffers immediately and engage ~8–16 ms / ~16–32 KB batching only once a backlog builds, so idle keystroke echo is not delayed. Pin the high watermark ≈ 2–4 MB and low ≈ 512 KB–1 MB, well below the 50 MB cap: watermarking bounds unacked bytes but not xterm.js's internal write buffer, and the true overshoot is `high + (pause RTT × peak throughput) + in-flight batches + one PTY-buffer read`, which must stay far under 50 MB.
 - KTD5. **Multiplexing: one `WebviewWindow`, multiple xterm.js instances in the DOM, layout as a per-tab binary split tree; mux runs in-process in Rust.** Tauri's multi-webview-per-window is experimental/unstable in v2; a daemonized mux is overkill for a single-user v1. Split tree mirrors the WezTerm Mux→Tab→Pane model. All pane operations route through the mux with `PaneId` as an opaque handle, so the deferred daemonized-mux / remote-pane features become a transport swap behind a stable interface rather than a rewrite.
 - KTD6. **Renderer: xterm.js WebGL addon with a DOM-renderer fallback on context loss/failure; dispose WebGL for background panes.** WebGL needs the same GPU path WebKitGTK's DMABUF issues break on Linux, and live WebGL contexts are capped (~16). Allocate WebGL to the focused pane plus the most-recently-focused visible panes up to a cap (≈12, with hysteresis to avoid create/dispose thrash on tab/pane switches); all other panes, visible or not, use the DOM renderer.
@@ -283,7 +303,7 @@ Grouped into phases. Phases are sequential; units within a phase are dependency-
 - **Requirements:** R1, R2
 - **Dependencies:** U2
 - **Files:** `src/lib/Terminal.svelte`, `src/ipc.ts`, `src-tauri/src/stream/mod.rs`
-- **Approach:** `@xterm/xterm` 5.5 with `addon-fit`, `addon-webgl`, `addon-unicode11`. `spawn_pane` takes an `ipc::Channel`; the read thread sends `InvokeResponseBody::Raw(bytes)`. Frontend: `new Channel<ArrayBuffer>()`; `onmessage` → `term.write(new Uint8Array(bytes))`; `term.onData` → `invoke('pty_write')`. `FitAddon` recomputes cols/rows on container resize (debounced ~50–100 ms) → `invoke('pty_resize')`. Raw bytes end to end, no transcoding. Activate unicode v11.
+- **Approach:** `@xterm/xterm` 5.5 with `addon-fit`, `addon-webgl`, `addon-unicode11`. `spawn_pane` takes an `ipc::Channel`; the read thread sends `InvokeResponseBody::Raw(bytes)`. Frontend: `new Channel<ArrayBuffer>()`; `onmessage` → `term.write(new Uint8Array(bytes))`; `term.onData` → `invoke('pty_write')`. `FitAddon` recomputes cols/rows on container resize (debounced ~50–100 ms) → `invoke('pty_resize')`. Raw bytes end to end, no transcoding *(qualified by the 2026-07-28 KTD3 addendum — sub-1 KiB chunks are re-encoded losslessly as a JSON number array)*. Activate unicode v11.
 - **Patterns to follow:** xterm.js + Tauri Channel wiring (see Sources).
 - **Test scenarios:**
   - Shell output renders in the pane.

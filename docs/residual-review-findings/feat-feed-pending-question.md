@@ -4,8 +4,9 @@ Accepted-and-deferred findings from the multi-agent code review of the
 `feed-pending-question` branch. Recorded per the ce-work Residual Work Gate
 (user decision: *accept & record*). None is a correctness or security defect;
 all applied review fixes landed in commit `01e065e`
-(`fix(feed): apply code-review findings …`). This repo has no remote, so these
-residuals live here rather than in a PR description.
+(`fix(feed): apply code-review findings …`). The repo had no remote when this
+was written (`origin` was added 2026-07-10), so these residuals live here rather
+than in a PR description — which remains the convention for this directory.
 
 **Review run:** `/tmp/compound-engineering/ce-code-review/20260706-124600-abfc5a55/`
 (base `28d3836`). 10 structured reviewers (correctness, security, adversarial,

@@ -2,7 +2,7 @@
 title: "feat: Local read-only agent/automation feed for the game portfolio"
 type: feat
 date: 2026-07-04
-status: planned
+status: implemented
 depth: standard
 origin: none (solo ce-plan invocation)
 ---

@@ -2,7 +2,7 @@
 title: "feat: Phone screenshot drop — a tailnet-served upload page that delivers a screenshot into a live agent pane"
 type: feat
 date: 2026-07-24
-status: planned
+status: implemented (U0–U8; three iOS-specific live checks outstanding — see docs/notes/2026-07-24-phone-drop-live-check.md)
 depth: deep
 origin: docs/brainstorms/2026-07-24-phone-screenshot-drop-requirements.md
 ---

@@ -3,7 +3,7 @@ title: "feat: Hotkey menu (cheat-sheet overlay) + close-tab chord"
 date: 2026-06-18
 type: feat
 depth: standard
-status: planned
+status: implemented
 ---
 
 # feat: Hotkey menu (cheat-sheet overlay) + close-tab chord
