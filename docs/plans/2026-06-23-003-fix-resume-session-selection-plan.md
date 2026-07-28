@@ -2,7 +2,7 @@
 title: "fix: Resume re-attaches the session the pane actually ran (not a stale most-recent-in-folder one)"
 type: fix
 date: 2026-06-23
-status: planned
+status: implemented
 depth: standard
 origin: docs/plans/2026-06-23-001-feat-resume-agents-plan.md
 ---

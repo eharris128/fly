@@ -323,6 +323,10 @@ fn handle(mut req: tiny_http::Request, ctx: &HandlerCtx) {
     // roster, no agent data, no token, not templated with any state — so
     // serving it discloses nothing. Everything it then *fetches* authenticates
     // normally, which is what keeps R9 intact.
+    //
+    // Two paths, one page: `/` is what a phone navigates to, `/drop-page` is a
+    // named alias for it. Both are unauthenticated — anything added to this
+    // branch inherits that, so keep it to the inert shell.
     if (path == "/" || path == "/drop-page") && *req.method() == Method::Get {
         let _ = req.respond(html_response(DROP_PAGE));
         return;

@@ -2,7 +2,7 @@
 title: "feat: Tab/workspace quality-of-life — digit tab nav, drag-reorder, cwd inheritance, clear-on-open"
 date: 2026-06-22
 type: feat
-status: ready
+status: implemented
 depth: standard
 origin: none (solo planning from direct feature requests)
 ---

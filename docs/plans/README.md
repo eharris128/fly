@@ -59,9 +59,13 @@ The plan dir also holds one non-plan artifact:
 `2026-07-03-002-automations-workspace-and-model-LIVE-CHECKLIST.md`, the
 live-validation checklist that accompanied the workspace-and-model plan.
 
-Not every merge has a plan. Small QoL features are documented in `CLAUDE.md`
-only (the settings-menu overlay, `leader ,`; quit-confirm while agents are
-mid-work), and the feed-monitor-enrichment follow-up (`monitor` / `retiredAt` /
+Not every merge has a plan. Small QoL features and fixes are documented in
+`CLAUDE.md` only: the settings-menu overlay (`leader ,`); quit-confirm while
+agents are mid-work; `leader o`/`O` pane-focus rotation (`e5e4781`); the
+sidebar's reason-typed attention dot, amber for input vs blue for done
+(`cdfa6b3`); the per-row automation delete on the dashboard (`97dd705`); and the
+resume launch-dir relocation for a drifted session cwd (`b821ca4`). The
+feed-monitor-enrichment follow-up (`monitor` / `retiredAt` /
 `lastVerdict` on the feed's automation projection, commit `608bb46` — designed
 in the *game* repo's Ambient Wall plan) is recorded in
 `docs/notes/2026-07-16-feed-monitor-enrichment.md`.
@@ -69,9 +73,9 @@ in the *game* repo's Ambient Wall plan) is recorded in
 ## Brainstorms
 
 `docs/brainstorms/` holds the requirements captured before a plan was written —
-the upstream `origin:` a plan's header points at (six plans have one, from
-dashboard-home-base through monitor-handoff). Start from the plan; drop to the
-brainstorm for the "why".
+the upstream `origin:` a plan's header points at (seven plans have one, from
+dashboard-home-base through phone-screenshot-drop). Start from the plan; drop to
+the brainstorm for the "why".
 
 ## Other doc directories
 
@@ -83,4 +87,8 @@ brainstorm for the "why".
 - `docs/notes/` — one-off evaluations and research notes that are neither a
   plan nor a brainstorm (e.g. the conductor-oss evaluation, the
   fix-feed-question-detection-gaps root-cause post-mortem, the
-  feed-monitor-enrichment record).
+  feed-monitor-enrichment record). Two carry content you'd otherwise hunt for:
+  **`2026-07-24-phone-drop-live-check.md` holds the phone drop's operator setup**
+  (the `tailscale serve` mount, the token, the identity knob) under its
+  "Operator setup (U8)" heading, and `2026-07-23-performance-audit-follow-ups.md`
+  is the open task list from that audit.

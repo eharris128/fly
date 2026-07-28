@@ -143,7 +143,14 @@ pub fn spawn_pane(
 
     let socket_path = server.socket_path().to_string_lossy().into_owned();
 
-    // Raw bytes end-to-end, no transcoding (KTD3).
+    // Raw bytes end-to-end (KTD3) — lossless, but only literally untranscoded
+    // above 1 KiB. Tauri 2.11.3 (`ipc/channel.rs:163`) re-encodes a
+    // `Raw` chunk **< 1024 bytes** as a JSON array of decimal numbers inside an
+    // `eval()`; ≥ 1024 rides the fetch path as real bytes. The small path
+    // round-trips the bytes exactly (no UTF-8 or escape-sequence damage — KTD3's
+    // actual concern), but costs ~3.4× on the wire plus one eval, and it is the
+    // path *every* interactive repaint takes (a spinner produces ~50-byte
+    // reads). Coalescing here is T1 of the 2026-07-23 performance audit.
     let sink = Box::new(move |bytes: &[u8]| {
         let _ = channel.send(InvokeResponseBody::Raw(bytes.to_vec()));
     });

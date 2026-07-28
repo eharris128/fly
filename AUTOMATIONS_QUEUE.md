@@ -12,6 +12,19 @@ see `docs/plans/` — automations-workspace-and-model (2026-07-03),
 automations-interrupt-resilience (2026-07-05), monitor-handoff (2026-07-10),
 and headless-monitor-checks (2026-07-11).
 
+> **Read the sections below as of 2026-07-02, not as current behavior.** Two
+> statements in particular were overtaken by the workspace-and-model plan and
+> are wrong today:
+> - **U8's "R12 auto-close is intentionally NOT built."** It was built —
+>   `automation://run-closed` + `shouldAutoCloseRun` (`lib/automation-panes.ts`)
+>   auto-close a *succeeded* run's tab after a ~6s linger; failed or
+>   genuinely-raised runs are kept.
+> - **U8's `resolveTargetWorkspace` placement** (origin workspace, else the
+>   first). Replaced by role-based placement: every agent run and the alerts
+>   tab open in the durable `role: "automations"` workspace, resolved by
+>   `findAutomationsWorkspace` (provision-if-absent) — never by workspace id,
+>   which resets each launch.
+
 ---
 
 ## U6: Alert Surfacing — Alerts Module and Sink Pane — DONE (2026-07-02)

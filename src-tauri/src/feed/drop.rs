@@ -558,15 +558,25 @@ pub fn parse_drop_query(raw: &str) -> Result<DropQuery, QueryError> {
     })
 }
 
-/// Strict percent-decoding to UTF-8. Rejects a truncated or non-hex escape and
-/// any byte sequence that is not valid UTF-8, rather than substituting
-/// replacement characters.
+/// Strict `application/x-www-form-urlencoded` decoding to UTF-8. Rejects a
+/// truncated or non-hex escape and any byte sequence that is not valid UTF-8,
+/// rather than substituting replacement characters.
+///
+/// `+` decodes to a space, which is the query-string half of the form-encoding
+/// the page actually emits: `drop-page.html` builds the query with
+/// `URLSearchParams`, whose `set` encodes a space as `+` and a *literal* plus as
+/// `%2B` — so the two are lossless together. Percent-decoding alone left every
+/// multi-word caption studded with pluses (caught in the first live drop from a
+/// phone, 2026-07-27).
 fn percent_decode(s: &str) -> Result<String, QueryError> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if bytes[i] == b'%' {
             let hex = bytes.get(i + 1..i + 3).ok_or(QueryError::BadEncoding)?;
             let hi = (hex[0] as char).to_digit(16).ok_or(QueryError::BadEncoding)?;
             let lo = (hex[1] as char).to_digit(16).ok_or(QueryError::BadEncoding)?;
@@ -1370,12 +1380,21 @@ mod tests {
         assert_eq!(q.caption.as_deref(), Some("café 📷"));
     }
 
-    /// `+` is a literal plus here, not a space: the page uses
-    /// `encodeURIComponent`, which emits `%20` for a space and leaves `+` alone.
+    /// `+` decodes to a space. The page builds its query with `URLSearchParams`,
+    /// which emits `+` for a space — decoding it as a literal plus mangled every
+    /// multi-word caption ("What+is+in+the+picture?" on the first phone drop).
     #[test]
-    fn plus_stays_a_plus_rather_than_becoming_a_space() {
+    fn plus_decodes_to_a_space() {
         let q = parse_drop_query("agent=l&pane=1&caption=a+b").unwrap();
-        assert_eq!(q.caption.as_deref(), Some("a+b"));
+        assert_eq!(q.caption.as_deref(), Some("a b"));
+    }
+
+    /// The other half of that contract: a caption the user genuinely typed with
+    /// a plus in it survives, because `URLSearchParams` escapes it as `%2B`.
+    #[test]
+    fn an_escaped_plus_survives_as_a_literal_plus() {
+        let q = parse_drop_query("agent=l&pane=1&caption=c%2B%2B+build+broke").unwrap();
+        assert_eq!(q.caption.as_deref(), Some("c++ build broke"));
     }
 
     #[test]

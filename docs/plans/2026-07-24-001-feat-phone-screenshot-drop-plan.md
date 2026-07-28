@@ -2,7 +2,7 @@
 title: "feat: Phone screenshot drop — a tailnet-served upload page that delivers a screenshot into a live agent pane"
 type: feat
 date: 2026-07-24
-status: planned
+status: implemented (U0–U8; three iOS-specific live checks outstanding — see docs/notes/2026-07-24-phone-drop-live-check.md)
 depth: deep
 origin: docs/brainstorms/2026-07-24-phone-screenshot-drop-requirements.md
 ---
@@ -169,6 +169,14 @@ an emoji or newline in a caption would need percent-encoding anyway, and a raw
 newline in a hand-parsed header value is a header-injection shape. The query is
 bounded before decoding and rejected — never lossily repaired — on invalid
 encoding.
+
+*(Corrected 2026-07-27, first live drop from a phone: the decoder is
+`application/x-www-form-urlencoded`, not bare percent-decoding. The page builds
+its query with `URLSearchParams`, which encodes a space as `+` and a literal
+plus as `%2B`; decoding `+` as a literal plus studded every multi-word caption
+with pluses. The two halves are lossless together. Strictness is unchanged — a
+truncated or non-hex escape and any non-UTF-8 byte sequence are still refused
+rather than repaired.)*
 
 ### KTD2. The bearer token stays the boundary; tailnet identity is additive
 
@@ -883,10 +891,11 @@ regression that skips a guard fails loudly rather than delivering.
 **Approach.** `POST /drop?agent=<leafKey>&pane=<paneId>&caption=<...>` — the
 existing dispatcher strips the query before matching, so query parsing is new and
 needs a small pure helper with its own tests. The caption arrives
-percent-encoded in the query rather than as a second request, revising KTD1's
+form-urlencoded in the query (see the KTD1 correction above) rather than as a
+second request, revising KTD1's
 follow-up-request sketch downward: a second request would need its own identity
 and lifetime, and the caption is small enough that the query carries it with
-`OTHER_MAX_CHARS`-style bounding. Percent-decoding is the one place client text
+`OTHER_MAX_CHARS`-style bounding. Query decoding is the one place client text
 becomes a Rust string, so it is bounded before decoding and rejected on invalid
 encoding rather than lossily repaired.
 
@@ -928,6 +937,8 @@ case is testable without a proxy.
 - A non-image body returns 415 and leaves no file.
 - A drop with a missing `pane` parameter returns 400.
 - A caption with invalid percent-encoding returns 400.
+- A caption's `+` decodes to a space and `%2B` to a literal plus (the
+  `URLSearchParams` contract the page actually emits — added 2026-07-27).
 - A caption over the cap returns 400 rather than being truncated.
 - Each refusal returns its distinct `error` code, and the set of codes is
   exhaustive over the precedence flowchart.

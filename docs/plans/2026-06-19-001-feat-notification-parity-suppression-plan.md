@@ -3,7 +3,7 @@ title: "feat: Notification parity with cmux (panel, badges, suppression)"
 type: feat
 date: 2026-06-19
 depth: deep
-status: ready
+status: implemented
 deepened: 2026-06-19
 origin: user request (parity target: http://cmux.com/docs/notifications)
 related:

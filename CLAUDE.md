@@ -146,8 +146,12 @@ time/inputs as arguments so they're tested without a running app.
 ### Backend modules (`src-tauri/src/`)
 - `pty/` — `PtyManager` registry + `Pane`: portable-pty, one read thread per
   pane, backpressure pause/resume (watermarks), ordered reap-on-exit.
-- `stream/` — `spawn_pane`, raw-byte PTY output over a Tauri `Channel` (no
-  transcoding), and the pane↔attention/focus wiring + Tauri commands.
+- `stream/` — `spawn_pane`, raw-byte PTY output over a Tauri `Channel`, and the
+  pane↔attention/focus wiring + Tauri commands. ("No transcoding" (KTD3) is
+  **lossless but not literal**: tauri 2.11.3 re-encodes a `Raw` chunk under
+  1024 bytes as a JSON number array in an `eval()` — exact bytes, ~3.4× wire
+  cost, and the path every interactive repaint takes. See the foundation plan's
+  2026-07-28 KTD3 addendum and T1 of the performance-audit note.)
 - `state/` — the pure state machines (`lifecycle`, `attention`) + the output
   `activity` tracker + suppression policy (`policy.rs`) + per-pane `manager`.
 - `hooks/` — the authenticated socket **(the security boundary)**: `token`,
@@ -189,7 +193,7 @@ time/inputs as arguments so they're tested without a running app.
   (never truncated — audit-remediation U1), and question and turn strings are
   control-sanitized, *then* secret-scrubbed, *then* truncated — see
   `io.rs::clean` for why that order),
-  and the single mutation route
+  and the per-agent mutation route
   `POST /agents/{key}/input` (submit = control-stripped bracketed-paste +
   Enter — refused 409 `askPending` when unguarded while a permission ask is
   pending, audit-remediation U2; `mode:"keys"` = raw filtered answer keys with **mandatory**
@@ -209,8 +213,10 @@ time/inputs as arguments so they're tested without a running app.
   mutation route and the feed's only HTML: `POST /drop?agent=&pane=&caption=`
   takes the image as the **raw body** (multipart would mean a boundary parser
   in the security-sensitive listener; the caption rides the query because a
-  header cannot hold a newline or emoji unencoded), and `GET /` serves an inert
-  `include_str!`-embedded page (`feed/drop-page.html`) **unauthenticated** —
+  header cannot hold a newline or emoji unencoded), and `GET /` — plus the
+  equivalent alias `GET /drop-page`, the two paths the one branch answers —
+  serves an inert `include_str!`-embedded page (`feed/drop-page.html`)
+  **unauthenticated** —
   the second and last exception to auth-precedes-routing after `/healthz`,
   unavoidable because a browser navigation sends no `Authorization` header, and
   safe because the shell carries no roster/agent data/token (pinned by a
@@ -241,6 +247,12 @@ time/inputs as arguments so they're tested without a running app.
   would persist an absolute path over the user's `~`), `feed.dropMaxBytes`,
   `feed.expectedTailnetLogin` (additive identity check, **off by default**;
   a local process can forge the header, so the token stays the boundary).
+  **Operator setup lives in
+  `docs/notes/2026-07-24-phone-drop-live-check.md` ("Operator setup (U8)")** —
+  three required steps, two of which fail silently: the `tailscale serve --bg`
+  mount, where to read `feed.token` (no in-app surface shows it), and setting
+  `expectedTailnetLogin` (the check ships inert). `tailscale funnel` must never
+  appear anywhere near this feature.
   **Pending-question detection is now event-first** (hook-ask-channel): the
   `PermissionRequest` hook fires at ask time for every dialog — incl.
   AskUserQuestion, incl. bypassPermissions (live-verified 2.1.207) — and
@@ -443,6 +455,15 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   the installed `fly` binary's wire version. `lib/resume.ts` builds the exact
   replay argv (stripping stale `--resume`/`--continue` and one-shot positional
   prompts — the flag hygiene lives in this one tested place).
+  A record's `cwd` is the hook's **live** cwd, which drifts when the agent `cd`s
+  away from its launch dir — but `claude --resume <id>` searches only the
+  *launch* dir's project folder, so restore relocates it:
+  `transcript.rs::resolve_resume_spawn_cwd` (a Tauri command, probed in parallel
+  per precise leaf) verifies the recorded cwd's project folder actually holds
+  the transcript, else scans the projects root for the file and recovers the
+  launch cwd from the transcript's own `cwd` entries (the folder name can't be
+  decoded — `-` is ambiguous — but exactly the launch cwd round-trips to it). A
+  null or failed probe keeps the recorded cwd, so it is never worse than before.
 - **Handoff** (session-handoff plan): `handoff.rs` resolves a *stale* leaf's
   previous session — from the durable resume record, **not** the 15-min-recency
   live id — into a spawnable `HandoffTarget`, qualified by at least one real
@@ -502,11 +523,19 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
 - `lib/keymap.ts` — the leader-key model (tmux-style: default Ctrl-A, then a
   command key; everything else passes through to the PTY). `BINDINGS` is the
   single source of truth shared by `dispatch()`, the hotkey menu, and the
-  command palette, so they cannot drift.
+  command palette, so they cannot drift — including `leader o`/`leader O`,
+  which rotate focus forward/back through the active tab's panes in
+  `layout.ts`'s leaf order.
 - `lib/Terminal.svelte` — embeddable xterm leaf; subscribes to `pane://attention`.
   Terminal font size comes from config (`config.fontSize`, default 15).
-- `lib/Sidebar.svelte` — collapsible cmux-style workspace tree (workspaces ▸
-  named tabs); `lib/ControlBar.svelte` — slim top bar (sidebar toggle +
+- `lib/Sidebar.svelte` — collapsible cmux-style workspace tree with a
+  **reason-typed attention dot** (`workspaces.ts::attentionKind` /
+  `rollupAttentionKind`: amber = an agent is blocked on you, blue = one
+  finished; input beats done, and anything non-`finished` folds to input so an
+  unknown ask never reads as a calm completion — the rollup runs per tab over
+  its leaves and per workspace over its tabs, so a collapsed workspace still
+  shows its most urgent raised agent) over workspaces ▸
+  named tabs; `lib/ControlBar.svelte` — slim top bar (sidebar toggle +
   breadcrumb + pane controls).
 - `lib/{config,serialize}.ts` (`serialize.migrateSession` upgrades old sessions
   into the workspace shape), `lib/HotkeyMenu.svelte` (passive cheat-sheet).

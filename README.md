@@ -46,6 +46,13 @@ attention — so you can run a fleet and only look when there's something to do.
   local consumer: an SSE roster of agents + automations (including monitor
   verdicts), per-agent latest reply / pending question / conversation tail,
   and a guarded input route for answering an agent remotely.
+- **Phone screenshot drop** — a page served over your tailnet that sends a
+  screenshot plus a caption from your phone straight into a live agent pane
+  (`POST /drop`): the image is stored `0600` and the agent is asked to read it.
+  Reachability is `tailscale serve` in front of the same loopback port — fly
+  adds no bind. Requires a one-time operator setup; see
+  [`docs/notes/2026-07-24-phone-drop-live-check.md`](docs/notes/2026-07-24-phone-drop-live-check.md)
+  ("Operator setup").
 - **Agent dashboard** — a "home" view (`leader d`) of every agent's status
   (waiting / working / idle / running), plus live plan-usage gauges.
 
