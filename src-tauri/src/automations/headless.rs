@@ -1,8 +1,14 @@
-//! Headless monitor checks — the stream core and the runner (U1 + U3 of
+//! Headless agent runs — the stream core and the runner (U1 + U3 of
 //! `docs/plans/2026-07-11-003-feat-headless-monitor-checks-plan.md`; all
-//! R-IDs below cite that plan).
+//! R-IDs below cite that plan). Built for monitor checks; since
+//! `docs/plans/2026-07-31-001-feat-headless-agent-automations-plan.md` it is
+//! also the **default dispatch for every regular agent automation** (routed
+//! by the claimed row's `headless` marker, R4 of that plan) — nothing in
+//! this module is monitor-specific, which is exactly why the reuse is
+//! wholesale: the verdict parse lives behind the manager's
+//! `automation.monitor` gate, not here.
 //!
-//! A monitor check runs as a backend-owned `claude -p --output-format
+//! A headless run is a backend-owned `claude -p --output-format
 //! stream-json --verbose` child. This module has two halves:
 //!
 //! - the **process-free core** (U1): the tolerant NDJSON event view

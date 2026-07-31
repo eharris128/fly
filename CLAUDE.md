@@ -302,9 +302,31 @@ time/inputs as arguments so they're tested without a running app.
   `lib/serialize.ts`). Add a command in both places.
 
 ### Automations (`src-tauri/src/automations/`, cross-referenced U1–U12)
-Cron-scheduled runs that either spawn a `claude --dangerously-skip-permissions
-"<prompt>"` agent pane (Agent
-mode) or run a stored script with no model spend (Script mode). Data flow: a
+Cron-scheduled runs that either run a `claude` agent (Agent mode) or a stored
+script with no model spend (Script mode). **Agent runs dispatch closed-loop
+headless by default**
+(`docs/plans/2026-07-31-001-feat-headless-agent-automations-plan.md`): a
+backend-owned `claude -p --output-format stream-json` child via the monitor
+runner (`headless.rs`) — no pane, no tab, no `automation://agent-run`; one
+prompt in, one captured result out (`RunRow.output` from the stream `result`,
+`RunRow.session_id` from `init` — the debugging handle `fly automation runs`
+prints, `-v` adds the derived transcript path). The disposition resolves
+automation-explicit → `config.automation_defaults.headless` (ships **true**;
+flipping the knob flips every non-explicit automation at once) at claim time,
+in one place — `Mode::resolved_headless`, stamped by `Automation::claim` onto
+the row, and dispatch routes on the **claimed row's marker**, so marker and
+routing can't disagree. `create --headless`/`--paned` pin one automation
+either way (mutually exclusive; agent-only; both rejected with `--monitor`,
+which is unconditionally headless). A **Failed** headless close rings the
+Automations alert path (sanitized `name: error (run id)` line — the
+replacement for the pane path's kept-open failed tab); Succeeded closes are
+silent, and non-monitor runs never verdict-parse/retire. The dashboard panel
+row is a running headless run's primary surface (`running · 2m` elapsed read;
+effective disposition resolved from the DTO's `headlessDefault`), and the
+feed's `AutomationEntry` carries an additive effective-`headless` bool. The
+**pane path survives only behind an explicit `--paned`** (or the knob off):
+ephemeral tab, transcript retry-capture, KTD5 suppression, kept-failed-tab —
+all unchanged there, removal deferred. Data flow: a
 named `fly-automation-sweep` thread ticks every 10s; a due automation is
 **claimed + persisted before it runs** (R2), then dispatched off the store lock
 (KTD-B). A due **agent-mode** occurrence is usage-gated first
@@ -346,7 +368,8 @@ next time the account is actually at a limit. Modules:
   `emit_attention`, R18) or queues + emits `automation://alert-pending`. The
   frontend single-flights a background "Automations" tab that `tail -f`s the log
   and calls the `register_alert_sink` command, which drains the backlog.
-- Agent dispatch (U7/U7.5/U8) links run↔pane atomically in `stream::spawn_pane`
+- **Paned** agent dispatch (U7/U7.5/U8 — since the headless-agent-automations
+  plan reachable only via `--paned`/knob) links run↔pane atomically in `stream::spawn_pane`
   (threading `automation_run_id`), spawns a background ephemeral tab
   (`App.svelte` `handleAgentRun` + `lib/automation-panes.ts`), and closes the run
   on the agent's Stop / pane-exit / 30-min deadline. The **R22 recursion gate**

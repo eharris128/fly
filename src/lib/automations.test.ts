@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   automationsToRows,
+  elapsedShort,
   humanSchedule,
   monitorStateOf,
   planPickup,
@@ -32,6 +33,7 @@ function run(status: RunStatus, over: Partial<RunRow> = {}): RunRow {
     effort: null,
     verdict: null,
     bundlePath: null,
+    headless: false,
     output: null,
     exitCode: null,
     error: null,
@@ -80,7 +82,7 @@ const POINTERS: MonitorPointers = {
 };
 function monitorAutomation(over: Partial<Automation> = {}): Automation {
   return automation({
-    mode: { kind: "agent", prompt: "check it", model: null, effort: null },
+    mode: { kind: "agent", prompt: "check it", model: null, effort: null, headless: null },
     monitor: true,
     pickupPointers: POINTERS,
     ...over,
@@ -154,7 +156,7 @@ describe("automationsToRows", () => {
 
   it("carries the agent automation's configured model/effort; scripts carry none (U9)", () => {
     const [agentRow] = automationsToRows(
-      [automation({ mode: { kind: "agent", prompt: "x", model: "opus", effort: "high" } })],
+      [automation({ mode: { kind: "agent", prompt: "x", model: "opus", effort: "high", headless: null } })],
       NOW,
     );
     expect(agentRow.mode).toBe("agent");
@@ -169,7 +171,7 @@ describe("automationsToRows", () => {
 
     // An agent with no pinned model → null (HomeView renders "Claude default").
     const [defaultRow] = automationsToRows(
-      [automation({ mode: { kind: "agent", prompt: "x", model: null, effort: null } })],
+      [automation({ mode: { kind: "agent", prompt: "x", model: null, effort: null, headless: null } })],
       NOW,
     );
     expect(defaultRow.mode).toBe("agent");
@@ -180,7 +182,7 @@ describe("automationsToRows", () => {
     const [row] = automationsToRows(
       [
         automation({
-          mode: { kind: "agent", prompt: "x", model: "opus", effort: "high" },
+          mode: { kind: "agent", prompt: "x", model: "opus", effort: "high", headless: null },
           runs: [run("succeeded", { model: "sonnet", effort: "medium" })],
         }),
       ],
@@ -477,5 +479,57 @@ describe("relativeTime", () => {
     expect(relativeTime(NOW - 5 * MIN, NOW)).toBe("5 minutes ago");
     expect(relativeTime(NOW - 1 * 60 * MIN, NOW)).toBe("1 hour ago");
     expect(relativeTime(NOW - 1 * 24 * 60 * MIN, NOW)).toBe("1 day ago");
+  });
+});
+
+// Headless-agent-automations U4 (R9): the row's effective disposition mirrors
+// the claim's resolution — monitor forces, explicit pin wins, else the DTO's
+// config default — and a still-running last run carries a live elapsed read.
+describe("headless disposition & running elapsed", () => {
+  const agent = (headless: boolean | null) =>
+    automation({
+      mode: { kind: "agent", prompt: "x", model: null, effort: null, headless },
+    });
+
+  it("resolves monitor > explicit pin > config default; scripts never", () => {
+    expect(automationsToRows([agent(null)], NOW)[0].headless).toBe(true); // shipped default
+    expect(
+      automationsToRows([agent(null)], NOW, undefined, false)[0].headless,
+    ).toBe(false);
+    expect(
+      automationsToRows([agent(true)], NOW, undefined, false)[0].headless,
+    ).toBe(true);
+    expect(
+      automationsToRows([agent(false)], NOW, undefined, true)[0].headless,
+    ).toBe(false);
+    expect(
+      automationsToRows([monitorAutomation()], NOW, undefined, false)[0].headless,
+    ).toBe(true);
+    expect(
+      automationsToRows([automation()], NOW, undefined, true)[0].headless,
+    ).toBe(false); // script
+  });
+
+  it("renders a live running read with elapsed time and none for terminal rows", () => {
+    const running = automation({
+      runs: [run("running", { startedAt: NOW - 2 * MIN, finishedAt: null })],
+    });
+    const [row] = automationsToRows([running], NOW);
+    expect(row.lastStatus).toBe("running");
+    expect(row.runningFor).toBe("2m");
+
+    const done = automation({
+      runs: [run("succeeded", { startedAt: NOW - 9 * MIN, finishedAt: NOW - MIN })],
+    });
+    expect(automationsToRows([done], NOW)[0].runningFor).toBeNull();
+    expect(automationsToRows([automation({ runs: [] })], NOW)[0].runningFor).toBeNull();
+  });
+
+  it("elapsedShort coarsens honestly", () => {
+    expect(elapsedShort(10_000)).toBe("<1m");
+    expect(elapsedShort(-5_000)).toBe("<1m");
+    expect(elapsedShort(12 * MIN)).toBe("12m");
+    expect(elapsedShort(65 * MIN)).toBe("1h 05m");
+    expect(elapsedShort(150 * MIN)).toBe("2h 30m");
   });
 });

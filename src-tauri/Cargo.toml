@@ -50,6 +50,20 @@ vte = "0.13"
 [dev-dependencies]
 tempfile = "3"
 
+# Debug symbols dominate this target dir, and they scale with BINARY COUNT, not
+# with the dependency graph: every integration test links the whole crate graph
+# statically, so the same DWARF is written once per test binary. Measured
+# 2026-07-31 at 13G total — 430 dependency rlibs were only 1.6G of it, while 16
+# unstripped test/bin executables averaging ~250MB came to 3.9G, plus 870M of
+# libfly_lib.a. line-tables-only keeps file/line backtraces (what panics and the
+# test harness actually need) and drops the per-variable DWARF that was being
+# duplicated; unpacked split-debuginfo moves what remains out of the binaries
+# into .dwo files the linker can share. Cost: no variable inspection under a
+# debugger — raise to `debug = true` locally and temporarily if you need it.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
 [profile.release]
 codegen-units = 1
 lto = true

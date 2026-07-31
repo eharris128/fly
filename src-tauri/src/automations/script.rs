@@ -639,6 +639,7 @@ impl Dispatcher for ScriptRunner {
         _a: &Automation,
         _run_id: &str,
         _launch: &super::ResolvedLaunch,
+        _headless: bool,
     ) -> Result<(), String> {
         Err("agent dispatch not wired yet (U7)".into())
     }

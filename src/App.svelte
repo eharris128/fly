@@ -1734,10 +1734,17 @@
       // Monitor-handoff U7: the broken-monitor inputs (derived infra-failure
       // counts + the one Rust threshold) ride the DTO — the view-model never
       // re-derives run-history walks or hardcodes the number.
-      automationRows = automationsToRows(dash.automations, Date.now(), {
-        infraFailures: dash.infraFailures,
-        brokenThreshold: dash.monitorBrokenThreshold,
-      });
+      automationRows = automationsToRows(
+        dash.automations,
+        Date.now(),
+        {
+          infraFailures: dash.infraFailures,
+          brokenThreshold: dash.monitorBrokenThreshold,
+        },
+        // Headless-agent-automations R9: the config dispatch default rides
+        // the DTO so the row's effective disposition matches the claim's.
+        dash.headlessDefault,
+      );
       automationsDegraded = dash.degraded;
       automationsCorruptBak = dash.corruptBak;
     } catch (e) {

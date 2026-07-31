@@ -494,7 +494,7 @@ mod tests {
         store
             .mutate(|map| {
                 let mut a = automation("a1");
-                a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1").unwrap();
+                a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false).unwrap();
                 a.close(
                     "r1",
                     RunOutcome::Succeeded {

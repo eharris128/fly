@@ -256,9 +256,9 @@ Unvalidated bets, labeled per non-interactive planning; each is cheap to confirm
 
 ### Deferred to Follow-Up Work
 
-- Headless dispatch as an option for regular agent automations (per-automation or config-default flag) — natural extension once the runner exists, deliberately out of scope now.
-- Surfacing the check's `session_id`/transcript path in the dashboard or CLI `runs` output (stamped and bundled now; display is a follow-up).
-- Retiring the transcript-retry capture entirely if regular agent automations ever go headless.
+- ~~Headless dispatch as an option for regular agent automations (per-automation or config-default flag)~~ — **done** (2026-07-31, `2026-07-31-001-feat-headless-agent-automations-plan.md`: the default, not just an option).
+- ~~Surfacing the check's `session_id`/transcript path in the dashboard or CLI `runs` output~~ — **done** (same plan: `runs` prints the session id, `-v` the derived transcript path).
+- Retiring the transcript-retry capture entirely — **half-closed** by the same plan: unreachable for headless runs (now the default), still live behind the explicit `--paned` path; full removal stays deferred there.
 
 ---
 

@@ -807,11 +807,24 @@ pub fn run() {
                         // frontend push and stays live on its own.
                         let mgr_for_feed =
                             app.state::<Arc<automations::AutomationManager>>().inner().clone();
+                        // Headless-agent-automations U4 (R11): the entry's
+                        // `headless` bit is the *effective* disposition, so
+                        // the config default is read per projection (emit
+                        // time, off any lock) exactly like the claim's
+                        // pre-lock read.
+                        let cfg_for_feed = Arc::clone(&config_store);
                         let automations_fn: feed::server::AutomationsFn = Arc::new(move || {
+                            let headless_default =
+                                cfg_for_feed.get().automation_defaults.headless;
                             mgr_for_feed
                                 .list()
                                 .iter()
-                                .map(feed::wire::AutomationEntry::from_automation)
+                                .map(|a| {
+                                    feed::wire::AutomationEntry::from_automation(
+                                        a,
+                                        headless_default,
+                                    )
+                                })
                                 .collect()
                         });
                         let now_fn: feed::server::NowFn = Arc::new(notify::now_unix_ms);
@@ -1250,15 +1263,34 @@ pub fn dispatch_automation_op(
                 // creates pass through untouched.
                 let (model, effort) =
                     cli::automation::monitor_launch_defaults(monitor, req.model, req.effort);
+                // Headless-agent-automations U2 (R2/R3): the wire is
+                // untrusted — re-reject the combinations the CLI already
+                // refuses. `--headless` with `--monitor` is redundant (a
+                // monitor is unconditionally headless), `--paned` with
+                // `--monitor` contradicts it; a plain create passes the
+                // tri-state through (None = follow the config default).
+                if monitor && req.headless.is_some() {
+                    return AutomationResponse::err(
+                        "a monitor is always headless — drop --headless/--paned",
+                    );
+                }
                 CreateMode::Agent {
                     prompt,
                     model,
                     effort,
+                    headless: req.headless,
                 }
             } else if let Some(content) = req.script {
                 if monitor {
                     return AutomationResponse::err(
                         "a monitor must be agent-mode (a prompt, not a script)",
+                    );
+                }
+                // Headless-agent-automations U2: agent-only, enforced on the
+                // untrusted wire like the CLI-side rejection.
+                if req.headless.is_some() {
+                    return AutomationResponse::err(
+                        "--headless/--paned are agent-mode only (a prompt, not a script)",
                     );
                 }
                 CreateMode::Script {
@@ -1367,13 +1399,16 @@ pub fn dispatch_automation_op(
 /// Composite dispatcher (automations U7+U5, headless-monitor-checks U5): the
 /// one [`automations::Dispatcher`] the manager routes through. Script
 /// dispatch goes to the [`automations::script::ScriptRunner`]; agent dispatch
-/// **forks on the automation's `monitor` flag** (the "Routing lives in the
-/// existing CompositeDispatcher" KTD): a monitor check hands to the
+/// **forks on the claimed row's `headless` marker** (the "Routing lives in
+/// the existing CompositeDispatcher" KTD, widened from the monitor flag by
+/// headless-agent-automations U3): a headless-resolved run — every monitor
+/// check, and by default every regular agent automation (R2) — hands to the
 /// [`automations::headless::HeadlessRunner`] — no pane, no tab, no
-/// `automation://agent-run` emission (headless-monitor-checks R1) — while a
-/// regular agent automation keeps the pane path via the frontend-emitting
-/// [`automations::AgentDispatcher`]. The `agent` arm is `dyn` so the routing
-/// tests below can inject a recorder without a Tauri `AppHandle`.
+/// `automation://agent-run` emission (headless-monitor-checks R1) — while an
+/// explicitly-paned agent automation keeps the pane path via the
+/// frontend-emitting [`automations::AgentDispatcher`]. The `agent` arm is
+/// `dyn` so the routing tests below can inject a recorder without a Tauri
+/// `AppHandle`.
 struct CompositeDispatcher {
     agent: std::sync::Arc<dyn automations::Dispatcher>,
     script: std::sync::Arc<automations::script::ScriptRunner>,
@@ -1386,8 +1421,13 @@ impl automations::Dispatcher for CompositeDispatcher {
         a: &automations::model::Automation,
         run_id: &str,
         launch: &automations::ResolvedLaunch,
+        headless: bool,
     ) -> Result<(), String> {
-        if a.monitor {
+        // Headless-agent-automations U3: the fork widens from `a.monitor` to
+        // the claimed row's marker (threaded by the manager) — a monitor's
+        // marker is always true, and a regular agent claim carries its
+        // resolved disposition (R1/R2), so one branch serves both.
+        if headless {
             // Headless-monitor-checks R1: the check is backend-owned — hand
             // it to the runner and return Ok. `run()` returns fast (it never
             // blocks the sweep on the child) and routes EVERY failure, spawn
@@ -1402,7 +1442,7 @@ impl automations::Dispatcher for CompositeDispatcher {
             self.headless.run(a, run_id, launch);
             return Ok(());
         }
-        self.agent.dispatch_agent(a, run_id, launch)
+        self.agent.dispatch_agent(a, run_id, launch, headless)
     }
     fn dispatch_script(
         &self,
@@ -1514,6 +1554,7 @@ mod tests {
             a: &automations::model::Automation,
             _run_id: &str,
             _launch: &automations::ResolvedLaunch,
+            _headless: bool,
         ) -> Result<(), String> {
             self.calls.lock().unwrap().push(a.id.clone());
             Ok(())
@@ -1543,7 +1584,7 @@ mod tests {
             mode: automations::model::Mode::Agent {
                 prompt: "check the run".into(),
                 model: None,
-                effort: None,
+                effort: None, headless: None,
             },
             origin: automations::model::Origin {
                 pane_id: 1,
@@ -1605,7 +1646,7 @@ mod tests {
     fn composite_dispatcher_routes_a_monitor_to_the_headless_runner() {
         let (d, agent, closes) = fork_harness();
         let res =
-            automations::Dispatcher::dispatch_agent(&d, &dispatcher_automation(true), "r1", &no_launch());
+            automations::Dispatcher::dispatch_agent(&d, &dispatcher_automation(true), "r1", &no_launch(), true);
         assert_eq!(res, Ok(()), "handed off — failures ride the closer");
         assert!(
             agent.calls.lock().unwrap().is_empty(),
@@ -1626,15 +1667,37 @@ mod tests {
         );
     }
 
-    // R15: a regular (non-monitor) agent automation keeps the pane path —
-    // the headless runner is untouched.
+    // Headless-agent-automations R2/AE3: an explicitly-paned agent claim
+    // (row marker false) keeps the pane path — the headless runner is
+    // untouched.
     #[test]
-    fn composite_dispatcher_keeps_regular_agent_automations_on_the_pane_arm() {
+    fn composite_dispatcher_keeps_paned_agent_automations_on_the_pane_arm() {
         let (d, agent, closes) = fork_harness();
         let res =
-            automations::Dispatcher::dispatch_agent(&d, &dispatcher_automation(false), "r2", &no_launch());
+            automations::Dispatcher::dispatch_agent(&d, &dispatcher_automation(false), "r2", &no_launch(), false);
         assert_eq!(res, Ok(()));
         assert_eq!(*agent.calls.lock().unwrap(), vec!["a1".to_string()]);
         assert!(closes.lock().unwrap().is_empty(), "runner untouched");
+    }
+
+    // Headless-agent-automations U3: the fork keys on the threaded row
+    // marker, not the monitor flag — a REGULAR agent claim resolved
+    // headless routes to the runner and never consults the pane arm.
+    #[test]
+    fn composite_dispatcher_routes_a_headless_regular_agent_to_the_runner() {
+        let (d, agent, closes) = fork_harness();
+        let res = automations::Dispatcher::dispatch_agent(
+            &d,
+            &dispatcher_automation(false),
+            "r3",
+            &no_launch(),
+            true,
+        );
+        assert_eq!(res, Ok(()), "handed off — failures ride the closer");
+        assert!(
+            agent.calls.lock().unwrap().is_empty(),
+            "the pane arm is never consulted for a headless-resolved run"
+        );
+        assert_eq!(closes.lock().unwrap().len(), 1, "runner reported through the closer");
     }
 }

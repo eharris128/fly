@@ -65,8 +65,10 @@ pub const ERR_DELETED: &str = "deleted";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Mode {
-    /// Spawn a fresh pane running `claude "<prompt>"` in the automation's cwd
-    /// (R9). `model`/`effort` (automations-workspace-and-model plan, U1 —
+    /// Run `claude "<prompt>"` in the automation's cwd (R9) — by default as
+    /// a closed-loop headless `claude -p` child, or in a fresh pane when the
+    /// resolved disposition is paned (see `headless` below).
+    /// `model`/`effort` (automations-workspace-and-model plan, U1 —
     /// R9/R10) optionally pin the launch model + reasoning effort; they are
     /// resolved deterministically at dispatch (automation → shared default →
     /// Claude's own default, U4a) and always passed explicitly so a run never
@@ -79,6 +81,19 @@ pub enum Mode {
         model: Option<String>,
         #[serde(default)]
         effort: Option<String>,
+        /// Dispatch disposition (headless-agent-automations plan, U1 — R1):
+        /// `Some(true)` = closed-loop headless (`claude -p`, no pane),
+        /// `Some(false)` = the explicit pane override (`--paned`), `None` =
+        /// follow `config.automation_defaults.headless` at claim time (R2:
+        /// the config default ships **true**, so legacy rows flip to
+        /// headless on upgrade unless explicitly paned). Resolution is
+        /// [`Mode::resolved_headless`] — one pure function, applied by the
+        /// manager *before* the store lock (the usage-gate precedent) and
+        /// stamped onto the claimed row so marker and routing can't
+        /// disagree. `#[serde(default)]` keeps legacy `{kind, prompt}` rows
+        /// loading as `None`.
+        #[serde(default)]
+        headless: Option<bool>,
     },
     /// Run a stored script with no model spend (R13–R15). `script_file` is a
     /// path under the store's script dir (U3); `interpreter` is a closed-enum
@@ -97,6 +112,18 @@ impl Mode {
         match self {
             Mode::Agent { .. } => RunMode::Agent,
             Mode::Script { .. } => RunMode::Script,
+        }
+    }
+
+    /// Effective dispatch disposition (headless-agent-automations U1 — R1):
+    /// automation-explicit → the caller-supplied config default. Agent-only —
+    /// scripts are never headless (they have their own runner). Monitors are
+    /// NOT special-cased here: [`Automation::claim`] forces their marker
+    /// regardless (R3), so this function stays a pure two-input resolution.
+    pub fn resolved_headless(&self, default: bool) -> bool {
+        match self {
+            Mode::Agent { headless, .. } => headless.unwrap_or(default),
+            Mode::Script { .. } => false,
         }
     }
 }
@@ -428,16 +455,24 @@ impl Automation {
     /// and manual alike — with [`ClaimError::Retired`], checked before the
     /// softer `enabled` gate (retirement is the permanent state).
     ///
-    /// Headless-monitor-checks U2 (R7): the appended row's `headless`
-    /// marker is derived HERE — `monitor` + agent mode — because every
-    /// claim path (scheduled sweep, manual run, retry drain) funnels
-    /// through this one method, so no caller signature changes.
+    /// Headless-monitor-checks U2 (R7), widened by the
+    /// headless-agent-automations plan (its U1 — R1/R3): the appended row's
+    /// `headless` marker is derived HERE, in the one funnel every claim path
+    /// (scheduled sweep, manual run, retry drain) goes through. `headless`
+    /// is the caller-resolved effective disposition
+    /// ([`Mode::resolved_headless`], resolved off the store lock); the
+    /// marker becomes `monitor || headless` for agent claims — a monitor
+    /// forces true regardless of the argument (R3) — and script claims
+    /// never stamp. Stamping at claim (not dispatch) keeps the row marker
+    /// and the routing from ever disagreeing: the sweep exemptions and kill
+    /// gates all key on the row.
     pub fn claim(
         &mut self,
         next_run_at: Option<u64>,
         now_ms: u64,
         trigger: Trigger,
         run_id: &str,
+        headless: bool,
     ) -> Result<(), ClaimError> {
         if self.retired_at.is_some() {
             return Err(ClaimError::Retired);
@@ -451,11 +486,13 @@ impl Automation {
             Trigger::Schedule => self.next_run_at,
             Trigger::Manual | Trigger::Retry => None,
         };
-        // Headless-monitor-checks U2 (R7): a monitor's agent check
-        // dispatches as a backend-managed `claude -p` child (no pane), so
-        // the row is marked at claim — letting the sweep's pane-oriented
-        // probes leave it alone regardless of which path claimed it.
-        let headless = self.monitor && self.mode.kind() == RunMode::Agent;
+        // The row is marked at claim — letting the sweep's pane-oriented
+        // probes leave it alone regardless of which path claimed it. A
+        // monitor's agent check is unconditionally headless (headless-
+        // monitor-checks R7); a regular agent claim takes the caller's
+        // resolved disposition (headless-agent-automations R1); scripts
+        // never mark.
+        let headless = self.mode.kind() == RunMode::Agent && (self.monitor || headless);
         self.next_run_at = next_run_at;
         self.updated_at = now_ms;
         self.push_row(RunRow {
@@ -739,7 +776,7 @@ mod tests {
     fn claim_on_enabled_due_automation_advances_next_run_at_and_appends_running_row() {
         let mut a = automation(script_mode());
         assert_eq!(
-            a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1"),
+            a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false),
             Ok(())
         );
 
@@ -768,7 +805,7 @@ mod tests {
         a.enabled = false;
 
         assert_eq!(
-            a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1"),
+            a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false),
             Err(ClaimError::Disabled)
         );
         assert!(a.runs.is_empty());
@@ -784,11 +821,11 @@ mod tests {
         let mut a = automation(Mode::Agent {
             prompt: "summarize CI".into(),
             model: None,
-            effort: None,
+            effort: None, headless: None,
         });
         a.next_run_at = None; // paused
 
-        assert_eq!(a.claim(None, 61_000, Trigger::Manual, "r1"), Ok(()));
+        assert_eq!(a.claim(None, 61_000, Trigger::Manual, "r1", false), Ok(()));
         assert_eq!(a.next_run_at, None, "still paused");
         let row = &a.runs[0];
         assert_eq!(row.trigger, Trigger::Manual);
@@ -806,7 +843,7 @@ mod tests {
         let mut a = automation(script_mode());
         let keep = a.next_run_at;
 
-        assert_eq!(a.claim(keep, 61_000, Trigger::Retry, "r1"), Ok(()));
+        assert_eq!(a.claim(keep, 61_000, Trigger::Retry, "r1", false), Ok(()));
         assert_eq!(a.next_run_at, keep, "retry never advances the schedule");
         let row = &a.runs[0];
         assert_eq!(row.trigger, Trigger::Retry);
@@ -842,7 +879,7 @@ mod tests {
     #[test]
     fn close_succeeded_sets_finished_at_and_derived_last_run_status() {
         let mut a = automation(script_mode());
-        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false)
             .unwrap();
 
         let res = a.close(
@@ -867,7 +904,7 @@ mod tests {
     #[test]
     fn close_failed_records_error_exit_code_output_and_finished_at() {
         let mut a = automation(script_mode());
-        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false)
             .unwrap();
 
         let res = a.close(
@@ -893,7 +930,7 @@ mod tests {
     #[test]
     fn double_close_is_a_no_op_returning_already_closed() {
         let mut a = automation(script_mode());
-        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false)
             .unwrap();
         a.close(
             "r1",
@@ -936,7 +973,7 @@ mod tests {
     #[test]
     fn rollback_recompute_overwrites_next_run_at_with_the_supplied_value() {
         let mut a = automation(script_mode());
-        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false)
             .unwrap();
 
         a.rollback_recompute(Some(420_000));
@@ -967,11 +1004,11 @@ mod tests {
         let mut a = automation(Mode::Agent {
             prompt: "long agent".into(),
             model: None,
-            effort: None,
+            effort: None, headless: None,
         });
         // A claim mid-history: an agent run that stays Running while later
         // occurrences skip past it.
-        a.claim(Some(60_000), 10, Trigger::Schedule, "live").unwrap();
+        a.claim(Some(60_000), 10, Trigger::Schedule, "live", false).unwrap();
         for i in 0..RUN_HISTORY_CAP as u64 + 5 {
             a.skip(100 + i, Trigger::Schedule, "overlap", &format!("r{i}"));
         }
@@ -990,7 +1027,7 @@ mod tests {
     #[test]
     fn stored_output_truncates_to_an_8_kib_tail_keeping_the_end() {
         let mut a = automation(script_mode());
-        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false)
             .unwrap();
 
         let big = format!("{}TAIL", "a".repeat(9_000));
@@ -1023,7 +1060,7 @@ mod tests {
     #[test]
     fn serde_round_trip_preserves_camel_case_field_names() {
         let mut a = automation(script_mode());
-        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false)
             .unwrap();
         a.close(
             "r1",
@@ -1073,7 +1110,7 @@ mod tests {
         let agent = serde_json::to_value(Mode::Agent {
             prompt: "summarize CI".into(),
             model: None,
-            effort: None,
+            effort: None, headless: None,
         })
         .unwrap();
         assert_eq!(agent["kind"], "agent");
@@ -1087,7 +1124,7 @@ mod tests {
         let mode = Mode::Agent {
             prompt: "audit disk".into(),
             model: Some("opus".into()),
-            effort: Some("high".into()),
+            effort: Some("high".into()), headless: None,
         };
         let v = serde_json::to_value(&mode).unwrap();
         assert_eq!(v["kind"], "agent");
@@ -1101,7 +1138,8 @@ mod tests {
     // U1 back-compat: a legacy `Mode::Agent` JSON with only `{kind, prompt}`
     // (written before this plan) deserializes with `model: None, effort: None`
     // — each new field defaults independently (the enum has no container
-    // default).
+    // default). Headless-agent-automations U1 (R1/R12): `headless` defaults
+    // the same way, and a `{kind, prompt, model}` shape does too.
     #[test]
     fn legacy_agent_mode_without_model_effort_defaults_to_none() {
         let json = serde_json::json!({ "kind": "agent", "prompt": "hi" });
@@ -1112,8 +1150,57 @@ mod tests {
                 prompt: "hi".into(),
                 model: None,
                 effort: None,
+                headless: None,
             }
         );
+
+        let json = serde_json::json!({ "kind": "agent", "prompt": "hi", "model": "opus" });
+        let mode: Mode = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            mode,
+            Mode::Agent {
+                prompt: "hi".into(),
+                model: Some("opus".into()),
+                effort: None,
+                headless: None,
+            }
+        );
+    }
+
+    // Headless-agent-automations U1 (R1/R12): an explicit `headless: false`
+    // is an override, not an absence — it must survive a store round-trip
+    // (with the config default `true`, losing it would silently flip a
+    // `--paned` automation headless).
+    #[test]
+    fn explicit_headless_false_survives_a_round_trip() {
+        let mode = Mode::Agent {
+            prompt: "audit".into(),
+            model: None,
+            effort: None,
+            headless: Some(false),
+        };
+        let v = serde_json::to_value(&mode).unwrap();
+        assert_eq!(v["headless"], false, "explicit false is written, not elided");
+        let back: Mode = serde_json::from_value(v).unwrap();
+        assert_eq!(back, mode);
+    }
+
+    // Headless-agent-automations U1 (R1): the one pure resolution —
+    // automation-explicit wins over the config default; scripts never
+    // resolve headless regardless of the default.
+    #[test]
+    fn resolved_headless_prefers_the_explicit_pin_over_the_default() {
+        let agent = |headless: Option<bool>| Mode::Agent {
+            prompt: "p".into(),
+            model: None,
+            effort: None,
+            headless,
+        };
+        assert!(agent(None).resolved_headless(true));
+        assert!(!agent(None).resolved_headless(false));
+        assert!(agent(Some(true)).resolved_headless(false));
+        assert!(!agent(Some(false)).resolved_headless(true));
+        assert!(!script_mode().resolved_headless(true), "scripts never headless");
     }
 
     // U1 back-compat: a legacy `RunRow` JSON missing `model`/`effort`
@@ -1202,32 +1289,50 @@ mod tests {
         let agent_mode = || Mode::Agent {
             prompt: "check the run".into(),
             model: None,
-            effort: None,
+            effort: None, headless: None,
         };
 
         // Monitor + agent mode: every claim path derives true.
         let mut m = automation(agent_mode());
         m.monitor = true;
-        m.claim(Some(360_000), 61_000, Trigger::Schedule, "sched")
+        m.claim(Some(360_000), 61_000, Trigger::Schedule, "sched", false)
             .unwrap();
-        m.claim(None, 62_000, Trigger::Manual, "manual").unwrap();
-        m.claim(None, 63_000, Trigger::Retry, "retry").unwrap();
+        m.claim(None, 62_000, Trigger::Manual, "manual", false).unwrap();
+        m.claim(None, 63_000, Trigger::Retry, "retry", false).unwrap();
         assert_eq!(m.runs.len(), 3);
         for row in &m.runs {
             assert!(row.headless, "claim path {:?} derives headless", row.trigger);
             assert_eq!(row.session_id, None, "stamped later by the runner (R12)");
         }
 
-        // Regular (non-monitor) agent automation: pane dispatch, unmarked.
+        // Monitors force the marker even when the caller resolved FALSE
+        // (headless-agent-automations R3: flag and config never un-headless
+        // a monitor) — the schedule-trigger claim above already passed
+        // false; re-check explicitly on a fresh record.
+        let mut mf = automation(agent_mode());
+        mf.monitor = true;
+        mf.claim(Some(360_000), 61_000, Trigger::Schedule, "forced", false)
+            .unwrap();
+        assert!(mf.runs[0].headless, "monitor forces true regardless of the argument");
+
+        // Regular (non-monitor) agent automation resolved paned: unmarked.
         let mut a = automation(agent_mode());
-        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false)
             .unwrap();
         assert!(!a.runs[0].headless);
 
-        // Script mode is never agent dispatch — even under a monitor flag.
+        // Regular agent automation resolved headless
+        // (headless-agent-automations R1): the claim stamps the row.
+        let mut ah = automation(agent_mode());
+        ah.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", true)
+            .unwrap();
+        assert!(ah.runs[0].headless, "resolved-headless agent claim stamps the row");
+
+        // Script mode is never agent dispatch — even under a monitor flag,
+        // and even when the caller passes resolved true.
         let mut s = automation(script_mode());
         s.monitor = true;
-        s.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+        s.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", true)
             .unwrap();
         assert!(!s.runs[0].headless);
 
@@ -1247,10 +1352,10 @@ mod tests {
         let mut a = automation(Mode::Agent {
             prompt: "check the run".into(),
             model: None,
-            effort: None,
+            effort: None, headless: None,
         });
         a.monitor = true;
-        a.claim(Some(60_000), 10, Trigger::Schedule, "check").unwrap();
+        a.claim(Some(60_000), 10, Trigger::Schedule, "check", false).unwrap();
         // U4/U5 stamp the session id from the stream's init event; the model
         // test sets the pub field directly (the verdict-test convention).
         a.runs[0].session_id = Some("sess-42".into());
@@ -1337,7 +1442,7 @@ mod tests {
             transcript_path: "/home/u/.claude/projects/x/sess-1.jsonl".into(),
             session_cwd: "/home/u/exp".into(),
         });
-        m.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+        m.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false)
             .unwrap();
         m.close(
             "r1",
@@ -1391,11 +1496,11 @@ mod tests {
         assert!(a.retire(90_000));
 
         assert_eq!(
-            a.claim(Some(360_000), 91_000, Trigger::Schedule, "r1"),
+            a.claim(Some(360_000), 91_000, Trigger::Schedule, "r1", false),
             Err(ClaimError::Retired)
         );
         assert_eq!(
-            a.claim(None, 91_000, Trigger::Manual, "r2"),
+            a.claim(None, 91_000, Trigger::Manual, "r2", false),
             Err(ClaimError::Retired)
         );
         assert!(a.runs.is_empty(), "nothing appended");
@@ -1405,7 +1510,7 @@ mod tests {
         // Retired wins over disabled — the permanent state reports first.
         a.enabled = false;
         assert_eq!(
-            a.claim(None, 92_000, Trigger::Manual, "r3"),
+            a.claim(None, 92_000, Trigger::Manual, "r3", false),
             Err(ClaimError::Retired)
         );
     }
@@ -1417,7 +1522,7 @@ mod tests {
     fn retire_is_idempotent_and_a_just_retired_monitors_running_row_still_closes() {
         let mut a = automation(script_mode());
         a.monitor = true;
-        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false)
             .unwrap();
 
         assert!(a.retire(70_000), "first retire transitions");
@@ -1452,7 +1557,7 @@ mod tests {
         assert_eq!(a.consecutive_infra_failures(), 0, "empty history");
 
         let fail = |a: &mut Automation, id: &str, t: u64| {
-            a.claim(Some(t + 1000), t, Trigger::Schedule, id).unwrap();
+            a.claim(Some(t + 1000), t, Trigger::Schedule, id, false).unwrap();
             a.close(
                 id,
                 RunOutcome::Failed {
@@ -1473,7 +1578,7 @@ mod tests {
         fail(&mut a, "f2", 3_000);
         assert_eq!(a.consecutive_infra_failures(), 2);
 
-        a.claim(Some(5_000), 4_000, Trigger::Schedule, "live").unwrap();
+        a.claim(Some(5_000), 4_000, Trigger::Schedule, "live", false).unwrap();
         assert_eq!(
             a.consecutive_infra_failures(),
             2,
@@ -1496,7 +1601,7 @@ mod tests {
         // U3 refinement: a Succeeded check whose output was never captured
         // (abstention — output None) is unreadable and COUNTS, so a monitor
         // whose output can never be attributed eventually escalates.
-        a.claim(Some(6_000), 4_600, Trigger::Schedule, "abst").unwrap();
+        a.claim(Some(6_000), 4_600, Trigger::Schedule, "abst", false).unwrap();
         a.close("abst", RunOutcome::Succeeded { output: None }, 4_700);
         assert_eq!(
             a.consecutive_infra_failures(),
@@ -1523,7 +1628,7 @@ mod tests {
         // fix(review) #5: a near-miss block — an opened ```verdict fence that
         // never parsed — counts like an unreadable check, extending the
         // trailing streak instead of resetting it.
-        a.claim(Some(9_000), 8_000, Trigger::Schedule, "m1").unwrap();
+        a.claim(Some(9_000), 8_000, Trigger::Schedule, "m1", false).unwrap();
         a.close(
             "m1",
             RunOutcome::Succeeded {
@@ -1553,7 +1658,7 @@ mod tests {
         a.monitor = true;
 
         let succeed_with = |a: &mut Automation, id: &str, t: u64, out: &str| {
-            a.claim(Some(t + 1000), t, Trigger::Schedule, id).unwrap();
+            a.claim(Some(t + 1000), t, Trigger::Schedule, id, false).unwrap();
             a.close(
                 id,
                 RunOutcome::Succeeded {
@@ -1590,7 +1695,7 @@ mod tests {
         let mut a = automation(script_mode());
         a.monitor = true;
         // The verdict run closes first...
-        a.claim(Some(60_000), 10, Trigger::Schedule, "verdict-run")
+        a.claim(Some(60_000), 10, Trigger::Schedule, "verdict-run", false)
             .unwrap();
         a.close(
             "verdict-run",
@@ -1606,7 +1711,7 @@ mod tests {
             note: "experiment died".into(),
         });
         // ...a later run is still in flight...
-        a.claim(Some(120_000), 30, Trigger::Schedule, "live").unwrap();
+        a.claim(Some(120_000), 30, Trigger::Schedule, "live", false).unwrap();
         // ...and skip pressure pushes the history well past the cap.
         for i in 0..RUN_HISTORY_CAP as u64 + 5 {
             a.skip(100 + i, Trigger::Schedule, "overlap", &format!("r{i}"));
@@ -1645,7 +1750,7 @@ mod tests {
         a.skip(50_000, Trigger::Schedule, "capacity", "r0");
         assert!(!a.in_flight(), "skipped rows are born terminal");
 
-        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1")
+        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false)
             .unwrap();
         assert!(a.in_flight());
 

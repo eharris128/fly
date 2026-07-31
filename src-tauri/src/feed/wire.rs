@@ -199,6 +199,14 @@ pub struct AutomationEntry {
     /// `false`; always serialized so a plain automation carries `false`.
     #[serde(default)]
     pub monitor: bool,
+    /// Whether this automation dispatches **closed-loop headless**
+    /// (headless-agent-automations R11): the *effective* disposition —
+    /// `monitor || (mode.headless ?? config default)` — resolved at
+    /// projection time, so a consumer can tell a closed-loop automation
+    /// from a pane-spawning one. Additive, the monitor-enrichment
+    /// convention: `#[serde(default)]` loads an old payload as `false`.
+    #[serde(default)]
+    pub headless: bool,
     /// Next occurrence, epoch ms; null when paused.
     pub next_run_at: Option<u64>,
     /// Last run's status (`running`/`succeeded`/`failed`/`skipped`), or null if
@@ -309,8 +317,14 @@ pub struct FeedSnapshot {
 }
 
 impl AutomationEntry {
-    /// Project a stored automation (+ its derived last run) into the wire shape.
-    pub fn from_automation(a: &crate::automations::model::Automation) -> Self {
+    /// Project a stored automation (+ its derived last run) into the wire
+    /// shape. `headless_default` is `config.automation_defaults.headless`,
+    /// read by the caller at emit time (headless-agent-automations U4) so
+    /// the projected `headless` bit matches what a claim would resolve.
+    pub fn from_automation(
+        a: &crate::automations::model::Automation,
+        headless_default: bool,
+    ) -> Self {
         let last = a.last_run();
         Self {
             id: a.id.clone(),
@@ -319,6 +333,7 @@ impl AutomationEntry {
             timezone: a.timezone.clone(),
             enabled: a.enabled,
             monitor: a.monitor,
+            headless: a.monitor || a.mode.resolved_headless(headless_default),
             next_run_at: a.next_run_at,
             last_status: last.map(|r| run_status_str(&r.status).to_string()),
             // A terminal row carries finished_at; a still-running one only
@@ -394,6 +409,7 @@ mod tests {
                 timezone: "UTC".into(),
                 enabled: true,
                 monitor: false,
+                headless: false,
                 next_run_at: Some(1_700_000_300_000),
                 last_status: Some("succeeded".into()),
                 last_run_at: Some(1_700_000_000_000),
@@ -463,7 +479,7 @@ mod tests {
             mode: Mode::Agent {
                 prompt: "do it".into(),
                 model: None,
-                effort: None,
+                effort: None, headless: None,
             },
             origin: Origin {
                 pane_id: 1,
@@ -475,7 +491,7 @@ mod tests {
             next_run_at: Some(2_000),
             runs: vec![run],
         };
-        let e = AutomationEntry::from_automation(&a);
+        let e = AutomationEntry::from_automation(&a, false);
         assert_eq!(e.id, "a1");
         assert_eq!(e.name, "nightly");
         assert_eq!(e.cron, "0 2 * * *");
@@ -490,6 +506,31 @@ mod tests {
         assert!(!e.monitor);
         assert_eq!(e.retired_at, None);
         assert_eq!(e.last_verdict, None);
+
+        // Headless-agent-automations R11: the projected bit is the EFFECTIVE
+        // disposition — the caller's config default fills an unpinned
+        // automation, an explicit pin wins, and a monitor always projects
+        // true regardless of both.
+        assert!(!e.headless, "unpinned + default false");
+        assert!(AutomationEntry::from_automation(&a, true).headless, "default fills");
+        let mut pinned = a.clone();
+        pinned.mode = Mode::Agent {
+            prompt: "do it".into(),
+            model: None,
+            effort: None,
+            headless: Some(false),
+        };
+        assert!(!AutomationEntry::from_automation(&pinned, true).headless, "pin wins");
+        let mut mon = a.clone();
+        mon.monitor = true;
+        assert!(AutomationEntry::from_automation(&mon, false).headless, "monitor forces");
+
+        // Additive back-compat (the monitor-enrichment convention): an old
+        // payload without the key still parses, reading false.
+        let mut v = serde_json::to_value(&e).unwrap();
+        v.as_object_mut().unwrap().remove("headless");
+        let back: AutomationEntry = serde_json::from_value(v).unwrap();
+        assert!(!back.headless);
     }
 
     /// U6: a monitor whose last run parsed a FAIL verdict — the case run
@@ -542,7 +583,7 @@ mod tests {
             mode: Mode::Agent {
                 prompt: "check disk".into(),
                 model: None,
-                effort: None,
+                effort: None, headless: None,
             },
             origin: Origin {
                 pane_id: 1,
@@ -554,7 +595,7 @@ mod tests {
             next_run_at: None,
             runs: vec![run],
         };
-        let e = AutomationEntry::from_automation(&a);
+        let e = AutomationEntry::from_automation(&a, false);
         assert!(e.monitor, "the monitor flag rides the wire");
         assert_eq!(e.retired_at, Some(1_200));
         // Run status is succeeded (infra ran clean) but the verdict is fail —
@@ -603,7 +644,7 @@ mod tests {
             next_run_at: None,
             runs: vec![],
         };
-        let e = AutomationEntry::from_automation(&a);
+        let e = AutomationEntry::from_automation(&a, false);
         assert!(!e.enabled);
         assert_eq!(e.next_run_at, None);
         assert_eq!(e.last_status, None);
@@ -682,7 +723,7 @@ mod tests {
             mode: Mode::Agent {
                 prompt: "check deploy".into(),
                 model: None,
-                effort: None,
+                effort: None, headless: None,
             },
             origin: Origin {
                 pane_id: 1,
@@ -694,7 +735,7 @@ mod tests {
             next_run_at: None,
             runs: vec![run],
         };
-        let e = AutomationEntry::from_automation(&a);
+        let e = AutomationEntry::from_automation(&a, false);
         assert!(e.monitor);
         assert_eq!(e.retired_at, Some(1_200));
         let verdict = e.last_verdict.as_ref().expect("the PASS verdict projects");

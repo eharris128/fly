@@ -97,6 +97,34 @@ pub fn validate_monitor_flags(
     Ok(())
 }
 
+/// Validate the dispatch-disposition flags at `create` time
+/// (headless-agent-automations U2 — R2/R3), the `--not-before` validation
+/// pattern: `--headless`/`--paned` are mutually exclusive and agent-only;
+/// with `--monitor` both are rejected — `--headless` as redundant (a monitor
+/// is unconditionally headless) and `--paned` as contradictory. The socket
+/// create arm enforces the same rules on the untrusted wire. Pure; returns
+/// the message the CLI prints before exiting 2.
+pub fn validate_headless_flags(
+    script_present: bool,
+    monitor: bool,
+    headless: bool,
+    paned: bool,
+) -> Result<(), String> {
+    if headless && paned {
+        return Err("pass only one of --headless / --paned".to_string());
+    }
+    if (headless || paned) && script_present {
+        return Err("--headless / --paned are agent-mode only (a prompt, not a script)".to_string());
+    }
+    if headless && monitor {
+        return Err("--headless is redundant with --monitor (a monitor is always headless)".to_string());
+    }
+    if paned && monitor {
+        return Err("--paned contradicts --monitor (a monitor is always headless)".to_string());
+    }
+    Ok(())
+}
+
 /// Monitor-handoff R8: monitors default **Sonnet at xhigh** when `--model` /
 /// `--effort` are unspecified; an explicit flag wins per-field. U1–U4 stamp
 /// no such default anywhere (the socket create arm passes the request's
@@ -232,6 +260,16 @@ pub struct AutomationRequest {
     /// into it; same back-compat pattern as `monitor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before_ms: Option<u64>,
+    /// Dispatch disposition (headless-agent-automations U2 — R1/R2):
+    /// create-only, agent-mode only. `Some(true)` = `--headless`,
+    /// `Some(false)` = `--paned`, `None` (the wire default, and what an old
+    /// CLI binary always sends) = follow `config.automation_defaults
+    /// .headless` at claim time. Validated CLI-side AND on the untrusted
+    /// wire (`--headless`+`--monitor` redundant, `--paned`+`--monitor`
+    /// contradictory, either with script agent-only); same back-compat
+    /// pattern as `monitor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headless: Option<bool>,
 }
 
 /// The app's response to an `automation/*` request.
@@ -394,6 +432,8 @@ fn handle_create(args: &[String]) -> i32 {
     let mut retry_on_interrupt = false;
     let mut monitor = false;
     let mut not_before: Option<String> = None;
+    let mut headless = false;
+    let mut paned = false;
     let mut json = false;
 
     let mut it = args.iter();
@@ -416,6 +456,10 @@ fn handle_create(args: &[String]) -> i32 {
                 println!("  --timeout <ms>          script timeout in milliseconds (default: 120000)");
                 println!("  --retry-on-interrupt    re-run once on the next launch if an app");
                 println!("                          crash/restart interrupts a run (default: off)");
+                println!("  --headless              agent mode: dispatch closed-loop (claude -p, no");
+                println!("                          pane/tab; one prompt in, one captured result out)");
+                println!("  --paned                 agent mode: dispatch as an interactive pane");
+                println!("                          (the pre-2026-07-31 behavior)");
                 println!("  --monitor               agent mode: a parked experiment monitor — sparse");
                 println!("                          checks that deliver one PASS/FAIL verdict, then retire");
                 println!("  --not-before <time>     monitor only: never check before this time;");
@@ -424,7 +468,9 @@ fn handle_create(args: &[String]) -> i32 {
                 println!("  --json                  output response as JSON");
                 println!();
                 println!("Either --prompt (agent mode) or --script/--script-file (script mode) is required.");
-                println!("--model / --effort / --monitor are agent-mode only.");
+                println!("--model / --effort / --monitor / --headless / --paned are agent-mode only.");
+                println!("Agent runs dispatch headless by default (config automationDefaults.headless);");
+                println!("--headless / --paned pin one automation either way. Monitors are always headless.");
                 println!("Monitors default to --model sonnet --effort xhigh and retry-on-interrupt on.");
                 println!("A monitor's check must END its final message with one fenced ```verdict block");
                 println!("(first line exactly PASS or FAIL, then a note) — a parsed verdict retires the");
@@ -450,6 +496,8 @@ fn handle_create(args: &[String]) -> i32 {
             "--script-file" => script_file = it.next().cloned(),
             "--retry-on-interrupt" => retry_on_interrupt = true,
             "--monitor" => monitor = true,
+            "--headless" => headless = true,
+            "--paned" => paned = true,
             "--not-before" => {
                 not_before = it.next().cloned();
                 if not_before.is_none() {
@@ -538,6 +586,13 @@ fn handle_create(args: &[String]) -> i32 {
         return 2;
     }
 
+    // --headless / --paned: mutually exclusive, agent-only, both rejected
+    // with --monitor (headless-agent-automations U2 — R2/R3).
+    if let Err(e) = validate_headless_flags(script.is_some(), monitor, headless, paned) {
+        eprintln!("fly automation create: {e}");
+        return 2;
+    }
+
     // Parse `--not-before` to epoch ms CLI-side (monitor-handoff U5, R1):
     // RFC3339 with offset, or naive "YYYY-MM-DD HH:MM" resolved through the
     // system-local zone. A past instant is accepted — it clamps to a no-op
@@ -582,6 +637,13 @@ fn handle_create(args: &[String]) -> i32 {
         retry_on_interrupt,
         monitor,
         not_before_ms,
+        // Tri-state: an unflagged create sends None and follows the config
+        // default at claim time (headless-agent-automations R1/R2).
+        headless: match (headless, paned) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        },
         ..Default::default()
     };
     send_and_report(req, "created", json)
@@ -742,7 +804,12 @@ fn handle_show(args: &[String]) -> i32 {
         return 0;
     }
     let now = now_ms();
-    for line in show_lines(&a, now) {
+    // Best-effort config read (read-only, like the store read): the
+    // disposition line names what "default" currently resolves to.
+    let headless_default = crate::config::load_with_fallback(&crate::config::default_path())
+        .automation_defaults
+        .headless;
+    for line in show_lines(&a, now, headless_default) {
         println!("{line}");
     }
     0
@@ -750,22 +817,25 @@ fn handle_show(args: &[String]) -> i32 {
 
 fn handle_runs(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("usage: fly automation runs <id> [--output <run-id>] [--json]");
+        println!("usage: fly automation runs <id> [--output <run-id>] [-v] [--json]");
         println!();
         println!("List runs for an automation, or show output of a specific run.");
         println!();
         println!("Options:");
         println!("  --output <run-id>  print captured output from a single run");
+        println!("  -v, --verbose      also print each run's derived transcript path");
         println!("  --json             output as JSON");
         return 0;
     }
     let json = wants_json(args);
     let mut id: Option<String> = None;
     let mut output_run: Option<String> = None;
+    let mut verbose = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--json" => {}
+            "-v" | "--verbose" => verbose = true,
             "--output" => output_run = it.next().cloned(),
             other if !other.starts_with('-') && id.is_none() => id = Some(other.to_string()),
             other => {
@@ -819,6 +889,13 @@ fn handle_runs(args: &[String]) -> i32 {
     let now = now_ms();
     for r in &a.runs {
         println!("{}", run_line(r, now));
+        // R10 (headless-agent-automations): the derived transcript path is
+        // the deep-dive handle behind the session id — verbose only.
+        if verbose {
+            if let Some(p) = run_transcript_path(&a, r) {
+                println!("    transcript {}", notify::sanitize_title(&p));
+            }
+        }
     }
     0
 }
@@ -928,7 +1005,7 @@ fn list_line(a: &Automation, now: u64) -> String {
 /// when present, and — while the monitor is still live — the missed-tick
 /// caveat the plan requires `show` to state (checks fire only while fly
 /// runs; no catch-up).
-fn show_lines(a: &Automation, now: u64) -> Vec<String> {
+fn show_lines(a: &Automation, now: u64, headless_default: bool) -> Vec<String> {
     let mut lines = vec![
         format!("id        {}", a.id),
         format!("name      {}", notify::sanitize_title(&a.name)),
@@ -941,6 +1018,22 @@ fn show_lines(a: &Automation, now: u64) -> Vec<String> {
             if a.retry_on_interrupt { "on interrupt" } else { "off" }
         ),
     ];
+    // Dispatch disposition (headless-agent-automations U2 — R10's display
+    // half): explicit pin, or the config default it follows. Monitors skip
+    // it — they are unconditionally headless and say so via their own lines.
+    if !a.monitor {
+        if let Mode::Agent { headless, .. } = &a.mode {
+            let disposition = match headless {
+                Some(true) => "headless".to_string(),
+                Some(false) => "paned".to_string(),
+                None => format!(
+                    "default ({})",
+                    if headless_default { "headless" } else { "paned" }
+                ),
+            };
+            lines.push(format!("dispatch  {disposition}"));
+        }
+    }
     if let Some(state) = monitor_state_label(a) {
         let mut line = state;
         if let Some(t) = a.retired_at {
@@ -992,7 +1085,24 @@ fn run_line(r: &RunRow, now: u64) -> String {
     if let Some(b) = &r.bundle_path {
         line.push_str(&format!("  bundle {}", notify::sanitize_title(b)));
     }
+    // Headless-agent-automations R10: the closed-loop debugging handle — a
+    // headless run has no pane scrollback, so the stream-stamped session id
+    // is how you get back to it (`claude --resume <id>` works on it).
+    if let Some(sid) = &r.session_id {
+        line.push_str(&format!("  session {}", notify::sanitize_title(sid)));
+    }
     line
+}
+
+/// Headless-agent-automations R10 (`runs -v`): the run's derived transcript
+/// path — `<claude projects root>/<encoded cwd>/<session id>.jsonl` — the
+/// deep-dive handle behind the session id. `None` when the run has no
+/// stamped session id or no home dir resolves.
+fn run_transcript_path(a: &Automation, r: &RunRow) -> Option<String> {
+    let sid = r.session_id.as_deref()?;
+    let root = crate::session::transcript::claude_projects_root()?;
+    let dir = crate::session::transcript::encode_cwd(&a.cwd);
+    Some(root.join(dir).join(format!("{sid}.jsonl")).display().to_string())
 }
 
 fn status_label(s: RunStatus) -> &'static str {
@@ -1204,6 +1314,56 @@ mod tests {
         assert!(validate_monitor_flags(false, true, true).is_ok(), "monitor + floor fine");
     }
 
+    // Headless-agent-automations U2 (R2/R3): --headless/--paned are mutually
+    // exclusive and agent-only; with --monitor, --headless is rejected as
+    // redundant and --paned as contradictory; the valid combinations pass.
+    #[test]
+    fn validate_headless_flags_rejects_the_bad_combinations() {
+        let m = validate_headless_flags(false, false, true, true).unwrap_err();
+        assert!(m.contains("only one"), "mutually exclusive: {m}");
+
+        let m = validate_headless_flags(true, false, true, false).unwrap_err();
+        assert!(m.contains("agent-mode"), "headless+script rejected: {m}");
+        let m = validate_headless_flags(true, false, false, true).unwrap_err();
+        assert!(m.contains("agent-mode"), "paned+script rejected: {m}");
+
+        let m = validate_headless_flags(false, true, true, false).unwrap_err();
+        assert!(m.contains("redundant"), "headless+monitor rejected: {m}");
+        let m = validate_headless_flags(false, true, false, true).unwrap_err();
+        assert!(m.contains("contradicts"), "paned+monitor rejected: {m}");
+
+        assert!(validate_headless_flags(false, false, false, false).is_ok());
+        assert!(validate_headless_flags(false, false, true, false).is_ok());
+        assert!(validate_headless_flags(false, false, false, true).is_ok());
+        assert!(validate_headless_flags(false, true, false, false).is_ok(), "plain monitor fine");
+        assert!(validate_headless_flags(true, false, false, false).is_ok(), "plain script fine");
+    }
+
+    // Headless-agent-automations U2 (R12): wire back-compat — an old CLI's
+    // request JSON has no `headless` key and must load as None (follow the
+    // config default), and a new CLI's unflagged create serializes without
+    // the key so an old server ignores nothing it can see.
+    #[test]
+    fn request_headless_is_back_compat_tri_state_on_the_wire() {
+        let old: AutomationRequest =
+            serde_json::from_str(r#"{"token":"t","op":"automation/create"}"#).unwrap();
+        assert_eq!(old.headless, None);
+
+        let unflagged = AutomationRequest {
+            op: "automation/create".into(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&unflagged).unwrap();
+        assert!(v.get("headless").is_none(), "None is omitted, not null");
+
+        let paned = AutomationRequest {
+            headless: Some(false),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&paned).unwrap();
+        assert_eq!(v["headless"], false, "the explicit override rides the wire");
+    }
+
     // monitor-handoff R8: monitors default sonnet/xhigh per-field; explicit
     // flags win; non-monitors are untouched (their None flows to the shared
     // config default at dispatch, as before).
@@ -1307,7 +1467,7 @@ mod tests {
         a.mode = Mode::Agent {
             prompt: "check the run".into(),
             model: Some("sonnet".into()),
-            effort: Some("xhigh".into()),
+            effort: Some("xhigh".into()), headless: None,
         };
         a.monitor = true;
         a
@@ -1411,7 +1571,7 @@ mod tests {
         a.retired_at = Some(now - 3_600_000);
         a.next_run_at = None;
 
-        let lines = show_lines(&a, now);
+        let lines = show_lines(&a, now, true);
         assert!(
             lines.iter().any(|l| l == "monitor   retired fail (1h ago)"),
             "state + retirement instant: {lines:?}"
@@ -1446,7 +1606,7 @@ mod tests {
         parked.not_before_ms = Some(now + 2 * 3_600_000);
         parked.next_run_at = Some(now + 2 * 3_600_000);
 
-        let lines = show_lines(&parked, now);
+        let lines = show_lines(&parked, now, true);
         assert!(
             lines.iter().any(|l| l == "monitor   parked (not before in 2h)"),
             "parked state carries the floor: {lines:?}"
@@ -1458,7 +1618,7 @@ mod tests {
         assert!(!lines.iter().any(|l| l.starts_with("verdict")), "no verdict yet");
 
         let plain = super_automation("p", "plain");
-        let lines = show_lines(&plain, now);
+        let lines = show_lines(&plain, now, true);
         for prefix in ["monitor", "verdict", "bundle", "note"] {
             assert!(
                 !lines.iter().any(|l| l.starts_with(prefix)),
@@ -1466,6 +1626,69 @@ mod tests {
             );
         }
         assert!(lines.iter().any(|l| l.starts_with("next run  ")));
+    }
+
+    // Headless-agent-automations U2 (R10's display half): `show` renders the
+    // dispatch disposition for non-monitor agent automations — the explicit
+    // pin, or what "default" currently resolves to — and skips it for
+    // scripts (no disposition) and monitors (unconditionally headless,
+    // stated by their own lines).
+    #[test]
+    fn show_lines_render_the_dispatch_disposition_for_plain_agents_only() {
+        let now = 1_000_000_000u64;
+        let agent = |headless: Option<bool>| {
+            let mut a = super_automation("a", "agent");
+            a.mode = Mode::Agent {
+                prompt: "audit".into(),
+                model: None,
+                effort: None,
+                headless,
+            };
+            a
+        };
+        let lines = show_lines(&agent(None), now, true);
+        assert!(
+            lines.iter().any(|l| l == "dispatch  default (headless)"),
+            "unpinned names the resolved default: {lines:?}"
+        );
+        let lines = show_lines(&agent(None), now, false);
+        assert!(lines.iter().any(|l| l == "dispatch  default (paned)"), "{lines:?}");
+        let lines = show_lines(&agent(Some(true)), now, false);
+        assert!(lines.iter().any(|l| l == "dispatch  headless"), "{lines:?}");
+        let lines = show_lines(&agent(Some(false)), now, true);
+        assert!(lines.iter().any(|l| l == "dispatch  paned"), "{lines:?}");
+
+        let script = super_automation("s", "script");
+        let lines = show_lines(&script, now, true);
+        assert!(!lines.iter().any(|l| l.starts_with("dispatch")), "{lines:?}");
+        let monitor = monitor_automation("m", "watch");
+        let lines = show_lines(&monitor, now, true);
+        assert!(
+            !lines.iter().any(|l| l.starts_with("dispatch")),
+            "a monitor states headless via its own lines: {lines:?}"
+        );
+    }
+
+    // Headless-agent-automations R10: a run row with a stamped session id
+    // renders it (the closed-loop debugging handle); pane rows (no id) are
+    // unchanged. The derived transcript path is the `-v` add-on, built from
+    // the automation's cwd + the id.
+    #[test]
+    fn run_line_renders_the_stamped_session_id() {
+        let now = 1_000_000_000u64;
+        let mut row = run_row("r1", RunStatus::Succeeded);
+        assert!(!run_line(&row, now).contains("session"), "pane rows unchanged");
+        row.headless = true;
+        row.session_id = Some("sess-42".into());
+        let line = run_line(&row, now);
+        assert!(line.contains("session sess-42"), "{line}");
+
+        let a = super_automation("a", "x");
+        assert_eq!(run_transcript_path(&a, &run_row("r2", RunStatus::Succeeded)), None);
+        if let Some(p) = run_transcript_path(&a, &row) {
+            assert!(p.ends_with("sess-42.jsonl"), "{p}");
+            assert!(p.contains("-tmp"), "encoded cwd rides the path: {p}");
+        }
     }
 
     // monitor-handoff R18 (CLI mirror): list rows carry the monitor state in
