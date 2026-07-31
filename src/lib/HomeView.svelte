@@ -279,8 +279,11 @@
       <ul class="auto-list">
         {#each automations as a (a.id)}
           <li class="auto-row" class:paused={a.paused} title={a.lastError ?? ""}>
-            <span class="a-status s-{statusWord(a.lastStatus)}">{statusWord(a.lastStatus)}</span>
-            <span class="a-name">{a.name}{#if a.monitorState}<span class="a-mode a-monitor {monitorClass(a.monitorState)}" title={a.verdictNote ?? ""}>monitor · {a.monitorState}</span>{:else}<span class="a-mode">{a.mode}</span>{/if}{#if a.retryOnInterrupt}<span class="a-retry" title="re-runs once if an app crash/restart interrupts it">retry</span>{/if}</span>
+            <!-- headless-agent-automations R9: a live headless run has no tab
+                 or agent-list row, so the status chip carries its elapsed time
+                 (`running · 2m`) — the panel row is its primary surface. -->
+            <span class="a-status s-{statusWord(a.lastStatus)}">{statusWord(a.lastStatus)}{#if a.runningFor}&nbsp;· {a.runningFor}{/if}</span>
+            <span class="a-name">{a.name}{#if a.monitorState}<span class="a-mode a-monitor {monitorClass(a.monitorState)}" title={a.verdictNote ?? ""}>monitor · {a.monitorState}</span>{:else}<span class="a-mode" title={a.headless ? "dispatches closed-loop (claude -p, no pane)" : "dispatches as an interactive pane"}>{a.mode}{#if a.mode === "agent" && a.headless}&nbsp;· headless{/if}</span>{/if}{#if a.retryOnInterrupt}<span class="a-retry" title="re-runs once if an app crash/restart interrupts it">retry</span>{/if}</span>
             <span class="a-meta">
               <span class="a-sched">{a.schedule}</span>
               <span class="a-model" title="launch model · effort">{modelLabel(a)}</span>

@@ -361,6 +361,10 @@ pub type InterruptSink = Arc<dyn Fn(&InterruptedRun) + Send + Sync>;
 /// rides the existing alert machinery (the plan's KTD: no new attention
 /// producer). Always invoked **after** the store lock is released (KTD-B).
 /// Default no-op; `lib.rs` injects `surface_alert` itself.
+///
+/// Headless-agent-automations R6 widens the callers (not the seam): a
+/// **Failed** close on a headless non-monitor agent run rings through this
+/// same sink — the replacement for the pane path's kept-open failed tab.
 pub type MonitorAlertSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// How claimed runs leave the manager (KTD-C/E): the sweep claims + flushes
@@ -373,11 +377,16 @@ pub type MonitorAlertSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
 pub trait Dispatcher: Send + Sync {
     /// Start an agent run (U7: emit `automation://agent-run`). `launch` is the
     /// resolved model/effort/fallback (U4a) the pane should launch with.
+    /// `headless` is the **claimed row's** marker (headless-agent-automations
+    /// U3 — the routing truth, stamped at claim): `lib.rs`'s
+    /// `CompositeDispatcher` forks on it to the backend-owned
+    /// `claude -p` runner instead of the pane path.
     fn dispatch_agent(
         &self,
         automation: &Automation,
         run_id: &str,
         launch: &ResolvedLaunch,
+        headless: bool,
     ) -> Result<(), String>;
     /// Start a script run (U5: spawn the interpreter in its own group).
     fn dispatch_script(&self, automation: &Automation, run_id: &str) -> Result<(), String>;
@@ -397,6 +406,7 @@ impl Dispatcher for UnwiredDispatcher {
         _a: &Automation,
         _run_id: &str,
         _launch: &ResolvedLaunch,
+        _headless: bool,
     ) -> Result<(), String> {
         Err("dispatch not wired yet (U5/U7)".into())
     }
@@ -445,6 +455,7 @@ impl Dispatcher for AgentDispatcher {
         a: &Automation,
         run_id: &str,
         launch: &ResolvedLaunch,
+        _headless: bool,
     ) -> Result<(), String> {
         let prompt = match &a.mode {
             Mode::Agent { prompt, .. } => prompt.clone(),
@@ -520,6 +531,10 @@ pub enum CreateMode {
         /// through to the shared default / Claude's own default at dispatch.
         model: Option<String>,
         effort: Option<String>,
+        /// Dispatch disposition (headless-agent-automations U1/U2 — R1/R2):
+        /// `Some(true)` = `--headless`, `Some(false)` = `--paned`, `None` =
+        /// follow `config.automation_defaults.headless` at claim time.
+        headless: Option<bool>,
     },
     Script {
         content: String,
@@ -945,10 +960,12 @@ impl AutomationManager {
                 prompt,
                 model,
                 effort,
+                headless,
             } => Mode::Agent {
                 prompt,
                 model,
                 effort,
+                headless,
             },
             CreateMode::Script {
                 content,
@@ -1149,6 +1166,10 @@ impl AutomationManager {
         let run_id = mint_id();
         let alive = Arc::clone(&self.agent_pane_alive.lock().unwrap());
         let headless_alive = Arc::clone(&self.headless_check_alive.lock().unwrap());
+        // Headless-agent-automations KTD ("Resolution at claim, stamped
+        // once"): read the config default BEFORE the store lock — the
+        // usage-gate precedent for pre-lock config reads (KTD-B).
+        let headless_default = self.headless_default();
         // Phase 1 (KTD-D/R2): decide + record + FLUSH under one lock hold.
         // `None` = unknown id; the inner Result carries the claim outcome.
         let decision: Option<Result<ManualRun, String>> = flush_tolerant(
@@ -1166,8 +1187,9 @@ impl AutomationManager {
                 // unchanged (R23: no advance); claim() records
                 // scheduled_for: None for manual triggers.
                 let keep = a.next_run_at;
+                let resolved = a.mode.resolved_headless(headless_default);
                 Some(
-                    a.claim(keep, now, Trigger::Manual, &run_id)
+                    a.claim(keep, now, Trigger::Manual, &run_id, resolved)
                         .map(|()| ManualRun::Started {
                             run_id: run_id.clone(),
                         })
@@ -1445,9 +1467,31 @@ impl AutomationManager {
             );
         }
         let status = outcome_status(&outcome);
+        // Headless-agent-automations R6: a Failed close on a headless
+        // NON-monitor run rings through the alert seam — the replacement for
+        // the pane path's kept-open failed tab (there is no tab to keep).
+        // Capture the pieces before the close consumes the outcome; ring
+        // only when the row actually closed (never on the AlreadyClosed /
+        // NotFound no-ops), and before `run-closed` fires. Monitors keep
+        // their own accounting (per-failure silence, R7 escalation at the
+        // threshold); Succeeded closes stay silent (tab auto-close parity).
+        let failed_error = match &outcome {
+            RunOutcome::Failed { error, .. } => Some(error.clone()),
+            RunOutcome::Succeeded { .. } => None,
+        };
+        let row_headless = automation
+            .runs
+            .iter()
+            .find(|r| r.id == run_id)
+            .is_some_and(|r| r.headless);
         if self.close_run_stamping(&automation.id, run_id, outcome, session_id)
             == model::CloseResult::Closed
         {
+            if status == RunStatus::Failed && row_headless && !automation.monitor {
+                let sink = Arc::clone(&self.monitor_alert_sink.lock().unwrap());
+                let error = failed_error.unwrap_or_else(|| "failed".to_owned());
+                sink(&automation.name, &format!("{error} (run {run_id})"));
+            }
             self.emit_run_closed(&automation.id, run_id, status);
             if automation.monitor && status == RunStatus::Succeeded {
                 // R7, after the lock (KTD-B). Every Succeeded close on this
@@ -1859,6 +1903,13 @@ impl AutomationManager {
         let alive = Arc::clone(&self.agent_pane_alive.lock().unwrap());
         let headless_alive = Arc::clone(&self.headless_check_alive.lock().unwrap());
         let capacity = Arc::clone(&self.script_capacity.lock().unwrap());
+        // Headless-agent-automations KTD ("Resolution at claim, stamped
+        // once"): the config default is read BEFORE the store lock (the
+        // usage-gate precedent) and resolved per automation via
+        // `Mode::resolved_headless`; the claim stamps the row from it, and
+        // dispatch routes on the claimed row's marker — so marker and
+        // routing can never disagree.
+        let headless_default = self.headless_default();
         // Interrupt-resilience U2/R1: this tick's retry candidates, taken out of
         // the queue up front (no nested store↔queue lock). Agent retries that
         // can't run yet (frontend not ready) are collected into `requeue` and
@@ -1889,7 +1940,13 @@ impl AutomationManager {
             let agent_claim_possible = snap.values().any(|a| {
                 a.enabled
                     && a.mode.kind() == RunMode::Agent
-                    && (frontend_ready || a.monitor)
+                    // A headless-resolved claim passes the R5 readiness gate
+                    // (no event to drop), so it must consult the usage gate
+                    // even before the frontend is up (headless-agent-
+                    // automations R5).
+                    && (frontend_ready
+                        || a.monitor
+                        || a.mode.resolved_headless(headless_default))
                     && a.next_run_at.is_some_and(|t| t <= now_ms)
             }) || retry_ids.iter().any(|id| {
                 snap.get(id)
@@ -1972,12 +2029,15 @@ impl AutomationManager {
                 let due = a.enabled && a.next_run_at.is_some_and(|t| t <= now_ms);
                 if due {
                     let is_agent = a.mode.kind() == RunMode::Agent;
-                    if is_agent && !a.monitor && !frontend_ready {
+                    let resolved_headless = a.mode.resolved_headless(headless_default);
+                    if is_agent && !a.monitor && !resolved_headless && !frontend_ready {
                         // R5: defer — see the method doc. Deliberately no row,
                         // no advance, no event. Monitors pass (headless-
-                        // monitor-checks R6): their checks dispatch headless,
-                        // so there is no event for a listener-less webview
-                        // to drop.
+                        // monitor-checks R6), and so does any headless-
+                        // resolved agent claim (headless-agent-automations
+                        // R5 — same rationale): the dispatch is backend-
+                        // owned, so there is no event for a listener-less
+                        // webview to drop.
                     } else if in_flight_widened(a, &alive, &headless_alive) {
                         // R7/KTD-D pre-claim skip: record + STILL advance the
                         // schedule past the skipped occurrence.
@@ -2013,7 +2073,8 @@ impl AutomationManager {
                         // returning: persist-before-dispatch.
                         let advanced = advance_or_pause(a, now_ms);
                         let run_id = mint_id();
-                        match a.claim(advanced, now_ms, Trigger::Schedule, &run_id) {
+                        match a.claim(advanced, now_ms, Trigger::Schedule, &run_id, resolved_headless)
+                        {
                             Ok(()) => {
                                 to_dispatch.push((a.clone(), run_id));
                                 touched = true;
@@ -2055,10 +2116,16 @@ impl AutomationManager {
                     continue; // paused/disabled since recovery — drop the retry
                 }
                 // Monitors are carved out of the readiness deferral
-                // (headless-monitor-checks R6): a monitor retry dispatches
-                // headless, so it neither waits on nor requeues behind the
-                // frontend-ready gate.
-                if a.mode.kind() == RunMode::Agent && !a.monitor && !frontend_ready {
+                // (headless-monitor-checks R6), and so is any headless-
+                // resolved agent retry (headless-agent-automations R5): the
+                // dispatch is backend-owned, so it neither waits on nor
+                // requeues behind the frontend-ready gate.
+                let resolved_headless = a.mode.resolved_headless(headless_default);
+                if a.mode.kind() == RunMode::Agent
+                    && !a.monitor
+                    && !resolved_headless
+                    && !frontend_ready
+                {
                     requeue.push(rid.clone()); // defer until the frontend is up
                     continue;
                 }
@@ -2078,7 +2145,10 @@ impl AutomationManager {
                 }
                 let run_id = mint_id();
                 let keep = a.next_run_at;
-                if a.claim(keep, now_ms, Trigger::Retry, &run_id).is_ok() {
+                if a
+                    .claim(keep, now_ms, Trigger::Retry, &run_id, resolved_headless)
+                    .is_ok()
+                {
                     to_dispatch_retry.push((a.clone(), run_id));
                     changed.push(a.id.clone());
                 }
@@ -2287,10 +2357,30 @@ impl AutomationManager {
                 if launch.model.is_some() || launch.effort.is_some() {
                     self.set_run_launch(run_id, &launch);
                 }
-                dispatcher.dispatch_agent(automation, run_id, &launch)
+                // Headless-agent-automations U3: route on the CLAIMED row's
+                // marker — the one stamped by `Automation::claim` from the
+                // pre-lock resolution (never re-resolved here, so marker and
+                // routing cannot disagree). Every caller hands us the
+                // post-claim record, so the row is present; a missing row
+                // (impossible short of history-eviction races) falls back to
+                // the monitor bit, which the marker always contains.
+                let headless = automation
+                    .runs
+                    .iter()
+                    .find(|r| r.id == run_id)
+                    .map_or(automation.monitor, |r| r.headless);
+                dispatcher.dispatch_agent(automation, run_id, &launch, headless)
             }
             Mode::Script { .. } => dispatcher.dispatch_script(automation, run_id),
         }
+    }
+
+    /// Headless-agent-automations U3: the pre-lock config read for
+    /// [`crate::automations::model::Mode::resolved_headless`] — the effective
+    /// dispatch-disposition default (R1/R2, config
+    /// `automation_defaults.headless`).
+    fn headless_default(&self) -> bool {
+        self.config.lock().unwrap().get().automation_defaults.headless
     }
 
     /// U4a (R13): stamp the resolved launch model/effort onto a still-`Running`
@@ -2707,6 +2797,12 @@ pub fn automations_frontend_ready(manager: tauri::State<'_, Arc<AutomationManage
 #[serde(rename_all = "camelCase")]
 pub struct AutomationsDashboard {
     pub automations: Vec<Automation>,
+    /// The config dispatch-disposition default (headless-agent-automations
+    /// U4 — R9): `automation_defaults.headless`, carried on the wire so the
+    /// frontend can resolve each automation's effective disposition
+    /// (`monitor || (mode.headless ?? headlessDefault)`) exactly as the
+    /// claim does, without a second source of truth.
+    pub headless_default: bool,
     /// Monitor id → derived consecutive-infra-failure count (monitors only).
     pub infra_failures: std::collections::HashMap<String, usize>,
     /// The R7 broken threshold, mirrored from [`verdict::MONITOR_BROKEN_THRESHOLD`].
@@ -2741,6 +2837,7 @@ pub fn list_automations(
     let automations = manager.list();
     let infra_failures = monitor_infra_failures(&automations);
     AutomationsDashboard {
+        headless_default: manager.headless_default(),
         automations,
         infra_failures,
         monitor_broken_threshold: verdict::MONITOR_BROKEN_THRESHOLD,
@@ -2865,9 +2962,12 @@ mod tests {
         /// U4a: the resolved launch handed to each `dispatch_agent`.
         agent_launches: Mutex<Vec<ResolvedLaunch>>,
         /// Headless-monitor-checks U4 routing contract: the `monitor` flag
-        /// visible on the `Automation` each `dispatch_agent` received — what
-        /// lib.rs's CompositeDispatcher forks on (U5).
+        /// visible on the `Automation` each `dispatch_agent` received.
         agent_monitor: Mutex<Vec<bool>>,
+        /// Headless-agent-automations U3 routing contract: the claimed row's
+        /// `headless` marker the manager threaded to each `dispatch_agent` —
+        /// what lib.rs's CompositeDispatcher now forks on.
+        agent_headless: Mutex<Vec<bool>>,
     }
 
     impl FakeDispatcher {
@@ -2896,7 +2996,9 @@ mod tests {
             a: &Automation,
             run_id: &str,
             launch: &ResolvedLaunch,
+            headless: bool,
         ) -> Result<(), String> {
+            self.agent_headless.lock().unwrap().push(headless);
             self.agent_launches.lock().unwrap().push(launch.clone());
             self.agent_monitor.lock().unwrap().push(a.monitor);
             self.record(a, run_id, RunMode::Agent)
@@ -3021,12 +3123,33 @@ mod tests {
         }
     }
 
+    /// The pane-path agent fixture: explicitly `--paned`
+    /// (headless-agent-automations R2/AE3 — with the config default now
+    /// `true`, only an explicit `Some(false)` still exercises the pane
+    /// machinery these pre-existing tests pin: readiness deferral,
+    /// ack-timeout, deadline, run-closed tab lifecycle).
     fn agent_spec(name: &str) -> CreateSpec {
         CreateSpec {
             mode: CreateMode::Agent {
                 prompt: "summarize overnight CI".into(),
                 model: None,
                 effort: None,
+                headless: Some(false),
+            },
+            ..script_spec(name)
+        }
+    }
+
+    /// A plain `fly automation create` agent spec — no disposition pin, so
+    /// it follows the config default (`true`): the headless-agent-automations
+    /// AE1 shape.
+    fn default_agent_spec(name: &str) -> CreateSpec {
+        CreateSpec {
+            mode: CreateMode::Agent {
+                prompt: "summarize overnight CI".into(),
+                model: None,
+                effort: None,
+                headless: None,
             },
             ..script_spec(name)
         }
@@ -3168,7 +3291,7 @@ mod tests {
             store
                 .mutate(|map| {
                     let mut a = raw_automation("a1");
-                    a.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, Trigger::Schedule, "r1")
+                    a.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, Trigger::Schedule, "r1", false)
                         .unwrap();
                     map.insert(a.id.clone(), a);
                 })
@@ -3493,7 +3616,7 @@ mod tests {
             mode: CreateMode::Agent {
                 prompt: "audit".into(),
                 model: Some("opus".into()),
-                effort: Some("high".into()),
+                effort: Some("high".into()), headless: None,
             },
             ..script_spec("pinned")
         };
@@ -4029,7 +4152,7 @@ mod tests {
                 mode: CreateMode::Agent {
                     prompt: "check the run".into(),
                     model: Some("opus".into()),
-                    effort: Some("high".into()),
+                    effort: Some("high".into()), headless: None,
                 },
                 ..script_spec("train watch")
             })
@@ -4477,7 +4600,7 @@ mod tests {
                     a.monitor = true;
                     a.retry_on_interrupt = true;
                     a.mode = agent_mode();
-                    a.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, Trigger::Schedule, "r1")
+                    a.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, Trigger::Schedule, "r1", false)
                         .unwrap();
                     map.insert(a.id.clone(), a);
                 })
@@ -4711,10 +4834,10 @@ mod tests {
                     a.mode = Mode::Agent {
                         prompt: "x".into(),
                         model: None,
-                        effort: None,
+                        effort: None, headless: None,
                     };
                     // A terminal row carrying a pane_id from a prior launch.
-                    a.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, Trigger::Schedule, "r1")
+                    a.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, Trigger::Schedule, "r1", false)
                         .unwrap();
                     a.runs[0].pane_id = Some(3);
                     a.close(
@@ -4779,11 +4902,16 @@ mod tests {
         }
     }
 
+    /// Explicitly paned, like [`agent_spec`] (headless-agent-automations
+    /// R2/AE3): the interrupt-resilience tests below pin the pane retry
+    /// machinery (readiness deferral / requeue), which only an explicit
+    /// `Some(false)` still exercises under the headless config default.
     fn agent_mode() -> Mode {
         Mode::Agent {
             prompt: "audit".into(),
             model: None,
             effort: None,
+            headless: Some(false),
         }
     }
 
@@ -4802,7 +4930,7 @@ mod tests {
                 let mut a = raw_automation("a1");
                 a.retry_on_interrupt = retry_on_interrupt;
                 a.mode = mode;
-                a.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, trigger, "r1")
+                a.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, trigger, "r1", false)
                     .unwrap();
                 map.insert(a.id.clone(), a);
             })
@@ -5910,7 +6038,7 @@ mod tests {
                 retired_at: None,
                 pickup_pointers: None,
                 cwd: "/tmp".into(),
-                mode: Mode::Agent { prompt: "p".into(), model: None, effort: None },
+                mode: Mode::Agent { prompt: "p".into(), model: None, effort: None, headless: None },
                 origin: Origin {
                     pane_id: 1,
                     workspace_id: "ws-1".into(),
@@ -5930,10 +6058,10 @@ mod tests {
             output: None,
         };
         let mut plain = bare("a1", false);
-        plain.claim(Some(T0), T0, Trigger::Schedule, "r1").unwrap();
+        plain.claim(Some(T0), T0, Trigger::Schedule, "r1", false).unwrap();
         plain.close("r1", fail(), T0);
         let mut mon = bare("a2", true);
-        mon.claim(Some(T0), T0, Trigger::Schedule, "r1").unwrap();
+        mon.claim(Some(T0), T0, Trigger::Schedule, "r1", false).unwrap();
         mon.close("r1", fail(), T0);
 
         let map = monitor_infra_failures(&[plain, mon.clone()]);
@@ -5992,5 +6120,154 @@ mod tests {
         assert!(text.ends_with("… (truncated)"));
         assert!(text.len() <= BUNDLE_READ_CAP_BYTES + 32);
         assert!(text.starts_with('é'), "head kept");
+    }
+    // ---- headless-agent-automations U3: closed-loop regular agent runs -------
+
+    // AE1: a plain create under the default config claims with the row
+    // marked headless, dispatches through `dispatch_agent` with the marker
+    // threaded (lib.rs's CompositeDispatcher forks to the runner on it), and
+    // does all of that with the frontend-ready gate DOWN — a headless claim
+    // has no `automation://agent-run` event to drop, so it is carved out of
+    // the R5 deferral exactly like a monitor check.
+    #[test]
+    fn default_agent_claim_dispatches_headless_with_the_row_marked_ae1() {
+        let h = harness(); // frontend-ready deliberately never set
+        let id = create_due(&h, default_agent_spec("nightly audit"));
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 1, "not deferred behind frontend-ready");
+        assert_eq!(
+            *h.dispatcher.agent_headless.lock().unwrap(),
+            vec![true],
+            "the claimed row's marker rides dispatch_agent"
+        );
+        let runs = h.runs(&id);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].headless, "claim stamped the row (resolution at claim)");
+        assert_eq!(runs[0].status, RunStatus::Running);
+    }
+
+    // R2/AE3 counterpart: `--paned` pins the pane path — the readiness
+    // deferral still applies and the row stays unmarked (the byte-identical
+    // pane behavior is pinned by the whole pre-existing agent_spec suite;
+    // this asserts the resolution seam itself).
+    #[test]
+    fn paned_agent_claim_keeps_the_pane_path_and_readiness_deferral() {
+        let h = harness();
+        let id = create_due(&h, agent_spec("nightly audit"));
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 0, "paned claim defers until frontend-ready");
+
+        h.mgr.set_frontend_ready();
+        h.sweep();
+        assert_eq!(h.dispatcher.count(), 1);
+        assert_eq!(*h.dispatcher.agent_headless.lock().unwrap(), vec![false]);
+        assert!(!h.runs(&id)[0].headless, "row unmarked — pane machinery owns it");
+    }
+
+    // Manual runs resolve the disposition exactly like the sweep (one
+    // resolution seam, applied at claim).
+    #[test]
+    fn manual_run_resolves_headless_like_the_sweep() {
+        let h = harness();
+        let created = h.mgr.create(default_agent_spec("adhoc")).expect("create");
+        let id = created.automation.id;
+        h.mgr.manual_run(&id).expect("manual run starts");
+        assert_eq!(*h.dispatcher.agent_headless.lock().unwrap(), vec![true]);
+        assert!(h.runs(&id)[0].headless);
+    }
+
+    // Usage-limit parity (R5): a headless occurrence at an exhausted window
+    // is skip-deferred pre-claim exactly like a paned one — and because a
+    // headless claim passes the readiness gate, the gate IS consulted even
+    // while the frontend is down (the peek widened with the resolution).
+    #[test]
+    fn usage_gate_defers_a_headless_claim_even_before_frontend_ready() {
+        let h = harness(); // frontend-ready never set
+        let (gate, cell, calls) = fake_usage_gate();
+        *cell.lock().unwrap() = Some(T0 + 13 * FIVE_MIN);
+        h.mgr.set_usage_gate(gate);
+        let id = create_due(&h, default_agent_spec("nightly audit"));
+
+        h.sweep();
+        assert!(calls.load(Ordering::SeqCst) >= 1, "gate consulted despite frontend down");
+        assert_eq!(h.dispatcher.count(), 0, "at-limit: nothing dispatches");
+        let runs = h.runs(&id);
+        assert_eq!(runs[0].status, RunStatus::Skipped);
+        assert_eq!(runs[0].error.as_deref(), Some(SKIP_USAGE_LIMIT));
+        assert!(!runs[0].headless, "a skip never dispatched — marker unset");
+    }
+
+    // AE2/R6: a Failed headless close on a NON-monitor rings the alert seam
+    // once — `name` + a line carrying the error and run id — replacing the
+    // kept-open failed tab as the failure surface. A second (already-closed)
+    // report never re-rings.
+    #[test]
+    fn failed_headless_close_rings_the_alert_sink_once_ae2() {
+        let h = harness();
+        let id = create_due(&h, default_agent_spec("nightly audit"));
+        h.sweep();
+        let run_id = h.runs(&id)[0].id.clone();
+
+        h.mgr.close_headless_run(
+            &id,
+            &run_id,
+            headless::CheckOutcome::Infra {
+                reason: "exit status 1 with no result event".into(),
+            },
+        );
+        {
+            let alerts = h.monitor_alerts.lock().unwrap();
+            assert_eq!(alerts.len(), 1, "exactly one ring");
+            assert_eq!(alerts[0].0, "nightly audit");
+            assert!(
+                alerts[0].1.contains("exit status 1") && alerts[0].1.contains(&run_id),
+                "line names the error and run id: {}",
+                alerts[0].1
+            );
+        }
+        assert_eq!(h.runs(&id)[0].status, RunStatus::Failed);
+
+        // Idempotence: the row is terminal — no second ring.
+        h.mgr.close_headless_run(
+            &id,
+            &run_id,
+            headless::CheckOutcome::Infra { reason: "late".into() },
+        );
+        assert_eq!(h.monitor_alerts.lock().unwrap().len(), 1);
+    }
+
+    // AE4/R7/R8: a Succeeded headless close is silent (tab auto-close
+    // parity), stamps output + sessionId from the stream, and NEVER
+    // verdict-parses — a well-formed ```verdict block in a non-monitor's
+    // output is just text: nothing retires, nothing escalates.
+    #[test]
+    fn succeeded_headless_close_is_silent_and_never_verdict_parses_ae4() {
+        let h = harness();
+        let id = create_due(&h, default_agent_spec("nightly audit"));
+        h.sweep();
+        let run_id = h.runs(&id)[0].id.clone();
+
+        let text = "done\n```verdict\nPASS\nall good\n```";
+        h.mgr.close_headless_run(
+            &id,
+            &run_id,
+            headless::CheckOutcome::Clean {
+                text: text.into(),
+                session_id: Some("sess-9".into()),
+            },
+        );
+        assert!(h.monitor_alerts.lock().unwrap().is_empty(), "success is silent");
+        let runs = h.runs(&id);
+        assert_eq!(runs[0].status, RunStatus::Succeeded);
+        assert_eq!(runs[0].output.as_deref(), Some(text), "stream result captured");
+        assert_eq!(runs[0].session_id.as_deref(), Some("sess-9"), "R10 handle stamped");
+        assert!(runs[0].verdict.is_none(), "no verdict parse off-monitor (R8)");
+        let a = h.mgr.list().into_iter().find(|a| a.id == id).unwrap();
+        assert_eq!(a.retired_at, None, "nothing retires (R8)");
+        assert_eq!(
+            h.run_closed.lock().unwrap().last(),
+            Some(&(run_id, RunStatus::Succeeded)),
+            "run-closed still fires for the frontend lifecycle"
+        );
     }
 }

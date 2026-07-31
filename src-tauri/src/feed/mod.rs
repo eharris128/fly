@@ -311,6 +311,7 @@ mod tests {
             timezone: "UTC".into(),
             enabled: true,
             monitor: false,
+            headless: false,
             next_run_at: None,
             last_status: None,
             last_run_at: None,

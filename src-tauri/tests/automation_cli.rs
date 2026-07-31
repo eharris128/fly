@@ -212,7 +212,7 @@ fn create_persists_agent_model_and_effort_and_defaults_to_none_r9_r10() {
         Mode::Agent {
             ref prompt,
             ref model,
-            ref effort,
+            ref effort, headless: None,
         } => {
             assert_eq!(prompt, "audit disk");
             assert_eq!(model.as_deref(), Some("opus"));
@@ -702,4 +702,44 @@ fn monitor_create_over_socket_round_trips_flags_and_stores_pointers_r11() {
         }
         other => panic!("expected agent mode, got {other:?}"),
     }
+}
+
+// Headless-agent-automations U2 (R1/R2/R12): the wire's tri-state `headless`
+// persists onto the stored Mode::Agent (an explicit `--paned` false is an
+// override that must survive), and the untrusted-wire rejections mirror the
+// CLI's: any disposition pin with --monitor, or with a script, refuses.
+#[test]
+fn create_persists_headless_tri_state_and_rejects_bad_combinations() {
+    use fly_lib::automations::model::Mode;
+    let (mgr, _d) = manager();
+
+    // --paned rides the wire and lands as Some(false).
+    let mut req = create_req("tok");
+    req.headless = Some(false);
+    let paned = dispatch_automation_op(&mgr, 1, "ws", false, req, &no_pointers);
+    assert!(paned.ok, "{paned:?}");
+    let a = mgr.get(&paned.id.unwrap()).unwrap();
+    match a.mode {
+        Mode::Agent { headless, .. } => assert_eq!(headless, Some(false)),
+        other => panic!("expected agent mode, got {other:?}"),
+    }
+
+    // A disposition pin on a monitor create refuses (redundant/contradictory).
+    let mut req = create_req("tok");
+    req.name = Some("mon".into());
+    req.monitor = true;
+    req.headless = Some(true);
+    let resp = dispatch_automation_op(&mgr, 1, "ws", false, req, &|| Some(sock_pointers()));
+    assert!(!resp.ok);
+    assert!(resp.error.unwrap().contains("always headless"));
+
+    // A disposition pin on a script create refuses (agent-only).
+    let mut req = create_req("tok");
+    req.name = Some("scripted".into());
+    req.prompt = None;
+    req.script = Some("echo hi".into());
+    req.headless = Some(true);
+    let resp = dispatch_automation_op(&mgr, 1, "ws", false, req, &no_pointers);
+    assert!(!resp.ok);
+    assert!(resp.error.unwrap().contains("agent-mode only"));
 }

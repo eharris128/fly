@@ -102,6 +102,16 @@ pub struct AutomationDefaults {
     /// into an exhausted window. The gate is fail-open (KTD3) — this knob
     /// exists to switch even the *attempt* off, not to make it safe.
     pub usage_gate: bool,
+    /// Headless-agent-automations plan (R1/R2): the dispatch-disposition
+    /// default for **agent-mode** automations that don't pin one
+    /// (`--headless`/`--paned`). Ships **`true`** — closed-loop `claude -p`
+    /// dispatch is the stated direction, and this knob (not a migration) is
+    /// the escape hatch: applied at claim time, so flipping it flips every
+    /// non-explicit automation at once. Existing automations therefore go
+    /// headless on upgrade unless created `--paned`; their failure surface
+    /// moves from the kept-open failed tab to the alert ring (R6). Scripts
+    /// and monitors ignore it (monitors are unconditionally headless).
+    pub headless: bool,
 }
 
 impl Default for AutomationDefaults {
@@ -111,6 +121,7 @@ impl Default for AutomationDefaults {
             effort: None,
             fallback_model: "sonnet".into(),
             usage_gate: true,
+            headless: true,
         }
     }
 }
@@ -341,6 +352,23 @@ mod tests {
         assert!(!c.automation_defaults.usage_gate);
         let v = serde_json::to_value(&c).unwrap();
         assert_eq!(v["automationDefaults"]["usageGate"], false);
+    }
+
+    // Headless-agent-automations R1/R2/R12: the dispatch-disposition default
+    // ships ON (closed-loop is the direction — a legacy config with no key
+    // flips its non-explicit agent automations headless on upgrade), can be
+    // switched off in the file, and round-trips camelCase.
+    #[test]
+    fn headless_defaults_on_and_can_be_disabled() {
+        assert!(AutomationDefaults::default().headless);
+        let legacy: Config =
+            serde_json::from_str(r#"{"automationDefaults":{"model":"opus"}}"#).unwrap();
+        assert!(legacy.automation_defaults.headless, "absent key ⇒ the new default");
+        let c: Config =
+            serde_json::from_str(r#"{"automationDefaults":{"headless":false}}"#).unwrap();
+        assert!(!c.automation_defaults.headless);
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["automationDefaults"]["headless"], false);
     }
 
     // U3: the shared defaults round-trip under camelCase.

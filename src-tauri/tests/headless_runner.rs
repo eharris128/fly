@@ -44,7 +44,7 @@ fn monitor_automation(id: &str, cwd: &str, prompt: &str) -> Automation {
         retired_at: None,
         pickup_pointers: None,
         cwd: cwd.into(),
-        mode: Mode::Agent { prompt: prompt.into(), model: None, effort: None },
+        mode: Mode::Agent { prompt: prompt.into(), model: None, effort: None, headless: None },
         origin: Origin { pane_id: 1, workspace_id: "ws-1".into(), label: "test".into() },
         created_at: 0,
         updated_at: 0,

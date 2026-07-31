@@ -266,6 +266,13 @@ export interface RunRow {
   /** Durable failure-bundle path for a FAIL verdict (monitor-handoff R15);
    * null otherwise (including a PASS, or a failed bundle write). */
   bundlePath: string | null;
+  /** Closed-loop dispatch marker (headless-monitor-checks U2, widened by
+   * headless-agent-automations R1): true when this run is a backend-owned
+   * `claude -p` child — no pane, no tab. */
+  headless: boolean;
+  /** The headless run's Claude session id (stamped at close from the stream's
+   * init event); absent/null for pane runs (headless-agent-automations R10). */
+  sessionId?: string | null;
   output: string | null;
   exitCode: number | null;
   /** Failure detail for `failed` rows; the skip reason for `skipped` rows. */
@@ -284,6 +291,10 @@ export type AutomationSpec =
        * default / Claude's own default resolved at dispatch. */
       model: string | null;
       effort: string | null;
+      /** Dispatch disposition (headless-agent-automations R1): true =
+       * `--headless`, false = `--paned`, null = follow the config default
+       * (`AutomationsDashboard.headlessDefault`) at claim time. */
+      headless: boolean | null;
     }
   | { kind: "script"; scriptFile: string; interpreter: string; timeoutMs: number };
 
@@ -338,6 +349,10 @@ export interface Automation {
  */
 export interface AutomationsDashboard {
   automations: Automation[];
+  /** The config dispatch-disposition default (headless-agent-automations R9):
+   * `automationDefaults.headless`, so the panel resolves each automation's
+   * effective disposition exactly as the claim does. */
+  headlessDefault: boolean;
   /** Monitor id → derived consecutive-infra-failure count (monitors only). */
   infraFailures: Record<string, number>;
   /** Mirrors Rust `verdict::MONITOR_BROKEN_THRESHOLD`. */

@@ -174,6 +174,10 @@ export interface AutomationEntry {
   enabled: boolean;
   /** Whether this automation is a monitor (bounded healthcheck) — U6. */
   monitor: boolean;
+  /** Effective closed-loop disposition (headless-agent-automations R11):
+   * true when its runs are backend-owned `claude -p` children (no pane).
+   * Additive — an older backend omits it, so read it absent-tolerant. */
+  headless?: boolean;
   nextRunAt: number | null;
   lastStatus: string | null;
   lastRunAt: number | null;

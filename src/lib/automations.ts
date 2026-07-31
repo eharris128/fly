@@ -87,6 +87,16 @@ export interface AutomationRow {
   lastRunModel: string | null;
   /** The effort the last run actually launched with, or null. */
   lastRunEffort: string | null;
+  /** Effective dispatch disposition (headless-agent-automations U4 — R9):
+   * `monitor || (mode.headless ?? headlessDefault)` — true when a run of this
+   * automation is a backend-owned closed-loop `claude -p` child (no pane, no
+   * tab; the panel row is its primary surface). */
+  headless: boolean;
+  /** Live elapsed time for a still-`running` last run (`"2m"`), or null when
+   * the last run is terminal / never run — the R9 `running · 2m` read: a
+   * headless run has no tab or agent-list row to find, so the panel row must
+   * say how long it has been going. */
+  runningFor: string | null;
   /** Monitor flavor bit (monitor-handoff U7); false for ordinary automations. */
   monitor: boolean;
   /** Derived monitor state (R18); null for non-monitors (they render mode tags). */
@@ -113,11 +123,14 @@ export interface AutomationRow {
  * (injected for tests). `monitor` carries the DTO's backend-derived
  * broken-monitor inputs; omitting it (legacy callers/tests) just means no
  * broken state can derive — every other monitor state still does.
+ * `headlessDefault` is the DTO's config dispatch-disposition default
+ * (headless-agent-automations R9); omitted ⇒ `true`, the shipped default.
  */
 export function automationsToRows(
   automations: Automation[],
   nowMs: number,
   monitor?: MonitorDerivation,
+  headlessDefault: boolean = true,
 ): AutomationRow[] {
   const sorted = [...automations].sort(
     (a, b) =>
@@ -125,7 +138,7 @@ export function automationsToRows(
       (a.nextRunAt ?? 0) - (b.nextRunAt ?? 0) ||
       a.name.localeCompare(b.name),
   );
-  return sorted.map((a) => toRow(a, nowMs, monitor));
+  return sorted.map((a) => toRow(a, nowMs, monitor, headlessDefault));
 }
 
 /**
@@ -189,6 +202,7 @@ function toRow(
   a: Automation,
   nowMs: number,
   monitor?: MonitorDerivation,
+  headlessDefault: boolean = true,
 ): AutomationRow {
   // Last-run state is *derived* from the history's last row (R25) — no separate
   // mirror to drift, matching the Rust model's `last_run()`.
@@ -201,10 +215,20 @@ function toRow(
   // The durable verdict record (monitor-handoff R4): outcome/note/bundle come
   // from the newest verdict-bearing row, not necessarily the last run.
   const vRun = a.monitor ? verdictRun(a) : null;
+  // Effective dispatch disposition (headless-agent-automations R9), the
+  // claim's own resolution mirrored: monitors force headless; an agent
+  // automation follows its pin or the config default; scripts never.
+  const headless =
+    a.monitor || (a.mode.kind === "agent" && (a.mode.headless ?? headlessDefault));
   return {
     id: a.id,
     name: a.name,
     mode: a.mode.kind,
+    headless,
+    runningFor:
+      last?.status === "running" && last.startedAt != null
+        ? elapsedShort(nowMs - last.startedAt)
+        : null,
     schedule: humanSchedule(a.cron, a.timezone),
     paused: a.nextRunAt == null,
     retryOnInterrupt: a.retryOnInterrupt,
@@ -260,6 +284,20 @@ function coarseCron(cron: string): string {
     if (fixed(dom) && wild(mon) && wild(dow)) return "monthly";
   }
   return raw;
+}
+
+/**
+ * Compact elapsed form for a live running row (headless-agent-automations
+ * R9): `"<1m"`, `"12m"`, `"1h 05m"` — terse on purpose (it sits inside
+ * `running · X` on a dense panel row, unlike the prose `relativeTime`).
+ * Negative deltas (clock skew) clamp to `"<1m"`.
+ */
+export function elapsedShort(deltaMs: number): string {
+  const mins = Math.floor(Math.max(0, deltaMs) / 60_000);
+  if (mins < 1) return "<1m";
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  return `${hours}h ${String(mins % 60).padStart(2, "0")}m`;
 }
 
 /** Full/singular unit word, e.g. `plural(1, "minute") === "minute"`. */
