@@ -156,9 +156,14 @@
     }
   }
 
-  // Flow control (KTD4).
-  const HIGH_WATERMARK = 2 * 1024 * 1024;
-  const LOW_WATERMARK = 512 * 1024;
+  // Flow control (KTD4). Tightened 2026-08-04 (was 2 MiB / 512 KiB): the high
+  // watermark bounds how much un-parsed output can queue into xterm on the
+  // main thread per pane before the backend pauses the PTY — at flood rates
+  // 2 MiB was multiple seconds of buffered work, which is exactly the queued
+  // backlog behind multi-second input lag. 256 KiB still amortizes the
+  // pause/resume round trip while capping the worst-case queue ~8× tighter.
+  const HIGH_WATERMARK = 256 * 1024;
+  const LOW_WATERMARK = 64 * 1024;
   let unacked = 0;
   let paused = false;
 

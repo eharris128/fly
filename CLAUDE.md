@@ -150,8 +150,12 @@ time/inputs as arguments so they're tested without a running app.
   pane↔attention/focus wiring + Tauri commands. ("No transcoding" (KTD3) is
   **lossless but not literal**: tauri 2.11.3 re-encodes a `Raw` chunk under
   1024 bytes as a JSON number array in an `eval()` — exact bytes, ~3.4× wire
-  cost, and the path every interactive repaint takes. See the foundation plan's
-  2026-07-28 KTD3 addendum and T1 of the performance-audit note.)
+  cost. See the foundation plan's 2026-07-28 KTD3 addendum.) `coalesce.rs`
+  (performance-audit T1, landed 2026-08-04) batches PTY reads per pane before
+  the channel on a **visibility-aware deadline** — ~4 ms visible, ~250 ms
+  hidden (retuned by `set_visible_panes`), 64 KiB size trip — so interactive
+  repaints ride the ≥ 1 KiB raw path instead of one eval per read, and hidden
+  panes cost ~4 main-thread wakeups/s each under flood.
 - `state/` — the pure state machines (`lifecycle`, `attention`) + the output
   `activity` tracker + suppression policy (`policy.rs`) + per-pane `manager`.
 - `hooks/` — the authenticated socket **(the security boundary)**: `token`,

@@ -28,6 +28,16 @@ Priority tiers: **P1** = measurable steady-state cost, worth scheduling.
 ## P1 — steady-state costs
 
 ### T1 — Coalesce PTY output chunks before the Tauri channel
+
+> **Done 2026-08-04** — `stream/coalesce.rs`: per-pane forwarder thread,
+> flush on a visibility-aware deadline (~4 ms for visible panes, ~250 ms for
+> hidden ones — the visible set already replicated via `set_visible_panes`
+> retunes it) or a 64 KiB size trip, whichever first; drain-before-exit-event;
+> ordering preserved (one forwarder, one channel). Went beyond the entry below
+> by making the deadline visibility-aware, which also bounds the *hidden*-pane
+> VT-parse wakeups to ~4/s per pane. The frontend watermarks were tightened in
+> the same change (2 MiB/512 KiB → 256 KiB/64 KiB) to cap per-pane queued
+> backlog. Original entry kept for the measurements:
 - **Where:** `stream/mod.rs` (the channel sink in `spawn_pane`, ~:147).
 - **What today:** the read thread calls `channel.send(InvokeResponseBody::Raw(...))`
   once per PTY `read()`. Verified in the vendored tauri 2.11.3 `ipc/channel.rs`:
@@ -258,8 +268,9 @@ off when that lands.
   clock read; never touches registry/attention locks or Tauri state; bytes
   sent before bookkeeping.
 - **Backpressure** is lossless and zero-CPU: condvar-parked read thread,
-  kernel PTY buffer holds the child, 2 MiB/512 KiB frontend watermarks via
-  xterm write-completion callbacks.
+  kernel PTY buffer holds the child, 256 KiB/64 KiB frontend watermarks
+  (tightened from 2 MiB/512 KiB with T1, 2026-08-04) via xterm
+  write-completion callbacks.
 - **Hidden panes are cheap**: `display:none` + xterm 5.5's
   IntersectionObserver pauses rendering (VT-parse cost only, necessary for
   buffer state); ResizeObservers early-out at zero size; reveal costs one

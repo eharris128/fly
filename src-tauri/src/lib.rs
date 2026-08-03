@@ -237,6 +237,9 @@ pub fn run() {
         .manage(tokens)
         .manage(attention)
         .manage(launch_mode)
+        // Per-pane output coalescers (performance-audit T1): spawn_pane
+        // registers, set_visible_panes retunes flush deadlines.
+        .manage(Arc::new(stream::coalesce::CoalescerRegistry::default()))
         .setup(move |app| {
             // A dev flavor (FLY_APP_NAME set) gets a distinct title so it's
             // obvious which window is the throwaway dev build next to a stable

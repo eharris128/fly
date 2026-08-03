@@ -24,8 +24,12 @@ deepened: 2026-06-16
 > flood. So: raw bytes are lossless end-to-end as designed, and "no transcoding"
 > is true for bursts and false for the idle-agent-thinking case. The fix is
 > `T1` in `docs/notes/2026-07-23-performance-audit-follow-ups.md` (coalesce
-> chunks in fly's own sink to push traffic over the threshold); this addendum
-> stands until that lands.
+> chunks in fly's own sink to push traffic over the threshold).
+> **Landed 2026-08-04** (`stream/coalesce.rs`): a per-pane forwarder batches
+> PTY reads on a visibility-aware deadline (~4 ms visible, ~250 ms hidden,
+> 64 KiB size trip) before they reach the channel, so sub-1 KiB eval-path
+> messages are the exception rather than the per-read norm. Tauri's small-chunk
+> behavior itself is unchanged; this addendum documents it.
 
 ## Summary
 

@@ -5,11 +5,15 @@
 //! a token (injected into its env), is registered with the attention manager,
 //! and is cleaned up on exit.
 
+pub mod coalesce;
+
 use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, Manager, State};
+
+use coalesce::{Coalescer, CoalescerRegistry};
 
 use crate::hooks::{HookServer, TokenRegistry};
 use crate::pty::{PaneId, PtyManager, SpawnConfig};
@@ -107,6 +111,7 @@ pub fn spawn_pane(
     tokens: State<'_, Arc<TokenRegistry>>,
     attention: State<'_, Arc<AttentionManager>>,
     server: State<'_, HookServer>,
+    coalescers: State<'_, Arc<CoalescerRegistry>>,
     channel: Channel<InvokeResponseBody>,
     rows: u16,
     cols: u16,
@@ -144,22 +149,34 @@ pub fn spawn_pane(
     let socket_path = server.socket_path().to_string_lossy().into_owned();
 
     // Raw bytes end-to-end (KTD3) — lossless, but only literally untranscoded
-    // above 1 KiB. Tauri 2.11.3 (`ipc/channel.rs:163`) re-encodes a
-    // `Raw` chunk **< 1024 bytes** as a JSON array of decimal numbers inside an
-    // `eval()`; ≥ 1024 rides the fetch path as real bytes. The small path
-    // round-trips the bytes exactly (no UTF-8 or escape-sequence damage — KTD3's
-    // actual concern), but costs ~3.4× on the wire plus one eval, and it is the
-    // path *every* interactive repaint takes (a spinner produces ~50-byte
-    // reads). Coalescing here is T1 of the 2026-07-23 performance audit.
-    let sink = Box::new(move |bytes: &[u8]| {
-        let _ = channel.send(InvokeResponseBody::Raw(bytes.to_vec()));
+    // above 1 KiB: Tauri 2.11.3 (`ipc/channel.rs:163`) re-encodes a `Raw`
+    // chunk **< 1024 bytes** as a JSON number array inside an `eval()` (~3.4×
+    // wire cost, exact bytes), and interactive repaints are exactly many
+    // sub-1 KiB reads. The per-pane coalescer (T1 of the 2026-07-23
+    // performance audit — see `coalesce.rs`) batches reads on a
+    // visibility-aware deadline before they hit the channel, so most traffic
+    // rides the ≥ 1 KiB raw path and the webview sees a few messages per pane
+    // per second instead of one per PTY read. One forwarder per pane, one
+    // channel — ordering is preserved.
+    let coalescer = Coalescer::spawn(id.0, move |bytes: Vec<u8>| {
+        let _ = channel.send(InvokeResponseBody::Raw(bytes));
     });
+    let sink = {
+        let coalescer = Arc::clone(&coalescer);
+        Box::new(move |bytes: &[u8]| coalescer.push(bytes))
+    };
 
     let on_exit = {
         let app = app.clone();
         let attention = Arc::clone(attention.inner());
         let tokens = Arc::clone(tokens.inner());
+        let coalescer = Arc::clone(&coalescer);
+        let coalescers = Arc::clone(coalescers.inner());
         Box::new(move |id: PaneId, state: LifecycleState| {
+            // Drain + stop the coalescer before anything is announced, so the
+            // pane's final output reaches the frontend ahead of the exit note.
+            coalescer.close();
+            coalescers.remove(id.0);
             // Exiting clears attention and tears down the pane's auth.
             if let Some(outcome) = attention.on_exit(id) {
                 emit_attention(&app, id, &outcome);
@@ -208,18 +225,34 @@ pub fn spawn_pane(
         ..Default::default()
     };
 
-    pty.spawn_with_id(id, cfg, token, sink, on_exit)
+    // Register before the spawn: the read thread only touches the registry on
+    // its exit path, so insert-before-spawn guarantees removal follows
+    // insertion even for a child that dies instantly.
+    coalescers.insert(id.0, Arc::clone(&coalescer));
+    match pty.spawn_with_id(id, cfg, token, sink, on_exit) {
+        Ok(pane) => Ok(pane),
+        Err(e) => {
+            coalescers.remove(id.0);
+            coalescer.close(); // stop the forwarder thread; nothing to drain
+            Err(e)
+        }
+    }
 }
 
 /// Replicate the set of visible panes — the active tab's leaves in the active
 /// workspace (U17). Generalizes the old per-pane keyboard-focus replication:
-/// any visible pane counts as "looking" for the Acknowledged transition.
+/// any visible pane counts as "looking" for the Acknowledged transition. Also
+/// retunes every pane's output-coalescing deadline (fast for visible panes,
+/// slow for hidden — see `coalesce.rs`).
 #[tauri::command]
 pub fn set_visible_panes(
     app: AppHandle,
     attention: State<'_, Arc<AttentionManager>>,
+    coalescers: State<'_, Arc<CoalescerRegistry>>,
     pane_ids: Vec<PaneId>,
 ) {
+    let ids: Vec<u64> = pane_ids.iter().map(|p| p.0).collect();
+    coalescers.set_visible_panes(&ids);
     for (pane, outcome) in attention.set_visible_panes(&pane_ids) {
         emit_attention(&app, pane, &outcome);
     }
