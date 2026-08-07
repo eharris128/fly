@@ -122,7 +122,16 @@ pub const ERR_SPAWN_ACK: &str = "spawn ack timeout";
 /// **keeps** the linked `pane_id`, so R7's alive-probe treats a genuinely
 /// stuck-but-alive agent as still in flight (no fan-out); a dead pane's row
 /// simply stays terminal.
-pub const RUN_DEADLINE_MS: u64 = 30 * 60 * 1000;
+///
+/// Raised 30 -> 90 min on 2026-08-07. A real pipeline stage outgrew it: an
+/// analysis agent that fans out one sub-agent per candidate runs for tens of
+/// minutes on a heavy day, and 30 min killed it mid-work. Note this is a
+/// GLOBAL bound — agent mode has no per-automation timeout knob (`--timeout`
+/// is script-mode only), so raising it lengthens the leash for every agent
+/// automation including monitors, where the only cost is that a genuinely
+/// hung check takes longer to be reaped. If per-automation agent timeouts
+/// ever land, this should become their clamp rather than the value itself.
+pub const RUN_DEADLINE_MS: u64 = 90 * 60 * 1000;
 
 /// Headless backstop slack (U2 of
 /// `docs/plans/2026-07-11-003-feat-headless-monitor-checks-plan.md` — R7).

@@ -1435,10 +1435,30 @@ pub fn dispatch_automation_op(
                         "--headless/--paned are agent-mode only (a prompt, not a script)",
                     );
                 }
+                // A timeout the dispatcher will never honour must be REFUSED,
+                // not quietly stored. `clamp_timeout_ms` bounds the stored
+                // value at run time (the store is same-UID-writable), so
+                // without this check `create` accepts e.g. 75 min, the store
+                // reports 75 min and `show` prints 75 min while every run is
+                // killed at the ceiling — three surfaces agreeing on a number
+                // that is not the one enforced. That cost a real debugging
+                // session on 2026-08-07: a scheduled job was "fixed" by
+                // raising its timeout, verified on all three surfaces, and
+                // went on dying at the old limit.
+                let timeout_ms = req.timeout_ms.unwrap_or(automations::script::TIMEOUT_DEFAULT_MS);
+                if timeout_ms > automations::script::TIMEOUT_MAX_MS {
+                    return AutomationResponse::err(format!(
+                        "--timeout {}ms exceeds the maximum {}ms ({} min); \
+                         it would be silently clamped at run time",
+                        timeout_ms,
+                        automations::script::TIMEOUT_MAX_MS,
+                        automations::script::TIMEOUT_MAX_MS / 60_000,
+                    ));
+                }
                 CreateMode::Script {
                     content,
                     interpreter: req.interpreter.unwrap_or_else(|| "bash".to_string()),
-                    timeout_ms: req.timeout_ms.unwrap_or(120_000),
+                    timeout_ms,
                 }
             } else {
                 return AutomationResponse::err("create requires a prompt or a script");

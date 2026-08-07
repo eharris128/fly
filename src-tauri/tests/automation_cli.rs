@@ -743,3 +743,45 @@ fn create_persists_headless_tri_state_and_rejects_bad_combinations() {
     assert!(!resp.ok);
     assert!(resp.error.unwrap().contains("agent-mode only"));
 }
+
+/// A timeout the dispatcher would silently clamp must be REFUSED at create.
+///
+/// The regression this pins, from 2026-08-07: a scheduled job was "fixed" by
+/// recreating it with `--timeout 4500000` (75 min). `create` accepted it, the
+/// store recorded it, and `show` printed it — three surfaces agreeing on a
+/// number that `clamp_timeout_ms` then ignored at every dispatch, so the job
+/// went on being killed at the old ceiling. A silently-unhonoured value is
+/// worse than a rejected one: it reads as a fix and is not one.
+#[test]
+fn create_rejects_a_timeout_above_the_dispatch_ceiling() {
+    use fly_lib::automations::model::Mode;
+    use fly_lib::automations::script::TIMEOUT_MAX_MS;
+    let (mgr, _d) = manager();
+    let no_pointers = || None;
+
+    let script_req = |ms: u64| {
+        let mut req = create_req("tok");
+        req.prompt = None;
+        req.script = Some("echo hi".into());
+        req.timeout_ms = Some(ms);
+        req
+    };
+
+    // Over the ceiling: refused, and the message names both numbers so the
+    // author can see the gap rather than guessing at it.
+    let resp = dispatch_automation_op(&mgr, 1, "ws", false, script_req(TIMEOUT_MAX_MS + 1), &no_pointers);
+    assert!(!resp.ok, "over-ceiling timeout must not be accepted: {resp:?}");
+    let err = resp.error.unwrap();
+    assert!(err.contains("exceeds the maximum"), "got: {err}");
+    assert!(err.contains(&TIMEOUT_MAX_MS.to_string()), "message names the cap: {err}");
+
+    // Exactly at the ceiling is accepted AND stored verbatim — the boundary is
+    // honoured, not clamped, so "accepted" and "enforced" mean the same thing.
+    let resp = dispatch_automation_op(&mgr, 1, "ws", false, script_req(TIMEOUT_MAX_MS), &no_pointers);
+    assert!(resp.ok, "a timeout at the ceiling is valid: {resp:?}");
+    let a = mgr.get(&resp.id.unwrap()).unwrap();
+    match a.mode {
+        Mode::Script { timeout_ms, .. } => assert_eq!(timeout_ms, TIMEOUT_MAX_MS),
+        other => panic!("expected script mode, got {other:?}"),
+    }
+}

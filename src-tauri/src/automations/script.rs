@@ -74,8 +74,20 @@ pub const CAPTURE_CAP_BYTES: usize = 64 * 1024;
 
 /// R13 timeout bounds, applied at RUN time regardless of the stored value
 /// (the store is same-UID-writable — untrusted numeric input).
+///
+/// `TIMEOUT_MAX_MS` raised 15 min -> 2 h on 2026-08-07. The old ceiling was
+/// not a safety property — the clamp exists to bound untrusted numeric input,
+/// not to assert that 15 minutes is a safe maximum — and it silently capped a
+/// real scheduled job whose runtime is set by how much work the outside world
+/// produced that day (2 min on a quiet day, 35-45 after a backlog). A cap
+/// below the workload's natural spread fails *unpredictably*: every by-hand
+/// test passes and the scheduled run dies.
+///
+/// The DEFAULT is deliberately unchanged: unset still means 2 minutes, so a
+/// script that forgets `--timeout` is still bounded tightly. Only the ceiling
+/// an author may opt into moved.
 pub const TIMEOUT_MIN_MS: u64 = 1_000;
-pub const TIMEOUT_MAX_MS: u64 = 900_000;
+pub const TIMEOUT_MAX_MS: u64 = 2 * 60 * 60 * 1_000;
 pub const TIMEOUT_DEFAULT_MS: u64 = 120_000;
 
 /// R14: the exact allowlist rebuilt after `env_clear()`. Deliberately
