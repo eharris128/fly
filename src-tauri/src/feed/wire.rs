@@ -238,6 +238,21 @@ pub struct AutomationEntry {
     /// carried no verdict; `#[serde(default)]` loads an old payload as None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verdict: Option<VerdictEntry>,
+    /// The dependency edge's upstream automation id (automation-dependencies
+    /// R16) — set for a dependent (`--after`) automation so a consumer can
+    /// tell "analysis waits on modal" without a second lookup path. Additive,
+    /// the monitor-enrichment convention: omitted for every non-dependent,
+    /// `#[serde(default)]` loads an old payload as None. `last_status` may
+    /// now also read `"withheld"` — a dependent that honestly declined to
+    /// run (upstream failed/stale/missing); a new *value* on an existing
+    /// field, which consumers must tolerate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// The honest decline reason when the last run is `withheld` (R16):
+    /// fly-minted, control-safe by construction (never agent output), e.g.
+    /// "upstream failed (exit 1)". Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_withheld_reason: Option<String>,
 }
 
 /// What the webview pushes each poll — just the agent half (the automations
@@ -360,6 +375,12 @@ impl AutomationEntry {
                 outcome: verdict_outcome_str(&v.outcome).to_string(),
                 note: v.note.clone(),
             }),
+            // Automation-dependencies R16: the edge + the honest decline
+            // reason (only when the last run actually withheld).
+            after: a.after.as_ref().map(|e| e.upstream_id.clone()),
+            last_withheld_reason: last
+                .filter(|r| r.status == crate::automations::model::RunStatus::Withheld)
+                .and_then(|r| r.error.clone()),
         }
     }
 }
@@ -384,6 +405,9 @@ fn run_status_str(status: &crate::automations::model::RunStatus) -> &'static str
         RunStatus::Succeeded => "succeeded",
         RunStatus::Failed => "failed",
         RunStatus::Skipped => "skipped",
+        // Automation-dependencies R16: the honest dependency decline — a
+        // new value on an existing field; consumers tolerate unknowns.
+        RunStatus::Withheld => "withheld",
     }
 }
 
@@ -426,6 +450,8 @@ mod tests {
                 last_run_at: Some(1_700_000_000_000),
                 retired_at: None,
                 last_verdict: None,
+                after: None,
+                last_withheld_reason: None,
             }],
         };
         let v = serde_json::to_value(&snap).unwrap();
@@ -468,6 +494,7 @@ mod tests {
             bundle_path: None,
             headless: false,
             session_id: None,
+            upstream_run_id: None,
             output: None,
             exit_code: None,
             error: None,
@@ -486,6 +513,7 @@ mod tests {
             not_before_ms: None,
             retired_at: None,
             pickup_pointers: None,
+            after: None,
             cwd: "/tmp".into(),
             mode: Mode::Agent {
                 prompt: "do it".into(),
@@ -571,6 +599,7 @@ mod tests {
             bundle_path: Some("/bundles/a1-r1.md".into()),
             headless: true,
             session_id: Some("sess-9".into()),
+            upstream_run_id: None,
             output: Some("FAIL: disk still climbing".into()),
             exit_code: Some(0),
             error: None,
@@ -590,6 +619,7 @@ mod tests {
             // Retired in the same mutation that closed the verdict run.
             retired_at: Some(1_200),
             pickup_pointers: None,
+            after: None,
             cwd: "/tmp".into(),
             mode: Mode::Agent {
                 prompt: "check disk".into(),
@@ -639,6 +669,7 @@ mod tests {
             not_before_ms: None,
             retired_at: None,
             pickup_pointers: None,
+            after: None,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "s.sh".into(),
@@ -712,6 +743,7 @@ mod tests {
             bundle_path: None,
             headless: true,
             session_id: None,
+            upstream_run_id: None,
             output: Some("PASS".into()),
             exit_code: Some(0),
             error: None,
@@ -730,6 +762,7 @@ mod tests {
             not_before_ms: None,
             retired_at: Some(1_200),
             pickup_pointers: None,
+            after: None,
             cwd: "/tmp".into(),
             mode: Mode::Agent {
                 prompt: "check deploy".into(),
@@ -1035,5 +1068,61 @@ mod tests {
         let v = serde_json::to_value(&snap).unwrap();
         assert!(v["agents"].as_array().unwrap().is_empty());
         assert!(v["automations"].as_array().unwrap().is_empty());
+    }
+
+    // Automation-dependencies R16: the projection is additive — a
+    // non-dependent automation serializes byte-identically to before (no
+    // `after`, no `lastWithheldReason`), while a dependent whose last run
+    // withheld carries the edge, the `"withheld"` status value, and the
+    // fly-minted reason.
+    #[test]
+    fn dependency_projection_is_additive_and_carries_the_withheld_reason() {
+        use crate::automations::model::{
+            Automation, Dependency, Mode, Origin, Trigger,
+        };
+        let mut a = Automation {
+            id: "d1".into(),
+            name: "feed analysis".into(),
+            cron: "22 9 * * 1-5".into(),
+            timezone: "Europe/Berlin".into(),
+            enabled: true,
+            retry_on_interrupt: false,
+            monitor: false,
+            not_before_ms: None,
+            retired_at: None,
+            pickup_pointers: None,
+            after: None,
+            cwd: "/tmp".into(),
+            mode: Mode::Script {
+                script_file: "s".into(),
+                interpreter: "bash".into(),
+                timeout_ms: 1_000,
+            },
+            origin: Origin {
+                pane_id: 1,
+                workspace_id: "ws".into(),
+                label: "cli".into(),
+            },
+            created_at: 0,
+            updated_at: 0,
+            next_run_at: Some(1_000),
+            runs: Vec::new(),
+        };
+
+        // Plain automation: neither key appears.
+        let v = serde_json::to_value(AutomationEntry::from_automation(&a, true)).unwrap();
+        assert!(v.get("after").is_none(), "non-dependent omits the edge");
+        assert!(v.get("lastWithheldReason").is_none());
+
+        // Dependent with a withheld last run: edge + status + reason.
+        a.after = Some(Dependency {
+            upstream_id: "up1".into(),
+            within_ms: None,
+        });
+        a.withhold(2_000, Trigger::Schedule, "upstream failed (exit 1)", "w1");
+        let v = serde_json::to_value(AutomationEntry::from_automation(&a, true)).unwrap();
+        assert_eq!(v["after"], "up1");
+        assert_eq!(v["lastStatus"], "withheld");
+        assert_eq!(v["lastWithheldReason"], "upstream failed (exit 1)");
     }
 }

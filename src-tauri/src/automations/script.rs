@@ -1040,6 +1040,7 @@ mod tests {
                 not_before_ms: None,
                 retired_at: None,
                 pickup_pointers: None,
+                after: None,
                 cwd: self.dir.path().to_string_lossy().into_owned(),
                 mode: Mode::Script {
                     script_file: path.to_string_lossy().into_owned(),

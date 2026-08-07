@@ -33,6 +33,7 @@
 //! manager or its store (the store mutex is not re-entrant).
 
 pub mod alerts;
+pub mod depend;
 pub mod headless;
 pub mod model;
 pub mod redact;
@@ -514,6 +515,13 @@ pub struct CreateSpec {
     /// reaches this spec: it is refused upstream with
     /// [`ERR_MONITOR_POINTERS`] (R12).
     pub pickup_pointers: Option<crate::automations::model::MonitorPointers>,
+    /// Dependency edge (automation-dependencies plan, U3 — R1/R7): the
+    /// dependent's upstream + window, validated by `create` against the
+    /// live store (existence, non-monitor upstream, chain depth/cycle,
+    /// within range — [`depend::validate_chain`]/[`depend::validate_within`])
+    /// since the socket payload is untrusted. `None` for every ordinary
+    /// automation.
+    pub after: Option<crate::automations::model::Dependency>,
     /// Resolved by the caller at create time (R22/R9: pane id + workspace
     /// identity + label); the manager only stamps it.
     pub origin: Origin,
@@ -568,6 +576,12 @@ pub enum ManualRun {
     Started { run_id: String },
     /// A run was already in flight: recorded as a skipped row (R7).
     Skipped { run_id: String },
+    /// Automation-dependencies R12: the dependency predicate refused —
+    /// recorded as a withheld row with the honest reason, reported
+    /// synchronously (manual is attended, so no alert rings). Manual is
+    /// deliberately NOT an override: the correct recovery is to re-run the
+    /// upstream, which satisfies the edge naturally.
+    Withheld { run_id: String, reason: String },
 }
 
 // ---- the manager -------------------------------------------------------------
@@ -932,6 +946,22 @@ impl AutomationManager {
     /// `automation://changed`.
     pub fn create(&self, spec: CreateSpec) -> Result<Created, String> {
         let validation = schedule::validate(&spec.cron, &spec.timezone)?;
+        // Automation-dependencies U3 (R7): validate the edge against the
+        // live store BEFORE any script write — upstream must exist and not
+        // be a monitor, the chain must be acyclic and bounded, the window in
+        // range. Snapshot-then-insert is a benign TOCTOU against a
+        // concurrent delete: the sweep's missing-upstream withhold is the
+        // honest backstop (R8). A dependent monitor is rejected (a monitor
+        // is a parked experiment, not a pipeline stage).
+        if let Some(edge) = &spec.after {
+            if spec.monitor {
+                return Err("--after cannot be combined with --monitor".into());
+            }
+            if let Some(w) = edge.within_ms {
+                depend::validate_within(w)?;
+            }
+            depend::validate_chain(&self.store.snapshot(), &edge.upstream_id)?;
+        }
         let now = (self.clock)();
         let next_run_at =
             schedule::advance_from(&spec.cron, &spec.timezone, now, spec.not_before_ms)?;
@@ -1001,6 +1031,7 @@ impl AutomationManager {
             not_before_ms: spec.not_before_ms,
             retired_at: None,
             pickup_pointers: spec.pickup_pointers,
+            after: spec.after,
             cwd: spec.cwd,
             mode,
             origin: spec.origin,
@@ -1174,6 +1205,22 @@ impl AutomationManager {
         // `None` = unknown id; the inner Result carries the claim outcome.
         let decision: Option<Result<ManualRun, String>> = flush_tolerant(
             self.store.mutate(|map| {
+                // Automation-dependencies R12: evaluate the dependency
+                // BEFORE the mutable borrow (the upstream lookup needs the
+                // map) — same predicate as the sweep, with a would-be Wait
+                // converted to the synchronous honest refusal. Atomic with
+                // the claim below: one mutate hold (KTD3).
+                let dep_decision: Option<depend::DepDecision> = {
+                    let Some(a) = map.get(id) else { return None };
+                    a.after.as_ref().map(|edge| {
+                        depend::manual_decision(
+                            edge,
+                            &a.runs,
+                            map.get(&edge.upstream_id),
+                            now,
+                        )
+                    })
+                };
                 let Some(a) = map.get_mut(id) else {
                     return None;
                 };
@@ -1183,6 +1230,13 @@ impl AutomationManager {
                         run_id: run_id.clone(),
                     }));
                 }
+                if let Some(depend::DepDecision::Withhold { reason }) = &dep_decision {
+                    a.withhold(now, Trigger::Manual, reason, &run_id);
+                    return Some(Ok(ManualRun::Withheld {
+                        run_id: run_id.clone(),
+                        reason: reason.clone(),
+                    }));
+                }
                 // Manual claims pass the *current* next_run_at through
                 // unchanged (R23: no advance); claim() records
                 // scheduled_for: None for manual triggers.
@@ -1190,8 +1244,17 @@ impl AutomationManager {
                 let resolved = a.mode.resolved_headless(headless_default);
                 Some(
                     a.claim(keep, now, Trigger::Manual, &run_id, resolved)
-                        .map(|()| ManualRun::Started {
-                            run_id: run_id.clone(),
+                        .map(|()| {
+                            // KTD3: consumption in the same mutation.
+                            if let Some(depend::DepDecision::Satisfied {
+                                upstream_run_id,
+                            }) = &dep_decision
+                            {
+                                a.stamp_upstream(&run_id, upstream_run_id);
+                            }
+                            ManualRun::Started {
+                                run_id: run_id.clone(),
+                            }
                         })
                         // fix(review) #8: report the variant — a retired
                         // monitor (R3, permanent) must not read as merely
@@ -1206,9 +1269,18 @@ impl AutomationManager {
             // contract): re-derive the decision from the recorded row.
             || {
                 self.store.get(id).map(|a| {
-                    match a.runs.iter().find(|r| r.id == run_id).map(|r| r.status) {
+                    let row = a.runs.iter().find(|r| r.id == run_id);
+                    match row.map(|r| r.status) {
                         Some(RunStatus::Skipped) => Ok(ManualRun::Skipped {
                             run_id: run_id.clone(),
+                        }),
+                        // Automation-dependencies R12: rederive the withheld
+                        // outcome (reason from the recorded row).
+                        Some(RunStatus::Withheld) => Ok(ManualRun::Withheld {
+                            run_id: run_id.clone(),
+                            reason: row
+                                .and_then(|r| r.error.clone())
+                                .unwrap_or_else(|| "withheld".to_owned()),
                         }),
                         Some(_) => Ok(ManualRun::Started {
                             run_id: run_id.clone(),
@@ -1225,7 +1297,10 @@ impl AutomationManager {
             },
         );
         let outcome = decision.ok_or_else(|| format!("no such automation: {id}"))??;
-        if let ManualRun::Skipped { .. } = outcome {
+        if let ManualRun::Skipped { .. } | ManualRun::Withheld { .. } = outcome {
+            // Nothing dispatched: the row (skip / dependencies R12 withhold)
+            // is the whole record. Manual withholds don't ring the alert —
+            // the caller gets the reason synchronously.
             (self.emit_changed)(id);
             return Ok(outcome);
         }
@@ -1859,7 +1934,13 @@ impl AutomationManager {
     /// 1. **Under one store lock hold** ([`store::Store::mutate`], which also
     ///    flushes before returning — R2's persist-before-run): close R10
     ///    ack-timed-out agent rows; then for each due automation run the
-    ///    KTD-D pre-claim checks (R7 overlap → skipped row + advance; U5
+    ///    KTD-D pre-claim checks (R7 overlap → skipped row + advance; the
+    ///    **dependency predicate** for an `after`-automation — automation-
+    ///    dependencies R9, evaluated in a read-only pre-pass under this same
+    ///    hold: `Wait` leaves the occurrence untouched, `Withhold` appends
+    ///    the honest terminal row + advance, `Satisfied` falls through to
+    ///    claim and stamps the consumed upstream run id in the same
+    ///    mutation, KTD3; U5
     ///    capacity → skipped("capacity") + advance; usage-limit-deferral U3 —
     ///    agent-mode at a confidently-exhausted plan window →
     ///    skipped("usage limit") + advance floored to the limit's reset,
@@ -1948,6 +2029,12 @@ impl AutomationManager {
                         || a.monitor
                         || a.mode.resolved_headless(headless_default))
                     && a.next_run_at.is_some_and(|t| t <= now_ms)
+                    // Automation-dependencies R11: a due dependent whose
+                    // predicate reads Wait/Withhold cannot claim this tick,
+                    // so it must not put the usage fetch on a de-facto
+                    // timer for up to its whole wait window. Benign
+                    // snapshot TOCTOU like the rest of this peek.
+                    && dep_satisfied_in_snapshot(a, &snap, now_ms)
             }) || retry_ids.iter().any(|id| {
                 snap.get(id)
                     .is_some_and(|a| a.enabled && a.mode.kind() == RunMode::Agent)
@@ -1978,9 +2065,37 @@ impl AutomationManager {
         // runners' rows, kill-then-closed in phase 2c — never inside the
         // mutate (the kill sleeps a grace, KTD-B).
         let mut headless_backstop: Vec<(String, String)> = Vec::new();
+        // Automation-dependencies U4 (R9/R10): dependency decisions for this
+        // tick's due dependents, computed in a read-only pre-pass INSIDE the
+        // same mutate hold (the claim loop below holds `values_mut`, so the
+        // upstream lookups must happen first) — atomic with the claims, so
+        // no interleaving can double-consume an upstream run (KTD3). Pure
+        // per-decision work; no I/O rides the lock (KTD-B).
+        let mut withheld_alerts: Vec<(String, String, String)> = Vec::new();
         let flush_result = self.store.mutate(|map| {
+            let mut dep_decisions: std::collections::HashMap<String, depend::DepDecision> =
+                std::collections::HashMap::new();
+            for a in map.values() {
+                let Some(edge) = &a.after else { continue };
+                let due = a.enabled && a.next_run_at.is_some_and(|t| t <= now_ms);
+                if !due {
+                    continue;
+                }
+                let occurrence = a.next_run_at.unwrap_or(now_ms);
+                dep_decisions.insert(
+                    a.id.clone(),
+                    depend::evaluate(
+                        edge,
+                        &a.runs,
+                        map.get(&edge.upstream_id),
+                        occurrence,
+                        now_ms,
+                    ),
+                );
+            }
             for a in map.values_mut() {
                 let mut touched = false;
+                let dep_decision = dep_decisions.get(&a.id);
 
                 // R10 ack-timeout: agent rows never linked to a pane within
                 // the window close failed (a dropped agent-run event).
@@ -2044,6 +2159,25 @@ impl AutomationManager {
                         a.skip(now_ms, Trigger::Schedule, SKIP_IN_FLIGHT, &mint_id());
                         a.rollback_recompute(advance_or_pause(a, now_ms));
                         touched = true;
+                    } else if matches!(dep_decision, Some(depend::DepDecision::Wait)) {
+                        // Automation-dependencies R9 (KTD1): the wait window
+                        // is still open — leave the occurrence completely
+                        // untouched (no row, no advance, no event; the R5
+                        // deferral posture) and re-evaluate next tick, so
+                        // the dependent fires within a sweep tick of the
+                        // upstream's success.
+                    } else if let Some(depend::DepDecision::Withhold { reason }) = dep_decision
+                    {
+                        // Automation-dependencies R9 (KTD2): the window
+                        // closed without a qualifying upstream run — record
+                        // the honest decline and advance past the
+                        // occurrence (KTD-D). The alert rings in phase 3,
+                        // off the lock (KTD-B).
+                        let run_id = mint_id();
+                        a.withhold(now_ms, Trigger::Schedule, reason, &run_id);
+                        a.rollback_recompute(advance_or_pause(a, now_ms));
+                        withheld_alerts.push((a.name.clone(), reason.clone(), run_id));
+                        touched = true;
                     } else if !is_agent && !capacity() {
                         // U5 capacity pre-claim skip (KTD-D): never a stranded
                         // Running row.
@@ -2076,6 +2210,15 @@ impl AutomationManager {
                         match a.claim(advanced, now_ms, Trigger::Schedule, &run_id, resolved_headless)
                         {
                             Ok(()) => {
+                                // Automation-dependencies KTD3: consumption
+                                // is stamped in the SAME mutation as the
+                                // claim — the exactly-once record.
+                                if let Some(depend::DepDecision::Satisfied {
+                                    upstream_run_id,
+                                }) = dep_decision
+                                {
+                                    a.stamp_upstream(&run_id, upstream_run_id);
+                                }
                                 to_dispatch.push((a.clone(), run_id));
                                 touched = true;
                             }
@@ -2145,10 +2288,23 @@ impl AutomationManager {
                 }
                 let run_id = mint_id();
                 let keep = a.next_run_at;
+                // Automation-dependencies R13: a dependent's interrupt retry
+                // BYPASSES the predicate (its occurrence already
+                // legitimately consumed an upstream run; the retry
+                // re-attempts the same work) and inherits the newest
+                // consumption record, so a later scheduled occurrence still
+                // refuses that upstream run — no double fire.
+                let inherited_upstream: Option<String> = a
+                    .after
+                    .as_ref()
+                    .and_then(|_| a.runs.iter().rev().find_map(|r| r.upstream_run_id.clone()));
                 if a
                     .claim(keep, now_ms, Trigger::Retry, &run_id, resolved_headless)
                     .is_ok()
                 {
+                    if let Some(uid) = inherited_upstream {
+                        a.stamp_upstream(&run_id, &uid);
+                    }
                     to_dispatch_retry.push((a.clone(), run_id));
                     changed.push(a.id.clone());
                 }
@@ -2286,6 +2442,17 @@ impl AutomationManager {
         // Phase 3: emit — after all store work, no lock held (KTD-B).
         for id in changed {
             (self.emit_changed)(&id);
+        }
+        // Automation-dependencies R9: every scheduled withhold rings one
+        // sanitized line through the existing alert seam — the visibility
+        // the plan's framing note demands ("today's upstream failed, so the
+        // analysis did not run" must reach a human, not just a row). Same
+        // sink and posture as a failed headless close; off the lock.
+        if !withheld_alerts.is_empty() {
+            let sink = Arc::clone(&self.monitor_alert_sink.lock().unwrap());
+            for (name, reason, run_id) in withheld_alerts {
+                sink(&name, &format!("withheld: {reason} (run {run_id})"));
+            }
         }
         // U5: agent runs the sweep closed failed (ack-timeout / deadline) emit
         // run-closed so the frontend tab lifecycle can react (keeps a failed
@@ -2523,6 +2690,24 @@ fn headless_deadline_expired_runs(a: &Automation, now_ms: u64) -> Vec<String> {
         })
         .map(|r| r.id.clone())
         .collect()
+}
+
+/// Automation-dependencies R11: whether a due automation's dependency (if
+/// any) currently reads `Satisfied` against a store snapshot — the usage
+/// gate's pre-lock peek uses this so a deferring/withholding dependent never
+/// puts the plan-usage fetch on a de-facto timer. Non-dependents are
+/// trivially satisfied.
+fn dep_satisfied_in_snapshot(
+    a: &Automation,
+    snap: &std::collections::BTreeMap<String, Automation>,
+    now_ms: u64,
+) -> bool {
+    let Some(edge) = &a.after else { return true };
+    let occurrence = a.next_run_at.unwrap_or(now_ms);
+    matches!(
+        depend::evaluate(edge, &a.runs, snap.get(&edge.upstream_id), occurrence, now_ms),
+        depend::DepDecision::Satisfied { .. }
+    )
 }
 
 /// R7 with the U7 widening: in flight = a `Running` row exists, or the probe
@@ -3119,6 +3304,7 @@ mod tests {
             not_before_ms: None,
             monitor: false,
             pickup_pointers: None,
+            after: None,
             origin: origin(),
         }
     }
@@ -4878,6 +5064,7 @@ mod tests {
             not_before_ms: None,
             retired_at: None,
             pickup_pointers: None,
+            after: None,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "script".into(),
@@ -6037,6 +6224,7 @@ mod tests {
                 not_before_ms: None,
                 retired_at: None,
                 pickup_pointers: None,
+                after: None,
                 cwd: "/tmp".into(),
                 mode: Mode::Agent { prompt: "p".into(), model: None, effort: None, headless: None },
                 origin: Origin {
@@ -6268,6 +6456,437 @@ mod tests {
             h.run_closed.lock().unwrap().last(),
             Some(&(run_id, RunStatus::Succeeded)),
             "run-closed still fires for the frontend lifecycle"
+        );
+    }
+
+    // ---- automation-dependencies (U3/U4) --------------------------------------
+
+    /// A dependent script spec pointing at `upstream_id` with a 10-minute
+    /// window (spans two 5-min occurrences — wide enough to observe both the
+    /// Wait leg and the consumed-refusal leg).
+    fn dependent_spec(name: &str, upstream_id: &str) -> CreateSpec {
+        CreateSpec {
+            after: Some(model::Dependency {
+                upstream_id: upstream_id.into(),
+                within_ms: Some(2 * FIVE_MIN),
+            }),
+            ..script_spec(name)
+        }
+    }
+
+    /// Create an upstream + dependent pair at T0 and move the clock to their
+    /// shared first occurrence.
+    fn create_pair(h: &Harness) -> (String, String) {
+        let up = h.mgr.create(script_spec("modal feed")).unwrap().automation.id;
+        let down = h
+            .mgr
+            .create(dependent_spec("feed analysis", &up))
+            .unwrap()
+            .automation
+            .id;
+        h.set_now(T0 + FIVE_MIN);
+        (up, down)
+    }
+
+    // Dependencies R9/KTD1 happy edge: while the upstream hasn't succeeded
+    // the dependent's due occurrence is left completely untouched (no row,
+    // no advance); within a tick of the upstream's success it claims,
+    // stamping the consumed upstream run id in the same mutation (KTD3).
+    #[test]
+    fn dependent_defers_then_fires_on_upstream_success_and_stamps_consumption() {
+        let h = harness();
+        let (up, down) = create_pair(&h);
+
+        h.sweep(); // upstream claims; dependent defers (upstream Running)
+        assert_eq!(h.runs(&up).len(), 1);
+        assert!(h.runs(&down).is_empty(), "Wait: no row");
+        assert_eq!(
+            h.next_run_at(&down),
+            Some(T0 + FIVE_MIN),
+            "Wait: no advance — the occurrence stays due"
+        );
+
+        let up_run = h.runs(&up)[0].id.clone();
+        h.mgr
+            .close_run(&up, &up_run, RunOutcome::Succeeded { output: None });
+
+        h.set_now(T0 + FIVE_MIN + SWEEP_TICK_MS);
+        h.sweep();
+        let runs = h.runs(&down);
+        assert_eq!(runs.len(), 1, "fired within a tick of the success");
+        assert_eq!(runs[0].status, RunStatus::Running);
+        assert_eq!(
+            runs[0].upstream_run_id.as_deref(),
+            Some(up_run.as_str()),
+            "consumption stamped with the claim (KTD3)"
+        );
+        assert_eq!(h.dispatcher.count(), 2, "upstream + dependent");
+    }
+
+    // The plan's required dependent-does-not-fire-when-upstream-failed pin
+    // (R9): a failed upstream leaves the dependent waiting inside the
+    // window, then a Withheld row (never Failed/Skipped) with the honest
+    // reason lands, the schedule advances, and one alert line rings through
+    // the existing sink — outside the store lock (the harness sink
+    // re-enters list()).
+    #[test]
+    fn dependent_does_not_fire_when_upstream_failed() {
+        let h = harness();
+        let (up, down) = create_pair(&h);
+
+        h.sweep();
+        let up_run = h.runs(&up)[0].id.clone();
+        h.mgr.close_run(
+            &up,
+            &up_run,
+            RunOutcome::Failed {
+                error: "exit 1".into(),
+                exit_code: Some(1),
+                output: None,
+            },
+        );
+
+        // Inside the window: still waiting (a manual upstream re-run could
+        // land), no row, no dispatch.
+        h.set_now(T0 + FIVE_MIN + SWEEP_TICK_MS);
+        h.sweep();
+        assert!(h.runs(&down).is_empty(), "still waiting inside the window");
+
+        // Past occurrence + within: the honest decline.
+        h.set_now(T0 + FIVE_MIN + 2 * FIVE_MIN);
+        h.sweep();
+        let runs = h.runs(&down);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Withheld, "not failed, not skipped");
+        assert_eq!(runs[0].error.as_deref(), Some("upstream failed (exit 1)"));
+        assert_eq!(runs[0].started_at, None, "never ran");
+        assert!(
+            h.next_run_at(&down).unwrap() > T0 + FIVE_MIN,
+            "the occurrence was consumed (KTD-D advance)"
+        );
+        // The upstream's own cron may have re-fired during the window — but
+        // the dependent itself never dispatched.
+        assert!(
+            h.dispatcher
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(id, _, _)| id == &up),
+            "the dependent never dispatched"
+        );
+        let alerts = h.monitor_alerts.lock().unwrap();
+        assert_eq!(alerts.len(), 1, "one ring per withhold");
+        assert_eq!(alerts[0].0, "feed analysis");
+        assert!(
+            alerts[0].1.starts_with("withheld: upstream failed (exit 1)"),
+            "the alert carries the reason: {}",
+            alerts[0].1
+        );
+    }
+
+    // The plan's required exactly-one-dependent-run-per-upstream-occurrence
+    // pin (KTD3): one upstream success feeds exactly one dependent run even
+    // though the dependent's cron ticks again while that success is still
+    // inside the freshness window — the second occurrence withholds with
+    // the consumed-run reason instead of double-firing.
+    #[test]
+    fn exactly_one_dependent_run_per_upstream_occurrence() {
+        let h = harness();
+        let (up, down) = create_pair(&h);
+
+        h.sweep();
+        let up_run = h.runs(&up)[0].id.clone();
+        h.mgr
+            .close_run(&up, &up_run, RunOutcome::Succeeded { output: None });
+        h.set_now(T0 + FIVE_MIN + SWEEP_TICK_MS);
+        h.sweep();
+        let down_run = h.runs(&down)[0].id.clone();
+        h.mgr
+            .close_run(&down, &down_run, RunOutcome::Succeeded { output: None });
+        // Pause the upstream so its own cron can't produce a NEW success (or
+        // an in-flight run) during the window — this test pins the
+        // consumed-run refusal specifically.
+        h.mgr.pause(&up).unwrap();
+
+        // The dependent's next occurrence arrives with the upstream success
+        // still fresh (10-min window) — it must NOT fire again off the same
+        // upstream run. It waits out the window, then withholds naming the
+        // consumed run.
+        h.set_now(T0 + 2 * FIVE_MIN);
+        h.sweep();
+        assert_eq!(h.runs(&down).len(), 1, "no second fire inside the wait");
+        h.set_now(T0 + 4 * FIVE_MIN + SWEEP_TICK_MS);
+        h.sweep();
+        let runs = h.runs(&down);
+        let fired: Vec<_> = runs
+            .iter()
+            .filter(|r| r.upstream_run_id.as_deref() == Some(up_run.as_str())
+                && r.status != RunStatus::Withheld)
+            .collect();
+        assert_eq!(fired.len(), 1, "exactly one dependent run per upstream run");
+        let last = runs.last().unwrap();
+        assert_eq!(last.status, RunStatus::Withheld);
+        assert_eq!(
+            last.error.as_deref(),
+            Some(format!("no new upstream run (run {up_run} already consumed)").as_str())
+        );
+    }
+
+    // R9 gate order: overlap outranks the dependency — a dependent with its
+    // own run still in flight records the R7 skip (advancing the schedule),
+    // never a withhold, even though its upstream has nothing fresh.
+    #[test]
+    fn overlap_skip_outranks_the_dependency_gate() {
+        let h = harness();
+        let (up, down) = create_pair(&h);
+
+        // Fire the dependent once (upstream success), leaving it Running.
+        h.sweep();
+        let up_run = h.runs(&up)[0].id.clone();
+        h.mgr
+            .close_run(&up, &up_run, RunOutcome::Succeeded { output: None });
+        h.set_now(T0 + FIVE_MIN + SWEEP_TICK_MS);
+        h.sweep();
+        assert_eq!(h.runs(&down)[0].status, RunStatus::Running);
+
+        // Next occurrence: own run in flight + upstream consumed → the
+        // overlap skip wins (KTD-D), not a withhold.
+        h.set_now(T0 + 2 * FIVE_MIN);
+        h.sweep();
+        let runs = h.runs(&down);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1].status, RunStatus::Skipped);
+        assert_eq!(runs[1].error.as_deref(), Some(SKIP_IN_FLIGHT));
+    }
+
+    // R12: a manual run of a dependent evaluates the same predicate — the
+    // refusal lands as a Withheld row reported synchronously, with no alert
+    // (manual is attended), and a satisfied manual run consumes the
+    // upstream run exactly like a scheduled fire.
+    #[test]
+    fn manual_run_on_a_dependent_withholds_or_consumes() {
+        let h = harness();
+        let (up, down) = create_pair(&h);
+
+        // Nothing fresh: the manual run is withheld with the honest reason.
+        match h.mgr.manual_run(&down) {
+            Ok(ManualRun::Withheld { reason, .. }) => {
+                assert_eq!(reason, "upstream has not run");
+            }
+            other => panic!("expected Withheld, got {other:?}"),
+        }
+        assert_eq!(h.runs(&down)[0].status, RunStatus::Withheld);
+        assert!(
+            h.monitor_alerts.lock().unwrap().is_empty(),
+            "manual withholds don't ring — the caller got the reason"
+        );
+
+        // A fresh upstream success: the manual run starts and consumes it.
+        h.sweep();
+        let up_run = h.runs(&up)[0].id.clone();
+        h.mgr
+            .close_run(&up, &up_run, RunOutcome::Succeeded { output: None });
+        match h.mgr.manual_run(&down) {
+            Ok(ManualRun::Started { run_id }) => {
+                let runs = h.runs(&down);
+                let row = runs.iter().find(|r| r.id == run_id).unwrap();
+                assert_eq!(row.upstream_run_id.as_deref(), Some(up_run.as_str()));
+            }
+            other => panic!("expected Started, got {other:?}"),
+        }
+
+        // And exactly-once holds across triggers: a second manual run
+        // refuses the already-consumed upstream run.
+        let runs = h.runs(&down);
+        let started = runs.iter().find(|r| r.status == RunStatus::Running).unwrap();
+        h.mgr.close_run(
+            &down,
+            &started.id.clone(),
+            RunOutcome::Succeeded { output: None },
+        );
+        match h.mgr.manual_run(&down) {
+            Ok(ManualRun::Withheld { reason, .. }) => {
+                assert!(reason.contains("already consumed"), "got: {reason}");
+            }
+            other => panic!("expected Withheld, got {other:?}"),
+        }
+    }
+
+    // R7 (U3): create-time validation on the untrusted payload — unknown
+    // upstream, monitor upstream, monitor dependent, and an out-of-range
+    // window all reject with nothing stored.
+    #[test]
+    fn create_rejects_bad_dependency_edges() {
+        let h = harness();
+        let up = h.mgr.create(script_spec("modal feed")).unwrap().automation.id;
+
+        let err = h
+            .mgr
+            .create(dependent_spec("d", "nonexistent"))
+            .unwrap_err();
+        assert!(err.contains("no such automation"), "got: {err}");
+
+        // A monitor upstream is rejected (it retires after one verdict).
+        let monitor = CreateSpec {
+            monitor: true,
+            mode: CreateMode::Agent {
+                prompt: "check".into(),
+                model: None,
+                effort: None,
+                headless: None,
+            },
+            ..script_spec("mon")
+        };
+        let mon_id = h.mgr.create(monitor).unwrap().automation.id;
+        let err = h.mgr.create(dependent_spec("d", &mon_id)).unwrap_err();
+        assert!(err.contains("monitor"), "got: {err}");
+
+        // A monitor dependent is rejected.
+        let bad = CreateSpec {
+            monitor: true,
+            mode: CreateMode::Agent {
+                prompt: "check".into(),
+                model: None,
+                effort: None,
+                headless: None,
+            },
+            ..dependent_spec("d", &up)
+        };
+        let err = h.mgr.create(bad).unwrap_err();
+        assert!(err.contains("--monitor"), "got: {err}");
+
+        // Window out of range: hard error, not a silent clamp.
+        let bad_within = CreateSpec {
+            after: Some(model::Dependency {
+                upstream_id: up.clone(),
+                within_ms: Some(1),
+            }),
+            ..script_spec("d")
+        };
+        let err = h.mgr.create(bad_within).unwrap_err();
+        assert!(err.contains("--within"), "got: {err}");
+
+        // Only the two valid records exist.
+        assert_eq!(h.mgr.list().len(), 2);
+    }
+
+    // R11: a due-but-unsatisfied AGENT dependent never consults the usage
+    // gate — deferral must not put the plan-usage fetch on a de-facto timer
+    // for the whole wait window (KTD-C).
+    #[test]
+    fn waiting_dependent_never_consults_the_usage_gate() {
+        let h = harness();
+        h.mgr.set_frontend_ready();
+        let up = h.mgr.create(script_spec("modal feed")).unwrap().automation.id;
+        let down = h
+            .mgr
+            .create(CreateSpec {
+                after: Some(model::Dependency {
+                    upstream_id: up.clone(),
+                    within_ms: Some(2 * FIVE_MIN),
+                }),
+                ..default_agent_spec("feed analysis")
+            })
+            .unwrap()
+            .automation
+            .id;
+        let (gate, _cell, calls) = fake_usage_gate();
+        h.mgr.set_usage_gate(gate);
+
+        // Pause the upstream so nothing else on this tick is agent-claimable
+        // and the dependent's own occurrence is the only candidate.
+        h.mgr.pause(&up).unwrap();
+        h.set_now(T0 + FIVE_MIN);
+        h.sweep();
+        assert!(h.runs(&down).is_empty(), "deferring");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no usage consultation while the dependency reads Wait"
+        );
+    }
+
+    // R13: a dependent's interrupt retry bypasses the predicate (the
+    // occurrence already consumed its upstream run) and inherits the
+    // interrupted row's consumption, so a later occurrence still refuses
+    // that upstream run — no double fire across {original, retry}.
+    #[test]
+    fn dependent_retry_bypasses_the_gate_and_inherits_consumption() {
+        let dir = tempfile::tempdir().unwrap();
+        // Seed: an upstream whose run u1 succeeded, and a dependent left
+        // Running mid-fire against u1 by a prior app run, opted into retry.
+        {
+            let store = store_in(&dir);
+            store
+                .mutate(|map| {
+                    let mut up = raw_automation("up1");
+                    up.name = "modal feed".into();
+                    up.claim(Some(T0 + 2 * FIVE_MIN), T0 + FIVE_MIN, Trigger::Schedule, "u1", false)
+                        .unwrap();
+                    up.close("u1", RunOutcome::Succeeded { output: None }, T0 + FIVE_MIN + 1);
+                    map.insert(up.id.clone(), up);
+
+                    let mut down = raw_automation("down1");
+                    down.name = "feed analysis".into();
+                    down.retry_on_interrupt = true;
+                    down.after = Some(model::Dependency {
+                        upstream_id: "up1".into(),
+                        within_ms: Some(2 * FIVE_MIN),
+                    });
+                    down.claim(
+                        Some(T0 + 2 * FIVE_MIN),
+                        T0 + FIVE_MIN + 2,
+                        Trigger::Schedule,
+                        "d1",
+                        false,
+                    )
+                    .unwrap();
+                    down.stamp_upstream("d1", "u1");
+                    map.insert(down.id.clone(), down);
+                })
+                .unwrap();
+        }
+        let h = harness_in(dir); // recovery closes d1 interrupted + queues the retry
+        h.set_now(T0 + FIVE_MIN + SWEEP_TICK_MS);
+        h.sweep();
+
+        let runs = h.runs("down1");
+        assert_eq!(runs.len(), 2, "interrupted original + running retry");
+        assert_eq!(runs[1].trigger, Trigger::Retry);
+        assert_eq!(runs[1].status, RunStatus::Running, "the gate was bypassed");
+        assert_eq!(
+            runs[1].upstream_run_id.as_deref(),
+            Some("u1"),
+            "consumption inherited from the interrupted row"
+        );
+
+        // Close the retry; the next scheduled occurrence still refuses u1 —
+        // the inherited record keeps exactly-once true across the retry.
+        h.mgr
+            .close_run("down1", &runs[1].id.clone(), RunOutcome::Succeeded { output: None });
+        h.set_now(T0 + 4 * FIVE_MIN + SWEEP_TICK_MS);
+        h.sweep();
+        let last = h.runs("down1").last().cloned().unwrap();
+        assert_eq!(last.status, RunStatus::Withheld, "no re-fire off u1");
+    }
+
+    // R8: deleting the upstream leaves the dependent recording an honest
+    // missing-upstream withhold at its next occurrence — immediately, with
+    // no wait (nothing can make a deleted upstream succeed).
+    #[test]
+    fn deleted_upstream_yields_an_immediate_missing_upstream_withhold() {
+        let h = harness();
+        let (up, down) = create_pair(&h);
+        h.mgr.delete(&up).unwrap();
+
+        h.sweep();
+        let runs = h.runs(&down);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Withheld);
+        assert_eq!(
+            runs[0].error.as_deref(),
+            Some(format!("upstream {up} no longer exists").as_str())
         );
     }
 }

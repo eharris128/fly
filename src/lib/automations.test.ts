@@ -532,4 +532,51 @@ describe("headless disposition & running elapsed", () => {
     expect(elapsedShort(65 * MIN)).toBe("1h 05m");
     expect(elapsedShort(150 * MIN)).toBe("2h 30m");
   });
+
+  // automation-dependencies R17: the dependency edge on the row — the
+  // after tag, the waiting-on-upstream next-run read for a due-and-deferring
+  // dependent (its nextRunAt sits in the past by design), and the withheld
+  // last-run status with its reason in lastError.
+  it("derives the dependency tag, waiting state, and withheld status", () => {
+    // Future occurrence: ordinary relative next-run, tag present.
+    const future = automationsToRows(
+      [automation({ after: { upstreamId: "up1" }, nextRunAt: NOW + MIN })],
+      NOW,
+    )[0];
+    expect(future.afterId).toBe("up1");
+    expect(future.nextRun).toBe("in 1 minute");
+
+    // Due (deferring): the waiting label replaces a misleading past time.
+    const waiting = automationsToRows(
+      [automation({ after: { upstreamId: "up1" }, nextRunAt: NOW - MIN })],
+      NOW,
+    )[0];
+    expect(waiting.nextRun).toBe("waiting on upstream");
+    expect(waiting.paused).toBe(false);
+
+    // A due NON-dependent keeps the ordinary relative read.
+    const plain = automationsToRows([automation({ nextRunAt: NOW - MIN })], NOW)[0];
+    expect(plain.afterId).toBeNull();
+    expect(plain.nextRun).not.toBe("waiting on upstream");
+
+    // A withheld last run surfaces as the status word with its reason.
+    const withheld = automationsToRows(
+      [
+        automation({
+          after: { upstreamId: "up1" },
+          runs: [
+            run("withheld", {
+              id: "w1",
+              error: "upstream failed (exit 1)",
+              startedAt: null,
+              finishedAt: NOW - MIN,
+            }),
+          ],
+        }),
+      ],
+      NOW,
+    )[0];
+    expect(withheld.lastStatus).toBe("withheld");
+    expect(withheld.lastError).toBe("upstream failed (exit 1)");
+  });
 });

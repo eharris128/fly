@@ -327,6 +327,8 @@ mod tests {
             last_run_at: None,
             retired_at: None,
             last_verdict: None,
+            after: None,
+            last_withheld_reason: None,
         }];
         let snap = s.snapshot(autos, 123);
         assert_eq!(snap.version, 1);

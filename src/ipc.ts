@@ -218,8 +218,10 @@ export function registerAlertSink(paneId: PaneId): Promise<void> {
 
 /** Run-row mode discriminant (`RunMode` in model.rs) — also an automation's mode. */
 export type AutomationMode = "agent" | "script";
-/** Run-row status (`RunStatus` in model.rs). `running` is the only non-terminal. */
-export type RunStatus = "running" | "succeeded" | "failed" | "skipped";
+/** Run-row status (`RunStatus` in model.rs). `running` is the only
+ * non-terminal. `withheld` (automation-dependencies R2) is a dependent's
+ * honest decline: its upstream didn't qualify, reason in `error`. */
+export type RunStatus = "running" | "succeeded" | "failed" | "skipped" | "withheld";
 /** What started a run (`Trigger` in model.rs). `retry` is a one-shot re-run of a
  * run an app crash/restart interrupted (interrupt-resilience U1). */
 export type RunTrigger = "schedule" | "manual" | "retry";
@@ -273,6 +275,9 @@ export interface RunRow {
   /** The headless run's Claude session id (stamped at close from the stream's
    * init event); absent/null for pane runs (headless-agent-automations R10). */
   sessionId?: string | null;
+  /** The upstream run a dependent's fire consumed (automation-dependencies
+   * R3/KTD3); absent/null for every non-dependent run. */
+  upstreamRunId?: string | null;
   output: string | null;
   exitCode: number | null;
   /** Failure detail for `failed` rows; the skip reason for `skipped` rows. */
@@ -327,6 +332,10 @@ export interface Automation {
   /** Pickup pointers captured at registration (monitor-handoff R11); null for
    * every non-monitor automation. */
   pickupPointers: MonitorPointers | null;
+  /** Dependency edge (automation-dependencies R1): this automation's due
+   * occurrences fire only against a fresh, successful, not-yet-consumed run
+   * of `upstreamId`; null/absent for ordinary automations. */
+  after?: { upstreamId: string; withinMs?: number | null } | null;
   cwd: string;
   mode: AutomationSpec;
   origin: AutomationOrigin;

@@ -194,6 +194,13 @@ export interface AutomationEntry {
   retiredAt: number | null;
   /** The last run's parsed verdict; absent when the run carried none. U6. */
   lastVerdict?: VerdictEntry;
+  /** The dependency edge's upstream automation id (automation-dependencies
+   * R16); absent for ordinary automations. Note `lastStatus` may also read
+   * `"withheld"` — the dependent honestly declined to run. Additive. */
+  after?: string;
+  /** The fly-minted decline reason when the last run is withheld; absent
+   * otherwise (automation-dependencies R16). */
+  lastWithheldReason?: string;
 }
 
 /** The full SSE frame (mirrors Rust `FeedSnapshot`). */
