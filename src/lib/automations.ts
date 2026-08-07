@@ -67,8 +67,14 @@ export interface AutomationRow {
   /** Opt-in interrupt resilience (interrupt-resilience U5/R1): a small "retry"
    * tag so the operator can see which automations re-run after a crash. */
   retryOnInterrupt: boolean;
-  /** Relative next-occurrence time (`"in 5 minutes"`), or null when paused. */
+  /** Relative next-occurrence time (`"in 5 minutes"`), or null when paused.
+   * A due-and-deferring dependent reads `"waiting on upstream"` instead of a
+   * misleading past-relative time (automation-dependencies R17 — its
+   * `nextRunAt` sits in the past by design while the sweep re-evaluates). */
   nextRun: string | null;
+  /** The dependency edge's upstream automation id (automation-dependencies
+   * R17), for the `after:<id>` tag; null for ordinary automations. */
+  afterId: string | null;
   /** Derived from the last run row (R25) — `"never run"` when there is none. */
   lastStatus: LastStatus;
   /** Relative last-run time (`"5 minutes ago"`), or null when never run. */
@@ -232,7 +238,15 @@ function toRow(
     schedule: humanSchedule(a.cron, a.timezone),
     paused: a.nextRunAt == null,
     retryOnInterrupt: a.retryOnInterrupt,
-    nextRun: a.nextRunAt != null ? relativeTime(a.nextRunAt, nowMs) : null,
+    // Automation-dependencies R17: the CLI's `next_label` mirrored — a
+    // due dependent is deferring on its upstream, not overdue.
+    nextRun:
+      a.after != null && a.enabled && a.nextRunAt != null && a.nextRunAt <= nowMs
+        ? "waiting on upstream"
+        : a.nextRunAt != null
+          ? relativeTime(a.nextRunAt, nowMs)
+          : null,
+    afterId: a.after?.upstreamId ?? null,
     lastStatus: last ? last.status : "never run",
     lastRun: lastRunAt != null ? relativeTime(lastRunAt, nowMs) : null,
     lastError: last?.error ?? null,

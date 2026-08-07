@@ -104,7 +104,12 @@
   // keeps the existing paused/relative labels.
   function nextLabel(a: AutomationRow): string {
     if (a.monitorState?.startsWith("retired")) return "—";
-    return a.paused ? "paused" : `next ${a.nextRun}`;
+    if (a.paused) return "paused";
+    // Automation-dependencies R17: a due dependent is deferring on its
+    // upstream — the view-model already substituted the label; don't
+    // prefix it with "next".
+    if (a.nextRun === "waiting on upstream") return a.nextRun;
+    return `next ${a.nextRun}`;
   }
 
   // Selection is tracked by leaf key (stable across live updates), never index.
@@ -283,7 +288,7 @@
                  or agent-list row, so the status chip carries its elapsed time
                  (`running · 2m`) — the panel row is its primary surface. -->
             <span class="a-status s-{statusWord(a.lastStatus)}">{statusWord(a.lastStatus)}{#if a.runningFor}&nbsp;· {a.runningFor}{/if}</span>
-            <span class="a-name">{a.name}{#if a.monitorState}<span class="a-mode a-monitor {monitorClass(a.monitorState)}" title={a.verdictNote ?? ""}>monitor · {a.monitorState}</span>{:else}<span class="a-mode" title={a.headless ? "dispatches closed-loop (claude -p, no pane)" : "dispatches as an interactive pane"}>{a.mode}{#if a.mode === "agent" && a.headless}&nbsp;· headless{/if}</span>{/if}{#if a.retryOnInterrupt}<span class="a-retry" title="re-runs once if an app crash/restart interrupts it">retry</span>{/if}</span>
+            <span class="a-name">{a.name}{#if a.monitorState}<span class="a-mode a-monitor {monitorClass(a.monitorState)}" title={a.verdictNote ?? ""}>monitor · {a.monitorState}</span>{:else}<span class="a-mode" title={a.headless ? "dispatches closed-loop (claude -p, no pane)" : "dispatches as an interactive pane"}>{a.mode}{#if a.mode === "agent" && a.headless}&nbsp;· headless{/if}</span>{/if}{#if a.retryOnInterrupt}<span class="a-retry" title="re-runs once if an app crash/restart interrupts it">retry</span>{/if}{#if a.afterId}<span class="a-after" title="runs only against a fresh successful run of {a.afterId}; otherwise records an honest 'withheld' row">after:{a.afterId}</span>{/if}</span>
             <span class="a-meta">
               <span class="a-sched">{a.schedule}</span>
               <span class="a-model" title="launch model · effort">{modelLabel(a)}</span>
@@ -793,6 +798,11 @@
   .a-status.s-skipped {
     color: #fbbf24;
   }
+  /* automation-dependencies R17: the honest dependency decline — distinct
+     from the amber skip (overloaded) and the red fail (dependent broke). */
+  .a-status.s-withheld {
+    color: #fb923c;
+  }
   .a-status.s-never {
     color: #7b84a3;
   }
@@ -822,6 +832,17 @@
     letter-spacing: 0.04em;
     color: #9ecbff;
     background: #1f3350;
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  /* automation-dependencies R17: the dependency-edge tag (after:<id>). Same
+     chip shape as retry; lowercase — the id is case-sensitive. */
+  .a-after {
+    margin-left: 6px;
+    font-size: 10px;
+    letter-spacing: 0.02em;
+    color: #fcd39b;
+    background: #3a2d1a;
     border-radius: 4px;
     padding: 1px 5px;
   }

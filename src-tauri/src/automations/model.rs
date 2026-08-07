@@ -42,6 +42,22 @@
 //! per-run `headless` marker on [`RunRow`], derived inside
 //! [`Automation::claim`] (R7), and the check's `session_id` (R12). Plain
 //! data again — the sweep exemptions the marker drives live in `mod.rs`.
+//!
+//! Dependency vocabulary (U1 of
+//! `docs/plans/2026-08-07-002-feat-automation-dependencies-plan.md` — IDs
+//! below that cite the automation-dependencies plan say so explicitly): the
+//! [`Dependency`] edge on [`Automation`] (`after`), the born-terminal
+//! [`RunStatus::Withheld`] decline (dependencies R2, KTD2 — never `Failed`,
+//! never the overloaded `Skipped`), the consumed upstream run's id on
+//! [`RunRow`] (`upstream_run_id`, dependencies R3/KTD3), and the
+//! [`Automation::withhold`] / [`Automation::stamp_upstream`] transitions.
+//! The predicate deciding *whether* to withhold lives in [`super::depend`];
+//! this module only carries the shapes and transitions. Back-compat note
+//! (dependencies KTD8): the new fields are additive `#[serde(default)]`, but
+//! `"withheld"` is a new [`RunStatus`] **value** — an older fly binary
+//! loading a store that contains one fails the whole-map parse and degrades
+//! via the R6 `.bad.bak` path. Accepted: no downgrade path is supported, and
+//! the value appears only after a dependent actually withholds.
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +75,40 @@ pub const ERR_INTERRUPTED: &str = "interrupted";
 pub const ERR_TIMED_OUT: &str = "timed out";
 /// R23: error string for open rows closed by automation delete.
 pub const ERR_DELETED: &str = "deleted";
+
+/// Dependencies KTD4: default `within` window for a [`Dependency`] — the one
+/// symmetric bound answering both staleness (a qualifying upstream success
+/// must have finished at or after `occurrence − within`) and wait (the
+/// dependent defers until `occurrence + within` before withholding).
+pub const DEFAULT_AFTER_WITHIN_MS: u64 = 60 * 60 * 1000;
+
+/// A dependency edge (dependencies U1 — R1, KTD5): this automation's
+/// scheduled occurrences fire only against a fresh, successful,
+/// not-yet-consumed run of `upstream_id`. A **struct**, not a bare id, so
+/// the future author-supplied gate predicate (a command run at claim time —
+/// the campaign-dag sentinel case) lands as one more `#[serde(default)]`
+/// field with no schema break. Serde camelCase like the rest of the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Dependency {
+    /// The upstream automation's id. Never self-referential by construction
+    /// (edges are create-only; the record does not exist yet when its edge
+    /// is validated — dependencies KTD6).
+    pub upstream_id: String,
+    /// The symmetric freshness/wait window, epoch-relative ms (KTD4);
+    /// `None` = [`DEFAULT_AFTER_WITHIN_MS`]. Untrusted numeric input —
+    /// consumers use saturating arithmetic (release builds have overflow
+    /// checks off).
+    #[serde(default)]
+    pub within_ms: Option<u64>,
+}
+
+impl Dependency {
+    /// The effective window (KTD4).
+    pub fn within(&self) -> u64 {
+        self.within_ms.unwrap_or(DEFAULT_AFTER_WITHIN_MS)
+    }
+}
 
 /// What a due automation executes (R1). Serde-tagged like
 /// [`crate::state::lifecycle::LifecycleState`] (`"kind"` discriminator).
@@ -155,7 +205,13 @@ pub enum Trigger {
 /// Run-row status. `Running` is the only non-terminal state; interrupted,
 /// timed-out, and deleted runs are `Failed` with distinct error strings
 /// (R5/R23), and `Skipped` is only ever *born* terminal — there is no
-/// `Running → Skipped` edge (KTD-D).
+/// `Running → Skipped` edge (KTD-D). `Withheld` (dependencies U1 — R2,
+/// KTD2) is likewise born terminal: a dependent that honestly declined to
+/// fire because its upstream didn't qualify, with the specific reason in
+/// [`RunRow::error`]. Deliberately not `Failed` (which reads "the dependent
+/// broke") and not `Skipped` (already overloaded: run-in-flight, capacity,
+/// usage limit); there is no `Running → Withheld` edge and [`RunOutcome`]
+/// cannot express it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RunStatus {
@@ -163,6 +219,7 @@ pub enum RunStatus {
     Succeeded,
     Failed,
     Skipped,
+    Withheld,
 }
 
 impl RunStatus {
@@ -301,6 +358,16 @@ pub struct RunRow {
     /// `None`, so pane rows serialize byte-identically to before (R14).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The upstream run this dependent run consumed (dependencies U1 —
+    /// R3, KTD3): stamped via [`Automation::stamp_upstream`] in the same
+    /// store mutation as the claim, so consumption and claim can never
+    /// disagree. The exactly-once guarantee derives from this field: the
+    /// predicate ([`super::depend`]) refuses any upstream run id already
+    /// stamped in the dependent's history. `None` for every non-dependent
+    /// run; omitted from the wire when `None`, so existing rows serialize
+    /// byte-identically (the R14 headless precedent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_run_id: Option<String>,
     /// Captured output, capped to an [`OUTPUT_TAIL_CAP_BYTES`] tail (R8).
     pub output: Option<String>,
     pub exit_code: Option<i32>,
@@ -364,6 +431,15 @@ pub struct Automation {
     /// (monitor-handoff U4); `None` for every non-monitor automation.
     #[serde(default)]
     pub pickup_pointers: Option<MonitorPointers>,
+    /// Dependency edge (dependencies U1 — R1): when set, the sweep fires a
+    /// due occurrence only against a fresh, successful, not-yet-consumed
+    /// run of the named upstream ([`super::depend::evaluate`]), deferring
+    /// within the window and otherwise recording an honest
+    /// [`RunStatus::Withheld`] row. Create-only (no update op exists — the
+    /// KTD6 cycle argument rests on this). `#[serde(default)]` keeps every
+    /// legacy store row loading as `None`.
+    #[serde(default)]
+    pub after: Option<Dependency>,
     pub cwd: String,
     pub mode: Mode,
     pub origin: Origin,
@@ -507,6 +583,7 @@ impl Automation {
             bundle_path: None,
             headless,
             session_id: None,
+            upstream_run_id: None,
             output: None,
             exit_code: None,
             error: None,
@@ -515,6 +592,58 @@ impl Automation {
             finished_at: None,
         });
         Ok(())
+    }
+
+    /// Dependencies U1 (R3, KTD3): record which upstream run a just-claimed
+    /// dependent row consumed. Callers invoke this **in the same store
+    /// mutation** as the [`Automation::claim`] that appended the row, so
+    /// claim and consumption can never disagree (the exactly-once
+    /// guarantee). Only a still-`Running` row is stamped — a terminal row's
+    /// consumption record is frozen.
+    pub fn stamp_upstream(&mut self, run_id: &str, upstream_run_id: &str) {
+        if let Some(row) = self
+            .runs
+            .iter_mut()
+            .find(|r| r.id == run_id && r.status == RunStatus::Running)
+        {
+            row.upstream_run_id = Some(upstream_run_id.to_owned());
+        }
+    }
+
+    /// Record a dependency decline (dependencies U1 — R2, KTD2): append a
+    /// born-terminal [`RunStatus::Withheld`] row with the specific reason in
+    /// `error`. Mirrors [`Automation::skip`], including the KTD-D honesty
+    /// note: this does **not** touch `next_run_at` — the schedule advance
+    /// past the withheld occurrence is the caller's separate
+    /// [`Automation::rollback_recompute`] step.
+    pub fn withhold(&mut self, now_ms: u64, trigger: Trigger, reason: &str, run_id: &str) {
+        let scheduled_for = match trigger {
+            Trigger::Schedule => self.next_run_at,
+            Trigger::Manual | Trigger::Retry => None,
+        };
+        self.updated_at = now_ms;
+        self.push_row(RunRow {
+            id: run_id.to_owned(),
+            mode: self.mode.kind(),
+            trigger,
+            status: RunStatus::Withheld,
+            pane_id: None,
+            model: None,
+            effort: None,
+            verdict: None,
+            bundle_path: None,
+            // A withhold never dispatches — the dispatch-shape marker stays
+            // unset, like a skip.
+            headless: false,
+            session_id: None,
+            upstream_run_id: None,
+            output: None,
+            exit_code: None,
+            error: Some(reason.to_owned()),
+            scheduled_for,
+            started_at: None,
+            finished_at: Some(now_ms),
+        });
     }
 
     /// Record a pre-claim skip (R7 overlap, U5 capacity): append a terminal
@@ -545,6 +674,7 @@ impl Automation {
             // unset even on a monitor (headless-monitor-checks U2).
             headless: false,
             session_id: None,
+            upstream_run_id: None,
             output: None,
             exit_code: None,
             error: Some(reason.to_owned()),
@@ -676,7 +806,9 @@ impl Automation {
                     n += 1
                 }
                 RunStatus::Succeeded => break, // readable not-done check: reset
-                RunStatus::Skipped | RunStatus::Running => {}
+                // Withheld is neutral like Skipped: the run never happened
+                // (dependencies R2), so it neither counts nor resets.
+                RunStatus::Skipped | RunStatus::Withheld | RunStatus::Running => {}
             }
         }
         n
@@ -755,6 +887,7 @@ mod tests {
             not_before_ms: None,
             retired_at: None,
             pickup_pointers: None,
+            after: None,
             cwd: "/tmp".into(),
             mode,
             origin: Origin {
@@ -1738,6 +1871,145 @@ mod tests {
     fn monitors_default_retry_on_interrupt_on() {
         assert!(default_retry_on_interrupt(true));
         assert!(!default_retry_on_interrupt(false));
+    }
+
+    // Dependencies R2/KTD2: withhold appends a born-terminal Withheld row
+    // with the reason in `error`, never touching next_run_at (the KTD-D
+    // advance stays the caller's separate step) — the skip contract, on the
+    // new honest status.
+    #[test]
+    fn withhold_appends_a_born_terminal_row_and_leaves_schedule_advance_to_the_caller() {
+        let mut a = automation(script_mode());
+        a.withhold(61_000, Trigger::Schedule, "upstream failed (timed out)", "w1");
+
+        assert_eq!(a.next_run_at, Some(60_000), "withhold itself never advances");
+        let row = &a.runs[0];
+        assert_eq!(row.status, RunStatus::Withheld);
+        assert!(row.status.is_terminal(), "born terminal");
+        assert_eq!(row.error.as_deref(), Some("upstream failed (timed out)"));
+        assert_eq!(row.scheduled_for, Some(60_000), "the occurrence withheld");
+        assert_eq!(row.started_at, None, "a withheld run never ran");
+        assert_eq!(row.finished_at, Some(61_000));
+        assert!(!row.headless, "never dispatched — the marker stays unset");
+        assert!(!a.in_flight(), "terminal from birth");
+
+        // The caller then advances the schedule separately (KTD-D).
+        a.rollback_recompute(Some(360_000));
+        assert_eq!(a.next_run_at, Some(360_000));
+
+        // A withheld row is neutral in the monitor infra walk, like Skipped.
+        assert_eq!(a.consecutive_infra_failures(), 0);
+    }
+
+    // Dependencies R3/KTD3: stamp_upstream records the consumed upstream run
+    // on the still-Running claimed row — and refuses to rewrite a terminal
+    // row's frozen consumption record.
+    #[test]
+    fn stamp_upstream_records_consumption_on_the_running_row_only() {
+        let mut a = automation(script_mode());
+        a.claim(Some(360_000), 61_000, Trigger::Schedule, "r1", false)
+            .unwrap();
+        a.stamp_upstream("r1", "up-run-9");
+        assert_eq!(a.runs[0].upstream_run_id.as_deref(), Some("up-run-9"));
+
+        a.close("r1", RunOutcome::Succeeded { output: None }, 70_000);
+        a.stamp_upstream("r1", "up-run-10");
+        assert_eq!(
+            a.runs[0].upstream_run_id.as_deref(),
+            Some("up-run-9"),
+            "a terminal row's consumption record is frozen"
+        );
+
+        // Unknown run id: a no-op, nothing invented.
+        a.stamp_upstream("ghost", "up-run-11");
+        assert!(a.runs.iter().all(|r| r.upstream_run_id.as_deref() != Some("up-run-11")));
+    }
+
+    // Dependencies R1/R3 back-compat (the plan's required
+    // legacy-rows-load-without-the-new-field pin): a pre-plan store JSON —
+    // no `after` on the automation, no `upstreamRunId` on its rows — loads
+    // with both defaulted, and serializing a fresh non-dependent row omits
+    // `upstreamRunId` entirely (byte-identical rows, the R14 precedent).
+    #[test]
+    fn legacy_rows_load_without_the_new_dependency_fields() {
+        let legacy = serde_json::json!({
+            "id": "a1",
+            "name": "old watch",
+            "cron": "*/5 * * * *",
+            "timezone": "UTC",
+            "enabled": true,
+            "cwd": "/tmp",
+            "mode": {
+                "kind": "script",
+                "scriptFile": "s",
+                "interpreter": "bash",
+                "timeoutMs": 1000,
+            },
+            "origin": { "paneId": 1, "workspaceId": "ws", "label": "cli" },
+            "createdAt": 0,
+            "updatedAt": 0,
+            "nextRunAt": 60_000,
+            "runs": [{
+                "id": "r1",
+                "mode": "script",
+                "trigger": "schedule",
+                "status": "succeeded",
+                "paneId": null,
+                "output": "ok",
+                "exitCode": 0,
+                "error": null,
+                "scheduledFor": 60_000,
+                "startedAt": 61_000,
+                "finishedAt": 62_000,
+            }],
+        });
+        let a: Automation = serde_json::from_value(legacy).unwrap();
+        assert_eq!(a.after, None, "legacy automations carry no dependency");
+        assert_eq!(a.runs[0].upstream_run_id, None);
+
+        let v = serde_json::to_value(&a).unwrap();
+        assert!(
+            v["runs"][0].get("upstreamRunId").is_none(),
+            "None upstreamRunId is omitted, not serialized as null"
+        );
+        assert!(v.get("after").is_some_and(|x| x.is_null()), "after serializes null");
+    }
+
+    // Dependencies U1: the dependency edge and a withheld row ride the
+    // camelCase wire contract and round-trip losslessly; within() defaults.
+    #[test]
+    fn dependency_and_withheld_rows_round_trip_camel_case() {
+        let mut a = automation(script_mode());
+        a.after = Some(Dependency {
+            upstream_id: "up1".into(),
+            within_ms: Some(120_000),
+        });
+        a.withhold(61_000, Trigger::Schedule, "upstream has not run", "w1");
+        a.claim(Some(360_000), 62_000, Trigger::Schedule, "r1", false)
+            .unwrap();
+        a.stamp_upstream("r1", "up-run-3");
+
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["after"]["upstreamId"], "up1");
+        assert_eq!(v["after"]["withinMs"], 120_000);
+        assert_eq!(v["runs"][0]["status"], "withheld");
+        assert_eq!(v["runs"][0]["error"], "upstream has not run");
+        assert_eq!(v["runs"][1]["upstreamRunId"], "up-run-3");
+
+        let back: Automation = serde_json::from_value(v).unwrap();
+        assert_eq!(back, a);
+
+        // KTD4: the window defaults when unset and honors an explicit value.
+        assert_eq!(
+            Dependency { upstream_id: "u".into(), within_ms: None }.within(),
+            DEFAULT_AFTER_WITHIN_MS
+        );
+        assert_eq!(a.after.as_ref().unwrap().within(), 120_000);
+
+        // A bare wire edge without withinMs loads with the default.
+        let bare: Dependency =
+            serde_json::from_value(serde_json::json!({ "upstreamId": "u2" })).unwrap();
+        assert_eq!(bare.within_ms, None);
     }
 
     // R7: in-flight is exactly "a Running row exists" — skips and closed

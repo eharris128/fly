@@ -205,6 +205,29 @@ pub fn parse_not_before<Z: chrono::TimeZone>(input: &str, local: &Z) -> Result<u
     ))
 }
 
+/// Parse a `--within` duration (automation-dependencies U5 — R14): bare
+/// minutes, or a number suffixed `m`/`h`/`d`. Range-checked against the same
+/// bounds the app enforces on the wire ([`crate::automations::depend`]), so
+/// the author hears about an out-of-range window before the socket.
+pub fn parse_within(input: &str) -> Result<u64, String> {
+    let s = input.trim();
+    let (num, unit_ms): (&str, u64) = match s.char_indices().last() {
+        Some((i, 'm')) => (&s[..i], 60 * 1000),
+        Some((i, 'h')) => (&s[..i], 60 * 60 * 1000),
+        Some((i, 'd')) => (&s[..i], 24 * 60 * 60 * 1000),
+        Some((_, c)) if c.is_ascii_digit() => (s, 60 * 1000), // bare = minutes
+        _ => {
+            return Err(format!(
+                "--within wants a duration like 45m, 2h, 1d, or bare minutes (got {s:?})"
+            ))
+        }
+    };
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("--within wants a duration like 45m, 2h, 1d (got {s:?})"))?;
+    crate::automations::depend::validate_within(n.saturating_mul(unit_ms))
+}
+
 /// Request posted for an `automation/*` op (U9). The client fills `token`, `op`,
 /// and the fields the op needs; the app-side handler in `lib.rs` deserializes
 /// the same bytes and dispatches. All op-specific fields are optional so one
@@ -270,6 +293,18 @@ pub struct AutomationRequest {
     /// pattern as `monitor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headless: Option<bool>,
+    /// Dependency edge (automation-dependencies plan, U5 — R14): create-only.
+    /// `after` names the upstream automation id; `within_ms` is the optional
+    /// symmetric freshness/wait window (absent = the 60-min default). The
+    /// untrusted wire is re-validated app-side (existence, non-monitor
+    /// upstream, chain depth/cycle, range — U3); same back-compat pattern as
+    /// `monitor`: an old server silently ignores the fields and creates an
+    /// ungated automation (accepted single-install skew, the plan's R14
+    /// note), an old CLI never sends them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within_ms: Option<u64>,
 }
 
 /// The app's response to an `automation/*` request.
@@ -434,6 +469,8 @@ fn handle_create(args: &[String]) -> i32 {
     let mut not_before: Option<String> = None;
     let mut headless = false;
     let mut paned = false;
+    let mut after: Option<String> = None;
+    let mut within: Option<String> = None;
     let mut json = false;
 
     let mut it = args.iter();
@@ -465,6 +502,16 @@ fn handle_create(args: &[String]) -> i32 {
                 println!("  --not-before <time>     monitor only: never check before this time;");
                 println!("                          RFC3339 (2026-07-12T09:00:00Z) or local \"YYYY-MM-DD HH:MM\";");
                 println!("                          a past time is fine (next cron occurrence from now)");
+                println!("  --after <id>            only run against a fresh, successful, not-yet-");
+                println!("                          consumed run of automation <id>: a due occurrence");
+                println!("                          waits (up to the window) for the upstream to");
+                println!("                          succeed, and otherwise records an honest");
+                println!("                          'withheld' run saying why it did not fire");
+                println!("  --within <dur>          freshness/wait window for --after (45m, 2h, 1d,");
+                println!("                          or bare minutes; default 60m): the upstream");
+                println!("                          success may be at most this old, and the");
+                println!("                          dependent waits at most this long past its");
+                println!("                          scheduled time");
                 println!("  --json                  output response as JSON");
                 println!();
                 println!("Either --prompt (agent mode) or --script/--script-file (script mode) is required.");
@@ -498,6 +545,20 @@ fn handle_create(args: &[String]) -> i32 {
             "--monitor" => monitor = true,
             "--headless" => headless = true,
             "--paned" => paned = true,
+            "--after" => {
+                after = it.next().cloned();
+                if after.is_none() {
+                    eprintln!("fly automation create: --after wants an automation id");
+                    return 2;
+                }
+            }
+            "--within" => {
+                within = it.next().cloned();
+                if within.is_none() {
+                    eprintln!("fly automation create: --within wants a duration");
+                    return 2;
+                }
+            }
             "--not-before" => {
                 not_before = it.next().cloned();
                 if not_before.is_none() {
@@ -593,6 +654,29 @@ fn handle_create(args: &[String]) -> i32 {
         return 2;
     }
 
+    // Automation-dependencies U5 (R14): --after is rejected with --monitor
+    // (a monitor is a parked experiment, not a pipeline stage), --within is
+    // meaningless without --after, and the window parses + range-checks
+    // client-side. All re-validated app-side on the untrusted wire (U3).
+    if after.is_some() && monitor {
+        eprintln!("fly automation create: --after cannot be combined with --monitor");
+        return 2;
+    }
+    if within.is_some() && after.is_none() {
+        eprintln!("fly automation create: --within requires --after");
+        return 2;
+    }
+    let within_ms = match &within {
+        Some(raw) => match parse_within(raw) {
+            Ok(ms) => Some(ms),
+            Err(e) => {
+                eprintln!("fly automation create: {e}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+
     // Parse `--not-before` to epoch ms CLI-side (monitor-handoff U5, R1):
     // RFC3339 with offset, or naive "YYYY-MM-DD HH:MM" resolved through the
     // system-local zone. A past instant is accepted — it clamps to a no-op
@@ -644,6 +728,8 @@ fn handle_create(args: &[String]) -> i32 {
             (_, true) => Some(false),
             _ => None,
         },
+        after,
+        within_ms,
         ..Default::default()
     };
     send_and_report(req, "created", json)
@@ -795,7 +881,7 @@ fn handle_show(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let Some(a) = list.into_iter().find(|a| a.id == id) else {
+    let Some(a) = list.iter().find(|a| a.id == id) else {
         eprintln!("fly automation show: no such automation: {id}");
         return 1;
     };
@@ -804,12 +890,19 @@ fn handle_show(args: &[String]) -> i32 {
         return 0;
     }
     let now = now_ms();
+    // Automation-dependencies R15: resolve the upstream's name from the same
+    // store read; None flags a dangling edge.
+    let upstream_name = a.after.as_ref().and_then(|e| {
+        list.iter()
+            .find(|u| u.id == e.upstream_id)
+            .map(|u| u.name.clone())
+    });
     // Best-effort config read (read-only, like the store read): the
     // disposition line names what "default" currently resolves to.
     let headless_default = crate::config::load_with_fallback(&crate::config::default_path())
         .automation_defaults
         .headless;
-    for line in show_lines(&a, now, headless_default) {
+    for line in show_lines(a, now, headless_default, upstream_name.as_deref()) {
         println!("{line}");
     }
     0
@@ -975,22 +1068,35 @@ fn type_label(a: &Automation) -> String {
 }
 
 /// The next-run column: a retired monitor never runs again — render `—`,
-/// not `paused` (monitor-handoff R3); everything else keeps the existing
-/// paused/relative labels.
+/// not `paused` (monitor-handoff R3); a dependent whose due occurrence is
+/// currently deferring renders `waiting on upstream` (automation-
+/// dependencies R15 — its `next_run_at` sits in the past by design while
+/// the sweep re-evaluates every tick, so a relative label would misread as
+/// "overdue"); everything else keeps the existing paused/relative labels.
 fn next_label(a: &Automation, now: u64) -> String {
     if a.retired_at.is_some() {
         return "—".to_string();
     }
+    if a.after.is_some() && a.enabled && a.next_run_at.is_some_and(|t| t <= now) {
+        return "waiting on upstream".to_string();
+    }
     next_run_label(a.next_run_at, now)
 }
 
-/// One `list` row (pure — testable without stdout).
+/// One `list` row (pure — testable without stdout). A dependent carries its
+/// edge inline (automation-dependencies R15).
 fn list_line(a: &Automation, now: u64) -> String {
+    let after = a
+        .after
+        .as_ref()
+        .map(|e| format!("  after:{}", e.upstream_id))
+        .unwrap_or_default();
     format!(
-        "{}  {}  [{}]  {} {}  next {}  last {}",
+        "{}  {}  [{}]{}  {} {}  next {}  last {}",
         a.id,
         notify::sanitize_title(&a.name),
         type_label(a),
+        after,
         a.cron,
         a.timezone,
         next_label(a, now),
@@ -1005,7 +1111,12 @@ fn list_line(a: &Automation, now: u64) -> String {
 /// when present, and — while the monitor is still live — the missed-tick
 /// caveat the plan requires `show` to state (checks fire only while fly
 /// runs; no catch-up).
-fn show_lines(a: &Automation, now: u64, headless_default: bool) -> Vec<String> {
+fn show_lines(
+    a: &Automation,
+    now: u64,
+    headless_default: bool,
+    upstream_name: Option<&str>,
+) -> Vec<String> {
     let mut lines = vec![
         format!("id        {}", a.id),
         format!("name      {}", notify::sanitize_title(&a.name)),
@@ -1018,6 +1129,19 @@ fn show_lines(a: &Automation, now: u64, headless_default: bool) -> Vec<String> {
             if a.retry_on_interrupt { "on interrupt" } else { "off" }
         ),
     ];
+    // Automation-dependencies R15: the dependency edge — upstream id (+ name
+    // when it still resolves; a dangling edge is flagged, since the sweep
+    // will withhold on it) and the effective window.
+    if let Some(edge) = &a.after {
+        let who = match upstream_name {
+            Some(n) => format!("{} ({})", edge.upstream_id, notify::sanitize_title(n)),
+            None => format!("{} (MISSING — runs will be withheld)", edge.upstream_id),
+        };
+        lines.push(format!(
+            "after     {who} — requires upstream success within {}m",
+            edge.within() / 60_000
+        ));
+    }
     // Dispatch disposition (headless-agent-automations U2 — R10's display
     // half): explicit pin, or the config default it follows. Monitors skip
     // it — they are unconditionally headless and say so via their own lines.
@@ -1111,6 +1235,9 @@ fn status_label(s: RunStatus) -> &'static str {
         RunStatus::Succeeded => "succeeded",
         RunStatus::Failed => "failed",
         RunStatus::Skipped => "skipped",
+        // Automation-dependencies R15: the honest dependency decline; the
+        // reason rides the row's error column like a skip reason.
+        RunStatus::Withheld => "withheld",
     }
 }
 
@@ -1233,6 +1360,7 @@ mod tests {
             not_before_ms: None,
             retired_at: None,
             pickup_pointers: None,
+            after: None,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "s".into(),
@@ -1488,6 +1616,7 @@ mod tests {
             bundle_path: None,
             headless: false,
             session_id: None,
+            upstream_run_id: None,
             output: None,
             exit_code: None,
             error: None,
@@ -1571,7 +1700,7 @@ mod tests {
         a.retired_at = Some(now - 3_600_000);
         a.next_run_at = None;
 
-        let lines = show_lines(&a, now, true);
+        let lines = show_lines(&a, now, true, None);
         assert!(
             lines.iter().any(|l| l == "monitor   retired fail (1h ago)"),
             "state + retirement instant: {lines:?}"
@@ -1606,7 +1735,7 @@ mod tests {
         parked.not_before_ms = Some(now + 2 * 3_600_000);
         parked.next_run_at = Some(now + 2 * 3_600_000);
 
-        let lines = show_lines(&parked, now, true);
+        let lines = show_lines(&parked, now, true, None);
         assert!(
             lines.iter().any(|l| l == "monitor   parked (not before in 2h)"),
             "parked state carries the floor: {lines:?}"
@@ -1618,7 +1747,7 @@ mod tests {
         assert!(!lines.iter().any(|l| l.starts_with("verdict")), "no verdict yet");
 
         let plain = super_automation("p", "plain");
-        let lines = show_lines(&plain, now, true);
+        let lines = show_lines(&plain, now, true, None);
         for prefix in ["monitor", "verdict", "bundle", "note"] {
             assert!(
                 !lines.iter().any(|l| l.starts_with(prefix)),
@@ -1646,23 +1775,23 @@ mod tests {
             };
             a
         };
-        let lines = show_lines(&agent(None), now, true);
+        let lines = show_lines(&agent(None), now, true, None);
         assert!(
             lines.iter().any(|l| l == "dispatch  default (headless)"),
             "unpinned names the resolved default: {lines:?}"
         );
-        let lines = show_lines(&agent(None), now, false);
+        let lines = show_lines(&agent(None), now, false, None);
         assert!(lines.iter().any(|l| l == "dispatch  default (paned)"), "{lines:?}");
-        let lines = show_lines(&agent(Some(true)), now, false);
+        let lines = show_lines(&agent(Some(true)), now, false, None);
         assert!(lines.iter().any(|l| l == "dispatch  headless"), "{lines:?}");
-        let lines = show_lines(&agent(Some(false)), now, true);
+        let lines = show_lines(&agent(Some(false)), now, true, None);
         assert!(lines.iter().any(|l| l == "dispatch  paned"), "{lines:?}");
 
         let script = super_automation("s", "script");
-        let lines = show_lines(&script, now, true);
+        let lines = show_lines(&script, now, true, None);
         assert!(!lines.iter().any(|l| l.starts_with("dispatch")), "{lines:?}");
         let monitor = monitor_automation("m", "watch");
-        let lines = show_lines(&monitor, now, true);
+        let lines = show_lines(&monitor, now, true, None);
         assert!(
             !lines.iter().any(|l| l.starts_with("dispatch")),
             "a monitor states headless via its own lines: {lines:?}"
@@ -1772,5 +1901,103 @@ mod tests {
             ["m", "b", "p", "r"],
             "parked by next-run with recurring, then paused, then retired"
         );
+    }
+
+    // ---- automation-dependencies (U5) -----------------------------------------
+
+    // R14: --within durations parse as bare minutes or m/h/d, range-checked
+    // against the app's own bounds; garbage rejects.
+    #[test]
+    fn parse_within_accepts_minutes_hours_days_and_rejects_garbage() {
+        assert_eq!(parse_within("45"), Ok(45 * 60 * 1000));
+        assert_eq!(parse_within("45m"), Ok(45 * 60 * 1000));
+        assert_eq!(parse_within("2h"), Ok(2 * 60 * 60 * 1000));
+        assert_eq!(parse_within("1d"), Ok(24 * 60 * 60 * 1000));
+        assert!(parse_within("0m").is_err(), "below the 1-min floor");
+        assert!(parse_within("8d").is_err(), "above the 7-day ceiling");
+        assert!(parse_within("soon").is_err());
+        assert!(parse_within("").is_err());
+    }
+
+    // R14 wire back-compat (the monitor-field pattern): a request without
+    // the dependency fields serializes without the keys — an old server
+    // sees yesterday's shape — and one carrying them round-trips.
+    #[test]
+    fn request_after_fields_are_back_compat_on_the_wire() {
+        let bare = AutomationRequest {
+            op: "automation/create".into(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&bare).unwrap();
+        assert!(v.get("after").is_none(), "absent field omitted entirely");
+        assert!(v.get("within_ms").is_none());
+
+        let with = AutomationRequest {
+            op: "automation/create".into(),
+            after: Some("up1".into()),
+            within_ms: Some(120_000),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["after"], "up1");
+        // The request envelope is snake_case (unlike the store/model shape).
+        assert_eq!(v["within_ms"], 120_000);
+        let back: AutomationRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.after.as_deref(), Some("up1"));
+        assert_eq!(back.within_ms, Some(120_000));
+
+        // An old client's payload (no keys) still parses with both None.
+        let old: AutomationRequest =
+            serde_json::from_str(r#"{"token":"t","op":"automation/create"}"#).unwrap();
+        assert_eq!(old.after, None);
+        assert_eq!(old.within_ms, None);
+    }
+
+    // R15: list marks the edge and renders `waiting on upstream` for a
+    // due-and-deferring dependent; show prints the edge with the window and
+    // flags a dangling upstream; a withheld run row renders its status and
+    // reason.
+    #[test]
+    fn dependency_rendering_in_list_show_and_runs() {
+        use crate::automations::model::Dependency;
+        let now = 1_000_000_000u64;
+        let mut a = super_automation("d1", "feed analysis");
+        a.after = Some(Dependency {
+            upstream_id: "up1".into(),
+            within_ms: Some(30 * 60 * 1000),
+        });
+
+        // Future occurrence: the ordinary relative label, plus the edge tag.
+        a.next_run_at = Some(now + 60_000);
+        let line = list_line(&a, now);
+        assert!(line.contains("after:up1"), "got: {line}");
+        assert!(!line.contains("waiting on upstream"), "got: {line}");
+
+        // Due (deferring): the waiting label replaces the misleading
+        // "overdue" relative time.
+        a.next_run_at = Some(now - 60_000);
+        let line = list_line(&a, now);
+        assert!(line.contains("next waiting on upstream"), "got: {line}");
+        // …but not when paused (next_run_at None renders paused as before).
+        a.next_run_at = None;
+        assert!(list_line(&a, now).contains("next paused"));
+
+        // show: resolved upstream name + window; dangling edge flagged.
+        a.next_run_at = Some(now + 60_000);
+        let lines = show_lines(&a, now, true, Some("modal feed"));
+        let after_line = lines.iter().find(|l| l.starts_with("after")).unwrap();
+        assert!(after_line.contains("up1 (modal feed)"), "got: {after_line}");
+        assert!(after_line.contains("within 30m"), "got: {after_line}");
+        let lines = show_lines(&a, now, true, None);
+        let after_line = lines.iter().find(|l| l.starts_with("after")).unwrap();
+        assert!(after_line.contains("MISSING"), "got: {after_line}");
+
+        // runs: a withheld row renders the status label + its reason.
+        let mut row = run_row("w1", RunStatus::Withheld);
+        row.error = Some("upstream failed (exit 1)".into());
+        row.started_at = None;
+        let line = run_line(&row, now);
+        assert!(line.contains("withheld"), "got: {line}");
+        assert!(line.contains("upstream failed (exit 1)"), "got: {line}");
     }
 }

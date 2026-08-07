@@ -465,6 +465,7 @@ mod tests {
             not_before_ms: None,
             retired_at: None,
             pickup_pointers: None,
+            after: None,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "script".into(),

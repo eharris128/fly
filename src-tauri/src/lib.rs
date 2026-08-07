@@ -1339,6 +1339,25 @@ pub fn dispatch_automation_op(
                 not_before_ms: req.not_before_ms,
                 monitor,
                 pickup_pointers,
+                // Automation-dependencies U3 (R7): the raw wire edge; the
+                // manager validates it against the live store (existence,
+                // non-monitor upstream, chain depth/cycle, within range) —
+                // the socket payload is untrusted, so nothing is trusted
+                // from flag combinations alone. `--within` without
+                // `--after` is rejected CLI-side and re-rejected here.
+                after: match (&req.after, req.within_ms) {
+                    (None, Some(_)) => {
+                        return AutomationResponse::err(
+                            "--within requires --after",
+                        )
+                    }
+                    (after, within_ms) => after.clone().map(|upstream_id| {
+                        automations::model::Dependency {
+                            upstream_id,
+                            within_ms,
+                        }
+                    }),
+                },
                 origin,
             }) {
                 Ok(created) => {
@@ -1377,7 +1396,28 @@ pub fn dispatch_automation_op(
         },
         "automation/delete" => match req.id {
             Some(id) => match mgr.delete(&id) {
-                Ok(a) => AutomationResponse::ok(Some(a.id), None),
+                Ok(a) => {
+                    // Automation-dependencies R8: delete is allowed with
+                    // dependents pointing here (no cascade, no refusal) —
+                    // they withhold honestly from now on — but the operator
+                    // is told which edges were left dangling.
+                    let dependents: Vec<String> = mgr
+                        .list()
+                        .into_iter()
+                        .filter(|d| {
+                            d.after.as_ref().is_some_and(|e| e.upstream_id == a.id)
+                        })
+                        .map(|d| format!("{} ({})", d.id, d.name))
+                        .collect();
+                    let warning = (!dependents.is_empty()).then(|| {
+                        format!(
+                            "dependent automation(s) now have a missing upstream and will \
+                             withhold: {}",
+                            dependents.join(", ")
+                        )
+                    });
+                    AutomationResponse::ok(Some(a.id), warning)
+                }
                 Err(e) => AutomationResponse::err(e),
             },
             None => AutomationResponse::err("delete requires an automation id"),
@@ -1389,6 +1429,15 @@ pub fn dispatch_automation_op(
                     ok: true,
                     id: Some(run_id),
                     warning: Some("a run was already in flight; this occurrence was skipped".into()),
+                    error: None,
+                },
+                // Automation-dependencies R12: the dependency refused — the
+                // honest reason reaches the operator synchronously (and is
+                // on the withheld row).
+                Ok(ManualRun::Withheld { run_id, reason }) => AutomationResponse {
+                    ok: true,
+                    id: Some(run_id),
+                    warning: Some(format!("withheld: {reason}")),
                     error: None,
                 },
                 Err(e) => AutomationResponse::err(e),
@@ -1583,6 +1632,7 @@ mod tests {
             not_before_ms: None,
             retired_at: None,
             pickup_pointers: None,
+            after: None,
             cwd: "/tmp".into(),
             mode: automations::model::Mode::Agent {
                 prompt: "check the run".into(),

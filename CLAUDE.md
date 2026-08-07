@@ -350,6 +350,30 @@ next time the account is actually at a limit. Modules:
   **camelCase** — this shape crosses the store file, the socket, and the
   dashboard, so it is the single wire contract.
 - `schedule.rs` (U2) — cron/timezone math (croner), the 5-min min-gap clamp (R1).
+- `depend.rs` — **automation dependencies**
+  (`docs/plans/2026-08-07-002-feat-automation-dependencies-plan.md`, its own
+  U1–U7/KTD1–KTD8): `fly automation create --after <id> [--within <dur>]`
+  makes a dependent's cron occurrence a *precondition-gated* fire — the pure
+  predicate here decides `Satisfied` (a fresh, successful, not-yet-consumed
+  upstream run exists; FAIL-verdict successes don't count) / `Wait` (window
+  open — the sweep leaves the occurrence untouched and re-evaluates each
+  tick, so the dependent fires within ~10 s of the upstream's success) /
+  `Withhold` (window closed — a new born-terminal `RunStatus::Withheld` row
+  records the specific reason: upstream failed/skipped/stale/still
+  running/missing/already consumed, chain-propagating for A→B→C). One
+  symmetric `within` window (default 60 min) bounds both staleness and wait.
+  Exactly-once per upstream run: the claim stamps `RunRow.upstreamRunId` in
+  the same store mutation (dependent retries bypass the gate and inherit
+  it). Scheduled withholds ring the Automations alert path; manual runs
+  evaluate the same predicate and report the refusal synchronously (no
+  override flag — re-run the upstream instead). Create-time validation walks
+  the chain (depth ≤ 8, cycle-reject; edges are create-only so cycles are
+  otherwise unconstructible); upstream must exist and not be a monitor.
+  Feed projection is additive (`after`, `lastWithheldReason`,
+  `lastStatus:"withheld"`); dashboard/CLI render `after:<id>` tags and
+  `waiting on upstream`. Back-compat note: the new `"withheld"` status value
+  makes a post-withhold store unreadable to *older* fly binaries (`.bad.bak`
+  degrade) — accepted, no downgrade path.
 - `store.rs` (U3) — the write-through **mutex-authority** store (KTD-B): the
   in-memory map is authoritative, flushed atomically per mutation; `StoreHealth`
   tracks corruption (`.bad.bak` rename, R6) and flush failures for the dashboard.
