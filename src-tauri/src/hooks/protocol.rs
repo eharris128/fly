@@ -89,6 +89,18 @@ impl Envelope {
     pub fn is_ask_hold(&self) -> bool {
         self.op == "ask/hold"
     }
+
+    /// Whether this op routes to the peer-messaging request handler
+    /// (agent-peer-messaging U1/KTD1): `peer/list` (`fly agents`) and
+    /// `peer/send` (`fly send`). Same request/response lifecycle as an
+    /// automation op — one bounded request in, one `{ok,…}` line out, never a
+    /// held connection. Skew rule as `ask/hold`: on an OLD server the op
+    /// falls through to notify, whose `HookMessage` parse fails on the
+    /// missing `reason` — silent reject, so `PeerRequest` must never gain a
+    /// field named `reason` (pinned by a test below).
+    pub fn is_peer(&self) -> bool {
+        self.op.starts_with("peer/")
+    }
 }
 
 /// A callback payload sent by an agent (via `fly notify`).
@@ -250,6 +262,29 @@ mod tests {
         let unknown: Envelope =
             serde_json::from_str(r#"{"token":"t","op":"something/else"}"#).unwrap();
         assert!(!unknown.is_automation());
+    }
+
+    #[test]
+    fn envelope_routes_peer_ops_and_their_payloads_never_parse_as_notify() {
+        // agent-peer-messaging U1/KTD1: both peer ops route to the peer
+        // handler, not the automation handler…
+        let list: Envelope =
+            serde_json::from_str(r#"{"token":"t","op":"peer/list"}"#).unwrap();
+        assert!(list.is_peer());
+        assert!(!list.is_automation());
+        assert!(!list.is_ask_hold());
+        let send_env: Envelope =
+            serde_json::from_str(r#"{"token":"t","op":"peer/send"}"#).unwrap();
+        assert!(send_env.is_peer());
+        // …and on an OLD server (unknown op → notify), a peer payload — which
+        // carries no `reason` — fails the HookMessage parse: silent reject,
+        // never a spurious raise. This is the skew rule PeerRequest must
+        // preserve by never gaining a `reason` field.
+        let list_wire = r#"{"token":"t","op":"peer/list"}"#;
+        assert!(serde_json::from_str::<HookMessage>(list_wire).is_err());
+        let send_wire =
+            r#"{"token":"t","op":"peer/send","pane":12,"message":"the run finished"}"#;
+        assert!(serde_json::from_str::<HookMessage>(send_wire).is_err());
     }
 
     #[test]

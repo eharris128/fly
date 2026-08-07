@@ -13,6 +13,7 @@
 pub mod automation;
 pub mod hooks;
 pub mod notify;
+pub mod peer;
 
 /// Whether the first argument selects a CLI subcommand (so the binary runs as
 /// the `fly` CLI rather than launching the desktop app). `resume` is excluded on
@@ -25,7 +26,7 @@ pub mod notify;
 pub fn is_cli_subcommand(arg: &str) -> bool {
     matches!(
         arg,
-        "notify" | "hooks" | "automation" | "help" | "--help" | "-h"
+        "notify" | "hooks" | "automation" | "agents" | "send" | "help" | "--help" | "-h"
     )
 }
 
@@ -46,7 +47,13 @@ pub fn top_level_help() -> String {
        fly hooks <setup|teardown> [--agent claude]\n                           \
                                 install or remove fly's Claude Code hooks\n  \
        fly automation <cmd> …   manage cron-scheduled agent/script runs\n  \
+       fly agents [--json]      list the live agent roster (peer messaging)\n  \
+       fly send <pane> <msg…>   deliver a message into another agent's pane\n  \
        fly help | --help | -h   show this help\n\
+     \n\
+     `fly agents` / `fly send` run inside a fly pane and talk over its\n\
+     authenticated socket; a target pane receives only after the human toggles\n\
+     'peers' on its dashboard row (off by default, every launch).\n\
      \n\
      Automation subcommands:\n  \
        fly automation list                     list automations\n  \
@@ -70,6 +77,8 @@ pub fn run(args: &[String]) -> i32 {
         }
         Some("notify") => notify::run(&args[2..]),
         Some("automation") => automation::run(&args[2..]),
+        Some("agents") => peer::run_agents(&args[2..]),
+        Some("send") => peer::run_send(&args[2..]),
         Some("hooks") => match args.get(2).map(String::as_str) {
             Some("setup") => hooks::run_setup(&args[3..]),
             Some("teardown") => hooks::run_teardown(&args[3..]),

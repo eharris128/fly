@@ -313,3 +313,134 @@ fn over_cap_connections_are_dropped_and_slots_free_on_close() {
         "a freed slot must admit and dispatch a valid notify"
     );
 }
+
+// ---- peer ops (agent-peer-messaging U1) -------------------------------------
+// The `peer/*` request/response family rides the same boundary as everything
+// else: token-validated before any op work, silent on auth failure, bounded.
+
+use fly_lib::hooks::PeerHandler;
+
+type PeerCalls = Arc<Mutex<Vec<(PaneId, Vec<u8>)>>>;
+
+/// A server with a recording peer handler wired (the automation-handler test
+/// shape): every authenticated peer op is logged with its token-resolved pane
+/// and answered with a canned ok line.
+fn setup_with_peer() -> (
+    tempfile::TempDir,
+    Arc<TokenRegistry>,
+    Recorder,
+    PeerCalls,
+    HookServer,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hook.sock");
+    let tokens = Arc::new(TokenRegistry::new());
+    let rec: Recorder = Arc::new(Mutex::new(Vec::new()));
+    let rec2 = Arc::clone(&rec);
+    let dispatch: Dispatch = Arc::new(move |pane, hook| {
+        rec2.lock().unwrap().push((pane, hook));
+    });
+    let calls: PeerCalls = Arc::new(Mutex::new(Vec::new()));
+    let calls2 = Arc::clone(&calls);
+    let peer: PeerHandler = Arc::new(move |pane, buf: &[u8]| {
+        calls2.lock().unwrap().push((pane, buf.to_vec()));
+        b"{\"ok\":true}".to_vec()
+    });
+    let server =
+        HookServer::start_full(path, Arc::clone(&tokens), dispatch, None, None, Some(peer))
+            .unwrap();
+    (dir, tokens, rec, calls, server)
+}
+
+/// One request/response round-trip: write, half-close, read to EOF (bounded).
+fn request(path: &Path, json: &str) -> Vec<u8> {
+    use std::io::Read;
+    let mut s = UnixStream::connect(path).unwrap();
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    s.write_all(json.as_bytes()).unwrap();
+    s.shutdown(Shutdown::Write).unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    buf
+}
+
+#[test]
+fn peer_ops_reject_invalid_tokens_silently_and_count_toward_lockout() {
+    let (_dir, tokens, _rec, calls, server) = setup_with_peer();
+    let _valid = tokens.issue(PaneId(1));
+    // A bad token gets no response bytes at all — indistinguishable from a
+    // dead socket — and never reaches the handler.
+    let resp = request(
+        server.socket_path(),
+        r#"{"token":"0000deadbeef","op":"peer/list"}"#,
+    );
+    assert!(resp.is_empty(), "bad token must be silent");
+    assert!(calls.lock().unwrap().is_empty(), "handler never invoked");
+    // Repeated bad presentations trip the same registry-wide lockout the
+    // notify path faces (the validate call is shared, pre-op).
+    for _ in 0..60 {
+        let _ = request(
+            server.socket_path(),
+            r#"{"token":"0000deadbeef","op":"peer/list"}"#,
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !tokens.is_locked() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(tokens.is_locked(), "peer-op failures count toward lockout");
+}
+
+#[test]
+fn peer_send_origin_is_the_token_resolved_pane_not_the_wire() {
+    let (_dir, tokens, _rec, calls, server) = setup_with_peer();
+    let tok = tokens.issue(PaneId(7));
+    // The payload tries to smuggle a different origin; unknown fields are
+    // ignored and the handler receives the token's pane (KTD2).
+    let resp = request(
+        server.socket_path(),
+        &format!(
+            r#"{{"token":"{tok}","op":"peer/send","pane":12,"message":"m","from":999,"origin":999}}"#
+        ),
+    );
+    assert_eq!(resp, b"{\"ok\":true}");
+    let got = calls.lock().unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, PaneId(7), "origin is the authenticated token's pane");
+}
+
+#[test]
+fn peer_ops_respect_the_message_bound() {
+    let (_dir, tokens, _rec, calls, server) = setup_with_peer();
+    let tok = tokens.issue(PaneId(7));
+    // Over MAX_MESSAGE (64 KiB): rejected silently by the shared read path,
+    // before any op work.
+    let big = "x".repeat(80 * 1024);
+    let resp = request(
+        server.socket_path(),
+        &format!(r#"{{"token":"{tok}","op":"peer/send","pane":12,"message":"{big}"}}"#),
+    );
+    assert!(resp.is_empty(), "oversized request must be silent");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn peer_ops_without_a_wired_handler_are_dropped_silently() {
+    // The behavioral half of the skew rule (agent-peer-messaging KTD1): a
+    // server with no peer handler — the old-server shape — neither answers a
+    // peer op nor lets it fall through to the notify dispatch (the payload
+    // carries no `reason`, so even the fallthrough parse would fail; here the
+    // routing returns first).
+    let (_dir, tokens, rec, server) = setup();
+    let tok = tokens.issue(PaneId(7));
+    let resp = request(
+        server.socket_path(),
+        &format!(r#"{{"token":"{tok}","op":"peer/send","pane":12,"message":"m"}}"#),
+    );
+    assert!(resp.is_empty(), "no handler → no response");
+    assert_eq!(
+        wait_count(&rec, 1, Duration::from_millis(400)),
+        0,
+        "a peer op must never dispatch as notify"
+    );
+}

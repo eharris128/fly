@@ -983,6 +983,7 @@ fn agent(leaf: &str, status: &str) -> AgentEntry {
         last_reply_at: None,
         question_pending_at: None,
         pane_id: None,
+        peer_opt_in: false,
     }
 }
 

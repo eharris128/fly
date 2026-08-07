@@ -55,6 +55,15 @@ export interface AgentEntry {
    * mapping lives in the webview, which is the only place that knows it.
    */
   paneId: number | null;
+  /**
+   * Whether the human opted this pane into receiving peer messages
+   * (agent-peer-messaging U3, R6/KTD6). Pushed — the dashboard toggle is
+   * deliberately the ONLY writer: no socket op, CLI verb, or feed route can
+   * set it, so a prompt-injected agent cannot opt itself (or its victim) in.
+   * Session-scoped: App seeds the map empty every launch (nothing persisted
+   * for a same-uid process to edit), so every launch starts closed.
+   */
+  peerOptIn: boolean;
 }
 
 /**
@@ -225,10 +234,15 @@ export interface FeedPublishPayload {
  * U4). A leaf missing from it yields `paneId: null` — the entry is still
  * published, because dropping it would make a starting agent vanish from the
  * roster rather than merely be untargetable.
+ *
+ * `peerOptInByLeaf` is the session-scoped peer-receive consent map
+ * (agent-peer-messaging U3): App owns it, the dashboard toggle is its only
+ * writer, and a leaf missing from it is closed — the KTD6 default.
  */
 export function buildFeedPayload(
   model: HomeWorkspaceGroup[],
   paneByLeaf: Readonly<Record<string, number>> = {},
+  peerOptInByLeaf: Readonly<Record<string, boolean>> = {},
 ): FeedPublishPayload {
   const agents: AgentEntry[] = [];
   for (const ws of model) {
@@ -248,6 +262,7 @@ export function buildFeedPayload(
           lastReplyAt: null, // backend-stamped at emit; never pushed
           questionPendingAt: null, // backend-stamped at emit; never pushed
           paneId: paneByLeaf[row.leafKey] ?? null,
+          peerOptIn: peerOptInByLeaf[row.leafKey] ?? false,
         });
       }
     }

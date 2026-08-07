@@ -566,10 +566,13 @@ fn gated_question(question: Option<QuestionBody>, reason: Option<&str>) -> Optio
 /// though it was never asked. A refusal is visible and recoverable; silent
 /// picker destruction is neither (AE4).
 ///
-/// This is a **drop-route rule**. The input route's behavior is deliberately
-/// left alone — the same hazard applies there, but changing it is a behavior
-/// change for an existing consumer and belongs in its own change (the plan's
-/// deferred list).
+/// This is a **drop-route rule** that the peer-messaging send path shares
+/// (agent-peer-messaging KTD5 — an unsolicited peer message is a drop, not an
+/// answer, so it takes the wide gate; `pub` so `lib.rs` and the peer
+/// integration tests consume the one predicate). The input route's
+/// behavior is deliberately left alone — the same hazard applies there, but
+/// changing it is a behavior change for an existing consumer and belongs in
+/// its own change (the plan's deferred list).
 ///
 /// Note what stays un-blocked. An agent that is merely *working* still receives
 /// the drop: Claude's composer queues mid-turn input, which is normal and is
@@ -577,7 +580,10 @@ fn gated_question(question: Option<QuestionBody>, reason: Option<&str>) -> Optio
 /// the gate inherits [`gated_question`]'s abstain-on-surprise posture, so a
 /// question fly cannot corroborate **fails open** and the drop is delivered —
 /// detection is best-effort (AE1), and the plan documents the consequence.
-fn drop_blocked_by_question(question: Option<QuestionBody>, reason: Option<&str>) -> bool {
+pub fn drop_blocked_by_question(
+    question: Option<QuestionBody>,
+    reason: Option<&str>,
+) -> bool {
     gated_question(question, reason).is_some()
 }
 

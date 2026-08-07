@@ -123,6 +123,13 @@ pub type Dispatch = Arc<dyn Fn(PaneId, ValidatedHook) + Send + Sync>;
 /// after token validation, outside every app lock the caller must avoid.
 pub type RequestHandler = Arc<dyn Fn(PaneId, &[u8]) -> Vec<u8> + Send + Sync>;
 
+/// Handler for an authenticated `peer/…` request (agent-peer-messaging
+/// U1/KTD1): same contract, lifecycle, and threading as [`RequestHandler`] —
+/// the validated *origin* pane (the token's pane, never the wire's — KTD2)
+/// plus the raw bytes in, one bounded `{ok,…}` response out. Distinct alias so
+/// the two seams can't be cross-wired silently at the constructor.
+pub type PeerHandler = RequestHandler;
+
 /// What the app-side registrar hands back for one accepted held ask
 /// (hook-ask-channel U2/KTD1). The connection thread acks, then parks on
 /// `decision_rx`: a received line is written to the client (a remote answer);
@@ -169,18 +176,20 @@ impl HookServer {
         dispatch: Dispatch,
         request_handler: Option<RequestHandler>,
     ) -> std::io::Result<HookServer> {
-        Self::start_full(socket_path, tokens, dispatch, request_handler, None)
+        Self::start_full(socket_path, tokens, dispatch, request_handler, None, None)
     }
 
     /// Bind the socket and start accepting callbacks, with the automation
-    /// request handler and the held-ask handler (hook-ask-channel U2). The
-    /// full production constructor; the narrower ones delegate here.
+    /// request handler, the held-ask handler (hook-ask-channel U2), and the
+    /// peer-messaging handler (agent-peer-messaging U1). The full production
+    /// constructor; the narrower ones delegate here.
     pub fn start_full(
         socket_path: PathBuf,
         tokens: Arc<TokenRegistry>,
         dispatch: Dispatch,
         request_handler: Option<RequestHandler>,
         ask_handler: Option<AskHandler>,
+        peer_handler: Option<PeerHandler>,
     ) -> std::io::Result<HookServer> {
         if let Some(parent) = socket_path.parent() {
             create_private_socket_dir(parent)?;
@@ -203,6 +212,7 @@ impl HookServer {
                     dispatch,
                     request_handler,
                     ask_handler,
+                    peer_handler,
                     accept_stopping,
                 )
             })?;
@@ -245,6 +255,7 @@ fn accept_loop(
     dispatch: Dispatch,
     request_handler: Option<RequestHandler>,
     ask_handler: Option<AskHandler>,
+    peer_handler: Option<PeerHandler>,
     stopping: Arc<AtomicBool>,
 ) {
     let cap = ConnCap::new(MAX_CONNECTIONS);
@@ -265,6 +276,7 @@ fn accept_loop(
                 let dispatch = Arc::clone(&dispatch);
                 let request_handler = request_handler.clone();
                 let ask_handler = ask_handler.clone();
+                let peer_handler = peer_handler.clone();
                 // Handle each callback concurrently.
                 let _ = std::thread::Builder::new()
                     .name("fly-hook-conn".into())
@@ -276,6 +288,7 @@ fn accept_loop(
                             &dispatch,
                             request_handler.as_ref(),
                             ask_handler.as_ref(),
+                            peer_handler.as_ref(),
                         )
                     });
             }
@@ -333,6 +346,7 @@ fn handle_conn(
     dispatch: &Dispatch,
     request_handler: Option<&RequestHandler>,
     ask_handler: Option<&AskHandler>,
+    peer_handler: Option<&PeerHandler>,
 ) {
     // The PTY is a trust boundary; only same-UID local peers may signal.
     if !peer_uid_matches(&stream) {
@@ -358,10 +372,19 @@ fn handle_conn(
     if envelope.is_automation() {
         if let Some(handler) = request_handler {
             let response = handler(pane, &buf);
-            let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-            let _ = stream.write_all(&response);
-            let _ = stream.flush();
-            let _ = stream.shutdown(Shutdown::Write);
+            write_response(&mut stream, &response);
+        }
+        return;
+    }
+
+    // Peer ops (agent-peer-messaging U1): same request/response lifecycle as
+    // an automation op, through the peer seam. The handler receives the
+    // *token-resolved* origin pane (KTD2) — the wire cannot claim another.
+    // With no handler wired the op is silently dropped, like an old server.
+    if envelope.is_peer() {
+        if let Some(handler) = peer_handler {
+            let response = handler(pane, &buf);
+            write_response(&mut stream, &response);
         }
         return;
     }
@@ -397,6 +420,16 @@ fn handle_conn(
             capture_only: msg.capture_only,
         },
     );
+}
+
+/// Write one bounded response and close the write half — the shared
+/// request/response tail for the automation and peer arms. The write timeout
+/// (U9) keeps a peer that connects but never reads from wedging the thread.
+fn write_response(stream: &mut UnixStream, response: &[u8]) {
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    let _ = stream.write_all(response);
+    let _ = stream.flush();
+    let _ = stream.shutdown(Shutdown::Write);
 }
 
 /// Hold a registered ask's connection until it resolves (hook-ask-channel

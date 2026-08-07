@@ -7,7 +7,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fly_lib::cli::notify::hold_ask;
@@ -44,6 +44,15 @@ fn handler(registry: Arc<AskRegistry>) -> AskHandler {
 }
 
 fn start(registry: &Arc<AskRegistry>) -> (tempfile::TempDir, Arc<TokenRegistry>, HookServer) {
+    start_with_peer(registry, None)
+}
+
+/// agent-peer-messaging U7: same harness with a peer handler wired, for the
+/// held-ask × peer-send interaction cases below.
+fn start_with_peer(
+    registry: &Arc<AskRegistry>,
+    peer_handler: Option<fly_lib::hooks::PeerHandler>,
+) -> (tempfile::TempDir, Arc<TokenRegistry>, HookServer) {
     let dir = tempfile::tempdir().unwrap();
     let tokens = Arc::new(TokenRegistry::new());
     let server = HookServer::start_full(
@@ -52,6 +61,7 @@ fn start(registry: &Arc<AskRegistry>) -> (tempfile::TempDir, Arc<TokenRegistry>,
         no_dispatch(),
         None,
         Some(handler(Arc::clone(registry))),
+        peer_handler,
     )
     .unwrap();
     (dir, tokens, server)
@@ -203,4 +213,200 @@ fn a_replacement_ask_releases_the_older_held_client() {
     assert_eq!(registry.answer("leaf-9", STAMP, false), AnswerOutcome::Delivered);
     let line = second.join().unwrap().unwrap().expect("decision");
     assert!(line.contains("\"behavior\":\"deny\""));
+}
+
+// ---- held asks × peer sends (agent-peer-messaging U7) -----------------------
+// The peer send path's wide question gate (KTD5) consumes the REAL resolver
+// chain here — a held `ask/hold` is the resolver's primary leg, so a send at
+// a pane whose hook is holding the socket must refuse `askPending` without
+// disturbing the held connection.
+
+use fly_lib::cli::peer::{PeerRequest, PeerResponse};
+use fly_lib::feed::pending::PendingSignals;
+use fly_lib::feed::server::drop_blocked_by_question;
+use fly_lib::hooks::PeerHandler;
+use fly_lib::peer::{self, rate, PeerPorts};
+
+type PtyLog = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+
+/// The lib.rs peer wiring, minus Tauri: a real `FallbackResolver` whose ask
+/// leg reads the same `AskRegistry` the socket's ask handler registers into,
+/// gated through the real `drop_blocked_by_question` predicate.
+fn peer_handler_with_real_ask_gate(
+    registry: Arc<AskRegistry>,
+    resume_dir: &tempfile::TempDir,
+    writes: PtyLog,
+) -> PeerHandler {
+    use fly_lib::feed::fallback::{AskFn, FallbackResolver, ScreenFn};
+    use fly_lib::feed::wire::AgentEntry;
+
+    let ask_reg = Arc::clone(&registry);
+    let ask_fn: AskFn = Arc::new(move |leaf| ask_reg.get(leaf));
+    let screen_fn: ScreenFn = Arc::new(|_| None);
+    let resolver = Arc::new(FallbackResolver::with_roots(
+        resume_dir.path().join("resume.json"),
+        None,
+        None,
+        Arc::new(PendingSignals::new()),
+        screen_fn,
+        ask_fn,
+    ));
+    let roster_rows = || -> Vec<AgentEntry> {
+        vec![AgentEntry {
+            leaf_key: "leaf-12".into(),
+            workspace: "home".into(),
+            tab: "fly".into(),
+            cwd: Some("/p".into()),
+            status: "waiting".into(),
+            needs_attention: false,
+            reason: None,
+            working_for_ms: None,
+            live_task_count: 0,
+            num: None,
+            last_reply_at: None,
+            question_pending_at: None,
+            pane_id: Some(12),
+            peer_opt_in: true,
+        }]
+    };
+    Arc::new(move |origin, buf: &[u8]| {
+        let req: PeerRequest = match serde_json::from_slice(buf) {
+            Ok(r) => r,
+            Err(_) => return PeerResponse::err("badRequest").to_bytes(),
+        };
+        let now = 1_000_000u64;
+        let roster = || (roster_rows(), Some(now - 1_000));
+        let leaf_for_pane =
+            |p: u64| (p == 12).then(|| "leaf-12".to_string());
+        let buckets = Mutex::new(rate::Buckets::new());
+        let try_take = |pane: u64, at: u64| buckets.lock().unwrap().try_take(pane, at);
+        // The production gate: resolver (held ask = primary leg) → the drop
+        // route's own predicate, roster reason/status from the same snapshot.
+        let ask_pending = |leaf: &str| {
+            let resolved = resolver.resolve_io(leaf, None, "waiting");
+            drop_blocked_by_question(resolved.question, None)
+        };
+        let w = Arc::clone(&writes);
+        let deliver = |_expect: u64, _leaf: &str, text: &str| {
+            w.lock().unwrap().push((12, text.as_bytes().to_vec()));
+            fly_lib::feed::drop::DropOutcome::Delivered
+        };
+        peer::dispatch_peer_op(
+            origin.0,
+            &req,
+            &PeerPorts {
+                now_ms: now,
+                roster: &roster,
+                leaf_for_pane: &leaf_for_pane,
+                try_take_rate: &try_take,
+                ask_pending: &ask_pending,
+                deliver: &deliver,
+            },
+        )
+        .to_bytes()
+    })
+}
+
+fn peer_send(path: &std::path::Path, token: &str, pane: u64, message: &str) -> PeerResponse {
+    use std::io::Read;
+    let mut s = UnixStream::connect(path).unwrap();
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    let req = PeerRequest {
+        token: token.into(),
+        op: "peer/send".into(),
+        pane: Some(pane),
+        message: Some(message.into()),
+    };
+    s.write_all(&serde_json::to_vec(&req).unwrap()).unwrap();
+    s.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    serde_json::from_slice(&buf).expect("peer op answers")
+}
+
+#[test]
+fn a_send_targeting_a_pane_with_a_held_ask_refuses_ask_pending() {
+    let registry = Arc::new(AskRegistry::new());
+    let resume_dir = tempfile::tempdir().unwrap();
+    let writes: PtyLog = Arc::new(Mutex::new(Vec::new()));
+    let (_dir, tokens, server) = start_with_peer(
+        &registry,
+        Some(peer_handler_with_real_ask_gate(
+            Arc::clone(&registry),
+            &resume_dir,
+            Arc::clone(&writes),
+        )),
+    );
+    let target_tok = tokens.issue(PaneId(12));
+    let sender_tok = tokens.issue(PaneId(7));
+    let path = server.socket_path().to_path_buf();
+
+    // Before any ask is held, the send lands (the gate is live, not latched).
+    let resp = peer_send(&path, &sender_tok, 12, "pre-ask ping");
+    assert!(resp.ok, "{resp:?}");
+    assert_eq!(writes.lock().unwrap().len(), 1);
+
+    // The target's hook registers a held permission ask…
+    let hold_path = path.clone();
+    let hold = std::thread::spawn(move || hold_ask(&hold_path, &target_tok, &bash_ask()));
+    assert!(wait_until(Duration::from_secs(2), || registry
+        .get("leaf-12")
+        .is_some()));
+
+    // …and now the same send refuses askPending, writes nothing, and the held
+    // connection is undisturbed (the ask is still registered afterwards).
+    let resp = peer_send(&path, &sender_tok, 12, "mid-ask ping");
+    assert_eq!(resp.error.as_deref(), Some("askPending"), "{resp:?}");
+    assert_eq!(writes.lock().unwrap().len(), 1, "nothing new reached the PTY");
+    assert!(registry.get("leaf-12").is_some(), "held ask survived");
+
+    // Resolve the ask remotely so the held client exits cleanly.
+    assert_eq!(registry.answer("leaf-12", STAMP, false), AnswerOutcome::Delivered);
+    let _ = hold.join().unwrap();
+}
+
+#[test]
+fn peer_traffic_does_not_perturb_held_ask_lifecycle() {
+    let registry = Arc::new(AskRegistry::new());
+    let resume_dir = tempfile::tempdir().unwrap();
+    let writes: PtyLog = Arc::new(Mutex::new(Vec::new()));
+    let (_dir, tokens, server) = start_with_peer(
+        &registry,
+        Some(peer_handler_with_real_ask_gate(
+            Arc::clone(&registry),
+            &resume_dir,
+            Arc::clone(&writes),
+        )),
+    );
+    let target_tok = tokens.issue(PaneId(12));
+    let sender_tok = tokens.issue(PaneId(7));
+    let path = server.socket_path().to_path_buf();
+
+    // A raw held client standing in for the hook process.
+    let mut stream = UnixStream::connect(&path).unwrap();
+    let msg = format!(r#"{{"token":"{target_tok}","op":"ask/hold","tool":"Bash"}}"#);
+    stream.write_all(format!("{msg}\n").as_bytes()).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut ack = String::new();
+    reader.read_line(&mut ack).unwrap();
+    assert!(ack.contains("\"held\":true"));
+    assert!(wait_until(Duration::from_secs(2), || registry
+        .get("leaf-12")
+        .is_some()));
+
+    // A burst of peer traffic — refused sends at the held pane, list ops.
+    for _ in 0..5 {
+        let resp = peer_send(&path, &sender_tok, 12, "ping");
+        assert_eq!(resp.error.as_deref(), Some("askPending"));
+    }
+    assert!(registry.get("leaf-12").is_some(), "ask survived the burst");
+
+    // The local answer kills the hook (peer close) → registry clears, exactly
+    // as without any peer traffic.
+    drop(reader);
+    drop(stream);
+    assert!(
+        wait_until(Duration::from_secs(2), || registry.get("leaf-12").is_none()),
+        "peer traffic must not perturb the drop-clears contract"
+    );
 }

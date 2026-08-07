@@ -98,9 +98,10 @@ The per-pane hook socket is also PID-keyed, so it never collides regardless.
 
 ### One binary, two roles
 `main.rs` → `lib.rs::run()`. If argv[1] is a CLI subcommand (`notify`, `hooks`,
-`automation`), the process runs as the **`fly` CLI** and exits; otherwise it
-launches the Tauri desktop app. The CLI and the app share the same `fly_lib`
-crate, so a `fly notify` invocation inside a pane talks to the running app.
+`automation`, `agents`, `send`), the process runs as the **`fly` CLI** and
+exits; otherwise it launches the Tauri desktop app. The CLI and the app share
+the same `fly_lib` crate, so a `fly notify` invocation inside a pane talks to
+the running app.
 
 `fly automation <create|list|show|runs|pause|resume|run|delete>` (U9) manages
 cron-scheduled runs: read ops work anywhere (they read the store file directly),
@@ -160,7 +161,8 @@ time/inputs as arguments so they're tested without a running app.
   `activity` tracker + suppression policy (`policy.rs`) + per-pane `manager`.
 - `hooks/` — the authenticated socket **(the security boundary)**: `token`,
   `protocol` (the notify path + the `automation/*` request envelope, U9, + the
-  newline-framed held `ask/hold` op, hook-ask-channel), `server`. Has its own
+  newline-framed held `ask/hold` op, hook-ask-channel, + the `peer/*`
+  request/response ops, agent-peer-messaging), `server`. Has its own
   scoped `CLAUDE.md` — read it before changing anything here.
 - `cli/` — `fly notify`, `fly hooks setup|teardown`, `fly automation …` (U9).
 - `automations/` — cron-scheduled agent/script runs (see the module map below).
@@ -298,6 +300,32 @@ time/inputs as arguments so they're tested without a running app.
   the no-entry leg) the ring's last-write time — never a transcript stamp — a
   late transcript flush takes over under its own stamp and stale `ifAskedAt`
   answers 409.
+- `peer/` — agent peer messaging (agent-peer-messaging plan, U1–U8): `fly
+  agents` (`peer/list`) and `fly send <pane> <message>` (`peer/send`) as
+  `peer/*` ops on the hook socket beside `automation/*` — same
+  token/peer-cred/bounds boundary, sender identity always the
+  **token-resolved** pane (KTD2; the wire carries no "from", and `PeerRequest`
+  must never gain a `reason` field — that absence is the version-skew rule).
+  `peer/mod.rs::dispatch_peer_op` is the pure gate sequence (KTD9, order
+  pinned by test): selfSend → tooLong → resolve target → **rosterStale**
+  (nothing roster-derived is trusted past a ~10s-old publish stamp; the read
+  op serves stale *marked*, the write path refuses) → **notOptedIn** (KTD6:
+  per-pane receive consent, **default off, session-scoped, human-only** — the
+  dashboard row's "peers" toggle is the sole writer, pushed on the roster as
+  `AgentEntry.peerOptIn`; no socket/CLI/config surface can set it, so a
+  prompt-injected agent can't opt itself in) → **rateLimited**
+  (`rate.rs` token buckets, per-sender + global backstop — the enforceable
+  fan-out brake; hop counters were rejected as unenforceable across a model
+  turn) → **askPending** (the drop route's own wide `drop_blocked_by_question`
+  predicate — any pending question refuses, ESC-cancels-picker hazard) →
+  delivery via `feed::drop::deliver_with_guards` (no-op commit, one app-wide
+  delivery mutex so two concurrent sends can't splice a composer line).
+  `compose.rs` sanitizes (`feed::io::clean` order) then wraps the body in a
+  fly-minted UNTRUSTED-provenance frame (delimiter-collision lines rewritten;
+  marking is advisory — containment is consent+rate+visibility). Peer
+  messaging depends on the webview roster publisher (runs when `feed.enabled`,
+  the default, or the dashboard is open) but NOT on the feed listener port.
+  Tests: `tests/peer_send.rs` + peer cases in `hook_auth`/`hook_ask`.
 - `notify/`, `config/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
   reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the

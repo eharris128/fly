@@ -4,11 +4,13 @@ This directory is fly's **trust boundary**. Read this before changing anything
 here, then see the module doc-comments for detail. The root `CLAUDE.md` covers
 the rest of the app; this note is scoped to the socket.
 
-IDs below are scoped to three plans (per-plan numbering — see
+IDs below are scoped to four plans (per-plan numbering — see
 `docs/plans/README.md`): the foundation plan
 `2026-06-16-001-feat-fly-agent-terminal` (`KTD7`/`U8`/`R10`), the automations
-plan `2026-07-01-002-feat-automations` (`U9`/`R22`), and the hook-ask-channel
-plan `2026-07-11-002-feat-hook-ask-channel` (the held `ask/hold` op).
+plan `2026-07-01-002-feat-automations` (`U9`/`R22`), the hook-ask-channel
+plan `2026-07-11-002-feat-hook-ask-channel` (the held `ask/hold` op), and the
+agent-peer-messaging plan `2026-08-07-001-feat-agent-peer-messaging` (the
+`peer/*` ops).
 
 ## What it defends
 
@@ -51,6 +53,16 @@ here is mandatory, not a nicety.
   recursion registry — `is_automation_pane`), which blocks an automation-spawned
   pane from creating or running automations. Keep the origin the token-resolved
   pane so that gate can do its job.
+- **Peer-op origin is token-resolved** (agent-peer-messaging `KTD2`) — a
+  `peer/send`'s sender is the authenticated token's pane, exactly like the
+  automation `R22` origin above: `PeerRequest` carries only the *target* pane
+  + message, never a "from", so a client cannot impersonate another pane to a
+  recipient (the delivered provenance frame is composed from the resolved
+  origin). Skew rule: `PeerRequest` must never gain a field named `reason` —
+  on an old server the op falls through to notify and that absence is what
+  makes the fallthrough parse fail silently. The consent gate (`peerOptIn`)
+  is deliberately **not settable over this socket** — it reaches the backend
+  only via the webview's roster push.
 - **Held asks stay bounded** (hook-ask-channel `R2`/`KTD1`) — the `ask/hold` op
   holds its connection for the ask's lifetime, so the pre-validation phase now
   has a hard wall-clock deadline (`REQUEST_DEADLINE`) on top of the size bound
@@ -60,19 +72,27 @@ here is mandatory, not a nicety.
   embedded newline truncates → silent reject). Token validation still precedes
   any held work; a held connection can only ever *receive* one decision line —
   nothing a peer writes after its request is parsed.
+  **Known broken upstream (Claude Code 2.1.224):** the clearing half of this
+  rests on Claude killing the hook when a dialog is answered locally, and it
+  no longer does — the hook lives on (≥250s measured, both dialog kinds), so
+  the held ask never clears and every question-gated surface refuses forever.
+  Diagnosis, measurements, and candidate fixes:
+  `docs/notes/2026-08-07-peer-messaging-live-check.md`. Re-verify this contract
+  whenever the Claude Code version moves.
 
 ## Layout
 
 - `token.rs` — `TokenRegistry`: mint / resolve tokens, constant-time compare,
   lockout.
 - `protocol.rs` — the wire schema (one UTF-8 JSON object per message: the
-  EOF-framed `notify` path + `automation/*` envelope, `U9`, and the
-  newline-framed held `ask/hold` op). Its doc-comment is the authoritative
-  schema + rejection-rule spec.
+  EOF-framed `notify` path + `automation/*` envelope, `U9`, the
+  newline-framed held `ask/hold` op, and the EOF-framed `peer/*`
+  request/response ops). Its doc-comment is the authoritative schema +
+  rejection-rule spec.
 - `server.rs` — `HookServer`: the accept loop, `SO_PEERCRED`, bounds/timeouts,
-  dispatch into `AttentionManager` / the automation handler, and the held-ask
-  connection loop (`hold_ask` — ack, park on the decision mailbox, probe for
-  peer death).
+  dispatch into `AttentionManager` / the automation handler / the peer
+  handler, and the held-ask connection loop (`hold_ask` — ack, park on the
+  decision mailbox, probe for peer death).
 
 ## Testing
 
@@ -81,8 +101,9 @@ The boundary has an integration test — run it after any change here:
 ```bash
 cargo test --offline --manifest-path src-tauri/Cargo.toml --test hook_auth
 cargo test --offline --manifest-path src-tauri/Cargo.toml --test hook_ask
+cargo test --offline --manifest-path src-tauri/Cargo.toml --test peer_send
 ```
 
 Add cases whenever you touch the token compare, peer-cred check, lockout,
-message bounds, or the held-ask framing — these are the parts that must not
-silently weaken.
+message bounds, the held-ask framing, or the peer-op routing/origin — these
+are the parts that must not silently weaken.

@@ -156,6 +156,15 @@ impl FeedState {
             })
     }
 
+    /// The pushed roster and its publish stamp in one lock acquisition
+    /// (agent-peer-messaging U2/KTD3): what the `peer/list` op serves and the
+    /// `peer/send` consent/staleness gates read. One snapshot, so the opt-in
+    /// bit and the stamp that vouches for it can't straddle a roster swap.
+    pub fn roster(&self) -> (Vec<AgentEntry>, Option<u64>) {
+        let inner = self.inner.lock().unwrap();
+        (inner.agents.clone(), inner.published_at)
+    }
+
     /// Assemble the frame to emit: the cached roster + the caller-supplied
     /// automations (read from the store at emit time, KTD4) + stamp. Kept free
     /// of any store/manager dependency so it is unit-tested in isolation.
@@ -248,6 +257,7 @@ mod tests {
             last_reply_at: None,
             question_pending_at: None,
             pane_id: None,
+            peer_opt_in: false,
         }
     }
 

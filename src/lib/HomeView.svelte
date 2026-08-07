@@ -32,6 +32,8 @@
     onRefresh,
     onJump,
     onClose,
+    peerOptInByLeaf,
+    onTogglePeer,
   }: {
     model: HomeWorkspaceGroup[];
     /** Wall-clock ms when `model`'s workingForMs values were measured, for the
@@ -75,6 +77,10 @@
     onRefresh: () => void;
     onJump: (wsId: string, tabId: string, leafKey: string) => void;
     onClose: () => void;
+    /** Peer-receive consent per leaf (agent-peer-messaging U3): read-only
+     *  here; App owns the map and this toggle callback is its one writer. */
+    peerOptInByLeaf: Readonly<Record<string, boolean>>;
+    onTogglePeer: (leafKey: string) => void;
   } = $props();
 
   // The last-run status word for a row: `"never run"` collapses to `"never"`;
@@ -244,6 +250,30 @@
                     {/if}
                   </span>
                   <span class="cwd">{row.cwd ?? ""}</span>
+                  <!-- The peer-receive toggle (agent-peer-messaging U3/KTD6):
+                       a switch span rather than a nested button (the row is
+                       one). Click/keys stop propagation so toggling never
+                       jumps to the pane. -->
+                  <span
+                    class="peer-toggle"
+                    class:on={peerOptInByLeaf[row.leafKey] ?? false}
+                    role="switch"
+                    aria-checked={peerOptInByLeaf[row.leafKey] ?? false}
+                    aria-label="Accept peer messages (fly send) into this pane"
+                    tabindex="0"
+                    title="Accept peer messages (fly send) into this pane — off by default, resets every launch"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      onTogglePeer(row.leafKey);
+                    }}
+                    onkeydown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        onTogglePeer(row.leafKey);
+                      }
+                    }}
+                  >peers {peerOptInByLeaf[row.leafKey] ? "on" : "off"}</span>
                 </button>
               {/each}
             </div>
@@ -602,7 +632,7 @@
   }
   .row {
     display: grid;
-    grid-template-columns: 28px 84px 64px 1fr;
+    grid-template-columns: 28px 84px 64px 1fr auto;
     align-items: center;
     gap: 12px;
     width: 100%;
@@ -701,6 +731,30 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* Peer-receive toggle (agent-peer-messaging U3): a quiet chip that reads
+     off/on at a glance — which panes are listening is a security-relevant
+     fact, so the on state gets the accent. */
+  .peer-toggle {
+    justify-self: end;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 9px;
+    border: 1px solid #343d59;
+    color: #7b84a3;
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+  }
+  .peer-toggle:hover {
+    border-color: #4a5578;
+    color: #aab3d0;
+  }
+  .peer-toggle.on {
+    border-color: #3d6bd6;
+    color: #7fa4f5;
+    background: rgba(61, 107, 214, 0.12);
   }
 
   /* Automations panel — stacked below the agent list in the same left column,

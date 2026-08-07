@@ -75,6 +75,16 @@ pub struct AgentEntry {
     /// `default` keeps both an older stored payload and an older consumer valid.
     #[serde(default)]
     pub pane_id: Option<u64>,
+    /// Whether the human opted this pane into receiving peer messages
+    /// (agent-peer-messaging U3, R6/KTD6). **Pushed from the webview** — the
+    /// dashboard toggle is deliberately the only surface that can set it: no
+    /// socket op, CLI verb, or feed route writes it, so a prompt-injected
+    /// agent cannot opt itself (or its victim) into receiving. Session-scoped
+    /// by construction (the webview seeds it empty every launch — nothing
+    /// persisted for a same-uid process to edit). `default` (= false, closed)
+    /// keeps an older pushed payload valid.
+    #[serde(default)]
+    pub peer_opt_in: bool,
 }
 
 /// One selectable option of a pending question, as the wire carries it
@@ -401,6 +411,7 @@ mod tests {
                 last_reply_at: Some(1_699_999_999_000),
                 question_pending_at: Some(1_700_000_000_500),
                 pane_id: Some(42),
+                peer_opt_in: false,
             }],
             automations: vec![AutomationEntry {
                 id: "a1".into(),
@@ -992,9 +1003,24 @@ mod tests {
             last_reply_at: None,
             question_pending_at: None,
             pane_id: Some(17),
+            peer_opt_in: true,
         })
         .unwrap();
         assert_eq!(json["paneId"], 17);
+        assert_eq!(json["peerOptIn"], true);
+    }
+
+    // agent-peer-messaging U3: the opt-in bit is additive — an entry pushed by
+    // an older webview (no `peerOptIn` key) deserializes closed, never open.
+    #[test]
+    fn agent_entry_without_peer_opt_in_deserializes_closed() {
+        let old = serde_json::json!({
+            "leafKey": "l", "workspace": "w", "tab": "t", "cwd": null,
+            "status": "idle", "needsAttention": false, "reason": null,
+            "workingForMs": null, "liveTaskCount": 0, "num": null
+        });
+        let back: AgentEntry = serde_json::from_value(old).unwrap();
+        assert!(!back.peer_opt_in, "absent opt-in is closed (KTD6)");
     }
 
     #[test]

@@ -124,6 +124,26 @@ describe("buildFeedPayload", () => {
     });
   });
 
+  // agent-peer-messaging U3 (R6/KTD6): the receive opt-in rides the pushed
+  // roster, and absence means closed — the default is never open.
+  describe("peerOptIn", () => {
+    it("carries the opt-in bit from the supplied consent map", () => {
+      const { agents } = buildFeedPayload(
+        model([row({ leafKey: "leaf-1" }), row({ leafKey: "leaf-2" })]),
+        {},
+        { "leaf-1": true, "leaf-2": false },
+      );
+      expect(agents.map((a) => a.peerOptIn)).toEqual([true, false]);
+    });
+
+    it("defaults to closed for a leaf missing from the map and when no map is supplied", () => {
+      const withMap = buildFeedPayload(model([row({ leafKey: "leaf-1" })]), {}, {});
+      expect(withMap.agents[0].peerOptIn).toBe(false);
+      const noMap = buildFeedPayload(model([row({ leafKey: "leaf-1" })]));
+      expect(noMap.agents[0].peerOptIn).toBe(false);
+    });
+  });
+
   // R4: two sessions in the same directory must still be tellable apart from a
   // phone, which is why the page renders workspace/tab/num and not just cwd.
   it("distinguishes two agents sharing a cwd by workspace, tab, and num", () => {
@@ -189,6 +209,7 @@ describe("buildFeedPayload", () => {
       lastReplyAt: null,
       questionPendingAt: null,
       paneId: 7,
+      peerOptIn: false,
     });
   });
 });

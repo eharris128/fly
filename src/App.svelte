@@ -221,6 +221,14 @@
   let notifications = $state<Notification[]>([]);
   // leaf key → backend pane id (for cwd queries) and last-known cwd (auto names).
   let paneIdByLeaf: Record<string, PaneId> = {};
+  // Peer-receive consent (agent-peer-messaging U3, R6/KTD6): leaf key → the
+  // human's per-pane opt-in for `fly send` delivery. Deliberately $state
+  // (drives the dashboard toggle + the publish effect) and deliberately NOT
+  // persisted — seeded empty every launch so receiving always starts closed,
+  // and there is no on-disk copy a same-uid process could edit. The toggle
+  // below is the only writer; the bit reaches the backend solely via the
+  // roster push.
+  let peerOptInByLeaf = $state<Record<string, boolean>>({});
   // Reverse index pane id → leaf key, to resolve a notification event's paneId
   // to the stable leafKey it's stored under. Overwritten on each spawn, so a
   // reused paneId maps to the new leaf; a now-exited pane's stale entry lingers
@@ -1699,13 +1707,24 @@
   // and stay untargetable by the phone drop until the next homeModel recompute.
   function publishFeed() {
     if (!feedEnabled) return;
-    void publishAgentFeed(buildFeedPayload(homeModel, paneIdByLeaf));
+    void publishAgentFeed(buildFeedPayload(homeModel, paneIdByLeaf, peerOptInByLeaf));
   }
   $effect(() => {
-    // Read `homeModel` inside the effect so it stays the tracked dependency.
+    // Read `homeModel` (and the peer consent map) inside the effect so both
+    // stay tracked dependencies — a toggle must reach the backend on the next
+    // publish, not the next roster recompute.
     void homeModel;
+    void peerOptInByLeaf;
     publishFeed();
   });
+  // The dashboard toggle (agent-peer-messaging U3): the one writer of the
+  // consent map. Keyed by leafKey so it survives paneId reassignment.
+  function togglePeerOptIn(leafKey: string) {
+    peerOptInByLeaf = {
+      ...peerOptInByLeaf,
+      [leafKey]: !(peerOptInByLeaf[leafKey] ?? false),
+    };
+  }
   // Fetch the live `/usage` gauges once per dashboard open (no timer): this
   // effect re-runs only when `homeViewOpen` flips, so reopening re-fetches while
   // an open dashboard never re-polls a remote endpoint.
@@ -2548,6 +2567,8 @@
         onRefresh={() => void refreshUsage()}
         onJump={jumpFromHome}
         onClose={toggleHome}
+        peerOptInByLeaf={peerOptInByLeaf}
+        onTogglePeer={togglePeerOptIn}
       />
     {/if}
   </div>

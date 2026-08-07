@@ -11,6 +11,7 @@ pub mod feed;
 pub mod hooks;
 pub mod lifecycle;
 pub mod notify;
+pub mod peer;
 pub mod pty;
 pub mod session;
 pub mod state;
@@ -267,6 +268,10 @@ pub fn run() {
             let ask_registry = Arc::new(feed::ask::AskRegistry::new());
             app.manage(Arc::clone(&ask_registry));
             let pty_for_ask = Arc::clone(&pty);
+            // Clones for the peer-messaging handler below (agent-peer-messaging
+            // U2/U6) — taken before the dispatch closure consumes the originals.
+            let pty_for_peer = Arc::clone(&pty);
+            let signals_for_peer = Arc::clone(&signals_for_hooks);
             // The per-effect dispatch (U18): decouple the in-app ring, the
             // history record, the desktop banner, and the chime — each decided
             // independently by the policy (KTD14), not fused behind one boolean.
@@ -536,12 +541,54 @@ pub fn run() {
                     on_drop,
                 })
             });
+            // Peer messaging (agent-peer-messaging U2/U6): the `peer/list` /
+            // `peer/send` handler. FeedState/AttentionManager resolve lazily
+            // via try_state (managed later in this setup — the automation
+            // handler's pattern); the question resolver is this handler's own
+            // FallbackResolver over the same seams the feed wires (shared
+            // PendingSignals + AskRegistry Arcs, so the two never disagree on
+            // a held ask), because the feed's instance is built only inside
+            // the feed-enabled branch. The rate buckets are the KTD8 brake —
+            // in-memory, reset on restart.
+            let peer_handle = app.handle().clone();
+            let peer_screen_pty = Arc::clone(&pty_for_peer);
+            let peer_screen: feed::fallback::ScreenFn =
+                Arc::new(move |leaf| peer_screen_pty.screen_tail_by_leaf(leaf));
+            let peer_asks = Arc::clone(&ask_registry);
+            let peer_ask_fn: feed::fallback::AskFn = Arc::new(move |leaf| peer_asks.get(leaf));
+            let peer_resolver = Arc::new(feed::fallback::FallbackResolver::new(
+                session::resume::resume_path(),
+                signals_for_peer,
+                peer_screen,
+                peer_ask_fn,
+            ));
+            let peer_buckets = Arc::new(std::sync::Mutex::new(peer::rate::Buckets::new()));
+            // Peer deliveries serialize behind one mutex (the plan's open
+            // question, resolved): delivery is two writes a settle apart, so
+            // two concurrent sends to one pane would otherwise splice —
+            // paste A, paste B, Enter, Enter — into a merged composer line.
+            // App-wide rather than per-leaf: the path is rate-limited to a
+            // trickle, and the coarser lock cannot deadlock or leak an entry.
+            let peer_delivery_lock = Arc::new(std::sync::Mutex::new(()));
+            let peer_handler: hooks::PeerHandler = Arc::new(move |pane, buf: &[u8]| {
+                handle_peer_request(
+                    &peer_handle,
+                    pane,
+                    buf,
+                    &pty_for_peer,
+                    &peer_resolver,
+                    &peer_buckets,
+                    &peer_delivery_lock,
+                )
+                .to_bytes()
+            });
             let server = HookServer::start_full(
                 hook_socket_path(),
                 tokens_for_hooks,
                 dispatch,
                 Some(automation_handler),
                 Some(ask_handler),
+                Some(peer_handler),
             )
             .map_err(|e| format!("failed to start hook server: {e}"))?;
             app.manage(server);
@@ -1185,6 +1232,98 @@ fn handle_automation_request(
         is_recursion,
         req,
         &resolve_pointers,
+    )
+}
+
+/// Peer-op entry (agent-peer-messaging U2/U6): parse the request, assemble
+/// the live ports, and route to the pure gate sequence
+/// (`peer::dispatch_peer_op` — where the ordering is unit-tested). `origin`
+/// is the socket's token-resolved pane (KTD2); the wire never carries a
+/// sender. Runs on the per-connection thread — the delivery settle sleep and
+/// the question resolution both belong there, never on a dispatch/PTY thread.
+fn handle_peer_request(
+    app: &tauri::AppHandle,
+    origin: pty::PaneId,
+    buf: &[u8],
+    pty: &Arc<PtyManager>,
+    resolver: &Arc<feed::fallback::FallbackResolver>,
+    buckets: &Arc<std::sync::Mutex<peer::rate::Buckets>>,
+    delivery_lock: &Arc<std::sync::Mutex<()>>,
+) -> cli::peer::PeerResponse {
+    use cli::peer::{PeerRequest, PeerResponse};
+
+    let req: PeerRequest = match serde_json::from_slice(buf) {
+        Ok(r) => r,
+        Err(_) => return PeerResponse::err("badRequest"),
+    };
+    // FeedState is managed unconditionally later in setup; a request can only
+    // arrive from a pane, which exists only after setup completed.
+    let Some(feed_state) = app
+        .try_state::<Arc<feed::FeedState>>()
+        .map(|s| s.inner().clone())
+    else {
+        return PeerResponse::err("unavailable");
+    };
+
+    let roster = || feed_state.roster();
+    let leaf_for_pane = |p: u64| pty.leaf_key(pty::PaneId(p));
+    let try_take = |pane: u64, at: u64| {
+        buckets
+            .lock()
+            .map(|mut b| b.try_take(pane, at))
+            .unwrap_or(false)
+    };
+    // The wide question gate (KTD5): existence/reason/status from ONE roster
+    // snapshot (`agent_gate`), the drop route's own predicate behind it. A
+    // leaf with no roster row can't be blocked — but it was already refused
+    // `notOptedIn` before this gate runs.
+    let ask_pending = |leaf: &str| match feed_state.agent_gate(leaf) {
+        None => false,
+        Some(gate) => {
+            let resolved = resolver.resolve_io(leaf, gate.reason.as_deref(), &gate.status);
+            feed::server::drop_blocked_by_question(resolved.question, gate.reason.as_deref())
+        }
+    };
+    // Guarded delivery (KTD4): `deliver_with_guards` with a no-op commit —
+    // there is nothing to publish on this path; the parameter exists so the
+    // drop route's ordering stays owned in one place. The delivery mutex
+    // spans both writes so concurrent sends can't splice a composer line. A
+    // delivered message clears the recipient's ring exactly as local typing
+    // would.
+    let deliver = |expect: u64, leaf: &str, text: &str| {
+        let _serialized = delivery_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let outcome = feed::drop::deliver_with_guards(
+            expect,
+            text,
+            || pty.pane_by_leaf(leaf).map(|p| p.0),
+            |pane| pty.is_agent(pty::PaneId(pane)),
+            |pane, bytes| pty.write(pty::PaneId(pane), bytes),
+            || std::thread::sleep(feed::io::SUBMIT_DELAY),
+            || Ok(()),
+        );
+        if matches!(outcome, feed::drop::DropOutcome::Delivered) {
+            if let Some(attention) = app.try_state::<Arc<AttentionManager>>() {
+                if let Some(pane) = pty.pane_by_leaf(leaf) {
+                    if let Some(o) = attention.on_input(pane) {
+                        stream::emit_attention(app, pane, &o);
+                    }
+                }
+            }
+        }
+        outcome
+    };
+
+    peer::dispatch_peer_op(
+        origin.0,
+        &req,
+        &peer::PeerPorts {
+            now_ms: notify::now_unix_ms(),
+            roster: &roster,
+            leaf_for_pane: &leaf_for_pane,
+            try_take_rate: &try_take,
+            ask_pending: &ask_pending,
+            deliver: &deliver,
+        },
     )
 }
 
