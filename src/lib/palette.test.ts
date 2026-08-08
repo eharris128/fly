@@ -36,6 +36,7 @@ function spyActions(calls: string[]): KeymapActions {
     prevWorkspace: mk("prev"),
     nextWorkspace: mk("next"),
     renameTab: mk("rename"),
+    renamePane: mk("renamePane"),
     handoffQuick: mk("handoffQuick"),
     handoffGuided: mk("handoffGuided"),
     sendLiteralLeader: mk("sendLiteral"),

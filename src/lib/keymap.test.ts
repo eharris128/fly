@@ -54,6 +54,7 @@ function spyActions(): KeymapActions & { calls: string[] } {
     prevWorkspace: mk("prevWorkspace"),
     nextWorkspace: mk("nextWorkspace"),
     renameTab: mk("renameTab"),
+    renamePane: mk("renamePane"),
     handoffQuick: mk("handoffQuick"),
     handoffGuided: mk("handoffGuided"),
     handoffRepick: mk("handoffRepick"),
@@ -263,7 +264,8 @@ describe("Keymap", () => {
     chord("W", { shift: true }); // uppercase → close workspace
     chord("[");
     chord("]");
-    chord("r");
+    chord("r"); // lowercase → rename tab
+    chord("R", { shift: true }); // uppercase → rename pane
     expect(a.calls).toEqual([
       "toggleSidebar",
       "newWorkspace",
@@ -271,6 +273,7 @@ describe("Keymap", () => {
       "prevWorkspace",
       "nextWorkspace",
       "renameTab",
+      "renamePane",
     ]);
   });
 

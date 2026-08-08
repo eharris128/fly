@@ -33,7 +33,9 @@
     input: "an agent needs your input",
     done: "an agent finished — result ready",
   };
-  type Editing = { kind: "tab" | "ws"; id: string } | null;
+  // `pane` is App's over-the-pane label editor — never rendered here, but the
+  // shared `editing` slot can hold it, so the type must admit it.
+  type Editing = { kind: "tab" | "ws" | "pane"; id: string } | null;
 
   interface Props {
     workspaces: SidebarWorkspace[];

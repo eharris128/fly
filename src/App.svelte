@@ -344,8 +344,14 @@
   let mutedWorkspaces = $state<Set<string>>(new Set());
   let sidebarCollapsed = $state(false);
   // Inline-rename target, owned here so the leader `r` chord and a sidebar
-  // double-click drive the exact same edit (U16).
-  let editing = $state<{ kind: "tab" | "ws"; id: string } | null>(null);
+  // double-click drive the exact same edit (U16). `pane` targets a leaf key:
+  // the per-pane label editor rendered centered over the pane itself.
+  let editing = $state<{ kind: "tab" | "ws" | "pane"; id: string } | null>(null);
+  // Per-pane display labels, keyed by leafKey (stable across paneId
+  // reassignment, like every other per-pane map). Absent = unlabeled; persisted
+  // through `SavedPane.title` so labels survive restart. This is what tells
+  // split siblings under one tab apart — the tab title can't.
+  let paneTitleByLeaf = $state<Record<string, string>>({});
   // Initialised to the config default so the menu never shows an empty leader
   // if it is somehow opened before restore() resolves (R6).
   let leaderKey = $state("ctrl+a");
@@ -994,7 +1000,13 @@
     sidebarCollapsed = false; // reveal the field being edited
     editing = { kind: "tab", id: activeTab.id };
   }
-  function startEdit(kind: "tab" | "ws", id: string) {
+  function startRenameFocusedPane() {
+    if (!activeTab) return;
+    const key = activeTab.focusedLeafKey;
+    if (!key) return;
+    editing = { kind: "pane", id: key };
+  }
+  function startEdit(kind: "tab" | "ws" | "pane", id: string) {
     editing = { kind, id };
   }
   function commitEdit(name: string) {
@@ -1002,6 +1014,16 @@
     editing = null;
     if (!target) return;
     const trimmed = name.trim();
+    if (target.kind === "pane") {
+      // Empty clears the label (back to unlabeled). The editor stole DOM focus
+      // from the terminal, so hand it back either way.
+      const next = { ...paneTitleByLeaf };
+      if (trimmed === "") delete next[target.id];
+      else next[target.id] = trimmed;
+      paneTitleByLeaf = next;
+      focusActivePane();
+      return;
+    }
     if (target.kind === "tab") {
       // Empty reverts to auto-naming (title = null).
       const title = trimmed === "" ? null : trimmed;
@@ -1017,7 +1039,37 @@
     }
   }
   function cancelEdit() {
+    const wasPane = editing?.kind === "pane";
     editing = null;
+    if (wasPane) focusActivePane();
+  }
+  // The pane-label editor's input plumbing — same shape as Sidebar.svelte's
+  // rename field: Enter/Escape both unmount the input, which fires a trailing
+  // blur; suppress that one blur so it can't override an explicit
+  // commit/cancel.
+  let suppressPaneEditBlur = false;
+  function focusSelect(node: HTMLInputElement) {
+    node.focus();
+    node.select();
+  }
+  function onPaneEditKey(e: KeyboardEvent, value: string) {
+    e.stopPropagation();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      suppressPaneEditBlur = true;
+      commitEdit(value);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      suppressPaneEditBlur = true;
+      cancelEdit();
+    }
+  }
+  function onPaneEditBlur(value: string) {
+    if (suppressPaneEditBlur) {
+      suppressPaneEditBlur = false;
+      return;
+    }
+    commitEdit(value);
   }
 
   // ---- destructive confirms (single shared overlay) ------------------------
@@ -1932,7 +1984,7 @@
         for (const l of leaves(t.tree)) {
           const pid = paneIdByLeaf[l.key];
           const cwd = pid != null ? await paneCwd(pid) : (cwdByLeaf[l.key] ?? null);
-          panesByLeaf[l.key] = { cwd, title: null };
+          panesByLeaf[l.key] = { cwd, title: paneTitleByLeaf[l.key] ?? null };
         }
       }
     }
@@ -1957,6 +2009,7 @@
     void activeWorkspaceId;
     void sidebarCollapsed;
     void notifications; // persist the history as it changes too
+    void paneTitleByLeaf; // pane labels ride SavedPane.title
     if (!ready) return;
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => void persist(), 800);
@@ -2061,6 +2114,7 @@
     prevWorkspace: () => shiftWorkspace(-1),
     nextWorkspace: () => shiftWorkspace(1),
     renameTab: startRenameActiveTab,
+    renamePane: startRenameFocusedPane,
     handoffQuick: () => void handoff("quick"),
     handoffGuided: () => void handoff("guided"),
     handoffRepick: () => void handoffRepick(),
@@ -2251,9 +2305,14 @@
         saved.workspaces.flatMap((w) => w.tabs.flatMap((t) => collectKeys(t.tree))),
       );
       const cwds: Record<string, string | null> = {};
+      const titles: Record<string, string> = {};
       for (const w of saved.workspaces)
         for (const st of w.tabs)
-          for (const [k, p] of Object.entries(st.panes)) cwds[k] = p.cwd;
+          for (const [k, p] of Object.entries(st.panes)) {
+            cwds[k] = p.cwd;
+            if (p.title) titles[k] = p.title;
+          }
+      paneTitleByLeaf = titles;
       // Resume wiring (U8; fix-003 U3): may await the crash offer, populate resume
       // commands + their tiers, drop stale `--continue` leaves to bare shells, and
       // override spawn cwds — all before workspaces mount so panes spawn as resumed
@@ -2531,6 +2590,28 @@
             {onAttention}
             onInjectionDone={clearGuidedHandoff}
           />
+          <!-- Per-pane label, centered over the pane (leader R). The tab title
+               can't tell split siblings apart; this can. Rendered only when a
+               label exists (or is being edited) so unlabeled panes stay clean;
+               it overlays the terminal's top edge rather than reserving a strip,
+               so pane geometry (rects) is untouched. -->
+          {#if editing?.kind === "pane" && editing.id === p.key}
+            <input
+              class="pane-title-edit"
+              value={paneTitleByLeaf[p.key] ?? ""}
+              placeholder="pane name (empty clears)"
+              use:focusSelect
+              onkeydown={(e) => onPaneEditKey(e, e.currentTarget.value)}
+              onblur={(e) => onPaneEditBlur(e.currentTarget.value)}
+            />
+          {:else if paneTitleByLeaf[p.key]}
+            <button
+              type="button"
+              class="pane-title"
+              title="double-click to rename (leader R)"
+              ondblclick={() => startEdit("pane", p.key)}
+            >{paneTitleByLeaf[p.key]}</button>
+          {/if}
         </div>
       {/each}
       {#each dividerList as d (d.splitKey)}
@@ -2709,6 +2790,41 @@
   }
   .slot.hidden {
     display: none;
+  }
+  /* Per-pane label pill + its inline editor, centered over the pane's top
+     edge. Overlay (not a reserved strip) so rects/PTY size never change. */
+  .pane-title,
+  .pane-title-edit {
+    position: absolute;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 6; /* above the terminal and the dividers (5) */
+    max-width: 60%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font:
+      12px "JetBrains Mono",
+      monospace;
+    border-radius: 0 0 6px 6px;
+    padding: 1px 10px 2px;
+  }
+  .pane-title {
+    color: #9fb2d8;
+    background: rgba(22, 27, 44, 0.92);
+    border: 1px solid #2b3a55;
+    border-top: none;
+    cursor: default;
+  }
+  .pane-title-edit {
+    color: #dfe7f5;
+    background: #0b1020;
+    border: 1px solid #4a6296;
+    border-top: none;
+    outline: none;
+    width: 220px;
+    text-align: center;
   }
   .divider {
     position: absolute;

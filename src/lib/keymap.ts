@@ -28,6 +28,7 @@ export interface KeymapActions {
   prevWorkspace: () => void;
   nextWorkspace: () => void;
   renameTab: () => void;
+  renamePane: () => void;
   handoffQuick: () => void;
   handoffGuided: () => void;
   handoffRepick: () => void;
@@ -87,6 +88,10 @@ export const BINDINGS: Binding[] = [
   { keys: ["n"], label: "Notifications", action: "openNotifications" },
   { keys: ["m"], label: "Toggle mute", action: "toggleMute" },
   { keys: ["r"], label: "Rename tab", action: "renameTab" },
+  // Uppercase R is distinct from lowercase r (rename tab) via `upper`, exactly
+  // like x / X: it renames the focused *pane* — the label shown centered over
+  // the pane so split siblings under one tab stay tellable apart.
+  { keys: ["r"], upper: true, label: "Rename pane", action: "renamePane" },
   // Session handoff (U2, R1/R2, docs/plans/2026-07-02-001-feat-session-handoff-
   // plan.md): f and F are distinct via `upper`, exactly like x / X. Lowercase f
   // is the quick handoff (fresh agent in a split, stock pickup prompt sent
