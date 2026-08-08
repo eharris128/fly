@@ -1435,6 +1435,14 @@ pub fn dispatch_automation_op(
                         "--headless/--paned are agent-mode only (a prompt, not a script)",
                     );
                 }
+                // fly-dag-primitives G1: verdict gating is agent-only (a
+                // script has no assistant turn to parse a fenced verdict from)
+                // — re-reject on the untrusted wire like the checks above.
+                if req.verdict_gated {
+                    return AutomationResponse::err(
+                        "--verdict-gated is agent-mode only (a prompt, not a script)",
+                    );
+                }
                 // A timeout the dispatcher will never honour must be REFUSED,
                 // not quietly stored. `clamp_timeout_ms` bounds the stored
                 // value at run time (the store is same-UID-writable), so
@@ -1517,6 +1525,9 @@ pub fn dispatch_automation_op(
                         }
                     }),
                 },
+                // fly-dag-primitives G1: agent-only, re-rejected above on the
+                // script path; stamped as-is here.
+                verdict_gated: req.verdict_gated,
                 origin,
             }) {
                 Ok(created) => {
@@ -1586,6 +1597,13 @@ pub fn dispatch_automation_op(
                     "pass only one of --headless / --paned / --default-disposition",
                 );
             }
+            // fly-dag-primitives G1: both directions of the verdict-gating
+            // toggle at once is a client bug, not a last-one-wins guess.
+            if req.verdict_gated && clear.verdict_gated {
+                return AutomationResponse::err(
+                    "pass only one of --verdict-gated / --no-verdict-gated",
+                );
+            }
             // The same closed effort set the create path validates CLI-side.
             if let Some(level) = req.effort.as_deref() {
                 if !cli::automation::VALID_EFFORTS.contains(&level) {
@@ -1639,6 +1657,13 @@ pub fn dispatch_automation_op(
                 headless: match (req.headless, clear.disposition) {
                     (Some(h), _) => Some(Some(h)),
                     (_, true) => Some(None),
+                    _ => None,
+                },
+                // fly-dag-primitives G1: `--verdict-gated` sets, the
+                // `verdictGated` clear member unsets, absent leaves unchanged.
+                verdict_gated: match (req.verdict_gated, clear.verdict_gated) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
                     _ => None,
                 },
                 script: req.script.clone(),
@@ -1906,6 +1931,7 @@ mod tests {
             retired_at: None,
             pickup_pointers: None,
             after: None,
+            verdict_gated: false,
             cwd: "/tmp".into(),
             mode: automations::model::Mode::Agent {
                 prompt: "check the run".into(),

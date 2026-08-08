@@ -45,9 +45,18 @@ pub enum DepDecision {
     /// occurrence completely untouched (no row, no advance; the R5
     /// frontend-gate precedent) and re-evaluate next tick.
     Wait,
-    /// The window closed without a qualifying run — record the honest
-    /// decline (R5 reasons) and advance the schedule.
+    /// The window closed without a qualifying run **and the reason is a
+    /// failure** (upstream broke / stale / in-flight / missing / consumed) —
+    /// record the honest withhold (R5 reasons), advance the schedule, and
+    /// **ring the alert** (dependencies R9).
     Withhold { reason: String },
+    /// The window closed and the upstream *declined* — it ran (or propagated a
+    /// decline) and had nothing to do (fly-dag-primitives G1, KTD3). Record a
+    /// silent born-terminal row via [`super::model::Automation::decline`] and
+    /// advance the schedule, but **do not alert**: a correct no-op is not a
+    /// failure (Non-goal 2). A further dependent reading that row declines in
+    /// turn (KTD4 propagation).
+    Declined { reason: String },
 }
 
 /// Evaluate the dependency for one due occurrence (R4). `dependent_runs` is
@@ -90,6 +99,14 @@ pub fn evaluate(
     if now_ms < deadline {
         return DepDecision::Wait;
     }
+    // Deadline passed with no qualifying (Pass) run. Distinguish a *decline*
+    // (upstream ran and had nothing to do — silent, G1 KTD3/KTD4) from a real
+    // withhold (upstream broke / stale / consumed — alert).
+    if declined_in_window(up, window_start) {
+        return DepDecision::Declined {
+            reason: "upstream declined (nothing to do)".to_owned(),
+        };
+    }
     DepDecision::Withhold {
         reason: withhold_reason(up, &consumed, window_start),
     }
@@ -113,24 +130,56 @@ pub fn manual_decision(
                 .collect();
             let window_start = now_ms.saturating_sub(dep.within());
             // `upstream` is Some here: a missing upstream never returns Wait.
-            let reason = upstream
-                .map(|up| withhold_reason(up, &consumed, window_start))
-                .unwrap_or_else(|| format!("upstream {} no longer exists", dep.upstream_id));
-            DepDecision::Withhold { reason }
+            let up = upstream.expect("a missing upstream never returns Wait");
+            // Same decline-vs-withhold split as the scheduled path (G1): a
+            // manual run against a declined upstream reports a silent decline,
+            // not a withhold-with-alert.
+            if declined_in_window(up, window_start) {
+                DepDecision::Declined {
+                    reason: "upstream declined (nothing to do)".to_owned(),
+                }
+            } else {
+                DepDecision::Withhold {
+                    reason: withhold_reason(up, &consumed, window_start),
+                }
+            }
         }
         other => other,
     }
 }
 
-/// KTD5: a qualifying upstream run — closed `Succeeded`, fresh enough, and
-/// not carrying a FAIL verdict (an infra-clean run whose *check* honestly
-/// failed must not read as pipeline success).
+/// KTD5 (extended by fly-dag-primitives G1 KTD2): a qualifying upstream run —
+/// closed `Succeeded`, fresh enough, and carrying **no verdict or a `Pass`
+/// verdict**. An absent verdict qualifies, so this is a **no-op on every
+/// pre-G1 row** (a non-monitor run's verdict is always `None`); the change
+/// from the original `!= Fail` is that a `Declined` verdict (G1) now also
+/// fails to qualify — a verdict-gated run that declined did no pipeline work,
+/// so a dependent must not fire on it (any more than on a `Fail`).
 fn qualifies(r: &RunRow, window_start_ms: u64) -> bool {
     r.status == RunStatus::Succeeded
         && r.finished_at.is_some_and(|t| t >= window_start_ms)
         && r.verdict
             .as_ref()
-            .map_or(true, |v| v.outcome != VerdictOutcome::Fail)
+            .map_or(true, |v| v.outcome == VerdictOutcome::Pass)
+}
+
+/// fly-dag-primitives G1 (KTD3/KTD4): whether the upstream's **newest**
+/// in-window terminal run is a *decline* — a `Declined`-verdict-bearing row.
+/// Two shapes carry that marker: a verdict-gated `Succeeded` run that emitted
+/// `DECLINED`, and a `Withheld` row that a further-upstream decline propagated
+/// ([`super::model::Automation::decline`]). Reached only after `qualifies`
+/// found no unconsumed `Pass` run and the wait window closed, so a decline
+/// here means "the upstream ran and correctly had nothing to do" → the
+/// dependent stands down silently instead of alerting. "Newest wins" matches
+/// [`withhold_reason`]: a later failure after an earlier decline reads as a
+/// failure (alert), not a decline.
+fn declined_in_window(up: &Automation, window_start_ms: u64) -> bool {
+    up.runs
+        .iter()
+        .rev()
+        .find(|r| r.status.is_terminal() && r.finished_at.is_some_and(|t| t >= window_start_ms))
+        .and_then(|r| r.verdict.as_ref())
+        .is_some_and(|v| v.outcome == VerdictOutcome::Declined)
 }
 
 /// R5: derive the specific decline reason from what the upstream actually
@@ -271,6 +320,7 @@ mod tests {
             retired_at: None,
             pickup_pointers: None,
             after: None,
+            verdict_gated: false,
             cwd: "/tmp".into(),
             mode: script_mode(),
             origin: Origin {
@@ -419,6 +469,106 @@ mod tests {
             d,
             DepDecision::Withhold {
                 reason: "upstream succeeded with a FAIL verdict".into()
+            }
+        );
+    }
+
+    /// fly-dag-primitives G1 helper: a verdict-gated Succeeded run carrying
+    /// the given outcome (the shape `close_run_with_capture` stamps).
+    fn succeeded_with_verdict(a: &mut Automation, id: &str, t: u64, outcome: VerdictOutcome) {
+        succeeded(a, id, t);
+        a.runs.last_mut().unwrap().verdict = Some(Verdict {
+            outcome,
+            note: "note".into(),
+        });
+    }
+
+    // fly-dag-primitives G1 (KTD2/KTD3): a verdict-gated upstream that emitted
+    // DECLINED (a Succeeded run with a Declined verdict) does NOT satisfy —
+    // inside the window the dependent still Waits (a later manual PASS re-run
+    // could land), and at the deadline it records a SILENT `Declined`, never a
+    // `Withhold` (which would ring the alert).
+    #[test]
+    fn gated_upstream_decline_waits_then_declines_silently() {
+        let mut up = automation("up");
+        succeeded_with_verdict(&mut up, "u1", OCC - 30_000, VerdictOutcome::Declined);
+        let inside = evaluate(&dep("up", Some(W)), &[], Some(&up), OCC, OCC + 10);
+        assert_eq!(inside, DepDecision::Wait, "a later PASS could still land");
+        let past = evaluate(&dep("up", Some(W)), &[], Some(&up), OCC, OCC + W);
+        assert_eq!(
+            past,
+            DepDecision::Declined {
+                reason: "upstream declined (nothing to do)".into()
+            }
+        );
+    }
+
+    // G1 (KTD2): a PASS verdict on a gated upstream qualifies exactly like an
+    // unverdicted success — the dependent fires and consumes the run.
+    #[test]
+    fn gated_upstream_pass_verdict_satisfies() {
+        let mut up = automation("up");
+        succeeded_with_verdict(&mut up, "u1", OCC - 30_000, VerdictOutcome::Pass);
+        let d = evaluate(&dep("up", Some(W)), &[], Some(&up), OCC, OCC + 1);
+        assert_eq!(
+            d,
+            DepDecision::Satisfied {
+                upstream_run_id: "u1".into()
+            }
+        );
+    }
+
+    // G1 (KTD4): a decline PROPAGATES. An upstream that itself stood down
+    // recorded a `Withheld` row bearing a `Declined` verdict (via
+    // [`Automation::decline`]); a further dependent reading that row declines
+    // in turn — silently — rather than reading the bare withhold as a failure
+    // to alert on. Contrast [`withhold_reasons_are_specific_and_chain_propagating`],
+    // where a *real* withheld upstream (no Declined marker) yields `Withhold`.
+    #[test]
+    fn decline_propagates_through_a_chain() {
+        let mut mid = automation("mid");
+        mid.decline(
+            OCC - 30_000,
+            Trigger::Schedule,
+            "upstream declined (nothing to do)",
+            "m1",
+        );
+        let past = evaluate(&dep("mid", Some(W)), &[], Some(&mid), OCC, OCC + W);
+        assert_eq!(
+            past,
+            DepDecision::Declined {
+                reason: "upstream declined (nothing to do)".into()
+            }
+        );
+    }
+
+    // G1: "newest wins" — a real failure AFTER an earlier decline reads as a
+    // failure (Withhold + alert), not a decline. The latest signal governs.
+    #[test]
+    fn a_failure_after_a_decline_withholds_not_declines() {
+        let mut up = automation("up");
+        succeeded_with_verdict(&mut up, "u1", OCC - 40_000, VerdictOutcome::Declined);
+        failed(&mut up, "u2", OCC - 10_000);
+        let past = evaluate(&dep("up", Some(W)), &[], Some(&up), OCC, OCC + W);
+        assert_eq!(
+            past,
+            DepDecision::Withhold {
+                reason: "upstream failed (timed out)".into()
+            }
+        );
+    }
+
+    // G1: the manual flavor reports a decline synchronously, just as it
+    // converts a would-be Wait into a synchronous withhold for a failure.
+    #[test]
+    fn manual_decision_reports_a_decline() {
+        let mut up = automation("up");
+        succeeded_with_verdict(&mut up, "u1", OCC - 10_000, VerdictOutcome::Declined);
+        let d = manual_decision(&dep("up", Some(W)), &[], Some(&up), OCC);
+        assert_eq!(
+            d,
+            DepDecision::Declined {
+                reason: "upstream declined (nothing to do)".into()
             }
         );
     }

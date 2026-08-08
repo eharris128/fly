@@ -393,6 +393,8 @@ fn verdict_outcome_str(outcome: &crate::automations::model::VerdictOutcome) -> &
     match outcome {
         VerdictOutcome::Pass => "pass",
         VerdictOutcome::Fail => "fail",
+        // fly-dag-primitives G1: the third outcome, on the wire as "declined".
+        VerdictOutcome::Declined => "declined",
     }
 }
 
@@ -514,6 +516,7 @@ mod tests {
             retired_at: None,
             pickup_pointers: None,
             after: None,
+            verdict_gated: false,
             cwd: "/tmp".into(),
             mode: Mode::Agent {
                 prompt: "do it".into(),
@@ -620,6 +623,7 @@ mod tests {
             retired_at: Some(1_200),
             pickup_pointers: None,
             after: None,
+            verdict_gated: false,
             cwd: "/tmp".into(),
             mode: Mode::Agent {
                 prompt: "check disk".into(),
@@ -670,6 +674,7 @@ mod tests {
             retired_at: None,
             pickup_pointers: None,
             after: None,
+            verdict_gated: false,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "s.sh".into(),
@@ -763,6 +768,7 @@ mod tests {
             retired_at: Some(1_200),
             pickup_pointers: None,
             after: None,
+            verdict_gated: false,
             cwd: "/tmp".into(),
             mode: Mode::Agent {
                 prompt: "check deploy".into(),
@@ -1092,6 +1098,7 @@ mod tests {
             retired_at: None,
             pickup_pointers: None,
             after: None,
+            verdict_gated: false,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "s".into(),

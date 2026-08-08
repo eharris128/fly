@@ -327,6 +327,15 @@ pub struct AutomationRequest {
     pub after: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub within_ms: Option<u64>,
+    /// Verdict gating opt-in (fly-dag-primitives G1): agent-only; when true, a
+    /// non-monitor agent run's Succeeded close parses a fenced verdict block
+    /// and a dependent gated on it reads PASS/FAIL/DECLINED. Set by `--verdict-gated`
+    /// on `create` and `update` (turned off on `update` via the `verdictGated`
+    /// clear member). `#[serde(default)]`/skip-if-false keeps old CLI binaries
+    /// and new servers mutually intelligible (same back-compat pattern as
+    /// `monitor`): an old server ignores it and creates an ungated automation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verdict_gated: bool,
     /// Fields an `automation/update` clears (automation-update U2 — R7,
     /// KTD1). Patch semantics make an absent field mean *unchanged*, which
     /// collides with the create convention where `None` means "use the
@@ -407,6 +416,8 @@ pub struct UpdateFlags {
     pub retry_on_interrupt: bool,
     pub no_retry_on_interrupt: bool,
     pub no_after: bool,
+    pub verdict_gated: bool,
+    pub no_verdict_gated: bool,
 }
 
 /// Build the `automation/update` request from parsed flags (R11), or the
@@ -424,6 +435,9 @@ pub fn build_update_request(f: UpdateFlags) -> Result<AutomationRequest, String>
     }
     if f.retry_on_interrupt && f.no_retry_on_interrupt {
         return Err("pass only one of --retry-on-interrupt / --no-retry-on-interrupt".to_string());
+    }
+    if f.verdict_gated && f.no_verdict_gated {
+        return Err("pass only one of --verdict-gated / --no-verdict-gated".to_string());
     }
     if [f.headless, f.paned, f.default_disposition]
         .iter()
@@ -463,6 +477,9 @@ pub fn build_update_request(f: UpdateFlags) -> Result<AutomationRequest, String>
     if f.no_after {
         clear.push("after".to_string());
     }
+    if f.no_verdict_gated {
+        clear.push("verdictGated".to_string());
+    }
 
     let req = AutomationRequest {
         op: "automation/update".to_string(),
@@ -482,6 +499,7 @@ pub fn build_update_request(f: UpdateFlags) -> Result<AutomationRequest, String>
             (_, true) => Some(false),
             _ => None,
         },
+        verdict_gated: f.verdict_gated,
         clear,
         ..Default::default()
     };
@@ -498,6 +516,7 @@ pub fn build_update_request(f: UpdateFlags) -> Result<AutomationRequest, String>
         && req.effort.is_none()
         && req.headless.is_none()
         && !req.retry_on_interrupt
+        && !req.verdict_gated
         && req.clear.is_empty();
     if changes_nothing {
         return Err("nothing to change — pass at least one field (see --help)".to_string());
@@ -633,6 +652,7 @@ fn handle_create(args: &[String]) -> i32 {
     let mut paned = false;
     let mut after: Option<String> = None;
     let mut within: Option<String> = None;
+    let mut verdict_gated = false;
     let mut json = false;
 
     let mut it = args.iter();
@@ -669,6 +689,11 @@ fn handle_create(args: &[String]) -> i32 {
                 println!("                          waits (up to the window) for the upstream to");
                 println!("                          succeed, and otherwise records an honest");
                 println!("                          'withheld' run saying why it did not fire");
+                println!("  --verdict-gated         agent mode: parse a fenced ```verdict block from");
+                println!("                          this run's final message (first line PASS, FAIL, or");
+                println!("                          DECLINED) — a dependent --after this one fires only");
+                println!("                          on PASS, withholds+alerts on FAIL, and withholds");
+                println!("                          SILENTLY on DECLINED (ran, nothing to do)");
                 println!("  --within <dur>          freshness/wait window for --after (45m, 2h, 1d,");
                 println!("                          or bare minutes; default 60m): the upstream");
                 println!("                          success may be at most this old, and the");
@@ -707,6 +732,7 @@ fn handle_create(args: &[String]) -> i32 {
             "--monitor" => monitor = true,
             "--headless" => headless = true,
             "--paned" => paned = true,
+            "--verdict-gated" => verdict_gated = true,
             "--after" => {
                 after = it.next().cloned();
                 if after.is_none() {
@@ -816,6 +842,18 @@ fn handle_create(args: &[String]) -> i32 {
         return 2;
     }
 
+    // fly-dag-primitives G1: --verdict-gated is agent-only (a script has no
+    // assistant turn to parse a verdict from) and pointless on a monitor (a
+    // monitor already parses its verdict and retires). Re-validated app-side.
+    if verdict_gated && script.is_some() {
+        eprintln!("fly automation create: --verdict-gated is agent-mode only (a prompt, not a script)");
+        return 2;
+    }
+    if verdict_gated && monitor {
+        eprintln!("fly automation create: --verdict-gated is redundant with --monitor (a monitor already delivers a verdict and retires)");
+        return 2;
+    }
+
     // Automation-dependencies U5 (R14): --after is rejected with --monitor
     // (a monitor is a parked experiment, not a pipeline stage), --within is
     // meaningless without --after, and the window parses + range-checks
@@ -892,6 +930,7 @@ fn handle_create(args: &[String]) -> i32 {
         },
         after,
         within_ms,
+        verdict_gated,
         ..Default::default()
     };
     send_and_report(req, "created", json)
@@ -937,6 +976,9 @@ fn handle_update(args: &[String]) -> i32 {
                 println!("  --retry-on-interrupt       re-run once after an app crash/restart");
                 println!("  --no-retry-on-interrupt    stop re-running after an interrupt");
                 println!("  --no-after                 drop the dependency edge (--after)");
+                println!("  --verdict-gated            agent mode: parse a fenced ```verdict block (PASS/");
+                println!("                             FAIL/DECLINED) so dependents gate on the conclusion");
+                println!("  --no-verdict-gated         agent mode: stop parsing a verdict block");
                 println!("  --json                     output response as JSON");
                 println!();
                 println!("Not updatable, by design — delete and recreate instead:");
@@ -981,6 +1023,8 @@ fn handle_update(args: &[String]) -> i32 {
             "--retry-on-interrupt" => f.retry_on_interrupt = true,
             "--no-retry-on-interrupt" => f.no_retry_on_interrupt = true,
             "--no-after" => f.no_after = true,
+            "--verdict-gated" => f.verdict_gated = true,
+            "--no-verdict-gated" => f.no_verdict_gated = true,
             "--json" => json = true,
             other if !other.starts_with('-') && id.is_none() => id = Some(other.to_string()),
             other => {
@@ -1332,6 +1376,9 @@ fn monitor_state_label(a: &Automation) -> Option<String> {
             Some(v) => match v.outcome {
                 VerdictOutcome::Pass => "retired pass".to_string(),
                 VerdictOutcome::Fail => "retired fail".to_string(),
+                // A monitor never retires on DECLINED (fly-dag-primitives G1
+                // KTD6) — defensive fallback if a hand-edited store shows one.
+                VerdictOutcome::Declined => "retired".to_string(),
             },
             // Defensive: retirement without a surviving verdict row.
             None => "retired".to_string(),
@@ -1670,6 +1717,7 @@ mod tests {
             retired_at: None,
             pickup_pointers: None,
             after: None,
+            verdict_gated: false,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "s".into(),

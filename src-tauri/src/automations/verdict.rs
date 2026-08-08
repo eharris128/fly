@@ -86,9 +86,10 @@ pub fn broken_alert_due(consecutive_infra_failures: usize) -> bool {
 /// anything but exactly one well-formed block (abstain-on-surprise):
 ///
 /// - opening fence: a line whose trimmed content is exactly ```` ```verdict ````;
-/// - outcome: the first non-blank line inside, exactly `PASS` or `FAIL`
-///   (uppercase, nothing else on the line — the wire spelling is
-///   [`VerdictOutcome`]'s camelCase, translated here);
+/// - outcome: the first non-blank line inside, exactly `PASS`, `FAIL`, or
+///   `DECLINED` (uppercase, nothing else on the line — the wire spelling is
+///   [`VerdictOutcome`]'s camelCase, translated here; `DECLINED` is the
+///   fly-dag-primitives G1 non-monitor outcome);
 /// - note: every line after the outcome up to the closing fence (a line whose
 ///   trimmed content is exactly ```` ``` ````), inner newlines preserved,
 ///   outer whitespace trimmed; may be empty;
@@ -122,6 +123,12 @@ pub fn parse_verdict(text: &str) -> Option<Verdict> {
     let outcome = match inner[first].trim() {
         "PASS" => VerdictOutcome::Pass,
         "FAIL" => VerdictOutcome::Fail,
+        // fly-dag-primitives G1: the third outcome, emitted by verdict-gated
+        // NON-monitor legs to mean "ran, nothing to do". Monitors never retire
+        // on it (filtered at the monitor close path, G1 KTD6); the monitor
+        // prompt contract [`VERDICT_BLOCK_SPEC`] deliberately still lists only
+        // PASS/FAIL, so a monitor is never told to emit it.
+        "DECLINED" => VerdictOutcome::Declined,
         _ => return None, // decorated/lowercase outcome line ⇒ abstain
     };
     let note = inner[first.saturating_add(1)..].join("\n").trim().to_owned();
@@ -281,6 +288,29 @@ mod tests {
                 note: "loss diverged at step 40\nsee train.log line 88".into(),
             })
         );
+    }
+
+    // fly-dag-primitives G1: DECLINED is the third outcome — it parses like
+    // PASS/FAIL (uppercase, alone on its line), keeping its free-text note.
+    #[test]
+    fn parses_a_declined_block() {
+        assert_eq!(
+            parse_verdict("```verdict\nDECLINED\nno candidates in the queue today\n```"),
+            Some(Verdict {
+                outcome: VerdictOutcome::Declined,
+                note: "no candidates in the queue today".into(),
+            })
+        );
+    }
+
+    // G1: DECLINED obeys the same strict outcome-line rule — lowercase or
+    // decorated forms abstain (the abstain-on-surprise convention extends
+    // unchanged).
+    #[test]
+    fn declined_is_strict_uppercase_alone_on_its_line() {
+        assert_eq!(parse_verdict("```verdict\ndeclined\nx\n```"), None);
+        assert_eq!(parse_verdict("```verdict\nDECLINED: nothing to do\n```"), None);
+        assert_eq!(parse_verdict("```verdict\nnothing to DECLINE\n```"), None);
     }
 
     // R2/R5: no block at all is a not-done check — abstain.

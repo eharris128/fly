@@ -565,6 +565,11 @@ pub struct CreateSpec {
     /// since the socket payload is untrusted. `None` for every ordinary
     /// automation.
     pub after: Option<crate::automations::model::Dependency>,
+    /// Verdict gating opt-in (fly-dag-primitives G1): agent-only; stamped onto
+    /// the record as-is. `false` for every ordinary automation. The agent-only
+    /// enforcement lives at the untrusted-wire boundary in `lib.rs` (like the
+    /// monitor/headless agent-only rejections); the manager only stamps.
+    pub verdict_gated: bool,
     /// Resolved by the caller at create time (R22/R9: pane id + workspace
     /// identity + label); the manager only stamps it.
     pub origin: Origin,
@@ -632,6 +637,10 @@ pub struct UpdateClear {
     /// rides here and the field's type is deliberately unchanged.
     pub retry_on_interrupt: bool,
     pub after: bool,
+    /// `--no-verdict-gated` (fly-dag-primitives G1). Like `retry_on_interrupt`,
+    /// the wire's `verdict_gated: bool` is skip-if-false and cannot express
+    /// "turn off", so the off direction rides here.
+    pub verdict_gated: bool,
 }
 
 impl UpdateClear {
@@ -642,6 +651,7 @@ impl UpdateClear {
         "disposition",
         "retryOnInterrupt",
         "after",
+        "verdictGated",
     ];
 
     /// Resolve the untrusted wire list against [`UpdateClear::MEMBERS`]
@@ -656,6 +666,7 @@ impl UpdateClear {
                 "disposition" => c.disposition = true,
                 "retryOnInterrupt" => c.retry_on_interrupt = true,
                 "after" => c.after = true,
+                "verdictGated" => c.verdict_gated = true,
                 other => {
                     return Err(format!(
                         "unknown clear field {other:?} — expected one of {}",
@@ -687,6 +698,12 @@ pub struct UpdateSpec {
     pub model: Option<Option<String>>,
     pub effort: Option<Option<String>>,
     pub headless: Option<Option<bool>>,
+    /// Verdict gating toggle (fly-dag-primitives G1): `Some(true)` =
+    /// `--verdict-gated`, `Some(false)` = `--no-verdict-gated` (via `clear`),
+    /// `None` = leave unchanged. Agent-only, so it counts toward the
+    /// mode-mismatch gate ([`UpdateSpec::touches_agent`]) — a
+    /// `--verdict-gated` against a script record is [`ERR_UPDATE_MODE_SWITCH`].
+    pub verdict_gated: Option<bool>,
     // Script-mode fields (against an agent record: [`ERR_UPDATE_MODE_SWITCH`]).
     /// New script **content**, read client-side (R21) and written to a fresh
     /// file before the record mutation (KTD5).
@@ -713,6 +730,7 @@ impl UpdateSpec {
             && self.interpreter.is_none()
             && self.timeout_ms.is_none()
             && !self.clear_after
+            && self.verdict_gated.is_none()
     }
 
     /// Whether the spec touches agent-only fields (mode-mismatch gate).
@@ -721,6 +739,7 @@ impl UpdateSpec {
             || self.model.is_some()
             || self.effort.is_some()
             || self.headless.is_some()
+            || self.verdict_gated.is_some()
     }
 
     /// Whether the spec touches script-only fields (mode-mismatch gate).
@@ -1205,6 +1224,7 @@ impl AutomationManager {
             retired_at: None,
             pickup_pointers: spec.pickup_pointers,
             after: spec.after,
+            verdict_gated: spec.verdict_gated,
             cwd: spec.cwd,
             mode,
             origin: spec.origin,
@@ -1535,6 +1555,19 @@ impl AutomationManager {
                         reason: reason.clone(),
                     }));
                 }
+                // fly-dag-primitives G1: a manual run against a *declined*
+                // upstream records the silent decline row (proper `Declined`
+                // verdict, so a further dependent propagates it) and reports
+                // the reason synchronously — reusing the not-dispatched
+                // `Withheld` outcome (manual runs never ring the alert anyway,
+                // so the decline/withhold alert split is moot here).
+                if let Some(depend::DepDecision::Declined { reason }) = &dep_decision {
+                    a.decline(now, Trigger::Manual, reason, &run_id);
+                    return Some(Ok(ManualRun::Withheld {
+                        run_id: run_id.clone(),
+                        reason: reason.clone(),
+                    }));
+                }
                 // Manual claims pass the *current* next_run_at through
                 // unchanged (R23: no advance); claim() records
                 // scheduled_for: None for manual triggers.
@@ -1644,7 +1677,7 @@ impl AutomationManager {
         run_id: &str,
         outcome: RunOutcome,
     ) -> model::CloseResult {
-        self.close_run_stamping(automation_id, run_id, outcome, None)
+        self.close_run_stamping(automation_id, run_id, outcome, None, None)
     }
 
     /// [`AutomationManager::close_run`] plus the headless session-id stamp
@@ -1659,6 +1692,7 @@ impl AutomationManager {
         run_id: &str,
         outcome: RunOutcome,
         session_id: Option<&str>,
+        verdict: Option<model::Verdict>,
     ) -> model::CloseResult {
         let now = (self.clock)();
         // Monitor-handoff R6/R7: a failed close is an infrastructure failure
@@ -1672,9 +1706,18 @@ impl AutomationManager {
                     // Guard on `session_id` first: the row scan must not run
                     // on the (vastly more common) `None` closes.
                     if res == model::CloseResult::Closed {
-                        if let Some(sid) = session_id {
+                        if session_id.is_some() || verdict.is_some() {
                             if let Some(row) = a.runs.iter_mut().find(|r| r.id == run_id) {
-                                row.session_id = Some(sid.to_owned());
+                                if let Some(sid) = session_id {
+                                    row.session_id = Some(sid.to_owned());
+                                }
+                                // fly-dag-primitives G1: stamp the verdict-gated
+                                // non-monitor verdict in the SAME mutation as the
+                                // close, so a crash can never strand a Succeeded
+                                // row missing the verdict a dependent reads.
+                                if let Some(v) = verdict.clone() {
+                                    row.verdict = Some(v);
+                                }
                             }
                         }
                     }
@@ -1829,7 +1872,15 @@ impl AutomationManager {
             && automation.retired_at.is_none()
             && matches!(outcome, RunOutcome::Succeeded { .. })
         {
-            outcome_output(&outcome).and_then(|t| verdict::parse_verdict(t))
+            // fly-dag-primitives G1 KTD6: a monitor NEVER retires on
+            // `Declined` — it is a done/not-done instrument, and the monitor
+            // prompt contract ([`verdict::VERDICT_BLOCK_SPEC`]) lists only
+            // PASS/FAIL. A stray DECLINED filters to a not-done check (falls
+            // through to the R7 escalation, like any other unparsed monitor
+            // result).
+            outcome_output(&outcome)
+                .and_then(|t| verdict::parse_verdict(t))
+                .filter(|v| v.outcome != model::VerdictOutcome::Declined)
         } else {
             None
         };
@@ -1839,6 +1890,20 @@ impl AutomationManager {
                 automation, run_id, outcome, v, &evidence, session_id,
             );
         }
+        // fly-dag-primitives G1: a verdict-gated NON-monitor agent run's
+        // Succeeded close parses the fenced verdict and stamps it on the row
+        // in the same mutation as the close — **without retiring** (that is
+        // monitor-only). A dependent then reads `Pass`/`Fail`/`Declined` off
+        // the row. `None` (ungated, or no parseable block) leaves the row's
+        // verdict untouched, so every pre-G1 automation closes byte-identically.
+        let gated_verdict = if !automation.monitor
+            && automation.verdict_gated
+            && matches!(outcome, RunOutcome::Succeeded { .. })
+        {
+            outcome_output(&outcome).and_then(|t| verdict::parse_verdict(t))
+        } else {
+            None
+        };
         let status = outcome_status(&outcome);
         // Headless-agent-automations R6: a Failed close on a headless
         // NON-monitor run rings through the alert seam — the replacement for
@@ -1857,7 +1922,7 @@ impl AutomationManager {
             .iter()
             .find(|r| r.id == run_id)
             .is_some_and(|r| r.headless);
-        if self.close_run_stamping(&automation.id, run_id, outcome, session_id)
+        if self.close_run_stamping(&automation.id, run_id, outcome, session_id, gated_verdict)
             == model::CloseResult::Closed
         {
             if status == RunStatus::Failed && row_headless && !automation.monitor {
@@ -2476,6 +2541,17 @@ impl AutomationManager {
                         a.rollback_recompute(advance_or_pause(a, now_ms));
                         withheld_alerts.push((a.name.clone(), reason.clone(), run_id));
                         touched = true;
+                    } else if let Some(depend::DepDecision::Declined { reason }) = dep_decision {
+                        // fly-dag-primitives G1 (KTD3): the upstream declined —
+                        // record a SILENT born-terminal decline row and advance
+                        // past the occurrence, but do NOT push a withheld alert
+                        // (a correct no-op is not a failure, Non-goal 2). The
+                        // `Declined` verdict on the row propagates the decline
+                        // to any further dependent (KTD4).
+                        let run_id = mint_id();
+                        a.decline(now_ms, Trigger::Schedule, reason, &run_id);
+                        a.rollback_recompute(advance_or_pause(a, now_ms));
+                        touched = true;
                     } else if !is_agent && !capacity() {
                         // U5 capacity pre-claim skip (KTD-D): never a stranded
                         // Running row.
@@ -2954,6 +3030,11 @@ fn apply_update(
     }
     if let Some(retry) = spec.retry_on_interrupt {
         a.retry_on_interrupt = retry;
+    }
+    // fly-dag-primitives G1: toggle verdict gating in place (agent-only, gated
+    // by `update_gates`' mode-mismatch check via `touches_agent`).
+    if let Some(gated) = spec.verdict_gated {
+        a.verdict_gated = gated;
     }
     if spec.clear_after {
         a.after = None;
@@ -3710,6 +3791,7 @@ mod tests {
             monitor: false,
             pickup_pointers: None,
             after: None,
+            verdict_gated: false,
             origin: origin(),
         }
     }
@@ -4905,6 +4987,92 @@ mod tests {
         assert!(!output.contains('\u{1b}'), "sanitized before storage");
     }
 
+    /// fly-dag-primitives G1: claim a headless run for a NON-monitor
+    /// verdict-gated agent automation (mirrors [`claim_headless_check`] but
+    /// without `make_monitor`; the disposition is pinned headless so the
+    /// sweep's claim routes through the same headless close path).
+    fn claim_gated_agent(h: &Harness, gated: bool) -> (String, String) {
+        let id = h
+            .mgr
+            .create(CreateSpec {
+                mode: CreateMode::Agent {
+                    prompt: "advance a candidate, or decline".into(),
+                    model: None,
+                    effort: None,
+                    headless: Some(true),
+                },
+                verdict_gated: gated,
+                ..script_spec("range leg")
+            })
+            .unwrap()
+            .automation
+            .id;
+        h.set_now(T0 + FIVE_MIN);
+        h.sweep();
+        let run = h.runs(&id).last().expect("claimed run").clone();
+        assert_eq!(run.status, RunStatus::Running);
+        assert!(run.headless, "pinned headless");
+        assert!(!h.mgr.get(&id).unwrap().monitor, "not a monitor");
+        (id, run.id)
+    }
+
+    // G1: a verdict-gated non-monitor run's Succeeded close parses the fenced
+    // verdict and STAMPS it on the row — without retiring (retiring is
+    // monitor-only). The dependency predicate reads it off the row.
+    #[test]
+    fn gated_non_monitor_close_stamps_the_verdict_without_retiring() {
+        let h = harness();
+        let (id, run_id) = claim_gated_agent(&h, true);
+
+        h.mgr.close_headless_run(
+            &id,
+            &run_id,
+            headless::CheckOutcome::Clean {
+                text: "no intake rows today\n```verdict\nDECLINED\nnothing to advance\n```".into(),
+                session_id: None,
+            },
+        );
+
+        let a = h.mgr.get(&id).unwrap();
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(row.status, RunStatus::Succeeded);
+        assert_eq!(
+            row.verdict.as_ref().unwrap().outcome,
+            VerdictOutcome::Declined,
+            "the gated verdict is stamped on the row"
+        );
+        assert!(
+            a.retired_at.is_none(),
+            "a non-monitor never retires on a verdict (G1 KTD1)"
+        );
+    }
+
+    // G1 KTD1: gating is OPT-IN. An UNGATED non-monitor run that happens to
+    // print a verdict block has NO verdict stamped — so opting nothing in
+    // leaves every pre-G1 automation closing exactly as before.
+    #[test]
+    fn ungated_non_monitor_close_ignores_a_verdict_block() {
+        let h = harness();
+        let (id, run_id) = claim_gated_agent(&h, false);
+
+        h.mgr.close_headless_run(
+            &id,
+            &run_id,
+            headless::CheckOutcome::Clean {
+                text: "done\n```verdict\nPASS\nlooks good\n```".into(),
+                session_id: None,
+            },
+        );
+
+        let a = h.mgr.get(&id).unwrap();
+        let row = a.runs.iter().find(|r| r.id == run_id).unwrap();
+        assert_eq!(row.status, RunStatus::Succeeded);
+        assert!(
+            row.verdict.is_none(),
+            "ungated: the block is ignored, the row carries no verdict"
+        );
+    }
+
     // headless-monitor-checks R8: cleaning order on the headless entry —
     // sanitize → scrub — for both the Clean result text (a secret token is
     // masked before the row) and the Infra reason (which may embed the raw
@@ -5470,6 +5638,7 @@ mod tests {
             retired_at: None,
             pickup_pointers: None,
             after: None,
+            verdict_gated: false,
             cwd: "/tmp".into(),
             mode: Mode::Script {
                 script_file: "script".into(),
@@ -6630,6 +6799,7 @@ mod tests {
                 retired_at: None,
                 pickup_pointers: None,
                 after: None,
+                verdict_gated: false,
                 cwd: "/tmp".into(),
                 mode: Mode::Agent { prompt: "p".into(), model: None, effort: None, headless: None },
                 origin: Origin {

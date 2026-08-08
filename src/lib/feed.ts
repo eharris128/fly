@@ -168,7 +168,12 @@ export interface AgentOutputBody {
  * the status, for honest pass/fail.
  */
 export interface VerdictEntry {
-  /** `"pass"` | `"fail"` — the lowercase wire spelling. */
+  /**
+   * `"pass"` | `"fail"` | `"declined"` — the lowercase wire spelling.
+   * `"declined"` (fly-dag-primitives G1) is a verdict-gated non-monitor run
+   * reporting it ran and had nothing to do: a dependent neither fires nor
+   * alerts. Kept as `string` so an older consumer tolerates the new value.
+   */
   outcome: string;
   /** The check's short verdict note; empty string when the parse had none. */
   note: string;

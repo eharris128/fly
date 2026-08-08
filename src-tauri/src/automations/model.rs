@@ -267,25 +267,37 @@ pub struct Verdict {
     pub note: String,
 }
 
-/// [`Verdict`] discriminant (monitor-handoff R2). On the wire as
-/// `"pass"`/`"fail"` (the file-wide camelCase convention); the uppercase
-/// `PASS`/`FAIL` spelling is the *prompt-block* contract, translated by the
-/// U3 parser.
+/// [`Verdict`] discriminant (monitor-handoff R2, extended by
+/// `docs/plans/2026-08-08-002-feat-fly-dag-primitives-plan.md` G1). On the
+/// wire as `"pass"`/`"fail"`/`"declined"` (the file-wide camelCase
+/// convention); the uppercase `PASS`/`FAIL`/`DECLINED` spelling is the
+/// *prompt-block* contract, translated by the parser.
+///
+/// `Declined` (fly-dag-primitives G1) is the third outcome a **verdict-gated
+/// non-monitor** run may emit: the run completed and *correctly did nothing*
+/// — nothing-to-do, not a failure. A dependent gated on such a run neither
+/// fires nor alerts (the whole point of G1; without it a correct no-op had to
+/// masquerade as `Pass`, firing the dependent on nothing, or as `Fail`,
+/// alerting a human about a correctly-idle stage). Monitors never retire on
+/// `Declined` — it is filtered to a not-done check at the monitor close path
+/// (G1 KTD6), since a monitor is a done/not-done instrument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum VerdictOutcome {
     Pass,
     Fail,
+    Declined,
 }
 
 impl VerdictOutcome {
-    /// The prompt-block spelling (`PASS`/`FAIL`) — the display form shared by
-    /// the alert line (`mod.rs`) and the CLI's verdict rendering, so the
-    /// human-facing spelling can't drift between surfaces.
+    /// The prompt-block spelling (`PASS`/`FAIL`/`DECLINED`) — the display form
+    /// shared by the alert line (`mod.rs`) and the CLI's verdict rendering, so
+    /// the human-facing spelling can't drift between surfaces.
     pub fn as_str(&self) -> &'static str {
         match self {
             VerdictOutcome::Pass => "PASS",
             VerdictOutcome::Fail => "FAIL",
+            VerdictOutcome::Declined => "DECLINED",
         }
     }
 }
@@ -454,6 +466,20 @@ pub struct Automation {
     /// `#[serde(default)]` keeps every legacy store row loading as `None`.
     #[serde(default)]
     pub after: Option<Dependency>,
+    /// Verdict gating opt-in (fly-dag-primitives G1): when `true`, a
+    /// **non-monitor agent** run's `Succeeded` close parses the fenced
+    /// `verdict` block from its captured final turn and stamps the parsed
+    /// [`Verdict`] on the row *without retiring* (retiring stays monitor-only).
+    /// A dependent gated on this automation then reads that verdict —
+    /// `Pass` fires it, `Fail` withholds + alerts, `Declined` withholds
+    /// silently (G1's third outcome). **Explicit opt-in, never inferred from a
+    /// block's presence** (G1 KTD1): inference would silently change a live
+    /// automation that merely prints a block. Agent-mode only; settable by
+    /// `create` **and** `update` (the off direction rides `clear`, like
+    /// `retry_on_interrupt`). `#[serde(default)]` keeps every legacy store row
+    /// and old CLI binary loading as ungated (`false`).
+    #[serde(default)]
+    pub verdict_gated: bool,
     pub cwd: String,
     pub mode: Mode,
     pub origin: Origin,
@@ -648,6 +674,51 @@ impl Automation {
             bundle_path: None,
             // A withhold never dispatches — the dispatch-shape marker stays
             // unset, like a skip.
+            headless: false,
+            session_id: None,
+            upstream_run_id: None,
+            output: None,
+            exit_code: None,
+            error: Some(reason.to_owned()),
+            scheduled_for,
+            started_at: None,
+            finished_at: Some(now_ms),
+        });
+    }
+
+    /// Record a dependency **decline** (fly-dag-primitives G1 — KTD3/KTD4):
+    /// the dependent correctly stands down because its upstream *declined*
+    /// (did the work and had nothing to do), not because anything broke.
+    /// Structurally a born-terminal [`RunStatus::Withheld`] row like
+    /// [`Automation::withhold`] — same schedule-advance-is-the-caller's-job
+    /// honesty note (KTD-D) — but distinguished two ways: the reason names a
+    /// decline, and the row carries a `Declined` **verdict** as the machine
+    /// marker. That marker is load-bearing: it is (a) what suppresses the
+    /// alert (the sweep rings `Withhold` rows, not `Declined` ones), and
+    /// (b) the propagation signal — a further dependent reading this row sees
+    /// `Withheld` + `Declined` verdict and declines in turn (A→B→C), rather
+    /// than reading a bare withhold as a failure to alert on.
+    pub fn decline(&mut self, now_ms: u64, trigger: Trigger, reason: &str, run_id: &str) {
+        let scheduled_for = match trigger {
+            Trigger::Schedule => self.next_run_at,
+            Trigger::Manual | Trigger::Retry => None,
+        };
+        self.updated_at = now_ms;
+        self.push_row(RunRow {
+            id: run_id.to_owned(),
+            mode: self.mode.kind(),
+            trigger,
+            status: RunStatus::Withheld,
+            pane_id: None,
+            model: None,
+            effort: None,
+            // The silence + propagation marker (G1 KTD3/KTD4). The note echoes
+            // the reason so a human reading the row sees the same story.
+            verdict: Some(Verdict {
+                outcome: VerdictOutcome::Declined,
+                note: reason.to_owned(),
+            }),
+            bundle_path: None,
             headless: false,
             session_id: None,
             upstream_run_id: None,
@@ -902,6 +973,7 @@ mod tests {
             retired_at: None,
             pickup_pointers: None,
             after: None,
+            verdict_gated: false,
             cwd: "/tmp".into(),
             mode,
             origin: Origin {
