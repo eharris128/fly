@@ -41,7 +41,8 @@ need to be on `PATH` — but re-run setup if you move the binary.
 
 Ported and expected to work: panes/tabs/splits, the attention pipeline
 (hooks → authenticated socket → ring/notification), session persistence,
-resume/handoff stores, the feed server, automations scheduling.
+resume/handoff stores, the feed server, automations *scheduling* (the sweep,
+the store, and script-mode runs — but see the agent-mode limitation below).
 
 Degraded — these read Linux's `/proc`, which doesn't exist on macOS, and
 currently fail soft (feature inert, no crash):
@@ -51,9 +52,13 @@ currently fail soft (feature inert, no crash):
 - **Dashboard agent detection & `running · N tasks`** (`cwd/` process table):
   panes won't classify as agents, so dashboard rows and the feed roster stay
   empty.
-- **Headless monitor checks** (`automations/headless.rs`): child liveness
-  pinning and the descendant kill sweep read `/proc` — monitors are not
-  usable on macOS yet.
+- **Headless agent runs** (`automations/headless.rs`): child liveness pinning
+  (pid + `/proc/<pid>/stat` start-time) and the descendant kill sweep read
+  `/proc`. One runner serves both monitor checks and ordinary agent-mode
+  automations, and headless is the **default disposition** for every agent
+  automation since the 2026-07-31 plan — so *all* agent-mode automations, not
+  just monitors, are unusable on macOS yet. Script-mode automations are
+  unaffected.
 
 Full parity needs a process-inspection seam with a `libproc` backend — see
 the macOS discussion in the repo history before starting that work.

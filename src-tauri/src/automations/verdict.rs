@@ -12,6 +12,12 @@
 //! **The verdict-block contract lives in exactly one place**:
 //! [`VERDICT_BLOCK_SPEC`]. The U8 skill quotes it verbatim so the parser and
 //! the prompt contract cannot drift; [`parse_verdict`] is its implementation.
+//! The two now differ by **exactly one outcome, on purpose**: the parser also
+//! accepts `DECLINED` (fly-dag-primitives G1, for verdict-gated non-monitor
+//! legs), while the spec deliberately still lists only PASS/FAIL, because a
+//! monitor is a done/not-done instrument and never retires on a decline (G1
+//! KTD6 — filtered at the monitor close path in [`super`]). Keep it to that
+//! one difference: spec and skill stay byte-identical to each other.
 //!
 //! Parsing follows the repo's abstain-on-surprise convention (R2/R5):
 //! anything that is not exactly one well-formed block is a not-done check —

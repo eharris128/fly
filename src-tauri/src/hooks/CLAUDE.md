@@ -36,6 +36,16 @@ here is mandatory, not a nicety.
 - **Bounded I/O** (`server.rs`) — cap a single request (`MAX_MESSAGE`, 64 KiB)
   and apply read/write timeouts, so a peer can't stream forever or wedge a
   handler thread by connecting and never reading.
+- **Accept-time connection cap** (`server.rs`, audit-remediation `U6`/`KTD6`) —
+  both this socket and the feed port are thread-per-connection, so a slot from
+  the shared `ConnCap` (`MAX_CONNECTIONS`, 64) is claimed **on accept, before
+  any read or auth work**, and released by RAII when the handler thread
+  finishes (a panicking handler can't leak one). Over-cap connections are
+  dropped immediately. It is an availability guard, not an authentication one:
+  64 is far above legitimate load (the feed has ~1 consumer; hook connections
+  are short-lived except held asks, themselves bounded by
+  `feed/ask.rs::MAX_HELD_ASKS`), but without it any same-uid process could grow
+  handler threads without bound.
 - **Silent rejection** — unknown, missing, or malformed tokens are rejected with
   **no signal**: don't leak whether a pane exists or why a message failed.
 - **Capture-only messages** (`capture_only` / `SessionStart`, the
@@ -85,11 +95,15 @@ here is mandatory, not a nicety.
 - `token.rs` — `TokenRegistry`: mint / resolve tokens, constant-time compare,
   lockout.
 - `protocol.rs` — the wire schema (one UTF-8 JSON object per message: the
-  EOF-framed `notify` path + `automation/*` envelope, `U9`, the
-  newline-framed held `ask/hold` op, and the EOF-framed `peer/*`
-  request/response ops). Its doc-comment is the authoritative schema +
+  `notify` path + `automation/*` envelope, `U9`, the held `ask/hold` op, and
+  the `peer/*` request/response ops). Framing is uniform across all of them —
+  `server.rs::read_request` ends a request at the first `\n` **or** at EOF,
+  whichever comes first — so the classic senders may simply close and
+  `ask/hold`, which must keep its connection open, terminates its one line
+  with a newline. Its doc-comment is the authoritative schema +
   rejection-rule spec.
-- `server.rs` — `HookServer`: the accept loop, `SO_PEERCRED`, bounds/timeouts,
+- `server.rs` — `HookServer`: the accept loop, `SO_PEERCRED`, the connection
+  cap, bounds/timeouts,
   dispatch into `AttentionManager` / the automation handler / the peer
   handler, and the held-ask connection loop (`hold_ask` — ack, park on the
   decision mailbox, probe for peer death).

@@ -33,9 +33,21 @@ attention — so you can run a fleet and only look when there's something to do.
   guided).
 - **Session attribution** — precise, per-pane session identity even when several
   `claude` sessions share one working directory (see below).
-- **Automations** — cron-scheduled agent or script runs, with alert surfacing
-  back into a pane (`fly automation …`), a dedicated Automations workspace,
-  and per-automation model/effort defaults.
+- **Automations** — cron-scheduled agent or script runs (`fly automation …`),
+  with alert surfacing back into a pane and per-automation model/effort
+  defaults. Agent runs dispatch **headless** by default — a backend-owned
+  `claude -p` child, no pane or tab, one prompt in and one captured result out;
+  `create --paned` opts an automation back into the older ephemeral-tab path,
+  which runs in a dedicated Automations workspace.
+- **Automation dependencies** — `create --after <id> [--within <dur>]` chains
+  one automation behind another: the dependent's cron occurrence fires only
+  against a fresh, successful, not-yet-consumed upstream run, waits out the
+  window otherwise, and then records an honest withheld row naming why —
+  never a green row over stale data.
+- **Agent peer messaging** — `fly agents` lists the live agent roster and `fly
+  send <pane> <message…>` delivers a provenance-framed message into another
+  agent's pane. Receiving is off by default and opt-in per pane, by you, from
+  the dashboard row's "peers" toggle — no agent can opt itself in.
 - **Monitors** — an automation flavor for parked experiments: sparse re-checks
   run headless (a backend-owned `claude -p`, no pane or tab), deliver one
   fenced PASS/FAIL verdict, and retire the monitor. A FAIL writes a durable
@@ -146,6 +158,10 @@ cargo test --offline --manifest-path src-tauri/Cargo.toml         # Rust (state 
 
 The same binary is both the desktop app and the `fly` CLI. Inside a pane, `fly
 notify` talks to the running app; `fly hooks setup|teardown` manages the Claude
-Code hooks; `fly automation <create|list|show|runs|pause|resume|run|delete>`
+Code hooks; `fly automation
+<create|update|list|show|runs|pause|resume|run|delete>`
 manages cron-scheduled runs (`create --monitor --not-before …` registers a
-monitor; `list`/`show`/`runs` are monitor-aware).
+monitor; `update` patches a stored automation in place, keeping its id and run
+history; `list`/`show`/`runs` are monitor-aware). `fly agents` lists the live
+agent roster and `fly send <pane> <message…>` delivers into another agent's
+pane (opt-in per pane, from the dashboard).

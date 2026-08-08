@@ -10,7 +10,10 @@ extended afterward. This file is a historical work-queue scratchpad, not a
 live queue or a statement that automations are frozen; for the later layers
 see `docs/plans/` — automations-workspace-and-model (2026-07-03),
 automations-interrupt-resilience (2026-07-05), monitor-handoff (2026-07-10),
-and headless-monitor-checks (2026-07-11).
+headless-monitor-checks (2026-07-11), automations-usage-limit-deferral
+(2026-07-16), headless-agent-automations (2026-07-31 — headless is now the
+default disposition for *every* agent run, not just monitor checks),
+automation-dependencies (2026-08-07), and automation-update (2026-08-08).
 
 > **Read the sections below as of 2026-07-02, not as current behavior.** Two
 > statements in particular were overtaken by the workspace-and-model plan and

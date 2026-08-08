@@ -164,7 +164,8 @@ time/inputs as arguments so they're tested without a running app.
   newline-framed held `ask/hold` op, hook-ask-channel, + the `peer/*`
   request/response ops, agent-peer-messaging), `server`. Has its own
   scoped `CLAUDE.md` — read it before changing anything here.
-- `cli/` — `fly notify`, `fly hooks setup|teardown`, `fly automation …` (U9).
+- `cli/` — `fly notify`, `fly hooks setup|teardown`, `fly automation …` (U9),
+  and `fly agents` / `fly send` (`cli/peer.rs`, see the `peer/` bullet above).
 - `automations/` — cron-scheduled agent/script runs (see the module map below).
 - `session/` — layout persistence (`mod.rs`) **plus the resume/handoff
   subsystem** (`resume.rs`, `transcript.rs`, `handoff.rs`); see "Session, resume
@@ -352,7 +353,14 @@ either way (mutually exclusive; agent-only; both rejected with `--monitor`,
 which is unconditionally headless). A **Failed** headless close rings the
 Automations alert path (sanitized `name: error (run id)` line — the
 replacement for the pane path's kept-open failed tab); Succeeded closes are
-silent, and non-monitor runs never verdict-parse/retire. The dashboard panel
+silent, and a non-monitor run **never retires** — retiring is the monitor-only
+half, and it is now the load-bearing distinction, because a non-monitor
+Succeeded close *does* verdict-parse when the automation opted in
+(fly-dag-primitives G1's `Automation.verdict_gated`, `model.rs`): the fenced
+block is parsed out of the run's captured output and stamped on the row in the
+same mutation as the close, for a dependent to read. Gating is **explicit
+opt-in, never inferred from a block's presence** (G1 KTD1) — ungated, every
+pre-G1 automation closes byte-identically. The dashboard panel
 row is a running headless run's primary surface (`running · 2m` elapsed read;
 effective disposition resolved from the DTO's `headlessDefault`), and the
 feed's `AutomationEntry` carries an additive effective-`headless` bool. The
@@ -382,13 +390,18 @@ next time the account is actually at a limit. Modules:
   (`docs/plans/2026-08-07-002-feat-automation-dependencies-plan.md`, its own
   U1–U7/KTD1–KTD8): `fly automation create --after <id> [--within <dur>]`
   makes a dependent's cron occurrence a *precondition-gated* fire — the pure
-  predicate here decides `Satisfied` (a fresh, successful, not-yet-consumed
-  upstream run exists; FAIL-verdict successes don't count) / `Wait` (window
-  open — the sweep leaves the occurrence untouched and re-evaluates each
+  predicate here decides one of **four**: `Satisfied` (a fresh, successful,
+  not-yet-consumed upstream run exists; a success carrying a FAIL *or* a
+  DECLINED verdict doesn't count) / `Wait` (window open — the sweep leaves the occurrence untouched and re-evaluates each
   tick, so the dependent fires within ~10 s of the upstream's success) /
   `Withhold` (window closed — a new born-terminal `RunStatus::Withheld` row
   records the specific reason: upstream failed/skipped/stale/still
-  running/missing/already consumed, chain-propagating for A→B→C). One
+  running/missing/already consumed, chain-propagating for A→B→C) /
+  `Declined` (fly-dag-primitives G1 KTD3/KTD4 — the window closed because the
+  upstream's newest in-window terminal run *declined*: it ran and correctly
+  had nothing to do. Records a silent born-terminal row and does **not** ring
+  the alert — a correct no-op is not a failure — and chain-propagates, so a
+  further dependent declines in turn). One
   symmetric `within` window (default 60 min) bounds both staleness and wait.
   Exactly-once per upstream run: the claim stamps `RunRow.upstreamRunId` in
   the same store mutation (dependent retries bypass the gate and inherit
@@ -434,7 +447,12 @@ next time the account is actually at a limit. Modules:
 - CLI (`cli/automation.rs`, U9): read ops (`list`/`show`/`runs`) read the store
   file directly (work outside a pane); mutating ops (`create`/`update`/`pause`/
   `resume`/`run`/`delete`) post over the hook socket (token-validated,
-  origin-stamped, R22-gated).
+  origin-stamped, R22-gated). `create --verdict-gated` and `update
+  --verdict-gated`/`--no-verdict-gated` (fly-dag-primitives G1) opt an
+  agent-mode automation into non-monitor verdict parsing — same flag shape as
+  `--headless`/`--paned`: the pair is mutually exclusive, and `--verdict-gated`
+  is rejected with `--script` (a script has no prompt) and with `--monitor`
+  (which already delivers a verdict and retires).
 - **Update** (`docs/plans/2026-08-08-001-feat-automation-update-plan.md`, its
   own U1–U6/KTD1–KTD7): `fly automation update <id> [flags]` patches a stored
   record in place — name, schedule, prompt/model/effort/disposition, script
@@ -442,9 +460,10 @@ next time the account is actually at a limit. Modules:
   dependency edge that the old delete + recreate dance destroyed.
   **Patch semantics** (KTD1): an absent field is unchanged, and clearing a pin
   rides an additive closed-set `clear: Vec<String>` on `AutomationRequest`
-  (`model`, `effort`, `disposition`, `retryOnInterrupt`, `after`; an unknown
-  member is refused, never ignored) — which is also the only way to express
-  "retry off", since the wire's `retryOnInterrupt` bool is skip-if-false.
+  (`model`, `effort`, `disposition`, `retryOnInterrupt`, `after`,
+  `verdictGated`; an unknown member is refused, never ignored) — which is also
+  the only way to express "retry off" or "verdict gating off", since both of
+  those wire bools are skip-if-false.
   `AutomationManager::update` runs its gates **inside** the store mutation
   (the `resume` retirement-gate shape): unknown id, retired, monitor, mode
   mismatch. **The exclusions are the design** (KTD2), each with its own
@@ -523,12 +542,16 @@ infra-unreadable Failed close, never a fabricated verdict. The check text is
 parsed for one fenced ` ```verdict ` block (`automations/verdict.rs` — the
 contract text is `VERDICT_BLOCK_SPEC`, quoted verbatim by
 `skills/fly-monitor-handoff/SKILL.md`, edited only together; abstain-on-surprise,
-so no block = "not done" = silent). A parsed verdict **retires** the monitor in
-the same store mutation that closes the row (`retiredAt` set, `next_run_at`
-cleared; claims/manual runs refused thereafter); FAIL also writes a durable
+so no block = "not done" = silent). A parsed PASS/FAIL verdict **retires** the
+monitor in the same store mutation that closes the row (`retiredAt` set,
+`next_run_at` cleared; claims/manual runs refused thereafter); FAIL also writes a durable
 bundle file under `<data root>/monitor-bundles/` (outside the run-output tail
 cap; evidence itself is tail-capped at 256 KiB at write time) and every verdict
-rings via the existing Alert path. Three consecutive *unreadable* checks
+rings via the existing Alert path. A **DECLINED** verdict never retires a
+monitor: the monitor close path filters it out (fly-dag-primitives G1 KTD6) and
+a stray one falls through as an ordinary not-done check — a monitor is a
+done/not-done instrument, and its prompt contract lists only PASS/FAIL.
+Three consecutive *unreadable* checks
 (Failed closes, Succeeded closes whose capture abstained, or captures whose
 opened ` ```verdict ` fence never parsed — a near-miss block is unreadable, not
 a healthy not-done — `Automation::consecutive_infra_failures`, derived not
@@ -629,6 +652,13 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   keys are stable and also key the scrollback files — preserve this invariant.
   `App.svelte` renders every pane across **all** workspaces/tabs (hiding inactive
   ones) so switching never unmounts/respawns an agent — same invariant.
+- `lib/pane-maps.ts` — the pure, vitest-tested half of the close-during-spawn
+  fix (audit-remediation U9/KTD9), sitting beside `layout.ts` because it guards
+  the same invariant from the other side: `resolveSpawnRace` (a pane that
+  arrives after its component's cleanup ran has no owner — close it, never
+  announce it) and `prunePaneIdMaps` (trim both pane-id maps to the live leaf
+  set on every close path, dropping a stale reverse entry a reused pane id
+  would otherwise resurrect).
 - `lib/workspaces.ts` — **pure workspace/tab model** (mirrors `layout.ts`): a
   workspace is a named collection of tabs; helpers (`tabDisplayTitle`,
   `closeTabIn`, `deleteWorkspaceFrom`, `flattenRaised`) take id factories so
