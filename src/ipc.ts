@@ -3,6 +3,7 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 // Type-only (erased at runtime, so the feed.ts ↔ ipc.ts cycle is harmless).
 import type { FeedPublishPayload } from "./lib/feed";
+import { makeWriteChain } from "./lib/write-chain";
 
 export type PaneId = number;
 
@@ -507,8 +508,17 @@ export function spawnPane(
   });
 }
 
+/**
+ * Per-pane write serialization (poll-batching plan KTD5/R5). `pty_write` is an
+ * async backend command, so two in-flight invokes can complete out of order
+ * across runtime workers — keystroke order is pinned here instead: each pane's
+ * write starts only after the previous one settles (see `lib/write-chain.ts`).
+ * A failed write rejects its own caller but never wedges the chain.
+ */
+const paneWrites = makeWriteChain<PaneId>();
+
 export function ptyWrite(paneId: PaneId, data: string): Promise<void> {
-  return invoke("pty_write", { paneId, data });
+  return paneWrites.run(paneId, () => invoke<void>("pty_write", { paneId, data }));
 }
 
 export function ptyResize(
@@ -635,6 +645,35 @@ export interface PaneActivity {
 /** Poll a pane's agent/work-stretch state (U4). */
 export function paneActivity(paneId: PaneId): Promise<PaneActivity> {
   return invoke<PaneActivity>("pane_activity", { paneId });
+}
+
+/**
+ * One pane's full poll-tick status (poll-batching plan U1): the batched union
+ * of `paneCwd` + `paneCommand` + `paneSessionId` + `paneActivity`, each field
+ * keeping its per-pane command's exact semantics (agent-only `argv` /
+ * `sessionId`; null timings and zero count for a non-agent; all-absent for a
+ * gone pane). Mirrors Rust `pty::PaneStatus`.
+ */
+export interface PaneStatus {
+  paneId: PaneId;
+  cwd: string | null;
+  isAgent: boolean;
+  argv: string[] | null;
+  sessionId: string | null;
+  workingForMs: number | null;
+  lastOutputAgoMs: number | null;
+  liveTaskCount: number;
+}
+
+/**
+ * Batched per-tick pane status (poll-batching plan U1/R1): one invoke per poll
+ * tick regardless of pane count, replacing the per-pane fan-out that ran 3–4
+ * sync commands × N panes on the backend main thread every 1.5 s. The per-pane
+ * wrappers above remain for one-off probes (spawn, on-close persist); no
+ * repeating poller should call them.
+ */
+export function panesStatus(paneIds: PaneId[]): Promise<PaneStatus[]> {
+  return invoke<PaneStatus[]>("panes_status", { paneIds });
 }
 
 /**

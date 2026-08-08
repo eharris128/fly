@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import Terminal from "./lib/Terminal.svelte";
   import ControlBar from "./lib/ControlBar.svelte";
   import Sidebar from "./lib/Sidebar.svelte";
@@ -93,9 +93,7 @@
     setWorkspaceMuted,
     onNotificationAdded,
     paneCwd,
-    paneCommand,
-    paneSessionId,
-    paneActivity,
+    panesStatus,
     ptyWrite,
     publishAgentFeed,
     usageSnapshot,
@@ -377,14 +375,11 @@
   let nudgePrevWorking: number | null = null; // last poll's workingForMs (deriveBusyIdle)
   let nudgeSuppressed = false; // Esc dismissed it this idle episode (U6)
   let nudgeSawRaise = false; // it raised for you this episode (triage, not a fresh launch)
-  // Episode generation + in-flight guard for the focused-pane poll: an async
-  // paneActivity() from a prior focus episode must not write back after the
-  // episode was reset (it would corrupt the new pane's transition history), and
-  // same-episode polls must not overlap and reorder their writes.
-  let nudgeGen = 0;
-  let nudgeTickBusy = false;
-  // Focused-pane nudge poll cadence — tighter than the 1.5s dashboard poll since
-  // it polls one pane and gates the nudge's responsiveness.
+  // Focused-pane nudge sample cadence. Synchronous and IPC-free since the
+  // poll-batching plan (KTD7): each tick samples the shared 1.5s poll's
+  // agentByLeaf and advances the user-idle clock, so no episode-generation or
+  // in-flight guard is needed — a reset effect re-run can't race a stale
+  // async write-back anymore.
   const NUDGE_POLL_MS = 1000;
   let layoutEl: HTMLDivElement;
   let layoutW = $state(1000);
@@ -1576,63 +1571,71 @@
   // write-through store churn-free at the ~1.5s cadence. Non-reactive, like
   // resumeArgvCaptured.
   let resumeSessionByLeaf = new Map<string, string>();
-  // Poll each live pane's cwd so an auto-named tab tracks `cd` without needing a
-  // layout change to trigger a save. Cheap (/proc read per pane); only writes
-  // state when something actually changed. This always-on poll is also the
-  // capture point for each agent's launch argv (U4) — see captureResumeArgv.
-  async function refreshCwds() {
+  // The one per-tick poller (poll-batching plan U3, R1): a single batched
+  // `panesStatus` invoke replaces the old refreshCwds/captureResumeArgv/
+  // captureResumeSession/refreshAgents fan-out of 3–4 sync invokes per pane —
+  // which ran as blocking work on the backend main thread and was measured
+  // stalling input 200–300 ms every 1.5 s
+  // (docs/notes/2026-08-08-typing-latency-diagnosis.md). Each capture keeps its
+  // prior semantics exactly; only the transport is batched:
+  //  - cwd: change-tracked, a null resolution never clears (auto tab names +
+  //    the persistence probe's warm cache);
+  //  - argv: captured once per leaf, agent-only (resume flag source, U4);
+  //  - session id: change-tracked via shouldCaptureSession, null never clears
+  //    (fix-003 U2, KTD-A/B — the version-skew-proof fallback capture; the
+  //    backend now TTLs the underlying dir scan ~5 s, within design because
+  //    the SessionStart hook remains the precise path);
+  //  - activity: the dashboard/feed/nudge signal, plus the task-count
+  //    rise-debounce bookkeeping (running-state KTD5).
+  async function refreshPanes() {
     const entries = Object.entries(paneIdByLeaf);
     if (entries.length === 0) return;
-    const results = await Promise.all(
-      entries.map(async ([key, pid]) => [key, await paneCwd(pid)] as const),
-    );
+    let statuses;
+    try {
+      statuses = await panesStatus(entries.map(([, pid]) => pid));
+    } catch {
+      return; // a transient IPC failure skips the tick, never wedges the poll
+    }
+    const byPane = new Map(statuses.map((s) => [s.paneId, s]));
+    const now = Date.now();
     const updates: Record<string, string | null> = {};
-    let changed = false;
-    for (const [key, cwd] of results) {
-      if (cwd != null && cwd !== cwdByLeaf[key]) {
-        updates[key] = cwd;
-        changed = true;
-      }
-    }
-    if (changed) cwdByLeaf = { ...cwdByLeaf, ...updates };
-    void captureResumeArgv(entries);
-    void captureResumeSession(entries);
-  }
-  // Capture each agent leaf's launch argv (the resume flag source) write-through,
-  // once per leaf (U4). pane_command returns the argv only for a detected Claude
-  // pane, so a bare shell upserts nothing. Best-effort: if the renderer dies the
-  // poll stops, but the hook path (U3) still captures the session id, and the
-  // builder's flag floor (U5) covers a missing argv.
-  async function captureResumeArgv(entries: [string, PaneId][]) {
+    let cwdChanged = false;
+    const nextAgents: Record<string, PaneActivity> = {};
     for (const [key, pid] of entries) {
-      if (resumeArgvCaptured.has(key)) continue;
-      const argv = await paneCommand(pid);
-      if (argv && argv.length > 0) {
+      const s = byPane.get(pid);
+      if (!s) continue;
+      if (s.cwd != null && s.cwd !== cwdByLeaf[key]) {
+        updates[key] = s.cwd;
+        cwdChanged = true;
+      }
+      if (!resumeArgvCaptured.has(key) && s.argv && s.argv.length > 0) {
         resumeArgvCaptured.add(key);
-        void saveResumeRecord(key, argv);
+        void saveResumeRecord(key, s.argv);
+      }
+      if (
+        s.sessionId != null &&
+        shouldCaptureSession(resumeSessionByLeaf.get(key) ?? null, s.sessionId)
+      ) {
+        resumeSessionByLeaf.set(key, s.sessionId);
+        void saveResumeSession(key, s.sessionId, s.cwd ?? cwdByLeaf[key] ?? null);
+      }
+      nextAgents[key] = {
+        isAgent: s.isAgent,
+        workingForMs: s.workingForMs,
+        lastOutputAgoMs: s.lastOutputAgoMs,
+        liveTaskCount: s.liveTaskCount,
+      };
+      // Rise/fall bookkeeping for the task-count debounce (KTD5): stamp the
+      // rise on a 0 → >0 transition, clear it the instant the count hits 0.
+      if (s.liveTaskCount > 0) {
+        if (taskRiseAt[key] == null) taskRiseAt[key] = now;
+      } else {
+        taskRiseAt[key] = null;
       }
     }
-  }
-  // Capture each agent leaf's active session id write-through, re-capturing
-  // whenever it changes (fix-003 U2, KTD-A/B). paneSessionId reads Claude's
-  // transcript store, so capture is independent of the installed `fly` binary's
-  // version — the skew that silently disabled the hook path — and fires before the
-  // first Notification/Stop. Change-tracked (shouldCaptureSession), so the store is
-  // touched only when the active session actually rotates; a null resolution
-  // (non-agent, or no active transcript) never clears a captured id. The pane's cwd
-  // doubles as the session cwd (the project dir resume runs in, KTD-H).
-  async function captureResumeSession(entries: [string, PaneId][]) {
-    // Read every pane's session id in parallel (each is an IPC round-trip), like
-    // refreshCwds does for cwds, so poll latency doesn't scale with pane count.
-    const results = await Promise.all(
-      entries.map(async ([key, pid]) => [key, await paneSessionId(pid)] as const),
-    );
-    for (const [key, id] of results) {
-      if (id == null) continue; // not an agent / no active transcript
-      if (!shouldCaptureSession(resumeSessionByLeaf.get(key) ?? null, id)) continue;
-      resumeSessionByLeaf.set(key, id);
-      void saveResumeSession(key, id, cwdByLeaf[key] ?? null);
-    }
+    if (cwdChanged) cwdByLeaf = { ...cwdByLeaf, ...updates };
+    agentByLeaf = nextAgents;
+    agentsPolledAt = now;
   }
 
   // ---- agent dashboard (U7) -------------------------------------------------
@@ -1641,30 +1644,6 @@
   // as `running`, so transient turn-start/tool spawns and pid-reuse blips don't
   // flash. The fall is immediate. Tunable (plan Open Question).
   const TASK_DEBOUNCE_MS = 3000;
-  // Poll each live pane's agent state. Gated to while the home view is open (the
-  // $effect below) so a toggle-only surface adds no always-on IPC. Rebuilt each
-  // poll from the live panes, so an exited pane drops out (its process is no
-  // longer `claude` → isAgent false).
-  async function refreshAgents() {
-    const entries = Object.entries(paneIdByLeaf);
-    const results = await Promise.all(
-      entries.map(async ([key, pid]) => [key, await paneActivity(pid)] as const),
-    );
-    const next: Record<string, PaneActivity> = {};
-    for (const [key, a] of results) next[key] = a;
-    const now = Date.now();
-    // Rise/fall bookkeeping for the debounce (KTD5): stamp the rise on a 0 → >0
-    // transition (riseAt currently null), clear it the instant the count hits 0.
-    for (const [key, a] of results) {
-      if (a.liveTaskCount > 0) {
-        if (taskRiseAt[key] == null) taskRiseAt[key] = now;
-      } else {
-        taskRiseAt[key] = null;
-      }
-    }
-    agentByLeaf = next;
-    agentsPolledAt = now;
-  }
   // Grace: drop a lingering work stretch for a leaf whose output all predates
   // your last engagement — a residual stretch from a turn you've already seen
   // must not resurrect a "working" timer. Keeps buildHomeModel pure.
@@ -1736,16 +1715,20 @@
       return () => clearInterval(timer);
     }
   }
-  // Run the agent poll while the dashboard is open OR the local feed is enabled
-  // (feat-agent-state-local-feed, U5). The feed needs a live roster whenever the
-  // app runs, not just while the dashboard drives the poll (KTD-C) — so an
-  // enabled feed keeps the same 1.5s poll going with the dashboard closed. An
-  // immediate fetch so it isn't blank, then every 1.5s via the un-throttled
-  // ticker; cleanup tears it down (and re-runs when either gate flips).
+  // The merged poll runs always-on at 1.5s on the un-throttled worker ticker
+  // (poll-batching plan U3, R7): the cwd/argv/session captures were always-on
+  // before the merge (their old main-thread interval throttled while
+  // backgrounded — the worker ticker strictly improves them), and the feed
+  // needs a live roster whenever the app runs (feat-agent-state-local-feed
+  // KTD-C). One batched invoke per tick makes the previously-gated activity
+  // half effectively free, so the homeViewOpen/feedEnabled gate now only
+  // controls *consumers* (feed publish, dashboard render), not the poll. The
+  // ticker itself starts in onMount beside the other listeners; this effect
+  // pulls one immediate refresh whenever a consumer surface opens, so the
+  // dashboard reads current on open instead of one interval later.
   $effect(() => {
     if (!homeViewOpen && !feedEnabled) return;
-    void refreshAgents();
-    return startPollTicker(1500, () => void refreshAgents());
+    void refreshPanes();
   });
   // Publish the assembled roster to the backend feed cache whenever it changes
   // (U5). Reads the same `homeModel` the dashboard renders, so the feed can
@@ -1900,38 +1883,31 @@
   // Watch the focused pane while the dashboard is closed and decide whether the
   // "move along" nudge should show. Re-runs (resetting the episode) on focus or
   // dashboard change; its own interval ticks the time-based trigger, so it never
-  // piggybacks the homeModel $derived (KTD6). The became-busy edge comes from the
-  // pane_activity poll (the attention stream has no output transition, KTD1); the
-  // finished/question signal comes from reasonByLeaf.
+  // piggybacks the homeModel $derived (KTD6). The became-busy edge samples the
+  // shared merged poll's `agentByLeaf` (the attention stream has no output
+  // transition, KTD1) — it used to issue its own 1 Hz `pane_activity` IPC,
+  // which cost a full /proc walk per second on the backend main thread exactly
+  // while the user typed (poll-batching plan KTD7); now the 1 s interval is
+  // IPC-free and only advances the user-idle clock + samples the 1.5 s-fresh
+  // shared data. The finished/question signal comes from reasonByLeaf.
   $effect(() => {
     const open = homeViewOpen;
     const leaf = activeTab?.focusedLeafKey ?? null;
-    // New focus context → bump the generation and reset the episode (non-reactive
-    // bookkeeping). A still-pending tick from a prior episode captured an older
-    // gen and bails after its await, so it can't write into this episode.
-    const gen = ++nudgeGen;
+    // New focus context → reset the episode (non-reactive bookkeeping).
     nudgeActive = false;
     nudgeEngaged = false;
     nudgeMovedOn = false;
     nudgeSuppressed = false;
     nudgePrevWorking = null;
     nudgeSawRaise = false;
-    nudgeTickBusy = false;
     if (open || !leaf) return; // no nudge while the dashboard is the view (R11)
-    const tick = async () => {
-      if (nudgeTickBusy) return; // don't overlap polls within an episode
+    const tick = () => {
       const pid = paneIdByLeaf[leaf];
       if (pid == null) return; // pane not spawned yet — try again next tick
-      nudgeTickBusy = true;
-      let a: PaneActivity;
-      try {
-        a = await paneActivity(pid);
-      } catch {
-        nudgeTickBusy = false;
-        return; // a transient poll failure must not wedge the trigger
-      }
-      nudgeTickBusy = false;
-      if (gen !== nudgeGen) return; // a newer focus episode superseded this tick
+      // The shared poll may not have covered this leaf yet (just spawned) —
+      // skip rather than fabricate an idle sample.
+      const a = agentByLeaf[leaf];
+      if (!a) return;
       const transition = deriveBusyIdle(nudgePrevWorking, a.workingForMs);
       nudgePrevWorking = a.workingForMs;
       const att = attentionByLeaf[leaf] ?? "idle";
@@ -1967,8 +1943,12 @@
         nudgeIdleMs,
       });
     };
-    void tick();
-    const timer = setInterval(() => void tick(), NUDGE_POLL_MS);
+    // The immediate sample runs synchronously inside the effect, so its state
+    // reads (agentByLeaf, attentionByLeaf, …) must be untracked — otherwise
+    // every 1.5s poll assignment would re-run the effect and reset the episode.
+    // Interval callbacks are untracked by nature.
+    untrack(tick);
+    const timer = setInterval(tick, NUDGE_POLL_MS);
     return () => clearInterval(timer);
   });
 
@@ -2408,21 +2388,12 @@
   function reportForeground() {
     const focused = document.hasFocus();
     void setWindowForeground(focused);
-    // Focus-in status refresh (fix-dashboard-stale-status-on-focus): WebKit
-    // throttles/pauses the 1.5s polls (refreshAgents/refreshCwds) while the window
-    // is backgrounded, so the dashboard freezes and only catches up on the next
-    // resumed tick — the ~700ms "statuses flip after I switch back" lag (avg half
-    // the 1.5s cadence). Pull a poll forward to the moment focus returns so the
-    // dashboard reads current on glance, not one interval later. Cheap: the same
-    // probes the timers already run, just not made to wait for the throttle to
-    // wake. Agents whenever that poll runs at all — the dashboard OR the feed
-    // drives it (homeViewOpen || feedEnabled), matching the poll effect's gate so
-    // a focus with the dashboard closed still refreshes the feed roster; cwds
-    // always, mirroring their unconditional timer.
-    if (focused) {
-      if (homeViewOpen || feedEnabled) void refreshAgents();
-      void refreshCwds();
-    }
+    // Focus-in status refresh (fix-dashboard-stale-status-on-focus): the worker
+    // ticker keeps the merged poll alive while backgrounded, but a tick can
+    // still be up to 1.5s stale at the moment focus returns — pull one poll
+    // forward so the dashboard/roster read current on glance, not one interval
+    // later. One batched invoke, same probe the ticker runs.
+    if (focused) void refreshPanes();
   }
   onMount(() => {
     window.addEventListener("focus", reportForeground);
@@ -2499,12 +2470,17 @@
     void onMonitorRegistered(handleMonitorRegistered).then(
       (un) => (unlistenMonitorRegistered = un),
     );
-    const cwdTimer = setInterval(() => void refreshCwds(), 1500);
+    // The merged always-on poll (poll-batching U3): one batched invoke per
+    // 1.5s tick on the un-throttled worker ticker (R7), replacing the old
+    // separate cwd interval + gated agent poll. Immediate first tick so
+    // restore doesn't wait 1.5s for cwds/statuses.
+    void refreshPanes();
+    const stopPanePoll = startPollTicker(1500, () => void refreshPanes());
     return () => {
       window.removeEventListener("focus", reportForeground);
       window.removeEventListener("blur", reportForeground);
       window.removeEventListener("keydown", onWindowKeydown, true);
-      clearInterval(cwdTimer);
+      stopPanePoll();
       unlistenNotify?.();
       unlistenAgentRun?.();
       unlistenAutomationChanged?.();

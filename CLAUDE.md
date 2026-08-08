@@ -617,7 +617,13 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   attention/cwd/activity state, debounced session persistence (~800ms), and the
   overlay wiring (hotkey menu, command palette, notification panel, triage nudge,
   dashboard, settings menu, destructive-confirm — the latter also guards quit
-  while agents are mid-work, via `home.ts::busyAgentCount`).
+  while agents are mid-work, via `home.ts::busyAgentCount`). All per-pane
+  status polling (cwd, resume argv/session capture, activity, task count) is
+  **one batched async `panes_status` invoke per 1.5 s worker tick**
+  (`refreshPanes`, poll-batching plan 2026-08-08-003 — one `/proc` snapshot
+  per call, ~5 s TTL on the session-id dir scan; keystrokes ride an async
+  `pty_write` whose per-pane order `lib/write-chain.ts` pins). Don't add
+  per-pane repeating invokes — extend `PaneStatus` instead.
 - `lib/layout.ts` — **pure split-tree model**. Leaves render flat and keyed, so
   splitting/resizing never unmounts a pane (which would respawn its agent). Leaf
   keys are stable and also key the scrollback files — preserve this invariant.

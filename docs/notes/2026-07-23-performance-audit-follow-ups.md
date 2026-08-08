@@ -74,8 +74,40 @@ Priority tiers: **P1** = measurable steady-state cost, worth scheduling.
 - **Impact:** high (core-surface throughput + latency). Confidence: mechanism
   and magnitude both high as of the 2026-07-28 measurements; end-to-end
   user-visible latency gain still unmeasured.
+- **Latency re-measured 2026-08-08:** the typing delay T1 was expected to fix
+  **persists**. Live profiling (see
+  `docs/notes/2026-08-08-typing-latency-diagnosis.md`) confirms T1 did its
+  job — PTY/coalescer threads at 0.3% CPU under spinner load — but the lag
+  is T4 (each coalesced flush costs ~20 ms of visible-pane DOM render on the
+  saturated webview main thread) stacked on T2 (sync poll-storm bursts
+  stalling the app main thread, where `pty_write` also runs).
 
 ### T2 — Batch the per-pane 1.5s polls; kill the /proc and readdir storms
+
+> **Promoted 2026-08-08** — live-diagnosed as a direct typing-latency driver,
+> not just idle power: the sync commands run on the GTK main thread and were
+> measured stalling it 80–110% for ~200–300 ms every ~1.5 s, with `pty_write`
+> (also sync) queued behind them; the nudge additionally full-walks `/proc`
+> at 1 Hz via `pane_activity(focused)` while the user types. See
+> `docs/notes/2026-08-08-typing-latency-diagnosis.md`.
+>
+> **Done 2026-08-08** —
+> `docs/plans/2026-08-08-003-perf-pane-status-poll-batching-plan.md`:
+> (a) one lazily-read `/proc` snapshot per `panes_status` call, shared across
+> every pane's task count; (b) the project-dir session scan behind a ~5 s
+> per-pane TTL cache (`PtyManager::session_id_cached` — the dir-mtime
+> short-circuit was **rejected**: appends don't bump dir mtime, so the
+> two-live-sessions case would serve stale unboundedly); (c) one batched
+> **async** `panes_status` invoke per 1.5 s worker tick (`App.refreshPanes`
+> replaces refreshCwds/captureResumeArgv/captureResumeSession/refreshAgents;
+> body under `spawn_blocking`, so nothing blocks the GTK loop), the nudge's
+> 1 Hz `pane_activity` IPC replaced by sampling the shared poll. `pty_write`
+> went async in the same change, with per-pane keystroke order pinned by
+> `lib/write-chain.ts`. Bonus item: `foreground_pid`'s tcgetpgrp-under-lock is
+> now a **documented deliberate exception** (non-blocking ~µs ioctl; freeing
+> it would mean re-plumbing the `MasterPty` box) rather than a fix.
+> Original entry kept for the measurements:
+
 Three audits converged here; this is the idle-power story. One task, three
 parts (they share the same plumbing):
 - **(a) Shared /proc snapshot for activity.** `pty/mod.rs::agent_task_count`

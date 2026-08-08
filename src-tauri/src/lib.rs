@@ -1145,6 +1145,7 @@ pub fn run() {
             pty::pane_command,
             pty::pane_session_id,
             pty::pane_activity,
+            pty::panes_status,
             session::save_session,
             session::load_session,
             session::save_scrollback,
