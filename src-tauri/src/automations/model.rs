@@ -92,8 +92,10 @@ pub const DEFAULT_AFTER_WITHIN_MS: u64 = 60 * 60 * 1000;
 #[serde(rename_all = "camelCase")]
 pub struct Dependency {
     /// The upstream automation's id. Never self-referential by construction
-    /// (edges are create-only; the record does not exist yet when its edge
-    /// is validated — dependencies KTD6).
+    /// (edges are **set** at create only — `fly automation update` may clear
+    /// an edge but never set or re-point one, automation-update KTD2 — and
+    /// the record does not exist yet when its edge is validated —
+    /// dependencies KTD6).
     pub upstream_id: String,
     /// The symmetric freshness/wait window, epoch-relative ms (KTD4);
     /// `None` = [`DEFAULT_AFTER_WITHIN_MS`]. Untrusted numeric input —
@@ -174,6 +176,16 @@ impl Mode {
         match self {
             Mode::Agent { headless, .. } => headless.unwrap_or(default),
             Mode::Script { .. } => false,
+        }
+    }
+
+    /// The stored script path, for script mode only (automation-update U1):
+    /// the content swap needs to know which file the record currently points
+    /// at, so it can write a *sibling* and drop the old one afterwards (KTD5).
+    pub fn script_file(&self) -> Option<&str> {
+        match self {
+            Mode::Script { script_file, .. } => Some(script_file),
+            Mode::Agent { .. } => None,
         }
     }
 }
@@ -435,9 +447,11 @@ pub struct Automation {
     /// due occurrence only against a fresh, successful, not-yet-consumed
     /// run of the named upstream ([`super::depend::evaluate`]), deferring
     /// within the window and otherwise recording an honest
-    /// [`RunStatus::Withheld`] row. Create-only (no update op exists — the
-    /// KTD6 cycle argument rests on this). `#[serde(default)]` keeps every
-    /// legacy store row loading as `None`.
+    /// [`RunStatus::Withheld`] row. **Set at create only**: `fly automation
+    /// update` may only *clear* this field (`--no-after`), never set or
+    /// re-point it (automation-update KTD2) — removing an edge can never
+    /// close a cycle, so the KTD6 cycle argument survives verbatim.
+    /// `#[serde(default)]` keeps every legacy store row loading as `None`.
     #[serde(default)]
     pub after: Option<Dependency>,
     pub cwd: String,

@@ -7,7 +7,8 @@
 //!   ([`store::store_path`]), so they work **outside a pane** and even when the
 //!   app isn't running (R19). Writes are atomic (temp + rename), so a
 //!   concurrent read always sees a complete document.
-//! - **Mutating ops** (`create`, `pause`, `resume`, `run`, `delete`) require the
+//! - **Mutating ops** (`create`, `update`, `pause`, `resume`, `run`, `delete`)
+//!   require the
 //!   pane token and post over the hook socket (R19), where the app validates the
 //!   token (the security boundary), enforces the R22 recursion gate, stamps
 //!   origin, and writes a `{ok,…}` response. A slow/absent app is reported as
@@ -24,6 +25,15 @@
 //! `runs` render the monitor states (parked / retired pass / retired fail /
 //! broken / paused — monitor-handoff R18's CLI mirror). This is the surface
 //! the U8 skill drives (monitor-handoff R10).
+//!
+//! Update surface (U4 of
+//! `docs/plans/2026-08-08-001-feat-automation-update-plan.md`): `update`
+//! patches a stored record in place with **patch semantics** — absent flag =
+//! unchanged, `--no-*` flags clear a pin through the additive `clear` list
+//! (KTD1) — keeping the id, run history, origin and any dependency edge that
+//! delete + recreate would lose. What it deliberately cannot do (KTD2) has no
+//! flag at all: mode-kind switches, monitors, retired records, `cwd`, and
+//! *setting* `--after`.
 
 use std::io::{Read, Write};
 use std::net::Shutdown;
@@ -265,12 +275,17 @@ pub struct AutomationRequest {
     pub effort: Option<String>,
     /// Opt-in interrupt resilience (interrupt-resilience U4/R1): re-run once on
     /// the next launch a run this automation leaves interrupted by an app
-    /// crash/restart. Create-only; `#[serde(default)]` = `false` for legacy
-    /// clients and every other op.
+    /// crash/restart. Set by `create` **and** by `update` (where it means
+    /// "turn on" — the off direction rides `clear`, since this field is
+    /// skip-if-false and cannot express it). `#[serde(default)]` = `false`
+    /// for legacy clients and every other op.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub retry_on_interrupt: bool,
-    /// Monitor flavor (monitor-handoff U4, R1/R11): create-only, agent-mode
-    /// only (the app rejects `monitor` + `script`). A monitor create makes
+    /// Monitor flavor (monitor-handoff U4, R1/R11): create-only — still
+    /// literally true, and `update` refuses both this field and any update
+    /// *to* a monitor (automation-update KTD2: pickup pointers cannot be
+    /// re-captured without a registering pane) — agent-mode only (the app
+    /// rejects `monitor` + `script`). A monitor create makes
     /// the app capture pickup pointers from the **validated calling pane** —
     /// the wire can never self-declare them — or refuse (R12). U5 sets this
     /// from `--monitor`. `#[serde(default)]`/`skip_serializing_if` keep old
@@ -278,13 +293,17 @@ pub struct AutomationRequest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub monitor: bool,
     /// Monitor not-before floor, epoch ms (monitor-handoff U2/U4, R1):
-    /// create-only; clamps every `next_run_at` recompute. Untrusted numeric
+    /// create-only (monitors are not updatable at all, automation-update
+    /// KTD2); clamps every `next_run_at` recompute — including an update's
+    /// cron-change recompute, for any record that carries one. Untrusted numeric
     /// input — schedule math is saturating/checked. U5 parses `--not-before`
     /// into it; same back-compat pattern as `monitor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before_ms: Option<u64>,
     /// Dispatch disposition (headless-agent-automations U2 — R1/R2):
-    /// create-only, agent-mode only. `Some(true)` = `--headless`,
+    /// agent-mode only; set by `create` and by `update` (whose
+    /// `--default-disposition` clears the pin back to `None` via `clear`).
+    /// `Some(true)` = `--headless`,
     /// `Some(false)` = `--paned`, `None` (the wire default, and what an old
     /// CLI binary always sends) = follow `config.automation_defaults
     /// .headless` at claim time. Validated CLI-side AND on the untrusted
@@ -293,7 +312,10 @@ pub struct AutomationRequest {
     /// pattern as `monitor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headless: Option<bool>,
-    /// Dependency edge (automation-dependencies plan, U5 — R14): create-only.
+    /// Dependency edge (automation-dependencies plan, U5 — R14): **set at
+    /// create only** — `update` refuses both fields outright and can only
+    /// *clear* the stored edge (`--no-after` → `clear`), so the KTD6 cycle
+    /// argument holds (automation-update KTD2).
     /// `after` names the upstream automation id; `within_ms` is the optional
     /// symmetric freshness/wait window (absent = the 60-min default). The
     /// untrusted wire is re-validated app-side (existence, non-monitor
@@ -305,6 +327,21 @@ pub struct AutomationRequest {
     pub after: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub within_ms: Option<u64>,
+    /// Fields an `automation/update` clears (automation-update U2 — R7,
+    /// KTD1). Patch semantics make an absent field mean *unchanged*, which
+    /// collides with the create convention where `None` means "use the
+    /// default" — so clearing a pinned value gets this explicit channel.
+    /// Members come from the closed set
+    /// [`crate::automations::UpdateClear::MEMBERS`] (`model`, `effort`,
+    /// `disposition`, `retryOnInterrupt`, `after`); an unknown member is
+    /// **refused** app-side, never ignored. Notably `retry_on_interrupt`
+    /// above is skip-if-false and so cannot express "turn off" — the off
+    /// direction rides here and that field's type is unchanged. Ignored by
+    /// every other op; `#[serde(default)]`/skip-if-empty keeps old CLI
+    /// binaries and new servers mutually intelligible (an *old server*
+    /// receiving `automation/update` fails loudly on the unknown op — KTD7).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clear: Vec<String>,
 }
 
 /// The app's response to an `automation/*` request.
@@ -345,10 +382,134 @@ impl AutomationResponse {
     }
 }
 
+/// The parsed `fly automation update` flags (automation-update U4, R11).
+/// Separated from the arg loop so the contradictory-pair and nothing-to-change
+/// refusals are pure and unit-tested — they must fire **before** any socket
+/// traffic.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateFlags {
+    pub id: String,
+    pub name: Option<String>,
+    pub cron: Option<String>,
+    pub timezone: Option<String>,
+    pub prompt: Option<String>,
+    /// Script **content**, already read client-side (R21).
+    pub script: Option<String>,
+    pub interpreter: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub model: Option<String>,
+    pub no_model: bool,
+    pub effort: Option<String>,
+    pub no_effort: bool,
+    pub headless: bool,
+    pub paned: bool,
+    pub default_disposition: bool,
+    pub retry_on_interrupt: bool,
+    pub no_retry_on_interrupt: bool,
+    pub no_after: bool,
+}
+
+/// Build the `automation/update` request from parsed flags (R11), or the
+/// message the CLI prints before exiting 2. Every check here is re-run
+/// app-side on the untrusted wire (KTD6) — this pass exists so a typo costs a
+/// message, not a socket round-trip.
+pub fn build_update_request(f: UpdateFlags) -> Result<AutomationRequest, String> {
+    // Contradictory pairs: a client that asks for both directions of a toggle
+    // has a bug, and last-one-wins would hide it.
+    if f.model.is_some() && f.no_model {
+        return Err("pass only one of --model / --no-model".to_string());
+    }
+    if f.effort.is_some() && f.no_effort {
+        return Err("pass only one of --effort / --no-effort".to_string());
+    }
+    if f.retry_on_interrupt && f.no_retry_on_interrupt {
+        return Err("pass only one of --retry-on-interrupt / --no-retry-on-interrupt".to_string());
+    }
+    if [f.headless, f.paned, f.default_disposition]
+        .iter()
+        .filter(|b| **b)
+        .count()
+        > 1
+    {
+        return Err("pass only one of --headless / --paned / --default-disposition".to_string());
+    }
+    if let Some(level) = f.effort.as_deref() {
+        if !VALID_EFFORTS.contains(&level) {
+            return Err(format!(
+                "--effort must be one of {} (got {level:?})",
+                VALID_EFFORTS.join(", ")
+            ));
+        }
+    }
+    if let Some(name) = f.interpreter.as_deref() {
+        crate::automations::script::resolve_interpreter(name)?;
+    }
+
+    // The closed clear set (KTD1) — the CLI's only job is mapping `--no-*`
+    // flags onto its member names.
+    let mut clear: Vec<String> = Vec::new();
+    if f.no_model {
+        clear.push("model".to_string());
+    }
+    if f.no_effort {
+        clear.push("effort".to_string());
+    }
+    if f.default_disposition {
+        clear.push("disposition".to_string());
+    }
+    if f.no_retry_on_interrupt {
+        clear.push("retryOnInterrupt".to_string());
+    }
+    if f.no_after {
+        clear.push("after".to_string());
+    }
+
+    let req = AutomationRequest {
+        op: "automation/update".to_string(),
+        id: Some(f.id),
+        name: f.name,
+        cron: f.cron,
+        timezone: f.timezone,
+        prompt: f.prompt,
+        script: f.script,
+        interpreter: f.interpreter,
+        timeout_ms: f.timeout_ms,
+        model: f.model,
+        effort: f.effort,
+        retry_on_interrupt: f.retry_on_interrupt,
+        headless: match (f.headless, f.paned) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        },
+        clear,
+        ..Default::default()
+    };
+    // R1: nothing to change is refused here too, so the round-trip is spent
+    // only on real edits. Mirrors `UpdateSpec::is_empty` app-side.
+    let changes_nothing = req.name.is_none()
+        && req.cron.is_none()
+        && req.timezone.is_none()
+        && req.prompt.is_none()
+        && req.script.is_none()
+        && req.interpreter.is_none()
+        && req.timeout_ms.is_none()
+        && req.model.is_none()
+        && req.effort.is_none()
+        && req.headless.is_none()
+        && !req.retry_on_interrupt
+        && req.clear.is_empty();
+    if changes_nothing {
+        return Err("nothing to change — pass at least one field (see --help)".to_string());
+    }
+    Ok(req)
+}
+
 /// Dispatch `fly automation <sub> …`. `args` starts at the subcommand.
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("create") => handle_create(&args[1..]),
+        Some("update") => handle_update(&args[1..]),
         Some("list") => handle_list(&args[1..]),
         Some("show") => handle_show(&args[1..]),
         Some("runs") => handle_runs(&args[1..]),
@@ -358,7 +519,8 @@ pub fn run(args: &[String]) -> i32 {
         Some("delete") => handle_target("automation/delete", "deleted", &args[1..]),
         _ => {
             eprintln!(
-                "usage: fly automation <create|list|show|runs|pause|resume|run|delete> …"
+                "usage: fly automation \
+                 <create|update|list|show|runs|pause|resume|run|delete> …"
             );
             2
         }
@@ -733,6 +895,153 @@ fn handle_create(args: &[String]) -> i32 {
         ..Default::default()
     };
     send_and_report(req, "created", json)
+}
+
+/// `fly automation update <id> [flags]` (automation-update U4 — R11/R12):
+/// patch a stored automation in place. Absent flag = unchanged; the `--no-*`
+/// flags clear a pin. The exclusions (mode-kind switch, monitors, retired
+/// records, setting `--after`, `cwd`) have no flags at all — they are refused
+/// app-side with their own messages if a raw socket client tries.
+fn handle_update(args: &[String]) -> i32 {
+    let mut f = UpdateFlags::default();
+    let mut id: Option<String> = None;
+    let mut script_file: Option<String> = None;
+    let mut json = false;
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                println!("usage: fly automation update <id> [options]");
+                println!();
+                println!("Patch a stored automation in place. Absent options are left unchanged;");
+                println!("the --no-* options clear a pinned value. The id, run history, origin");
+                println!("and any dependency edge survive — unlike delete + recreate.");
+                println!();
+                println!("Options:");
+                println!("  --name <name>              rename");
+                println!("  --cron <expr>              new cron schedule");
+                println!("  --tz, --timezone <tz>      new timezone");
+                println!("  --prompt <text>            agent mode: replace the prompt");
+                println!("  --model <name>             agent mode: pin the model");
+                println!("  --no-model                 agent mode: unpin the model (use the default)");
+                println!("  --effort <level>           agent mode: reasoning effort (low, medium, high, xhigh, max)");
+                println!("  --no-effort                agent mode: unpin the effort");
+                println!("  --headless                 agent mode: pin closed-loop dispatch");
+                println!("  --paned                    agent mode: pin interactive-pane dispatch");
+                println!("  --default-disposition      agent mode: unpin (follow automationDefaults.headless)");
+                println!("  --script <code>            script mode: replace the script content");
+                println!("  --script-file <path>       script mode: replace it from a file");
+                println!("  --interpreter <name>       script mode: bash, sh, node, python3");
+                println!("  --timeout <ms>             script mode: run timeout in milliseconds");
+                println!("  --retry-on-interrupt       re-run once after an app crash/restart");
+                println!("  --no-retry-on-interrupt    stop re-running after an interrupt");
+                println!("  --no-after                 drop the dependency edge (--after)");
+                println!("  --json                     output response as JSON");
+                println!();
+                println!("Not updatable, by design — delete and recreate instead:");
+                println!("  the mode kind (agent ↔ script), the cwd, monitors, retired records,");
+                println!("  and setting/re-pointing --after (only --no-after is allowed, since");
+                println!("  removing an edge can never create a dependency cycle).");
+                println!();
+                println!("A cron or timezone change recomputes the next run from now; a PAUSED");
+                println!("automation stays paused and picks the new schedule up on resume.");
+                println!("A run already in flight keeps the parameters it launched with — the new");
+                println!("ones apply from its next run.");
+                println!();
+                println!("Examples:");
+                println!("  fly automation update a1b2c3d4e5 --cron '0 */4 * * *'");
+                println!("  fly automation update a1b2c3d4e5 --prompt 'summarize CI, then …' --no-model");
+                println!("  fly automation update a1b2c3d4e5 --script-file backup.sh --timeout 300000");
+                return 0;
+            }
+            "--name" => f.name = it.next().cloned(),
+            "--cron" => f.cron = it.next().cloned(),
+            "--tz" | "--timezone" => f.timezone = it.next().cloned(),
+            "--prompt" => f.prompt = it.next().cloned(),
+            "--model" => f.model = it.next().cloned(),
+            "--no-model" => f.no_model = true,
+            "--effort" => f.effort = it.next().cloned(),
+            "--no-effort" => f.no_effort = true,
+            "--headless" => f.headless = true,
+            "--paned" => f.paned = true,
+            "--default-disposition" => f.default_disposition = true,
+            "--script" => f.script = it.next().cloned(),
+            "--script-file" => script_file = it.next().cloned(),
+            "--interpreter" => f.interpreter = it.next().cloned(),
+            "--timeout" => {
+                f.timeout_ms = match it.next().map(|s| s.parse::<u64>()) {
+                    Some(Ok(n)) => Some(n),
+                    _ => {
+                        eprintln!("fly automation update: --timeout wants a millisecond integer");
+                        return 2;
+                    }
+                }
+            }
+            "--retry-on-interrupt" => f.retry_on_interrupt = true,
+            "--no-retry-on-interrupt" => f.no_retry_on_interrupt = true,
+            "--no-after" => f.no_after = true,
+            "--json" => json = true,
+            other if !other.starts_with('-') && id.is_none() => id = Some(other.to_string()),
+            other => {
+                eprintln!("fly automation update: unknown argument {other:?}");
+                return 2;
+            }
+        }
+    }
+
+    let Some(id) = id else {
+        eprintln!("fly automation update: an automation id is required");
+        return 2;
+    };
+    f.id = id.clone();
+
+    // Read a `--script-file` client-side — the app never opens a client path
+    // (R21) — and keep the create path's mutual exclusion.
+    if f.script.is_some() && script_file.is_some() {
+        eprintln!("fly automation update: pass only one of --script / --script-file");
+        return 2;
+    }
+    if let Some(path) = &script_file {
+        match std::fs::read_to_string(path) {
+            Ok(content) => f.script = Some(content),
+            Err(e) => {
+                eprintln!("fly automation update: cannot read --script-file {path:?}: {e}");
+                return 1;
+            }
+        }
+    }
+
+    let req = match build_update_request(f) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("fly automation update: {e}");
+            return 2;
+        }
+    };
+    let code = send_and_report(req, "updated", json);
+    // R12: echo the updated record show-style (the store is already flushed by
+    // the time the response came back). `--json` stays machine-clean — the
+    // response object is the whole output there.
+    if code == 0 && !json {
+        if let Ok(list) = load_store() {
+            if let Some(a) = list.iter().find(|a| a.id == id) {
+                let upstream_name = a.after.as_ref().and_then(|e| {
+                    list.iter()
+                        .find(|u| u.id == e.upstream_id)
+                        .map(|u| u.name.clone())
+                });
+                let headless_default =
+                    crate::config::load_with_fallback(&crate::config::default_path())
+                        .automation_defaults
+                        .headless;
+                for line in show_lines(a, now_ms(), headless_default, upstream_name.as_deref()) {
+                    println!("{line}");
+                }
+            }
+        }
+    }
+    code
 }
 
 /// pause / resume / run / delete: all take a single automation id.
@@ -1999,5 +2308,146 @@ mod tests {
         let line = run_line(&row, now);
         assert!(line.contains("withheld"), "got: {line}");
         assert!(line.contains("upstream failed (exit 1)"), "got: {line}");
+    }
+
+    // ---- automation-update U4 (R11) ----------------------------------------
+
+    fn update_flags(id: &str) -> UpdateFlags {
+        UpdateFlags {
+            id: id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    // R11: contradictory pairs and a zero-change invocation are CLI errors
+    // *before* any socket traffic — the round-trip is spent only on real edits.
+    #[test]
+    fn update_rejects_contradictory_pairs_and_empty_edits_before_the_socket() {
+        let cases: Vec<(UpdateFlags, &str)> = vec![
+            (update_flags("a1"), "nothing to change"),
+            (
+                UpdateFlags {
+                    model: Some("opus".into()),
+                    no_model: true,
+                    ..update_flags("a1")
+                },
+                "--model / --no-model",
+            ),
+            (
+                UpdateFlags {
+                    effort: Some("high".into()),
+                    no_effort: true,
+                    ..update_flags("a1")
+                },
+                "--effort / --no-effort",
+            ),
+            (
+                UpdateFlags {
+                    retry_on_interrupt: true,
+                    no_retry_on_interrupt: true,
+                    ..update_flags("a1")
+                },
+                "--retry-on-interrupt / --no-retry-on-interrupt",
+            ),
+            (
+                UpdateFlags {
+                    headless: true,
+                    paned: true,
+                    ..update_flags("a1")
+                },
+                "--headless / --paned / --default-disposition",
+            ),
+            (
+                UpdateFlags {
+                    paned: true,
+                    default_disposition: true,
+                    ..update_flags("a1")
+                },
+                "--headless / --paned / --default-disposition",
+            ),
+            (
+                UpdateFlags {
+                    effort: Some("extreme".into()),
+                    ..update_flags("a1")
+                },
+                "--effort must be one of",
+            ),
+            (
+                UpdateFlags {
+                    interpreter: Some("perl".into()),
+                    ..update_flags("a1")
+                },
+                "interpreter",
+            ),
+        ];
+        for (flags, expect) in cases {
+            let err = build_update_request(flags.clone()).unwrap_err();
+            assert!(err.contains(expect), "got {err:?} for {flags:?}");
+        }
+    }
+
+    // KTD1: `--no-*` flags map onto the closed clear set, and both directions
+    // of the retry toggle are expressible (the wire bool is skip-if-false, so
+    // "off" can only ride `clear`).
+    #[test]
+    fn update_maps_no_flags_onto_the_clear_set_and_pins_onto_the_fields() {
+        let req = build_update_request(UpdateFlags {
+            no_model: true,
+            no_effort: true,
+            default_disposition: true,
+            no_retry_on_interrupt: true,
+            no_after: true,
+            ..update_flags("a1")
+        })
+        .unwrap();
+        assert_eq!(req.op, "automation/update");
+        assert_eq!(req.id.as_deref(), Some("a1"));
+        assert_eq!(
+            req.clear,
+            vec!["model", "effort", "disposition", "retryOnInterrupt", "after"]
+        );
+        assert!(!req.retry_on_interrupt, "off rides `clear`, not the bool");
+        assert_eq!(req.headless, None, "clearing the pin is not pinning `paned`");
+        // Every emitted member is one the app accepts (the two sides of KTD1's
+        // closed set cannot drift).
+        crate::automations::UpdateClear::parse(&req.clear).expect("members are known app-side");
+
+        let req = build_update_request(UpdateFlags {
+            model: Some("opus".into()),
+            effort: Some("xhigh".into()),
+            paned: true,
+            retry_on_interrupt: true,
+            name: Some("nightly".into()),
+            ..update_flags("a1")
+        })
+        .unwrap();
+        assert!(req.clear.is_empty());
+        assert_eq!(req.model.as_deref(), Some("opus"));
+        assert_eq!(req.effort.as_deref(), Some("xhigh"));
+        assert_eq!(req.headless, Some(false), "--paned pins the pane disposition");
+        assert!(req.retry_on_interrupt);
+        assert_eq!(req.name.as_deref(), Some("nightly"));
+        // Update never carries the create-only fields (each refused app-side).
+        assert_eq!(req.cwd, None);
+        assert_eq!(req.after, None);
+        assert_eq!(req.not_before_ms, None);
+        assert!(!req.monitor);
+    }
+
+    // Back-compat (KTD7): the additive `clear` field is skip-if-empty, so
+    // every existing op serializes byte-identically for old servers.
+    #[test]
+    fn an_empty_clear_list_never_appears_on_the_wire() {
+        let req = AutomationRequest {
+            op: "automation/pause".into(),
+            id: Some("a1".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("clear"), "got: {json}");
+        // …and an old CLI's payload (no `clear` key) still deserializes.
+        let back: AutomationRequest =
+            serde_json::from_str(r#"{"token":"t","op":"automation/update","id":"a1"}"#).unwrap();
+        assert!(back.clear.is_empty());
     }
 }

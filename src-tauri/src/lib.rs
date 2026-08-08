@@ -1539,6 +1539,120 @@ pub fn dispatch_automation_op(
                 Err(e) => AutomationResponse::err(e),
             }
         }
+        // Automation-update U2 (R8, KTD6): patch a stored record in place.
+        // The payload is untrusted regardless of what the CLI already
+        // checked, so this arm re-validates exactly like the create arm
+        // above — same closed sets, same ceilings, same refusals. The gates
+        // that need the *record* (retired / monitor / mode-kind switch) run
+        // inside the manager's store mutation (U1), not here.
+        "automation/update" => {
+            let Some(id) = req.id.clone() else {
+                return AutomationResponse::err("update requires an automation id");
+            };
+            // KTD1: resolve the clear list against the closed name set; an
+            // unknown member is refused, never ignored.
+            let clear = match automations::UpdateClear::parse(&req.clear) {
+                Ok(c) => c,
+                Err(e) => return AutomationResponse::err(e),
+            };
+            // KTD2 — the exclusions are the design, each with its own error.
+            if req.after.is_some() || req.within_ms.is_some() {
+                return AutomationResponse::err(automations::ERR_UPDATE_SET_AFTER);
+            }
+            if req.cwd.is_some() {
+                return AutomationResponse::err(
+                    "update cannot change cwd — it would silently change which transcripts \
+                     the output-capture guard can match; delete and recreate instead",
+                );
+            }
+            if req.monitor || req.not_before_ms.is_some() {
+                return AutomationResponse::err(automations::ERR_UPDATE_MONITOR);
+            }
+            // Both directions of a toggle at once is a client bug, not a
+            // last-one-wins guess.
+            if req.retry_on_interrupt && clear.retry_on_interrupt {
+                return AutomationResponse::err(
+                    "pass only one of --retry-on-interrupt / --no-retry-on-interrupt",
+                );
+            }
+            if req.model.is_some() && clear.model {
+                return AutomationResponse::err("pass only one of --model / --no-model");
+            }
+            if req.effort.is_some() && clear.effort {
+                return AutomationResponse::err("pass only one of --effort / --no-effort");
+            }
+            if req.headless.is_some() && clear.disposition {
+                return AutomationResponse::err(
+                    "pass only one of --headless / --paned / --default-disposition",
+                );
+            }
+            // The same closed effort set the create path validates CLI-side.
+            if let Some(level) = req.effort.as_deref() {
+                if !cli::automation::VALID_EFFORTS.contains(&level) {
+                    return AutomationResponse::err(format!(
+                        "--effort must be one of {} (got {level:?})",
+                        cli::automation::VALID_EFFORTS.join(", ")
+                    ));
+                }
+            }
+            if let Some(name) = req.interpreter.as_deref() {
+                if let Err(e) = automations::script::resolve_interpreter(name) {
+                    return AutomationResponse::err(e);
+                }
+            }
+            // A timeout the dispatcher will never honour is REFUSED, not
+            // clamped — the create arm's 2026-08-07 lesson applies verbatim
+            // here, and an update is *exactly* the surface someone reaches for
+            // when raising a timeout.
+            if let Some(timeout_ms) = req.timeout_ms {
+                if timeout_ms > automations::script::TIMEOUT_MAX_MS {
+                    return AutomationResponse::err(format!(
+                        "--timeout {}ms exceeds the maximum {}ms ({} min); \
+                         it would be silently clamped at run time",
+                        timeout_ms,
+                        automations::script::TIMEOUT_MAX_MS,
+                        automations::script::TIMEOUT_MAX_MS / 60_000,
+                    ));
+                }
+            }
+            let spec = automations::UpdateSpec {
+                name: req.name.clone(),
+                cron: req.cron.clone(),
+                timezone: req.timezone.clone(),
+                retry_on_interrupt: match (req.retry_on_interrupt, clear.retry_on_interrupt) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                },
+                prompt: req.prompt.clone(),
+                // The nested Option is the tri-state: set / clear / leave.
+                model: match (req.model.clone(), clear.model) {
+                    (Some(m), _) => Some(Some(m)),
+                    (_, true) => Some(None),
+                    _ => None,
+                },
+                effort: match (req.effort.clone(), clear.effort) {
+                    (Some(e), _) => Some(Some(e)),
+                    (_, true) => Some(None),
+                    _ => None,
+                },
+                headless: match (req.headless, clear.disposition) {
+                    (Some(h), _) => Some(Some(h)),
+                    (_, true) => Some(None),
+                    _ => None,
+                },
+                script: req.script.clone(),
+                interpreter: req.interpreter.clone(),
+                timeout_ms: req.timeout_ms,
+                clear_after: clear.after,
+            };
+            match mgr.update(&id, spec) {
+                Ok(updated) => {
+                    AutomationResponse::ok(Some(updated.automation.id), updated.warning)
+                }
+                Err(e) => AutomationResponse::err(e),
+            }
+        }
         "automation/pause" => match req.id {
             Some(id) => match mgr.pause(&id) {
                 Ok(a) => AutomationResponse::ok(Some(a.id), None),

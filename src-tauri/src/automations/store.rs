@@ -31,6 +31,11 @@
 //! `automation-scripts/<id>/script` under the same app-data root, written on
 //! create ([`Store::put_script`]) and removed — file *and* its `<id>/` dir —
 //! on delete ([`Store::delete`]). Script files are `0600` in `0700` dirs.
+//! An **update** never overwrites one in place (automation-update U3, KTD5):
+//! a running interpreter holds the old file open, so new content lands in a
+//! sibling ([`Store::put_script_fresh`]), the record's pointer is swapped
+//! under the store lock, and the orphan is dropped afterwards
+//! ([`Store::discard_script_file`]).
 //!
 //! This unit is dumb persistence: it mints no ids and validates no cron —
 //! that is the manager's job (U4). Ids are only checked for filesystem
@@ -329,6 +334,80 @@ impl Store {
     /// or will write.
     pub fn script_path(&self, id: &str) -> io::Result<PathBuf> {
         Ok(self.script_dir_for(id)?.join("script"))
+    }
+
+    /// Write **new** script content to a *fresh* file in the automation's
+    /// script dir, never over `current` (automation-update U3, R10 — KTD5).
+    ///
+    /// An in-flight run's interpreter holds the old `script_file` path open;
+    /// overwriting it mid-run would splice the new program under a running
+    /// process, so an update writes a sibling and the caller swaps the
+    /// record's pointer afterwards ([`Store::discard_script_file`] then drops
+    /// the orphan). Same naming/permissions machinery as [`Store::put_script`]
+    /// — `0600` in `0700`, atomic temp + rename — so the two paths cannot
+    /// drift.
+    ///
+    /// The candidate names are `script`, `script.2`, `script.3`, … : the first
+    /// that is neither `current` nor already on disk wins. Because the caller
+    /// deletes the orphan after the swap, successive updates ping-pong between
+    /// `script` and `script.2` rather than growing the dir. Failure leaves the
+    /// dir untouched — the caller then leaves the record untouched too (R10's
+    /// failed-write arm).
+    pub fn put_script_fresh(
+        &self,
+        id: &str,
+        content: &str,
+        current: Option<&Path>,
+    ) -> io::Result<PathBuf> {
+        let dir = self.script_dir_for(id)?;
+        create_private_dir(&self.scripts_dir)?;
+        create_private_dir(&dir)?;
+        // Bounded (release builds have overflow checks off): 1000 live script
+        // files for one automation is unreachable — the orphan is deleted on
+        // every successful swap.
+        let mut chosen: Option<PathBuf> = None;
+        for n in 1..1000u32 {
+            let cand = dir.join(if n == 1 {
+                "script".to_string()
+            } else {
+                format!("script.{n}")
+            });
+            if current.is_some_and(|c| c == cand) || cand.exists() {
+                continue;
+            }
+            chosen = Some(cand);
+            break;
+        }
+        let path = chosen.ok_or_else(|| {
+            io::Error::other(format!("no free script filename for automation {id:?}"))
+        })?;
+        write_atomic_owner_only(&path, content.as_bytes())?;
+        Ok(path)
+    }
+
+    /// Best-effort removal of an orphaned script file after a content swap
+    /// (automation-update U3, KTD5). Scoped to this store's script root — the
+    /// path comes from a store record, i.e. from a same-UID-writable JSON
+    /// file, so it is treated as untrusted at the filesystem boundary exactly
+    /// like an id ([`Store::script_dir_for`]). Failure is logged, never
+    /// surfaced: an orphan is inert residue.
+    pub fn discard_script_file(&self, path: &Path) {
+        if !path.starts_with(&self.scripts_dir) {
+            eprintln!(
+                "[fly-automations] refusing to remove {} — outside the script root",
+                path.display()
+            );
+            return;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "[fly-automations] could not remove orphaned script file {} ({e}); \
+                 it is inert residue",
+                path.display()
+            ),
+        }
     }
 
     /// Remove an automation's script file and its `<id>/` dir. Missing is
@@ -785,6 +864,84 @@ mod tests {
             0o700,
             "scripts root dir"
         );
+    }
+
+    // automation-update U3 (R10/KTD5): a content swap writes a FRESH file —
+    // the old one is byte-for-byte untouched until the caller discards it, so
+    // a running interpreter keeps reading the program it started with.
+    #[test]
+    fn script_swap_writes_a_new_file_then_swaps_leaving_the_old_one_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+
+        let old = store.put_script("a1", "echo one\n").unwrap();
+        let new = store
+            .put_script_fresh("a1", "echo two\n", Some(&old))
+            .unwrap();
+
+        assert_ne!(new, old, "a fresh path, never an in-place overwrite");
+        assert_eq!(
+            std::fs::read_to_string(&old).unwrap(),
+            "echo one\n",
+            "the running interpreter's file is untouched"
+        );
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "echo two\n");
+        assert_eq!(
+            std::fs::metadata(&new).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "same permissions as put_script"
+        );
+
+        // The caller discards the orphan after swapping the record pointer;
+        // the next swap then reclaims the freed name (no unbounded growth).
+        store.discard_script_file(&old);
+        assert!(!old.exists());
+        let third = store
+            .put_script_fresh("a1", "echo three\n", Some(&new))
+            .unwrap();
+        assert_eq!(third, old, "the freed name is reused");
+    }
+
+    // R10's failed-write arm: an unwritable script dir leaves EVERYTHING
+    // untouched — the caller aborts before mutating the record, so the
+    // automation keeps pointing at its existing content.
+    #[test]
+    fn a_failed_script_swap_leaves_the_existing_script_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let old = store.put_script("a1", "echo one\n").unwrap();
+        let id_dir = old.parent().unwrap().to_path_buf();
+
+        // Failure injection: a read-only dir cannot work here — the write path
+        // re-asserts 0700 on its dirs (the create_private_dir self-healing the
+        // flush-failure test documents) and an owner's chmod always succeeds.
+        // So block the atomic write's *temp* file instead, by occupying its
+        // name with a directory (white-box, but the only deterministic
+        // non-root injection): `write_atomic_owner_only` then fails before it
+        // can touch any real script file.
+        std::fs::create_dir(id_dir.join("script.tmp")).unwrap();
+        let err = store.put_script_fresh("a1", "echo two\n", Some(&old));
+
+        assert!(err.is_err(), "the write failed");
+        assert_eq!(
+            std::fs::read_to_string(&old).unwrap(),
+            "echo one\n",
+            "existing content untouched"
+        );
+    }
+
+    // The orphan-discard path is scoped to the script root: a store record is
+    // same-UID-writable JSON, so its script_file string is untrusted at the
+    // filesystem boundary.
+    #[test]
+    fn discard_script_file_refuses_paths_outside_the_script_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let outside = dir.path().join("precious");
+        std::fs::write(&outside, b"keep me").unwrap();
+
+        store.discard_script_file(&outside);
+        assert!(outside.exists(), "nothing outside the script root is removed");
     }
 
     // U3 boundary guard: ids are joined into filesystem paths, so anything

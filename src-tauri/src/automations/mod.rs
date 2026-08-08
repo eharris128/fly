@@ -207,6 +207,40 @@ const ERR_RESUME_RETIRED: &str =
 const ERR_RUN_RETIRED: &str =
     "monitor is retired — it delivered its verdict and will never run again";
 
+// ---- update refusals (automation-update U1 — KTD2: the exclusions ARE the
+// design, so each one gets its own distinct, quotable string) ----------------
+
+/// Nothing to change (automation-update R1): refused before any store access —
+/// a no-op "update" that silently restamps `updated_at` teaches the operator
+/// that their flags took effect.
+pub const ERR_UPDATE_EMPTY: &str = "update: nothing to change — pass at least one field";
+
+/// A retired record is immutable (automation-update KTD2, mirroring the
+/// [`ERR_RESUME_RETIRED`] gate and running in the same inside-the-mutation
+/// position).
+pub const ERR_UPDATE_RETIRED: &str =
+    "cannot update a retired monitor — it delivered its verdict and will never run again";
+
+/// Monitors are not updatable (automation-update KTD2). Their pickup pointers
+/// were captured from the *registering pane* at create time (monitor-handoff
+/// R11/R12) and there is no pane to re-capture from at update time; cron/floor
+/// tuning is an explicit non-goal.
+pub const ERR_UPDATE_MONITOR: &str =
+    "cannot update a monitor — its pickup pointers were captured from the registering \
+     pane at create time and cannot be re-captured; delete it and register a new one";
+
+/// Mode-kind switches are refused (automation-update KTD2): delete + recreate
+/// is the honest spelling of "this is a different automation".
+pub const ERR_UPDATE_MODE_SWITCH: &str =
+    "cannot switch an automation between agent and script mode — delete and recreate it";
+
+/// Setting or re-pointing a dependency edge is refused (automation-update
+/// KTD2). Only *clearing* is allowed (`--no-after`): removing an edge can
+/// never close a cycle, so the dependencies plan's KTD6 argument survives.
+pub const ERR_UPDATE_SET_AFTER: &str =
+    "cannot set or re-point --after on an existing automation (only --no-after clears \
+     it) — recreate the dependent instead";
+
 /// Length of minted automation/run ids (short random alphanumerics).
 const ID_LEN: usize = 10;
 
@@ -575,6 +609,136 @@ pub struct Created {
     /// monitor-registered emit (monitor-handoff R13) is gated on it in
     /// `lib.rs`: R12's refuse-rather-than-lose posture means never closing
     /// the parent tab on a registration that may die with the app.
+    pub flush_ok: bool,
+}
+
+// ---- update payloads (automation-update U1) ---------------------------------
+
+/// The closed set of clearable pins (automation-update KTD1). Patch semantics
+/// make an absent wire field mean *unchanged*, which collides with the create
+/// convention where `None` means "use the default" — so clearing a pin gets
+/// its own explicit channel: the wire's `clear: Vec<String>`, parsed here.
+/// An unknown member is **refused**, never ignored (a silently-dropped typo
+/// leaves the operator believing a pin is gone when it is not).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpdateClear {
+    pub model: bool,
+    pub effort: bool,
+    /// `--default-disposition`: drop the `--headless`/`--paned` pin and follow
+    /// `config.automation_defaults.headless` again.
+    pub disposition: bool,
+    /// `--no-retry-on-interrupt`. The wire's `retry_on_interrupt: bool` is
+    /// skip-if-false, so it cannot express "turn off" — the off direction
+    /// rides here and the field's type is deliberately unchanged.
+    pub retry_on_interrupt: bool,
+    pub after: bool,
+}
+
+impl UpdateClear {
+    /// Wire member names, in the order `--help` lists their flags.
+    pub const MEMBERS: &'static [&'static str] = &[
+        "model",
+        "effort",
+        "disposition",
+        "retryOnInterrupt",
+        "after",
+    ];
+
+    /// Resolve the untrusted wire list against [`UpdateClear::MEMBERS`]
+    /// (KTD1). Duplicates are idempotent; an unknown member is an error
+    /// naming the closed set.
+    pub fn parse(members: &[String]) -> Result<UpdateClear, String> {
+        let mut c = UpdateClear::default();
+        for m in members {
+            match m.as_str() {
+                "model" => c.model = true,
+                "effort" => c.effort = true,
+                "disposition" => c.disposition = true,
+                "retryOnInterrupt" => c.retry_on_interrupt = true,
+                "after" => c.after = true,
+                other => {
+                    return Err(format!(
+                        "unknown clear field {other:?} — expected one of {}",
+                        UpdateClear::MEMBERS.join(", ")
+                    ))
+                }
+            }
+        }
+        Ok(c)
+    }
+}
+
+/// What [`AutomationManager::update`] changes (automation-update U1, R1).
+///
+/// **Patch semantics** (KTD1): an outer `None` means *unchanged*. The three
+/// pinnable launch fields nest — `Some(Some(v))` sets the pin, `Some(None)`
+/// clears it back to the resolution default — so one shape carries both
+/// directions without a second parallel struct. Fields the plan excludes
+/// (KTD2) simply do not exist here: no mode kind, no `cwd`, no monitor
+/// fields, and `after` can only be *cleared*.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateSpec {
+    pub name: Option<String>,
+    pub cron: Option<String>,
+    pub timezone: Option<String>,
+    pub retry_on_interrupt: Option<bool>,
+    // Agent-mode fields (against a script record: [`ERR_UPDATE_MODE_SWITCH`]).
+    pub prompt: Option<String>,
+    pub model: Option<Option<String>>,
+    pub effort: Option<Option<String>>,
+    pub headless: Option<Option<bool>>,
+    // Script-mode fields (against an agent record: [`ERR_UPDATE_MODE_SWITCH`]).
+    /// New script **content**, read client-side (R21) and written to a fresh
+    /// file before the record mutation (KTD5).
+    pub script: Option<String>,
+    pub interpreter: Option<String>,
+    pub timeout_ms: Option<u64>,
+    /// `--no-after`: drop the dependency edge. There is deliberately no
+    /// set-edge counterpart ([`ERR_UPDATE_SET_AFTER`], KTD2).
+    pub clear_after: bool,
+}
+
+impl UpdateSpec {
+    /// R1: an update that changes nothing is refused before any store access.
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.cron.is_none()
+            && self.timezone.is_none()
+            && self.retry_on_interrupt.is_none()
+            && self.prompt.is_none()
+            && self.model.is_none()
+            && self.effort.is_none()
+            && self.headless.is_none()
+            && self.script.is_none()
+            && self.interpreter.is_none()
+            && self.timeout_ms.is_none()
+            && !self.clear_after
+    }
+
+    /// Whether the spec touches agent-only fields (mode-mismatch gate).
+    fn touches_agent(&self) -> bool {
+        self.prompt.is_some()
+            || self.model.is_some()
+            || self.effort.is_some()
+            || self.headless.is_some()
+    }
+
+    /// Whether the spec touches script-only fields (mode-mismatch gate).
+    fn touches_script(&self) -> bool {
+        self.script.is_some() || self.interpreter.is_some() || self.timeout_ms.is_some()
+    }
+}
+
+/// A successful update (automation-update R4) — the [`Created`] shape: the
+/// persisted record plus the *advisory* warning slot, which carries the R1
+/// min-gap advisory and/or the KTD-B flush degradation.
+#[derive(Debug, Clone)]
+pub struct Updated {
+    pub automation: Automation,
+    pub warning: Option<String>,
+    /// Whether the update's store flush reached disk. `false` only in the
+    /// KTD-B degraded arm: the change is live in memory (and `warning` says
+    /// so) but would not survive a restart.
     pub flush_ok: bool,
 }
 
@@ -1079,6 +1243,131 @@ impl AutomationManager {
         (self.emit_changed)(&id); // after the lock is released (KTD-B)
         Ok(Created {
             automation: record,
+            warning,
+            flush_ok,
+        })
+    }
+
+    /// Patch a stored automation in place (automation-update U1 — R2–R6).
+    ///
+    /// Patch semantics (KTD1): every absent [`UpdateSpec`] field is left
+    /// alone. The gates run **inside** the store mutation, before any write —
+    /// the [`AutomationManager::resume`] retirement-gate shape (fix(review)
+    /// #2) — so nothing can slip between check and write: unknown id,
+    /// retired, monitor, and the mode-kind mismatch that a disguised
+    /// agent↔script switch would be (KTD2).
+    ///
+    /// **In-flight runs are untouched** (KTD3). A claimed row already carries
+    /// its resolved model/effort/headless (workspace-and-model R13,
+    /// headless-agent-automations R2) and a running script's interpreter holds
+    /// the *old* script file (KTD5, which is why new content lands in a fresh
+    /// file); the new values simply apply from the next claim.
+    ///
+    /// **Schedule recompute only when enabled** (KTD4): a cron/timezone change
+    /// validates through [`schedule::validate`] — surfacing R1's min-gap
+    /// advisory as a warning, never fatally — and recomputes `next_run_at`
+    /// from *now* with the `not_before_ms` floor riding along, but only for a
+    /// live automation. A paused one (`next_run_at == None`, R23) stays paused
+    /// and picks the new schedule up on resume, which already recomputes from
+    /// now. Update never flips the enabled bit in either direction —
+    /// pause/resume remain its sole owners.
+    pub fn update(&self, id: &str, spec: UpdateSpec) -> Result<Updated, String> {
+        if spec.is_empty() {
+            return Err(ERR_UPDATE_EMPTY.to_string());
+        }
+        // A pre-read for the three things that must be decided BEFORE the
+        // mutation: which cron/timezone pair to validate (a lone `--cron`
+        // validates against the stored timezone), whether a script write is
+        // even legitimate, and where the current script content lives. Every
+        // gate it informs is re-run authoritatively inside the mutation — this
+        // read only avoids writing a file for an update that is about to be
+        // refused.
+        let current = self
+            .store
+            .get(id)
+            .ok_or_else(|| format!("no such automation: {id}"))?;
+        update_gates(&current, &spec)?;
+
+        // R3: unparseable new state must never be stored, so the schedule is
+        // validated before the mutation. Only a cron/timezone change triggers
+        // it (an untouched schedule is already known-good).
+        let schedule_changed = spec.cron.is_some() || spec.timezone.is_some();
+        let mut warning = None;
+        if schedule_changed {
+            let cron = spec.cron.as_deref().unwrap_or(&current.cron);
+            let tz = spec.timezone.as_deref().unwrap_or(&current.timezone);
+            warning = schedule::validate(cron, tz)?.min_gap_warning;
+        }
+
+        // KTD5: new script content goes to a FRESH file before the record
+        // mutation — a running interpreter holds the old path open, and a
+        // failed write must leave the record untouched (so this cannot move
+        // below the mutation).
+        let new_script_file = match &spec.script {
+            Some(content) => {
+                let old = current.mode.script_file().map(std::path::PathBuf::from);
+                Some(
+                    self.store
+                        .put_script_fresh(id, content, old.as_deref())
+                        .map_err(|e| format!("could not store script content: {e}"))?,
+                )
+            }
+            None => None,
+        };
+
+        let now = (self.clock)();
+        // `(outcome, orphaned script file)`: the orphan is deleted after the
+        // lock (KTD-B bans I/O inside the mutation).
+        type Outcome = (Result<Automation, String>, Option<std::path::PathBuf>);
+        let mutated = self.store.mutate(|map| {
+            map.get_mut(id).map(|a| -> Outcome {
+                // Authoritative gates, inside the mutation, before any write
+                // (the resume precedent).
+                if let Err(e) = update_gates(a, &spec) {
+                    return (Err(e), None);
+                }
+                let orphan = apply_update(a, &spec, new_script_file.clone(), now);
+                (Ok(a.clone()), orphan)
+            })
+        });
+        // A flush failure keeps the in-memory mutation (the map is the
+        // authority, KTD-B) — the update succeeded, so report it with the
+        // degradation on the warning slot and `flush_ok: false`, exactly as
+        // `create` does. The orphan is dropped from this arm on purpose: it is
+        // inert residue, and the refetch cannot observe which file it replaced.
+        let mut flush_ok = true;
+        let applied: Option<Outcome> = match mutated {
+            Ok(v) => v,
+            Err(e) => {
+                flush_ok = false;
+                warning = Some(match warning {
+                    Some(w) => format!("{w}; store flush failed: {e} (the change is live in memory)"),
+                    None => format!("store flush failed: {e} (the change is live in memory)"),
+                });
+                self.store.get(id).map(|a| (Ok(a), None))
+            }
+        };
+        let (result, orphan) =
+            applied.ok_or_else(|| format!("no such automation: {id}"))?;
+        // Lock released.
+        let updated = match result {
+            Ok(a) => a,
+            Err(e) => {
+                // A refused update may still have written the fresh script
+                // file (the gates re-ran against a record that changed under
+                // us). Drop it rather than leaving residue.
+                if let Some(p) = &new_script_file {
+                    self.store.discard_script_file(p);
+                }
+                return Err(e);
+            }
+        };
+        if let Some(p) = &orphan {
+            self.store.discard_script_file(p);
+        }
+        (self.emit_changed)(id); // after the lock (KTD-B), R5
+        Ok(Updated {
+            automation: updated,
             warning,
             flush_ok,
         })
@@ -2616,6 +2905,113 @@ fn flush_tolerant<R>(result: std::io::Result<R>, refetch: impl FnOnce() -> R) ->
             refetch()
         }
     }
+}
+
+/// The update refusal gates (automation-update U1 — R2, KTD2), pure so the
+/// pre-flight check and the authoritative inside-the-mutation check are
+/// literally the same function and cannot drift. Order is deliberate:
+/// retirement first (the permanent state), then the monitor flavor, then the
+/// mode mismatch a disguised agent↔script switch would be.
+fn update_gates(a: &Automation, spec: &UpdateSpec) -> Result<(), String> {
+    if a.retired_at.is_some() {
+        return Err(ERR_UPDATE_RETIRED.to_string());
+    }
+    if a.monitor {
+        return Err(ERR_UPDATE_MONITOR.to_string());
+    }
+    match a.mode.kind() {
+        RunMode::Agent if spec.touches_script() => Err(ERR_UPDATE_MODE_SWITCH.to_string()),
+        RunMode::Script if spec.touches_agent() => Err(ERR_UPDATE_MODE_SWITCH.to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// Apply a validated [`UpdateSpec`] to a record under the store lock
+/// (automation-update U1). Pure map manipulation — no I/O (KTD-B): the new
+/// script file was already written by the caller and only its *path* is
+/// swapped in here; the replaced path is returned so the caller can drop the
+/// orphan after the lock (KTD5). Returns `None` when no file was replaced.
+///
+/// KTD4: `next_run_at` is recomputed only when the schedule actually changed
+/// **and** the automation is live. `next_run_at == None` is the R23 spelling
+/// of paused, so the check is exactly "is it currently scheduled" — a paused
+/// automation keeps its `None` and picks the new cron up on resume.
+fn apply_update(
+    a: &mut Automation,
+    spec: &UpdateSpec,
+    new_script_file: Option<std::path::PathBuf>,
+    now_ms: u64,
+) -> Option<std::path::PathBuf> {
+    if let Some(name) = &spec.name {
+        a.name = name.clone();
+    }
+    let schedule_changed = spec.cron.is_some() || spec.timezone.is_some();
+    if let Some(cron) = &spec.cron {
+        a.cron = cron.clone();
+    }
+    if let Some(tz) = &spec.timezone {
+        a.timezone = tz.clone();
+    }
+    if let Some(retry) = spec.retry_on_interrupt {
+        a.retry_on_interrupt = retry;
+    }
+    if spec.clear_after {
+        a.after = None;
+    }
+    let mut orphan = None;
+    match &mut a.mode {
+        Mode::Agent {
+            prompt,
+            model,
+            effort,
+            headless,
+        } => {
+            if let Some(p) = &spec.prompt {
+                *prompt = p.clone();
+            }
+            if let Some(m) = &spec.model {
+                *model = m.clone();
+            }
+            if let Some(e) = &spec.effort {
+                *effort = e.clone();
+            }
+            if let Some(h) = &spec.headless {
+                *headless = *h;
+            }
+        }
+        Mode::Script {
+            script_file,
+            interpreter,
+            timeout_ms,
+        } => {
+            if let Some(path) = new_script_file {
+                let path = path.to_string_lossy().into_owned();
+                if path != *script_file {
+                    orphan = Some(std::path::PathBuf::from(std::mem::replace(
+                        script_file,
+                        path,
+                    )));
+                }
+            }
+            if let Some(i) = &spec.interpreter {
+                *interpreter = i.clone();
+            }
+            if let Some(t) = spec.timeout_ms {
+                *timeout_ms = t;
+            }
+        }
+    }
+    if schedule_changed && a.enabled && a.next_run_at.is_some() {
+        // Pure cron math under the lock is fine (KTD-B bans dispatch/emit/IO,
+        // not computation), and the pair was validated before the mutation —
+        // `.ok().flatten()` is the same defensive degrade `resume` uses.
+        a.next_run_at =
+            schedule::advance_from(&a.cron, &a.timezone, now_ms, a.not_before_ms)
+                .ok()
+                .flatten();
+    }
+    a.updated_at = now_ms;
+    orphan
 }
 
 /// Ids of rows still `Running` (helper shared by recovery/delete/shutdown).
@@ -6878,6 +7274,510 @@ mod tests {
         h.sweep();
         let last = h.runs("down1").last().cloned().unwrap();
         assert_eq!(last.status, RunStatus::Withheld, "no re-fire off u1");
+    }
+
+    // ---- automation-update U1 (R1–R6, KTD2–KTD5) ---------------------------
+
+    /// A stored-script automation created at T0 (not yet due).
+    fn create_script(h: &Harness, name: &str) -> String {
+        h.mgr.create(script_spec(name)).unwrap().automation.id
+    }
+
+    // R1: an update that changes nothing is refused before any store access —
+    // a silent `updated_at` restamp would teach the operator that flags they
+    // misspelled took effect.
+    #[test]
+    fn empty_update_is_refused_before_touching_the_store() {
+        let h = harness();
+        let id = create_script(&h, "disk watch");
+        let before = h.mgr.get(&id).unwrap();
+        h.events.lock().unwrap().clear(); // the create's own emit
+
+        let err = h.mgr.update(&id, UpdateSpec::default()).unwrap_err();
+
+        assert_eq!(err, ERR_UPDATE_EMPTY);
+        assert_eq!(h.mgr.get(&id).unwrap().updated_at, before.updated_at);
+        assert!(h.events.lock().unwrap().is_empty(), "no changed event");
+        assert!(
+            h.mgr.update("ghost", UpdateSpec::default()).is_err(),
+            "an unknown id is an error too"
+        );
+    }
+
+    // KTD1: the clear list is a closed set — an unknown member is refused,
+    // never ignored (a dropped typo leaves a pin the operator believes gone).
+    #[test]
+    fn unknown_clear_member_is_refused_and_the_known_ones_parse() {
+        assert_eq!(
+            UpdateClear::parse(&["model".into(), "after".into(), "model".into()]).unwrap(),
+            UpdateClear {
+                model: true,
+                after: true,
+                ..Default::default()
+            },
+            "duplicates are idempotent"
+        );
+        let err = UpdateClear::parse(&["prompt".into()]).unwrap_err();
+        assert!(err.contains("prompt"), "names the offender: {err}");
+        assert!(err.contains("retryOnInterrupt"), "names the set: {err}");
+        // Every advertised member parses.
+        for m in UpdateClear::MEMBERS {
+            UpdateClear::parse(&[(*m).to_string()]).expect(m);
+        }
+    }
+
+    // KTD2: agent fields against a script record (and vice versa) are a
+    // disguised mode switch — refused with the distinct error, nothing
+    // written.
+    #[test]
+    fn update_refuses_a_mode_switch_in_either_direction() {
+        let h = harness();
+        let script = create_script(&h, "backup");
+        let agent = h.mgr.create(agent_spec("triage")).unwrap().automation.id;
+        h.events.lock().unwrap().clear(); // the creates' own emits
+
+        let err = h
+            .mgr
+            .update(
+                &script,
+                UpdateSpec {
+                    prompt: Some("summarize".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err, ERR_UPDATE_MODE_SWITCH);
+
+        for spec in [
+            UpdateSpec {
+                script: Some("echo two".into()),
+                ..Default::default()
+            },
+            UpdateSpec {
+                interpreter: Some("node".into()),
+                ..Default::default()
+            },
+            UpdateSpec {
+                timeout_ms: Some(1000),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(h.mgr.update(&agent, spec).unwrap_err(), ERR_UPDATE_MODE_SWITCH);
+        }
+
+        // Neither record moved, and no script file was written for the
+        // refused agent-side swap (KTD5: the write is gated by the same
+        // pre-flight gates).
+        assert!(matches!(h.mgr.get(&agent).unwrap().mode, Mode::Agent { .. }));
+        assert!(matches!(h.mgr.get(&script).unwrap().mode, Mode::Script { .. }));
+        assert!(h.events.lock().unwrap().is_empty());
+    }
+
+    // KTD2: monitors and retired records are immutable — the monitor because
+    // its pickup pointers cannot be re-captured (no registering pane at update
+    // time), the retired record mirroring the `resume` retirement gate.
+    #[test]
+    fn update_refuses_a_monitor_and_a_retired_record() {
+        let h = harness();
+        let monitor = CreateSpec {
+            monitor: true,
+            mode: CreateMode::Agent {
+                prompt: "check the run".into(),
+                model: None,
+                effort: None,
+                headless: None,
+            },
+            pickup_pointers: Some(model::MonitorPointers {
+                session_id: "s".into(),
+                transcript_path: "/t/s.jsonl".into(),
+                session_cwd: "/proj".into(),
+            }),
+            ..script_spec("training watch")
+        };
+        let mon = h.mgr.create(monitor).unwrap().automation.id;
+        let rename = || UpdateSpec {
+            name: Some("renamed".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(h.mgr.update(&mon, rename()).unwrap_err(), ERR_UPDATE_MONITOR);
+
+        // A retired record refuses too — and retirement outranks everything
+        // else, so a retired *non*-monitor would report the same.
+        let plain = create_script(&h, "backup");
+        h.mgr
+            .with_automation(&plain, |a| a.retired_at = Some(T0 + FIVE_MIN))
+            .unwrap();
+        assert_eq!(h.mgr.update(&plain, rename()).unwrap_err(), ERR_UPDATE_RETIRED);
+
+        assert_eq!(h.mgr.get(&mon).unwrap().name, "training watch");
+        assert_eq!(h.mgr.get(&plain).unwrap().name, "backup");
+    }
+
+    // KTD2: `after` can only be CLEARED. Clearing works here (the manager's
+    // half); the set/re-point refusal is the dispatch arm's (U2), where the
+    // wire field lives — pinned in tests/automation_cli.rs.
+    #[test]
+    fn update_clears_a_dependency_edge_and_the_dependent_stops_withholding() {
+        let h = harness();
+        let (up, down) = create_pair(&h);
+        assert!(h.mgr.get(&down).unwrap().after.is_some());
+
+        // With the upstream gone, every occurrence withholds honestly.
+        h.mgr.delete(&up).unwrap();
+        assert!(matches!(
+            h.mgr.manual_run(&down).unwrap(),
+            ManualRun::Withheld { .. }
+        ));
+
+        let updated = h
+            .mgr
+            .update(
+                &down,
+                UpdateSpec {
+                    clear_after: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.automation.after, None, "the edge is gone");
+
+        // Ungated from here on — the dependency predicate is not consulted.
+        assert!(matches!(
+            h.mgr.manual_run(&down).unwrap(),
+            ManualRun::Started { .. }
+        ));
+    }
+
+    // KTD4: a cron change recomputes `next_run_at` from NOW for a live
+    // automation, and leaves a paused one paused — it picks the new schedule
+    // up on resume, which already recomputes from now (R23/AE7).
+    #[test]
+    fn cron_change_recomputes_only_when_enabled_and_paused_stays_paused() {
+        let h = harness();
+        let live = create_script(&h, "live");
+        let paused = create_script(&h, "paused");
+        h.mgr.pause(&paused).unwrap();
+        // Move well past the original occurrence so "from now" is visible.
+        h.set_now(T0 + 3 * FIVE_MIN);
+
+        let hourly = || UpdateSpec {
+            cron: Some("0 * * * *".into()),
+            ..Default::default()
+        };
+        let updated = h.mgr.update(&live, hourly()).unwrap();
+        assert_eq!(
+            updated.automation.next_run_at,
+            schedule::advance_from("0 * * * *", "UTC", T0 + 3 * FIVE_MIN, None).unwrap(),
+            "recomputed from now, on the NEW cron"
+        );
+
+        let updated = h.mgr.update(&paused, hourly()).unwrap();
+        assert_eq!(updated.automation.cron, "0 * * * *", "the cron still changed");
+        assert_eq!(
+            updated.automation.next_run_at, None,
+            "paused stays paused — update never flips the enabled bit"
+        );
+        // …and resume then honors the new schedule.
+        let resumed = h.mgr.resume(&paused).unwrap();
+        assert_eq!(
+            resumed.next_run_at,
+            schedule::advance_from("0 * * * *", "UTC", T0 + 3 * FIVE_MIN, None).unwrap()
+        );
+
+        // A non-schedule field never recomputes: renaming leaves next_run_at.
+        let before = h.mgr.get(&live).unwrap().next_run_at;
+        let renamed = h
+            .mgr
+            .update(
+                &live,
+                UpdateSpec {
+                    name: Some("renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(renamed.automation.next_run_at, before);
+    }
+
+    // KTD4 + monitor-handoff R1: the not-before floor rides the update's
+    // recompute like every other one. (A *monitor* can't be updated at all —
+    // this pins the floor on the record itself, which a hand-written store or
+    // a future non-monitor floor could carry.)
+    #[test]
+    fn the_not_before_floor_rides_the_update_recompute() {
+        let h = harness();
+        let id = create_script(&h, "floored");
+        let floor = T0 + 30 * FIVE_MIN;
+        // Stamp a floor directly (no create surface sets one on a plain
+        // automation) and update the cron.
+        h.mgr
+            .with_automation(&id, |a| a.not_before_ms = Some(floor))
+            .unwrap();
+
+        let updated = h
+            .mgr
+            .update(
+                &id,
+                UpdateSpec {
+                    cron: Some("*/5 * * * *".into()),
+                    timezone: Some("America/New_York".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(
+            updated.automation.next_run_at.unwrap() >= floor,
+            "the recompute clamped to the floor: {:?} < {floor}",
+            updated.automation.next_run_at
+        );
+        assert_eq!(updated.automation.timezone, "America/New_York");
+    }
+
+    // R4: the R1 min-gap advisory rides the return value as a create-style
+    // warning — surfaced, never fatal. An INVALID cron is fatal and stores
+    // nothing (R3: unparseable state can never be stored).
+    #[test]
+    fn a_tight_cron_warns_but_applies_and_an_invalid_one_refuses() {
+        let h = harness();
+        let id = create_script(&h, "tight");
+
+        let updated = h
+            .mgr
+            .update(
+                &id,
+                UpdateSpec {
+                    cron: Some("* * * * *".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            updated.warning.is_some(),
+            "the every-minute advisory rides the response"
+        );
+        assert_eq!(h.mgr.get(&id).unwrap().cron, "* * * * *", "still applied");
+
+        let err = h
+            .mgr
+            .update(
+                &id,
+                UpdateSpec {
+                    cron: Some("not a cron".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(!err.is_empty());
+        assert_eq!(
+            h.mgr.get(&id).unwrap().cron,
+            "* * * * *",
+            "the bad cron was never stored"
+        );
+    }
+
+    // KTD1: the retry toggle moves in BOTH directions — on through the field,
+    // off through the clear set (the wire's skip-if-false bool cannot express
+    // "off", and its type is deliberately unchanged).
+    #[test]
+    fn retry_on_interrupt_toggles_both_directions() {
+        let h = harness();
+        let id = create_script(&h, "flaky");
+        assert!(!h.mgr.get(&id).unwrap().retry_on_interrupt);
+
+        h.mgr
+            .update(
+                &id,
+                UpdateSpec {
+                    retry_on_interrupt: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(h.mgr.get(&id).unwrap().retry_on_interrupt);
+
+        h.mgr
+            .update(
+                &id,
+                UpdateSpec {
+                    retry_on_interrupt: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!h.mgr.get(&id).unwrap().retry_on_interrupt);
+    }
+
+    // R1/KTD1: the nested launch pins set AND clear — `Some(Some(v))` pins,
+    // `Some(None)` drops back to the resolution default, absent leaves alone.
+    #[test]
+    fn launch_pins_set_and_clear_through_the_nested_option() {
+        let h = harness();
+        let id = h.mgr.create(default_agent_spec("triage")).unwrap().automation.id;
+
+        h.mgr
+            .update(
+                &id,
+                UpdateSpec {
+                    model: Some(Some("opus".into())),
+                    effort: Some(Some("high".into())),
+                    headless: Some(Some(false)),
+                    prompt: Some("summarize the new CI".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let Mode::Agent {
+            prompt,
+            model,
+            effort,
+            headless,
+        } = h.mgr.get(&id).unwrap().mode
+        else {
+            panic!("still agent mode")
+        };
+        assert_eq!(prompt, "summarize the new CI");
+        assert_eq!(model.as_deref(), Some("opus"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert_eq!(headless, Some(false));
+
+        // Clear the model only: effort and disposition are untouched.
+        h.mgr
+            .update(
+                &id,
+                UpdateSpec {
+                    model: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let Mode::Agent { model, effort, headless, .. } = h.mgr.get(&id).unwrap().mode else {
+            panic!("agent")
+        };
+        assert_eq!(model, None, "cleared back to the resolution default");
+        assert_eq!(effort.as_deref(), Some("high"), "untouched");
+        assert_eq!(headless, Some(false), "untouched");
+    }
+
+    // KTD5: a content swap writes a fresh file and swaps the pointer — the
+    // old file survives until after the mutation, then is dropped. A running
+    // interpreter therefore keeps reading the program it started with.
+    #[test]
+    fn script_content_swap_repoints_the_record_and_drops_the_orphan() {
+        let h = harness();
+        let id = create_script(&h, "backup");
+        let old_path = match h.mgr.get(&id).unwrap().mode {
+            Mode::Script { script_file, .. } => script_file,
+            _ => panic!("script mode"),
+        };
+        assert_eq!(std::fs::read_to_string(&old_path).unwrap(), "echo hi");
+
+        h.mgr
+            .update(
+                &id,
+                UpdateSpec {
+                    script: Some("echo two\n".into()),
+                    interpreter: Some("sh".into()),
+                    timeout_ms: Some(30_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let Mode::Script {
+            script_file,
+            interpreter,
+            timeout_ms,
+        } = h.mgr.get(&id).unwrap().mode
+        else {
+            panic!("script mode")
+        };
+        assert_ne!(script_file, old_path, "repointed at a fresh file");
+        assert_eq!(std::fs::read_to_string(&script_file).unwrap(), "echo two\n");
+        assert!(
+            !std::path::Path::new(&old_path).exists(),
+            "the orphan is dropped after the lock"
+        );
+        assert_eq!(interpreter, "sh");
+        assert_eq!(timeout_ms, 30_000);
+    }
+
+    // KTD3 — the plan's required mid-run pin: an update never kills,
+    // re-dispatches, or re-parameterizes a Running row. The claimed row keeps
+    // the parameters it launched with; the NEXT claim uses the new ones.
+    #[test]
+    fn a_mid_run_update_leaves_the_running_row_alone() {
+        let h = harness();
+        let id = create_due(&h, script_spec("backup"));
+        h.sweep();
+        let running = h.runs(&id)[0].clone();
+        assert_eq!(running.status, RunStatus::Running);
+        let old_path = match h.mgr.get(&id).unwrap().mode {
+            Mode::Script { script_file, .. } => script_file,
+            _ => panic!("script"),
+        };
+
+        h.mgr
+            .update(
+                &id,
+                UpdateSpec {
+                    script: Some("echo new\n".into()),
+                    timeout_ms: Some(30_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // The row is untouched: same id, still Running, never closed.
+        let after = h.runs(&id);
+        assert_eq!(after.len(), 1, "no row appended or replaced");
+        assert_eq!(after[0].id, running.id);
+        assert_eq!(after[0].status, RunStatus::Running);
+        assert_eq!(after[0].started_at, running.started_at);
+        assert!(h.run_closed.lock().unwrap().is_empty(), "nothing closed");
+        assert_eq!(h.dispatcher.count(), 1, "no re-dispatch");
+        // The old script file is gone from disk (the interpreter already has
+        // its fd; KTD5's accepted consequence), and the record points at the
+        // new content for the next claim.
+        assert!(!std::path::Path::new(&old_path).exists());
+
+        h.mgr
+            .close_run(&id, &running.id.clone(), RunOutcome::Succeeded { output: None });
+        h.set_now(h.now() + FIVE_MIN);
+        h.sweep();
+        let next = h.runs(&id).last().cloned().unwrap();
+        assert_eq!(next.status, RunStatus::Running, "the next claim ran");
+        let Mode::Script { script_file, timeout_ms, .. } = h.mgr.get(&id).unwrap().mode else {
+            panic!("script")
+        };
+        assert_eq!(std::fs::read_to_string(&script_file).unwrap(), "echo new\n");
+        assert_eq!(timeout_ms, 30_000, "the next claim sees the new parameters");
+    }
+
+    // R5: a successful update emits `automation://changed` so the dashboard
+    // refetches — and a refused one emits nothing.
+    #[test]
+    fn a_successful_update_emits_changed_and_a_refused_one_does_not() {
+        let h = harness();
+        let id = create_script(&h, "backup");
+        h.events.lock().unwrap().clear();
+
+        h.mgr
+            .update(
+                &id,
+                UpdateSpec {
+                    name: Some("nightly backup".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(h.events.lock().unwrap().as_slice(), &[id.clone()]);
+
+        h.events.lock().unwrap().clear();
+        let _ = h.mgr.update(&id, UpdateSpec::default());
+        let _ = h.mgr.update("ghost", UpdateSpec { name: Some("x".into()), ..Default::default() });
+        assert!(h.events.lock().unwrap().is_empty());
     }
 
     // R8: deleting the upstream leaves the dependent recording an honest

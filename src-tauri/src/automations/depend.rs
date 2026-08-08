@@ -24,7 +24,8 @@ use std::collections::{BTreeMap, HashSet};
 use super::model::{Automation, Dependency, RunRow, RunStatus, VerdictOutcome};
 
 /// KTD6: maximum dependency-chain depth accepted at create time. Edges are
-/// create-only, so this bounds a *linear* chain (A→B→…); it exists to keep
+/// set at create only (update may only clear one — automation-update KTD2),
+/// so this bounds a *linear* chain (A→B→…); it exists to keep
 /// `show`/debugging tractable, not to protect the sweep (which is
 /// single-hop by construction).
 pub const MAX_CHAIN_DEPTH: usize = 8;
@@ -187,7 +188,8 @@ fn withhold_reason(up: &Automation, consumed: &HashSet<&str>, window_start_ms: u
 /// verdict — a dependent on it would wither forever; rejected in v1). The
 /// walk then climbs `after` edges: depth beyond [`MAX_CHAIN_DEPTH`] or any
 /// revisit (a cycle — only constructible by hand-editing the store file,
-/// since edges are create-only) rejects. A *dangling* mid-chain edge (an
+/// since edges are set at create only and `fly automation update` can only
+/// clear one, automation-update KTD2) rejects. A *dangling* mid-chain edge (an
 /// upstream deleted after its dependent was created) ends the walk without
 /// error — that chain's honesty is the sweep's job (R8), not this create's
 /// fault.

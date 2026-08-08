@@ -785,3 +785,231 @@ fn create_rejects_a_timeout_above_the_dispatch_ceiling() {
         other => panic!("expected script mode, got {other:?}"),
     }
 }
+
+// ---- automation-update U6 (R14) ---------------------------------------------
+
+fn update_req(token: &str, id: &str) -> AutomationRequest {
+    AutomationRequest {
+        token: token.to_string(),
+        op: "automation/update".to_string(),
+        id: Some(id.to_string()),
+        ..Default::default()
+    }
+}
+
+/// R14: an update posted from a validated pane lands end-to-end — over the
+/// real socket, through the token boundary, into the store.
+#[test]
+fn update_over_socket_patches_the_record_end_to_end() {
+    let (mgr, _d) = manager();
+    let tokens = Arc::new(TokenRegistry::new());
+    let server = server_over(&mgr, &tokens);
+    let tok = tokens.issue(PaneId(5));
+
+    let id = send_request(server.socket_path(), &create_req(&tok))
+        .unwrap()
+        .id
+        .expect("created");
+
+    let resp = send_request(
+        server.socket_path(),
+        &AutomationRequest {
+            name: Some("nightly (v2)".into()),
+            cron: Some("0 */4 * * *".into()),
+            model: Some("opus".into()),
+            ..update_req(&tok, &id)
+        },
+    )
+    .unwrap();
+    assert!(resp.ok, "update succeeds: {resp:?}");
+    assert_eq!(resp.id.as_deref(), Some(id.as_str()));
+
+    let a = mgr.get(&id).expect("still there");
+    assert_eq!(a.name, "nightly (v2)");
+    assert_eq!(a.cron, "0 */4 * * *");
+    assert_eq!(a.origin.pane_id, 5, "origin is never re-stamped by an update");
+    match &a.mode {
+        fly_lib::automations::model::Mode::Agent { model, prompt, .. } => {
+            assert_eq!(model.as_deref(), Some("opus"));
+            assert_eq!(prompt, "summarize CI", "untouched fields are untouched");
+        }
+        other => panic!("still agent mode: {other:?}"),
+    }
+}
+
+/// R14/R22: the recursion gate covers update exactly like every other
+/// mutating op — it runs before the op match, so no new hole opens.
+#[test]
+fn recursion_gate_rejects_update_from_an_automation_pane_r22() {
+    let (mgr, _d) = manager();
+    let id = dispatch_automation_op(&mgr, 1, "ws", false, create_req("tok"), &no_pointers)
+        .id
+        .expect("created");
+    mgr.register_automation_pane(6);
+
+    let resp = dispatch_automation_op(
+        &mgr,
+        6,
+        "ws",
+        true,
+        AutomationRequest {
+            name: Some("hijacked".into()),
+            ..update_req("tok", &id)
+        },
+        &no_pointers,
+    );
+
+    assert!(!resp.ok);
+    assert!(
+        resp.error.unwrap().contains("automation-spawned pane"),
+        "the R22 refusal, not a field error"
+    );
+    assert_eq!(mgr.get(&id).unwrap().name, "nightly", "nothing changed");
+}
+
+/// KTD7: an old app receiving `automation/update` hits the dispatch default
+/// arm and fails LOUDLY with an explicit unknown-op error — unlike create's
+/// silently-ignored new *fields*. Pinned from the other direction: an unknown
+/// op is never quietly accepted.
+#[test]
+fn an_unknown_automation_op_fails_loudly_not_silently() {
+    let (mgr, _d) = manager();
+    let resp = dispatch_automation_op(
+        &mgr,
+        1,
+        "ws",
+        false,
+        AutomationRequest {
+            op: "automation/upsert".into(),
+            id: Some("a1".into()),
+            ..Default::default()
+        },
+        &no_pointers,
+    );
+    assert!(!resp.ok);
+    let err = resp.error.unwrap();
+    assert!(err.contains("unknown automation op"), "got: {err}");
+    assert!(err.contains("automation/upsert"), "names the op: {err}");
+}
+
+/// KTD2/KTD6: the untrusted wire is re-validated in the update arm — the
+/// exclusions and the closed sets, each with its own refusal, and NOTHING
+/// stored.
+#[test]
+fn update_arm_re_validates_the_untrusted_payload() {
+    let (mgr, _d) = manager();
+    let id = dispatch_automation_op(&mgr, 1, "ws", false, create_req("tok"), &no_pointers)
+        .id
+        .expect("created");
+    let before = mgr.get(&id).unwrap();
+
+    let refuse = |req: AutomationRequest| -> String {
+        let resp = dispatch_automation_op(&mgr, 1, "ws", false, req, &no_pointers);
+        assert!(!resp.ok, "must refuse: {resp:?}");
+        resp.error.unwrap()
+    };
+
+    // Setting/re-pointing a dependency edge (the dependencies KTD6 argument
+    // rests on this staying impossible); clearing is the only allowed move.
+    let err = refuse(AutomationRequest {
+        after: Some("other".into()),
+        ..update_req("tok", &id)
+    });
+    assert!(err.contains("--after"), "got: {err}");
+    let err = refuse(AutomationRequest {
+        within_ms: Some(60_000),
+        ..update_req("tok", &id)
+    });
+    assert!(err.contains("--after"), "got: {err}");
+
+    // cwd, monitor, and the monitor floor are all create-only.
+    assert!(refuse(AutomationRequest {
+        cwd: Some("/elsewhere".into()),
+        ..update_req("tok", &id)
+    })
+    .contains("cwd"));
+    assert!(refuse(AutomationRequest {
+        monitor: true,
+        ..update_req("tok", &id)
+    })
+    .contains("monitor"));
+    assert!(refuse(AutomationRequest {
+        not_before_ms: Some(1),
+        ..update_req("tok", &id)
+    })
+    .contains("monitor"));
+
+    // An unknown clear member is refused, never ignored (KTD1).
+    let err = refuse(AutomationRequest {
+        clear: vec!["prompt".into()],
+        ..update_req("tok", &id)
+    });
+    assert!(err.contains("unknown clear field"), "got: {err}");
+
+    // Both directions of a toggle at once.
+    assert!(refuse(AutomationRequest {
+        retry_on_interrupt: true,
+        clear: vec!["retryOnInterrupt".into()],
+        ..update_req("tok", &id)
+    })
+    .contains("only one of"));
+
+    // Closed sets: effort levels and script interpreters.
+    assert!(refuse(AutomationRequest {
+        effort: Some("extreme".into()),
+        ..update_req("tok", &id)
+    })
+    .contains("--effort must be one of"));
+    assert!(refuse(AutomationRequest {
+        interpreter: Some("perl".into()),
+        ..update_req("tok", &id)
+    })
+    .contains("interpreter"));
+
+    // An empty patch.
+    assert!(refuse(update_req("tok", &id)).contains("nothing to change"));
+
+    assert_eq!(mgr.get(&id).unwrap(), before, "no refusal stored anything");
+}
+
+/// KTD6 — the 2026-08-07 lesson, re-pinned on the surface someone actually
+/// reaches for when a timeout is too short: a timeout over the ceiling is
+/// REFUSED, never clamped. Three surfaces agreeing on a number that is not
+/// the one enforced cost a real debugging session.
+#[test]
+fn update_refuses_a_timeout_over_the_ceiling_it_never_clamps() {
+    let (mgr, _d) = manager();
+    let script = AutomationRequest {
+        prompt: None,
+        script: Some("echo hi".into()),
+        interpreter: Some("bash".into()),
+        ..create_req("tok")
+    };
+    let id = dispatch_automation_op(&mgr, 1, "ws", false, script, &no_pointers)
+        .id
+        .expect("created");
+    let over = fly_lib::automations::script::TIMEOUT_MAX_MS + 1;
+
+    let resp = dispatch_automation_op(
+        &mgr,
+        1,
+        "ws",
+        false,
+        AutomationRequest {
+            timeout_ms: Some(over),
+            ..update_req("tok", &id)
+        },
+        &no_pointers,
+    );
+
+    assert!(!resp.ok);
+    let err = resp.error.unwrap();
+    assert!(err.contains("exceeds the maximum"), "got: {err}");
+    match mgr.get(&id).unwrap().mode {
+        fly_lib::automations::model::Mode::Script { timeout_ms, .. } => {
+            assert_ne!(timeout_ms, over, "not stored");
+            assert!(timeout_ms <= fly_lib::automations::script::TIMEOUT_MAX_MS, "not clamped-and-stored either");
+        }
+        other => panic!("script mode: {other:?}"),
+    }
+}

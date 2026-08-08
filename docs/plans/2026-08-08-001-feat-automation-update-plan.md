@@ -2,7 +2,7 @@
 title: "feat: `fly automation update` — patch a stored automation in place"
 type: feat
 date: 2026-08-08
-status: planned
+status: implemented (U1–U6 2026-08-08; the R15 live check passed in the dev flavor — mid-run update left the running row closing under its old script, the next run used the new one, and the open dashboard refetched on `automation://changed` without a restart)
 ---
 
 # feat: `fly automation update` — patch a stored automation in place

@@ -60,6 +60,7 @@ pub fn top_level_help() -> String {
        fly automation show <id>                show one automation\n  \
        fly automation runs <id>                show an automation's run history\n  \
        fly automation create [options]         create one (see `create --help`)\n  \
+       fly automation update <id> [options]    patch one in place (see `update --help`)\n  \
        fly automation pause|resume|run|delete <id>\n\
      \n\
      Read-only automation commands work anywhere; creating or mutating one must\n\

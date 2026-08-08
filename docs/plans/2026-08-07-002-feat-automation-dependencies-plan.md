@@ -297,3 +297,29 @@ dependent-does-not-fire-when-upstream-failed, exactly-one-dependent-run-
 per-upstream-occurrence, stale-upstream-refused, cycle-rejected-at-create,
 legacy-rows-load-without-the-new-field — plus the R9 gate-order pin, the R13
 retry pair, the manual-withhold path, and the feed/CLI projections.
+
+---
+
+## Addendum — 2026-08-08: an update op exists; KTD6 survives with one word changed
+
+`docs/plans/2026-08-08-001-feat-automation-update-plan.md` added
+`fly automation update` (the `automation/update` socket op), so KTD6's
+parenthetical "there is no automation-update op" is no longer literally true.
+The argument it supports is unchanged, because update **cannot set or
+re-point an edge** — `after`/`within_ms` on an update payload are refused
+outright (`ERR_UPDATE_SET_AFTER`), and the only edge mutation it offers is
+`--no-after`, which *clears* one.
+
+Read KTD6 as: **edges are set at create only; update may only clear them.**
+Clearing can never close a cycle, so "no create can close a cycle — the new
+record has no dependents yet" still covers every reachable state, and the
+create-time chain walk (depth cap 8, visited-set rejection) remains the
+defense-in-depth against a hand-edited store file. The single-hop sweep
+predicate is untouched.
+
+One further interaction worth stating: an update **preserves the id and the
+run history**, which is exactly what the delete + recreate workaround
+destroyed — a recreate minted a new id (silently orphaning any dependent's
+`after` edge) and reset the R8 run history that this plan's freshness
+predicate and `consecutive_infra_failures` both read. Re-tuning a pipeline
+stage no longer breaks its dependents.

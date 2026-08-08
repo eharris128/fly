@@ -103,10 +103,10 @@ exits; otherwise it launches the Tauri desktop app. The CLI and the app share
 the same `fly_lib` crate, so a `fly notify` invocation inside a pane talks to
 the running app.
 
-`fly automation <create|list|show|runs|pause|resume|run|delete>` (U9) manages
-cron-scheduled runs: read ops work anywhere (they read the store file directly),
-mutating ops must run inside a pane (they post over the token-authenticated hook
-socket). See the Automations module map below.
+`fly automation <create|update|list|show|runs|pause|resume|run|delete>` (U9)
+manages cron-scheduled runs: read ops work anywhere (they read the store file
+directly), mutating ops must run inside a pane (they post over the
+token-authenticated hook socket). See the Automations module map below.
 
 ### The attention pipeline (the core feature, spans many files)
 This is the data flow that makes an agent's "I need you" reach the UI:
@@ -395,8 +395,9 @@ next time the account is actually at a limit. Modules:
   it). Scheduled withholds ring the Automations alert path; manual runs
   evaluate the same predicate and report the refusal synchronously (no
   override flag — re-run the upstream instead). Create-time validation walks
-  the chain (depth ≤ 8, cycle-reject; edges are create-only so cycles are
-  otherwise unconstructible); upstream must exist and not be a monitor.
+  the chain (depth ≤ 8, cycle-reject; edges are set at create only — update
+  may only *clear* one — so cycles are otherwise unconstructible); upstream
+  must exist and not be a monitor.
   Feed projection is additive (`after`, `lastWithheldReason`,
   `lastStatus:"withheld"`); dashboard/CLI render `after:<id>` tags and
   `waiting on upstream`. Back-compat note: the new `"withheld"` status value
@@ -431,9 +432,36 @@ next time the account is actually at a limit. Modules:
   on the agent's Stop / pane-exit / 30-min deadline. The **R22 recursion gate**
   blocks an automation-spawned pane from creating or running automations.
 - CLI (`cli/automation.rs`, U9): read ops (`list`/`show`/`runs`) read the store
-  file directly (work outside a pane); mutating ops (`create`/`pause`/`resume`/
-  `run`/`delete`) post over the hook socket (token-validated, origin-stamped,
-  R22-gated).
+  file directly (work outside a pane); mutating ops (`create`/`update`/`pause`/
+  `resume`/`run`/`delete`) post over the hook socket (token-validated,
+  origin-stamped, R22-gated).
+- **Update** (`docs/plans/2026-08-08-001-feat-automation-update-plan.md`, its
+  own U1–U6/KTD1–KTD7): `fly automation update <id> [flags]` patches a stored
+  record in place — name, schedule, prompt/model/effort/disposition, script
+  content/interpreter/timeout — keeping the id, run history, origin and any
+  dependency edge that the old delete + recreate dance destroyed.
+  **Patch semantics** (KTD1): an absent field is unchanged, and clearing a pin
+  rides an additive closed-set `clear: Vec<String>` on `AutomationRequest`
+  (`model`, `effort`, `disposition`, `retryOnInterrupt`, `after`; an unknown
+  member is refused, never ignored) — which is also the only way to express
+  "retry off", since the wire's `retryOnInterrupt` bool is skip-if-false.
+  `AutomationManager::update` runs its gates **inside** the store mutation
+  (the `resume` retirement-gate shape): unknown id, retired, monitor, mode
+  mismatch. **The exclusions are the design** (KTD2), each with its own
+  error: mode-kind switch (agent ↔ script), any update to a monitor (pickup
+  pointers can't be re-captured without a registering pane) or a retired
+  record, `cwd`, and **setting/re-pointing `after`** — only `--no-after`
+  clears, so the dependencies plan's KTD6 cycle argument survives. A
+  cron/timezone change recomputes `next_run_at` from now (not-before floor
+  riding along) **only when the automation is live** — paused stays paused and
+  picks the change up on resume; update never flips the enabled bit (KTD4).
+  In-flight runs are never killed or re-parameterized (KTD3): a claimed row
+  already carries its resolved model/effort/headless, and new script content
+  is written to a **fresh** file whose pointer is swapped under the lock
+  (KTD5 — a running interpreter holds the old one; the orphan is dropped
+  after the lock). The untrusted socket payload is re-validated exactly like
+  the create arm (KTD6), notably a `timeout_ms` over `TIMEOUT_MAX_MS` is
+  **refused, never clamped**.
 - Dashboard panel (U10): `lib/automations.ts` is the pure view-model
   (`automationsToRows` — sort next-run asc / paused last, mirroring the CLI —
   plus `humanSchedule`/`relativeTime`); `HomeView.svelte` renders it below the
