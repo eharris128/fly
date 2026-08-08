@@ -2574,6 +2574,7 @@
               leafKey={p.key}
               focused={p.tabId === activeTab?.id &&
                 activeTab?.focusedLeafKey === p.key}
+              visible={p.tabId === activeTab?.id}
               cwd={cwdByLeaf[p.key] ?? null}
               command={resumeCommandByLeaf[p.key] ??
                 automationCommandByLeaf[p.key] ??

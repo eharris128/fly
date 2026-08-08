@@ -13,9 +13,10 @@ fn defaults_load_when_no_file_exists() {
     let config = load_with_fallback(&path);
     assert_eq!(config, Config::default());
     assert_eq!(config.leader_key, "ctrl+a");
-    // DOM is the default renderer (KTD6 superseded): multiple live WebGL contexts
-    // blank inactive panes on WebKitGTK, so WebGL is opt-in (auto/webgl).
-    assert_eq!(config.renderer, Renderer::Dom);
+    // Auto is the default renderer since perf-audit T4 (2026-08-08): WebGL on
+    // visible panes with the KTD6 dispose-on-hide eviction; `dom` is the
+    // escape hatch, `webgl` the force-always debug switch.
+    assert_eq!(config.renderer, Renderer::Auto);
     assert_eq!(config.font_size, 15);
 }
 
@@ -34,9 +35,9 @@ fn valid_config_overrides_defaults() {
     assert_eq!(config.attention_debounce_ms, 250);
     assert_eq!(config.font_size, 18);
     assert!(config.save_scrollback);
-    // Unspecified fields keep their defaults (renderer defaults to DOM — KTD6
-    // superseded, WebGL is opt-in).
-    assert_eq!(config.renderer, Renderer::Dom);
+    // Unspecified fields keep their defaults (renderer defaults to Auto —
+    // perf-audit T4's KTD6 eviction).
+    assert_eq!(config.renderer, Renderer::Auto);
     assert_eq!(config.scrollback_lines, 10_000);
 }
 

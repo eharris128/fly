@@ -7,6 +7,8 @@
   import { SerializeAddon } from "@xterm/addon-serialize";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getConfig } from "./config";
+  import type { Renderer as RendererMode } from "./config";
+  import { wantsWebgl } from "./renderer";
   import type { Keymap } from "./keymap";
   import { resolveSpawnRace } from "./pane-maps";
   import type { ResumeTier } from "./resume";
@@ -40,6 +42,14 @@
   interface Props {
     leafKey: string;
     focused: boolean;
+    /** Whether this pane's slot is displayed — its tab is the active tab of
+     * the active workspace. Drives the KTD6/T4 WebGL eviction: a visible pane
+     * may hold a live GL context, a hidden one must not. Deliberately NOT
+     * gated on the dashboard overlay (which display:nones the whole layout):
+     * the bounded set is "one tab's panes" either way, and keeping contexts
+     * alive under the dashboard avoids a dispose/recreate churn on every
+     * `leader d` toggle. */
+    visible?: boolean;
     keymap?: Keymap | null;
     cwd?: string | null;
     /** Program to run instead of the shell — set only when resuming a Claude
@@ -74,6 +84,7 @@
   let {
     leafKey,
     focused,
+    visible = true,
     keymap,
     cwd = null,
     command = null,
@@ -109,6 +120,61 @@
 
   let attention = $state<AttentionState>("idle");
   let reason = $state<AttentionReason | null>(null);
+
+  // ---- Renderer eviction (foundation KTD6, perf-audit T4) -------------------
+  // The DOM renderer's per-flush row rebuild (~20 ms on the WebKitGTK main
+  // thread, 2026-08-08 diagnosis) is the typing/scroll stutter under visible
+  // streaming agents. `auto` (the default) therefore attaches a WebglAddon
+  // only while this pane is visible and disposes it on hide — disposal is not
+  // an unmount: xterm drops to the DOM renderer transparently, the buffer and
+  // the agent survive, so the never-respawn invariant holds and live GL
+  // contexts stay bounded at one tab's panes (the many-context WebKitGTK
+  // blanking that kept WebGL opt-in cannot accumulate). The decision rule is
+  // the pure `wantsWebgl` (lib/renderer.ts); this is the effectful half.
+  let rendererMode: RendererMode = "dom"; // real value read from config at mount
+  let webgl: WebglAddon | null = null;
+  let webglFailed = false; // construction threw or context lost → DOM for good
+
+  function syncRenderer() {
+    if (!term) return;
+    if (wantsWebgl(rendererMode, visible, webglFailed)) attachWebgl();
+    else detachWebgl();
+  }
+
+  function attachWebgl() {
+    if (webgl || !term) return;
+    // A zero-size container (hidden slot, or the layout under the dashboard)
+    // cannot host a GL canvas; the ResizeObserver re-runs this once the pane
+    // has real dimensions.
+    if (container.clientWidth === 0 || container.clientHeight === 0) return;
+    try {
+      const addon = new WebglAddon();
+      addon.onContextLoss(() => {
+        webglFailed = true;
+        detachWebgl();
+      });
+      term.loadAddon(addon);
+      webgl = addon;
+    } catch (err) {
+      webglFailed = true;
+      console.warn("WebGL renderer unavailable, using DOM renderer", err);
+    }
+  }
+
+  function detachWebgl() {
+    if (!webgl) return;
+    const addon = webgl;
+    webgl = null; // null-first: dispose must not re-enter through onContextLoss
+    addon.dispose();
+  }
+
+  // Re-evaluate the attachment whenever visibility flips (tab/workspace
+  // switch). Also runs before mount resolves — syncRenderer no-ops until
+  // `term` exists; onMount calls it once directly after the terminal opens.
+  $effect(() => {
+    void visible;
+    syncRenderer();
+  });
 
   const REASON_LABEL: Record<AttentionReason, string> = {
     question: "waiting for you",
@@ -236,22 +302,11 @@
       return true;
     });
 
-    // Renderer (KTD6): DOM is the default (see `Renderer` in config/schema.rs),
-    // so this WebGL path runs only when the user opts in (`auto`/`webgl`). WebGL
-    // is not the default because multiple live contexts blank inactive panes on
-    // WebKitGTK and the KTD6 per-pane eviction policy was never built; on a
-    // context-loss event we dispose the addon, dropping this pane to DOM.
-    if (config.renderer !== "dom") {
-      try {
-        const webgl = new WebglAddon();
-        webgl.onContextLoss(() => webgl.dispose());
-        term.loadAddon(webgl);
-      } catch (err) {
-        console.warn("WebGL renderer unavailable, using DOM renderer", err);
-      }
-    }
-
     fit.fit();
+    // Renderer (KTD6/T4): after fit so the container is measured — a hidden
+    // pane defers its attach to the ResizeObserver/visibility effect above.
+    rendererMode = config.renderer;
+    syncRenderer();
     const cols = term.cols >= 2 ? term.cols : 80;
     const rows = term.rows >= 2 ? term.rows : 24;
 
@@ -339,6 +394,9 @@
       // Skip while hidden (a background tab) — clientWidth is 0.
       if (container.clientWidth === 0 || container.clientHeight === 0) return;
       fit.fit();
+      // A pane revealed from zero size attaches its deferred WebGL context
+      // here (KTD6/T4) — the visibility effect saw clientWidth 0 and skipped.
+      syncRenderer();
       if (paneId !== null) void ptyResize(paneId, term.rows, term.cols);
     });
     resizeObs.observe(container);

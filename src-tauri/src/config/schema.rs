@@ -12,17 +12,24 @@ use crate::state::policy::ReasonEffects;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Renderer {
-    /// Try WebGL, falling back to the DOM renderer on construction failure or a
-    /// context-loss event. Opt-in, *not* the default: with multiple panes each
-    /// holding a live WebGL context, WebKitGTK fails to keep them all composited
-    /// and an inactive pane blanks until it next repaints. The KTD6 eviction
-    /// policy meant to bound live contexts was never built, so WebGL is opt-in.
+    /// WebGL on **visible** panes with dispose-on-hide eviction — the default
+    /// since perf-audit T4 (2026-08-08). The frontend attaches a `WebglAddon`
+    /// only while a pane sits in the active tab and disposes it when the pane
+    /// hides (`lib/renderer.ts` + `Terminal.svelte`), so live GL contexts stay
+    /// bounded at one tab's panes and the historical WebKitGTK many-context
+    /// blanking cannot accumulate. Construction failure or a context-loss
+    /// event drops that pane to the DOM renderer for the rest of its life.
     Auto,
-    /// Force WebGL (same WebKitGTK multi-context caveat as [`Renderer::Auto`]).
+    /// Force a persistent WebGL context per pane, visible or not — the
+    /// pre-eviction behavior, kept as a debugging switch. This is the mode
+    /// with the multi-context caveat: WebKitGTK fails to keep many live
+    /// contexts composited and an inactive pane blanks until it repaints.
     Webgl,
-    /// Force the DOM renderer — the default. No GL context to contend, so panes
-    /// never blank; the cost is no GPU-accelerated glyph rendering (U4 flow
-    /// control already bounds output floods, so this is rarely the bottleneck).
+    /// Force the DOM renderer everywhere. No GL context at all, but the
+    /// per-refresh row-DOM rebuild is xterm's slowest path — the 2026-08-08
+    /// typing-latency diagnosis measured ~20 ms of webview main-thread work
+    /// per coalesced output flush, which is exactly the typing/scroll stutter
+    /// T4 removed. Kept as the escape hatch for GL-hostile environments.
     Dom,
 }
 
@@ -282,9 +289,10 @@ impl Default for Config {
             nudge_idle_ms: 1500,
             notification_coalesce_threshold: 3,
             osc_bel_fallback: false,
-            // DOM by default (KTD6, superseded): WebGL blanks inactive panes on
-            // WebKitGTK with multiple live contexts. WebGL is opt-in (auto/webgl).
-            renderer: Renderer::Dom,
+            // Auto since perf-audit T4 (2026-08-08): WebGL on visible panes with
+            // dispose-on-hide — the KTD6 eviction the old DOM default was
+            // waiting for. See `Renderer::Auto`.
+            renderer: Renderer::Auto,
             scrollback_lines: 10_000,
             font_size: 15,
             save_scrollback: false,
@@ -304,13 +312,14 @@ impl Default for Config {
 mod tests {
     use super::*;
 
-    /// The default renderer is DOM, not WebGL (KTD6, superseded). Multiple live
-    /// WebGL contexts blank inactive panes on WebKitGTK and the KTD6 eviction
-    /// policy was never built, so DOM is the safe default; WebGL stays opt-in via
-    /// `auto`/`webgl`. Guards against an accidental revert to the blanking default.
+    /// The default renderer is Auto — WebGL on visible panes with the KTD6
+    /// dispose-on-hide eviction (perf-audit T4, 2026-08-08). DOM was the default
+    /// only while the eviction policy was unbuilt; the DOM renderer's per-flush
+    /// row rebuild is the measured typing/scroll-stutter ceiling, so guard
+    /// against an accidental revert to it.
     #[test]
-    fn default_renderer_is_dom() {
-        assert_eq!(Config::default().renderer, Renderer::Dom);
+    fn default_renderer_is_auto() {
+        assert_eq!(Config::default().renderer, Renderer::Auto);
     }
 
     // U3 (R12/R15): an empty config loads the shared automation defaults —

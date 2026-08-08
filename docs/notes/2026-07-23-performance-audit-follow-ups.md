@@ -166,6 +166,20 @@ parts (they share the same plumbing):
 ## P2 — real but situational
 
 ### T4 — WebGL renderer for the visible pane (build the deferred KTD6 eviction)
+
+> **Done 2026-08-08** — `lib/renderer.ts` (pure attach rule, vitest) +
+> `Terminal.svelte` (effectful half) + a `visible` prop from `App.svelte`
+> (`p.tabId === activeTab?.id` — deliberately not gated on the dashboard
+> overlay, so `leader d` doesn't churn contexts): `auto` attaches a
+> `WebglAddon` only while the pane sits in the active tab and disposes it on
+> hide, bounding live GL contexts to one tab's panes; zero-size containers
+> defer the attach to the ResizeObserver. Construction failure or context
+> loss drops that pane to DOM for good (no retry loop, parity with the old
+> fallback). Default flipped `dom` → `auto` (`config/schema.rs`; `webgl` kept
+> as the force-always debug switch, `dom` as the escape hatch). Note: config
+> files that were ever saved by the settings menu have `"renderer": "dom"`
+> baked in — the round-trip persists all fields — and need a one-time edit to
+> pick up the new default. Original entry kept for the rationale:
 - **Where:** `lib/Terminal.svelte` (renderer selection); default renderer is
   DOM (`config/schema.rs`, `renderer`).
 - **What today:** the visible pane doing heavy agent output renders through

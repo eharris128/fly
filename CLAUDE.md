@@ -671,6 +671,9 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   `layout.ts`'s leaf order.
 - `lib/Terminal.svelte` — embeddable xterm leaf; subscribes to `pane://attention`.
   Terminal font size comes from config (`config.fontSize`, default 15).
+  Renders through WebGL while its pane is in the active tab, disposed on hide
+  (the KTD6 eviction, built as perf-audit T4 — `lib/renderer.ts` holds the
+  pure attach rule; `renderer: "dom"` in config is the escape hatch).
 - `lib/Sidebar.svelte` — collapsible cmux-style workspace tree with a
   **reason-typed attention dot** (`workspaces.ts::attentionKind` /
   `rollupAttentionKind`: amber = an agent is blocked on you, blue = one

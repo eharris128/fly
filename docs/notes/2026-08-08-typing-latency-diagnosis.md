@@ -89,7 +89,10 @@ average) but runs off both main threads.
 2. **T4 second**: WebGL addon on visible panes, dispose-on-hide (bounded
    contexts, DOM fallback, no unmount). Attacks the ~20 ms/flush render
    cost — the continuous saturation. Needs the deferred WebKitGTK live
-   validation (CLAUDE.md capture recipe).
+   validation (CLAUDE.md capture recipe). **Landed 2026-08-08** —
+   `lib/renderer.ts` + `Terminal.svelte`, default `renderer` flipped to
+   `auto`; see the T4 entry in
+   `docs/notes/2026-07-23-performance-audit-follow-ups.md`.
 3. Expectation setting: after T2 alone, typing should stop hitching in
    bursts but the webview can still saturate while ≥3–4 agent spinners are
    *visible*; full relief under many visible streaming panes is T4's job.
@@ -108,6 +111,28 @@ protocol, agents streaming:
   output bursts — the T4 DOM-render cost, unchanged by design; WebGL is the
   next step.
 - PTY/coalescer threads 0.2% — unchanged, as expected.
+
+## Post-T4 live validation (2026-08-08 ~22:30, dev flavor on WebKitGTK)
+
+T4 (WebGL on visible panes, dispose-on-hide — `lib/renderer.ts` +
+`Terminal.svelte`, default `renderer` now `auto`) validated live against the
+dev flavor under X11, three visible panes, one emitting a 33-lines/s
+spinner-cadence loop for 10 s. Webview main thread sampled at 100 ms:
+
+| renderer      | avg CPU | peak | samples >50% |
+|---------------|---------|------|--------------|
+| auto (run 1)  | 47.9%   | 100% | 19%          |
+| auto (run 2)  | 45.8%   | 100% | 14%          |
+| dom (pinned)  | 60.3%   |  90% | **75%**      |
+
+The busy-fraction is the discriminator: DOM grinds >50% of a core for ~¾ of
+the load duration (~18 ms/flush — reproducing the ~20 ms diagnosis figure);
+WebGL stays under 50% for ~85% of it. This is the protocol's acceptance
+signal ("the CPU% must not [saturate]"). Render correctness also validated:
+three simultaneous GL contexts, scrollback scrolling while streaming, and the
+critical dispose→re-attach reveal (tab away/back) — content intact, scroll
+position preserved, **no blanking** (the historical failure the eviction was
+designed around).
 
 ## Re-measurement protocol (for validating the fixes)
 
