@@ -20,7 +20,7 @@ something about a *candidate*, it is out of scope; if it makes fly represent a
 |---|---|---|---|---|
 | `9ukbpue112` | feed triage | script | `0 9 * * 1-5` | feed |
 | `ksdnx5whgt` | feed triage analysis | agent | `5 9 * * 1-5`, `--after 9ukbpue112 --within 90m` | feed |
-| `wk5dz9yav2` | feed stage 5 (gate-1 handoff) | script | `0 10-18 * * 1-5` | feed |
+| `4341og0pjb` | feed stage 5 (gate-1 handoff) | script | `0 10-18 * * 1-5`, `--after ksdnx5whgt --within 90m` | feed | *(was `wk5dz9yav2`, polling; recreated 2026-08-08 when feed adopted G1)*
 | `nqcesrj1qq` | secure handoff intake (feed→secure) | script | `0 10-18 * * 1-5` | secure |
 | `sjbrjb2pgh` | secure range leg (gate-2 opener) | agent | `30 10-17 * * 1-5`, `--after nqcesrj1qq --within 90m` | secure |
 | `hctsfexvz3` | secure lab leg (stage 3 calibration) | agent | `0 12,16 * * 1-5`, `--after sjbrjb2pgh --within 4h` | secure |
