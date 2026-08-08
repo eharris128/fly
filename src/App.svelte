@@ -2544,33 +2544,13 @@
           class:hidden={!r}
           style={r ? `left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px` : ""}
         >
-          <Terminal
-            bind:this={paneRefs[p.key]}
-            leafKey={p.key}
-            focused={p.tabId === activeTab?.id && activeTab?.focusedLeafKey === p.key}
-            cwd={cwdByLeaf[p.key] ?? null}
-            command={resumeCommandByLeaf[p.key] ??
-              automationCommandByLeaf[p.key] ??
-              sinkCommandByLeaf[p.key] ??
-              handoffCommandByLeaf[p.key] ??
-              null}
-            automationRunId={automationRunIdByLeaf[p.key] ?? null}
-            resumeTier={resumeTierByLeaf[p.key] ?? null}
-            injectText={guidedHandoffByLeaf[p.key]
-              ? handoffPrompt(guidedHandoffByLeaf[p.key].transcriptPath)
-              : null}
-            saveScrollback={saveScrollbackEnabled && p.scrollback}
-            {keymap}
-            onFocusRequest={setActiveFocus}
-            {onSpawned}
-            {onAttention}
-            onInjectionDone={clearGuidedHandoff}
-          />
-          <!-- Per-pane label, centered over the pane (leader R). The tab title
-               can't tell split siblings apart; this can. Rendered only when a
-               label exists (or is being edited) so unlabeled panes stay clean;
-               it overlays the terminal's top edge rather than reserving a strip,
-               so pane geometry (rects) is untouched. -->
+          <!-- Per-pane label, centered above the pane (leader R). The tab title
+               can't tell split siblings apart; this can. It sits in a reserved
+               strip *above* the pane's top border rather than overlaying the
+               terminal's first row, so it never covers agent output; the strip
+               exists only while a label does (or is being edited), so unlabeled
+               panes keep their full height. Slot rects are untouched — the
+               terminal just refits to the remaining height. -->
           {#if editing?.kind === "pane" && editing.id === p.key}
             <input
               class="pane-title-edit"
@@ -2588,6 +2568,31 @@
               ondblclick={() => startEdit("pane", p.key)}
             >{paneTitleByLeaf[p.key]}</button>
           {/if}
+          <div class="pane-host">
+            <Terminal
+              bind:this={paneRefs[p.key]}
+              leafKey={p.key}
+              focused={p.tabId === activeTab?.id &&
+                activeTab?.focusedLeafKey === p.key}
+              cwd={cwdByLeaf[p.key] ?? null}
+              command={resumeCommandByLeaf[p.key] ??
+                automationCommandByLeaf[p.key] ??
+                sinkCommandByLeaf[p.key] ??
+                handoffCommandByLeaf[p.key] ??
+                null}
+              automationRunId={automationRunIdByLeaf[p.key] ?? null}
+              resumeTier={resumeTierByLeaf[p.key] ?? null}
+              injectText={guidedHandoffByLeaf[p.key]
+                ? handoffPrompt(guidedHandoffByLeaf[p.key].transcriptPath)
+                : null}
+              saveScrollback={saveScrollbackEnabled && p.scrollback}
+              {keymap}
+              onFocusRequest={setActiveFocus}
+              {onSpawned}
+              {onAttention}
+              onInjectionDone={clearGuidedHandoff}
+            />
+          </div>
         </div>
       {/each}
       {#each dividerList as d (d.splitKey)}
@@ -2763,43 +2768,48 @@
   }
   .slot {
     position: absolute;
+    display: flex;
+    flex-direction: column;
   }
   .slot.hidden {
     display: none;
   }
-  /* Per-pane label pill + its inline editor, centered over the pane's top
-     edge. Overlay (not a reserved strip) so rects/PTY size never change. */
+  /* The terminal takes whatever height the label strip (if any) leaves. */
+  .pane-host {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+  }
+  /* Per-pane label pill + its inline editor, centered in a reserved strip
+     above the pane's top border, so neither ever covers terminal output. */
   .pane-title,
   .pane-title-edit {
-    position: absolute;
-    top: 0;
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 6; /* above the terminal and the dividers (5) */
+    flex: none;
+    align-self: center;
     max-width: 60%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font:
-      12px "JetBrains Mono",
+      15px "JetBrains Mono",
       monospace;
-    border-radius: 0 0 6px 6px;
+    border-radius: 6px 6px 0 0;
     padding: 1px 10px 2px;
   }
   .pane-title {
     color: #9fb2d8;
     background: rgba(22, 27, 44, 0.92);
     border: 1px solid #2b3a55;
-    border-top: none;
+    border-bottom: none;
     cursor: default;
   }
   .pane-title-edit {
     color: #dfe7f5;
     background: #0b1020;
     border: 1px solid #4a6296;
-    border-top: none;
+    border-bottom: none;
     outline: none;
-    width: 220px;
+    width: 275px;
     text-align: center;
   }
   .divider {
@@ -2834,7 +2844,7 @@
     text-align: center;
     color: #c9d1d9;
     font:
-      13px/1.4 ui-monospace,
+      16px/1.4 ui-monospace,
       monospace;
     box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
   }
@@ -2845,7 +2855,7 @@
   .confirm-sub {
     margin: -8px 0 14px;
     opacity: 0.6;
-    font-size: 12px;
+    font-size: 15px;
   }
   .confirm-actions {
     display: flex;
@@ -2874,7 +2884,7 @@
   .confirm-hint {
     margin: 12px 0 0;
     opacity: 0.5;
-    font-size: 11px;
+    font-size: 14px;
   }
   /* Shared transient notice (fix-003 U4; session-handoff U2/R6): a quiet,
      dismissible toast pinned bottom-centre, styled like the passive cheat-sheet
@@ -2892,7 +2902,7 @@
     border-radius: 6px;
     padding: 8px 14px;
     font: inherit;
-    font-size: 12px;
+    font-size: 15px;
     cursor: pointer;
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
     opacity: 0.92;

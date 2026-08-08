@@ -47,7 +47,7 @@
     padding: 8px 14px;
     color: #c9d1d9;
     font:
-      12px/1.4 ui-monospace,
+      15px/1.4 ui-monospace,
       monospace;
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
   }

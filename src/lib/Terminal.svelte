@@ -467,7 +467,7 @@
     right: 8px;
     padding: 2px 8px;
     font:
-      600 11px/1.4 ui-monospace,
+      600 14px/1.4 ui-monospace,
       monospace;
     color: #1a1205;
     background: #f5a623;
@@ -484,7 +484,7 @@
     max-width: calc(100% - 16px);
     padding: 3px 9px;
     font:
-      11px/1.4 ui-monospace,
+      14px/1.4 ui-monospace,
       monospace;
     color: #c9d1d9;
     background: #11182b;

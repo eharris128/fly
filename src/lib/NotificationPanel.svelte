@@ -170,7 +170,7 @@
     max-height: 80vh;
     color: #c9d1d9;
     font:
-      13px/1.4 ui-monospace,
+      16px/1.4 ui-monospace,
       monospace;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
     overflow: hidden;
@@ -233,7 +233,7 @@
     margin-top: 1px;
     padding: 1px 7px;
     border-radius: 9px;
-    font-size: 10px;
+    font-size: 13px;
     font-weight: 600;
     color: #1a1205;
     background: #f5a623;
@@ -263,7 +263,7 @@
   }
   .body {
     opacity: 0.65;
-    font-size: 12px;
+    font-size: 15px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -274,7 +274,7 @@
     gap: 5px;
     align-items: center;
     margin-top: 3px;
-    font-size: 11px;
+    font-size: 14px;
     opacity: 0.55;
   }
   .src {
@@ -292,7 +292,7 @@
     border: none;
     color: #c9d1d9;
     opacity: 0.35;
-    font-size: 16px;
+    font-size: 20px;
     line-height: 1;
     cursor: pointer;
     padding: 0 2px;
@@ -308,7 +308,7 @@
   .hint {
     padding: 6px 12px;
     border-top: 1px solid #161b2c;
-    font-size: 11px;
+    font-size: 14px;
     opacity: 0.45;
   }
 </style>

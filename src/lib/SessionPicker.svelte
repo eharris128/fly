@@ -134,7 +134,7 @@
     max-height: 70vh;
     color: #c9d1d9;
     font:
-      13px/1.4 ui-monospace,
+      16px/1.4 ui-monospace,
       monospace;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
     overflow: hidden;
@@ -152,7 +152,7 @@
   }
   .sub {
     padding: 7px 12px;
-    font-size: 12px;
+    font-size: 15px;
     color: #f5a623;
     border-bottom: 1px solid #161b2c;
   }
@@ -182,12 +182,12 @@
     color: #4da3ff;
   }
   .time {
-    font-size: 11px;
+    font-size: 14px;
     opacity: 0.55;
   }
   .snippet {
     margin-top: 2px;
-    font-size: 12px;
+    font-size: 15px;
     opacity: 0.7;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -196,7 +196,7 @@
   .hint {
     padding: 6px 12px;
     border-top: 1px solid #161b2c;
-    font-size: 11px;
+    font-size: 14px;
     opacity: 0.45;
   }
 </style>

@@ -86,7 +86,7 @@
     max-height: 70vh;
     color: #c9d1d9;
     font:
-      12px/1 ui-monospace,
+      15px/1 ui-monospace,
       monospace;
     box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
     overflow: hidden;
@@ -113,7 +113,7 @@
     color: inherit;
     opacity: 0.5;
     cursor: pointer;
-    font-size: 16px;
+    font-size: 20px;
     line-height: 1;
     padding: 0 2px;
   }

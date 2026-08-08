@@ -459,7 +459,7 @@
     margin-bottom: 16px;
   }
   .usage-head h2 {
-    font-size: 13px;
+    font-size: 16px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.06em;
@@ -472,7 +472,7 @@
     gap: 8px;
   }
   .plan {
-    font-size: 11px;
+    font-size: 14px;
     font-weight: 600;
     text-transform: capitalize;
     color: #cdd3ea;
@@ -493,7 +493,7 @@
     border-radius: 5px;
     background: #1d2336;
     color: #aeb6d4;
-    font-size: 13px;
+    font-size: 16px;
     line-height: 1;
     cursor: pointer;
   }
@@ -514,7 +514,7 @@
     }
   }
   .usage-msg {
-    font-size: 13px;
+    font-size: 16px;
     color: #7b84a3;
     margin: 0;
   }
@@ -537,7 +537,7 @@
     margin-bottom: 6px;
   }
   .limit-label {
-    font-size: 13px;
+    font-size: 16px;
     color: #cdd3ea;
   }
   /* The currently-binding window stands out from the others. */
@@ -546,7 +546,7 @@
     color: #e6e9f2;
   }
   .limit-pct {
-    font-size: 12px;
+    font-size: 15px;
     font-variant-numeric: tabular-nums;
     color: #aeb6d4;
   }
@@ -572,16 +572,16 @@
   .limit-reset {
     display: block;
     margin-top: 5px;
-    font-size: 11px;
+    font-size: 14px;
     color: #7b84a3;
   }
   .usage-foot {
     margin: 20px 0 0;
-    font-size: 11px;
+    font-size: 14px;
     color: #5d667f;
   }
   .usage-foot code {
-    font-size: 11px;
+    font-size: 14px;
     color: #8b93b2;
   }
   .home-head {
@@ -591,12 +591,12 @@
     margin-bottom: 18px;
   }
   .home-head h1 {
-    font-size: 18px;
+    font-size: 23px;
     font-weight: 600;
     margin: 0;
   }
   .hint {
-    font-size: 12px;
+    font-size: 15px;
     color: #7b84a3;
   }
   .empty {
@@ -605,7 +605,7 @@
     color: #7b84a3;
   }
   .empty .sub {
-    font-size: 13px;
+    font-size: 16px;
     margin-top: 4px;
   }
   .groups {
@@ -618,7 +618,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 12px;
+    font-size: 15px;
     margin: 0 0 8px;
   }
   .ws-label {
@@ -630,7 +630,7 @@
     margin-bottom: 10px;
   }
   .tab-title {
-    font-size: 13px;
+    font-size: 16px;
     font-weight: 500;
     color: #aeb6d4;
     margin: 0 0 4px;
@@ -677,7 +677,7 @@
     background: #2a3350;
     color: #cdd3ea;
     font: inherit;
-    font-size: 11px;
+    font-size: 14px;
     font-weight: 700;
     font-variant-numeric: tabular-nums;
   }
@@ -685,7 +685,7 @@
     background: transparent;
   }
   .status {
-    font-size: 12px;
+    font-size: 15px;
     font-weight: 600;
     text-transform: capitalize;
   }
@@ -727,11 +727,11 @@
   }
   .dur {
     font-variant-numeric: tabular-nums;
-    font-size: 13px;
+    font-size: 16px;
     color: #cdd3ea;
   }
   .cwd {
-    font-size: 12px;
+    font-size: 15px;
     color: #7b84a3;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -743,7 +743,7 @@
      fact, so the on state gets the accent. */
   .peer-toggle {
     justify-self: end;
-    font-size: 11px;
+    font-size: 14px;
     padding: 2px 8px;
     border-radius: 9px;
     border: 1px solid #343d59;
@@ -777,18 +777,18 @@
     margin-bottom: 12px;
   }
   .auto-head h2 {
-    font-size: 14px;
+    font-size: 18px;
     font-weight: 600;
     margin: 0;
   }
   .auto-head .hint {
-    font-size: 12px;
+    font-size: 15px;
     color: #7b84a3;
   }
   .auto-head code,
   .auto-empty code,
   .auto-warn code {
-    font-size: 11px;
+    font-size: 14px;
     color: #8b93b2;
   }
   .auto-warn {
@@ -796,7 +796,7 @@
     flex-wrap: wrap;
     align-items: baseline;
     gap: 4px;
-    font-size: 12px;
+    font-size: 15px;
     color: #f0a8a8;
     background: #2a1a1e;
     border: 1px solid #5a2a30;
@@ -808,7 +808,7 @@
     color: #f0c0c0;
   }
   .auto-empty {
-    font-size: 13px;
+    font-size: 16px;
     color: #7b84a3;
     margin: 0;
   }
@@ -835,7 +835,7 @@
     opacity: 0.72;
   }
   .a-status {
-    font-size: 11px;
+    font-size: 14px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -861,7 +861,7 @@
     color: #7b84a3;
   }
   .a-name {
-    font-size: 13px;
+    font-size: 16px;
     color: #e6e9f2;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -869,7 +869,7 @@
   }
   .a-mode {
     margin-left: 8px;
-    font-size: 10px;
+    font-size: 13px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: #8b93b2;
@@ -881,7 +881,7 @@
      so it reads as an at-a-glance "this one survives a crash" marker. */
   .a-retry {
     margin-left: 6px;
-    font-size: 10px;
+    font-size: 13px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: #9ecbff;
@@ -893,7 +893,7 @@
      chip shape as retry; lowercase — the id is case-sensitive. */
   .a-after {
     margin-left: 6px;
-    font-size: 10px;
+    font-size: 13px;
     letter-spacing: 0.02em;
     color: #fcd39b;
     background: #3a2d1a;
@@ -931,7 +931,7 @@
   /* The R16 pickup action — the panel's one interactive control. */
   .a-pickup {
     font: inherit;
-    font-size: 11px;
+    font-size: 14px;
     font-weight: 600;
     color: #fda4af;
     background: #45182b;
@@ -953,7 +953,7 @@
      unceremonious. */
   .a-delete {
     font: inherit;
-    font-size: 11px;
+    font-size: 14px;
     line-height: 1;
     color: #7b84a3;
     background: transparent;
@@ -975,7 +975,7 @@
     border: 1px solid #45182b;
     border-radius: 6px;
     padding: 10px 12px;
-    font-size: 12px;
+    font-size: 15px;
     color: #cdd3ea;
   }
   .pf-head {
@@ -990,7 +990,7 @@
   .pf-dismiss {
     flex: none;
     font: inherit;
-    font-size: 11px;
+    font-size: 14px;
     color: #aeb6d4;
     background: #1d2336;
     border: 1px solid #2a3350;
@@ -1008,7 +1008,7 @@
     overflow: auto;
     white-space: pre-wrap;
     word-break: break-word;
-    font-size: 11px;
+    font-size: 14px;
     color: #aeb6d4;
     background: #12172480;
     border-radius: 4px;
@@ -1021,7 +1021,7 @@
   .a-meta {
     display: flex;
     gap: 8px;
-    font-size: 12px;
+    font-size: 15px;
     color: #7b84a3;
     white-space: nowrap;
   }

@@ -157,7 +157,7 @@
     max-height: 80vh;
     color: #c9d1d9;
     font:
-      13px/1.4 ui-monospace,
+      16px/1.4 ui-monospace,
       monospace;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
     overflow: hidden;
@@ -203,7 +203,7 @@
   }
   .desc {
     opacity: 0.6;
-    font-size: 12px;
+    font-size: 15px;
     margin-top: 2px;
   }
   .switch {
@@ -246,7 +246,7 @@
   .hint {
     padding: 6px 12px;
     border-top: 1px solid #161b2c;
-    font-size: 11px;
+    font-size: 14px;
     opacity: 0.45;
   }
 </style>

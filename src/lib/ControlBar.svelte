@@ -79,12 +79,12 @@
     display: flex;
     align-items: stretch;
     justify-content: space-between;
-    height: 34px;
+    height: 42px;
     background: #0a0e1a;
     border-bottom: 1px solid #161b2c;
     user-select: none;
     font:
-      12px/1 ui-monospace,
+      15px/1 ui-monospace,
       monospace;
     color: #c9d1d9;
   }
@@ -118,7 +118,7 @@
     color: #c9d1d9;
     opacity: 0.6;
     cursor: pointer;
-    font-size: 14px;
+    font-size: 18px;
     padding: 0 8px;
     height: 100%;
   }
@@ -137,20 +137,20 @@
     position: absolute;
     top: 2px;
     right: 1px;
-    min-width: 14px;
-    height: 14px;
+    min-width: 18px;
+    height: 18px;
     padding: 0 3px;
-    border-radius: 7px;
+    border-radius: 9px;
     background: #f5a623;
     color: #1a1205;
-    font-size: 9px;
+    font-size: 11px;
     font-weight: 700;
-    line-height: 14px;
+    line-height: 18px;
     text-align: center;
   }
   .divider {
     width: 1px;
-    height: 16px;
+    height: 20px;
     margin: 0 4px;
     background: #2b3a55;
     opacity: 0.6;

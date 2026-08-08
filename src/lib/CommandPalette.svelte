@@ -147,7 +147,7 @@
     max-height: 60vh;
     color: #c9d1d9;
     font:
-      13px/1.4 ui-monospace,
+      16px/1.4 ui-monospace,
       monospace;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
     overflow: hidden;
@@ -193,7 +193,7 @@
   .hint {
     flex: none;
     opacity: 0.5;
-    font-size: 12px;
+    font-size: 15px;
   }
   .empty {
     padding: 10px 14px;

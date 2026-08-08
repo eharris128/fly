@@ -357,14 +357,14 @@
   .sidebar {
     display: flex;
     flex-direction: column;
-    width: 200px;
+    width: 250px;
     flex: none;
     height: 100%;
     background: #0a0e1a;
     border-right: 1px solid #161b2c;
     user-select: none;
     font:
-      12px/1.3 ui-monospace,
+      15px/1.3 ui-monospace,
       monospace;
     color: #c9d1d9;
     overflow: hidden;
@@ -398,8 +398,8 @@
     color: inherit;
     opacity: 0.7;
     cursor: pointer;
-    font-size: 10px;
-    width: 14px;
+    font-size: 13px;
+    width: 18px;
     padding: 0;
     line-height: 1;
   }
@@ -410,9 +410,9 @@
     color: inherit;
     opacity: 0.25;
     cursor: grab;
-    font-size: 11px;
+    font-size: 14px;
     line-height: 1;
-    width: 11px;
+    width: 14px;
     flex: none;
     padding: 0;
     touch-action: none;
@@ -511,20 +511,20 @@
   /* Unread-notification count — a distinct cue from the amber raised dot. */
   .count {
     flex: none;
-    min-width: 16px;
-    height: 15px;
-    padding: 0 4px;
-    border-radius: 8px;
+    min-width: 20px;
+    height: 19px;
+    padding: 0 5px;
+    border-radius: 10px;
     background: #2b3a55;
     color: #c9d1d9;
-    font-size: 10px;
+    font-size: 13px;
     font-weight: 700;
-    line-height: 15px;
+    line-height: 19px;
     text-align: center;
   }
   .muted-ind {
     flex: none;
-    font-size: 11px;
+    font-size: 14px;
     line-height: 1;
     opacity: 0.85;
   }
@@ -538,7 +538,7 @@
     color: inherit;
     opacity: 0.5;
     cursor: pointer;
-    font-size: 13px;
+    font-size: 16px;
     line-height: 1;
     padding: 0 3px;
   }
@@ -587,7 +587,7 @@
     background: #11182b;
   }
   .collapse {
-    font-size: 14px;
+    font-size: 18px;
     padding: 2px 8px;
   }
 </style>
