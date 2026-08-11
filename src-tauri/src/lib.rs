@@ -16,6 +16,7 @@ pub mod pty;
 pub mod session;
 pub mod state;
 pub mod stream;
+pub mod substrate;
 pub mod usage;
 
 use std::path::PathBuf;
