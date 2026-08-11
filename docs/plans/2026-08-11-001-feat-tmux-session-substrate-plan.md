@@ -263,6 +263,19 @@ Build order; each lands green behind KTD10's flag until U9.
 - **tpgid (U4):** `/proc/<pane_pid>/stat` field 8 (`tpgid`) is the pane's
   foreground job — full `/proc` parity for cwd/agent-detection/task-count
   with zero tmux round trips; `#{pane_current_path}` not needed.
+- **KTD2/U5 revised at build time (better source found):** mirrors render
+  from the pane's own hidden xterm buffer, not `capture-pane` — every pane
+  keeps ingesting into its mounted, display:none'd xterm (parse-only;
+  renderer paused by IntersectionObserver; WebGL gated on
+  `visible && !mirrored`), and a 2 Hz `<pre>` snapshot
+  (`lib/mirror.ts`) replaces the live render for visible-unfocused panes.
+  Substrate-agnostic (relieves the PTY path immediately), zero new IPC,
+  no staleness, and **the focus-swap splice protocol is deleted** — the
+  buffer is always current, reveal is a display toggle. Consequences:
+  pipe-narrowing-to-focused becomes a deferred optimization; the U5 R2
+  measurement + a visual check ride the next dev-flavor run; knob
+  `mirrorUnfocused` (default on). D8's capture-pane screen-fallback idea
+  is likewise superseded — the tail ring/vte can stay until U9 decides.
 
 ## Rollout & validation
 
