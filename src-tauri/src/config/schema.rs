@@ -279,6 +279,21 @@ pub struct Config {
     /// Local read-only agent/automation feed (feat-agent-state-local-feed).
     /// See [`FeedConfig`].
     pub feed: FeedConfig,
+    /// Session substrate (tmux plan KTD10): `pty` (default) keeps the
+    /// portable-pty path; `tmux` backs every leaf-keyed pane with a marked
+    /// session on the flavor's tmux server. A **rollout-window flag, not a
+    /// mode** — it is removed (with the pty path) once the substrate reaches
+    /// parity; do not build on it.
+    pub substrate: SubstrateKind,
+}
+
+/// KTD10 rollout switch. Lowercase on the wire to match sibling enums.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubstrateKind {
+    #[default]
+    Pty,
+    Tmux,
 }
 
 impl Default for Config {
@@ -304,6 +319,7 @@ impl Default for Config {
             resume_default_args: vec!["--dangerously-skip-permissions".into()],
             automation_defaults: AutomationDefaults::default(),
             feed: FeedConfig::default(),
+            substrate: SubstrateKind::default(),
         }
     }
 }

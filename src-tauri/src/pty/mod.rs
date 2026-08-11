@@ -97,6 +97,9 @@ pub struct PtyManager {
     /// change (a `cd` must not serve the old dir's answer). Independent of
     /// `panes` — never held together with it.
     session_cache: Mutex<HashMap<PaneId, SessionCacheEntry>>,
+    /// The tmux substrate handle when the KTD10 flag selects it (tmux plan
+    /// U3); `None` ⇒ every spawn is PTY-backed. Set once at app setup.
+    substrate: Mutex<Option<std::sync::Arc<crate::substrate::Substrate>>>,
 }
 
 /// One pane's cached session-id resolution (poll-batching KTD4). `resolved`
@@ -126,6 +129,7 @@ impl PtyManager {
             panes: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             session_cache: Mutex::new(HashMap::new()),
+            substrate: Mutex::new(None),
         }
     }
 
@@ -140,6 +144,14 @@ impl PtyManager {
     }
 
     /// Spawn a pane under a previously reserved id.
+    /// Select the tmux substrate for every subsequent spawn (tmux plan
+    /// U3/KTD10). Set once at app setup when the `substrate` config flag says
+    /// tmux; absent (tests, the default config) every spawn is PTY-backed
+    /// exactly as before.
+    pub fn set_substrate(&self, substrate: std::sync::Arc<crate::substrate::Substrate>) {
+        *self.substrate.lock().unwrap() = Some(substrate);
+    }
+
     pub fn spawn_with_id(
         &self,
         id: PaneId,
@@ -148,7 +160,15 @@ impl PtyManager {
         sink: OutputSink,
         on_exit: ExitCallback,
     ) -> Result<PaneId, String> {
-        let pane = Pane::spawn(id, cfg, token, sink, on_exit)?;
+        let substrate = self.substrate.lock().unwrap().clone();
+        let pane = match substrate {
+            Some(sub) if cfg.leaf_key.is_some() => {
+                Pane::spawn_tmux(id, cfg, token, sink, on_exit, sub)?
+            }
+            // Leafless spawns (tests/headless) stay PTY-backed even under the
+            // flag: they have no stable identity to mark a session with.
+            _ => Pane::spawn(id, cfg, token, sink, on_exit)?,
+        };
         self.panes.lock().unwrap().insert(id, pane);
         Ok(id)
     }

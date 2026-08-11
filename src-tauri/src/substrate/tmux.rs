@@ -271,8 +271,12 @@ impl Tmux {
                 Ok(true)
             }
             Ok(out) => match Self::classify(&args, &out) {
-                TmuxError::SessionNotFound(_) => Ok(true), // healthy negative
-                TmuxError::NoServer => Ok(false),          // clean absence
+                // Healthy negatives: "can't find session" (server holds
+                // sessions) or "no current target" (server alive, ZERO
+                // sessions — the Gas City ErrNoCurrentTarget case, hit live
+                // right after `start_server`).
+                TmuxError::SessionNotFound(_) | TmuxError::EmptyServer => Ok(true),
+                TmuxError::NoServer => Ok(false), // clean absence
                 _ => Err(TmuxError::Degraded),
             },
             Err(TmuxError::Io(_)) => Err(TmuxError::Degraded), // hung probe
@@ -287,26 +291,42 @@ impl Tmux {
     /// server and its socket must survive zero sessions) and the global
     /// `history-limit` (KTD9).
     pub fn start_server(&self, env: &BTreeMap<String, String>) -> Result<(), TmuxError> {
-        let out = self.run_full(&["start-server"], None, Some(env), SUBPROCESS_TIMEOUT)?;
+        // One invocation, `;`-chained: a bare `start-server` exits the moment
+        // the command completes (default `exit-empty on`) — the options must
+        // land in the same client connection that started it, and
+        // `exit-empty off` is what then holds the empty server alive.
+        let limit = self.cfg.history_limit.to_string();
+        let args = [
+            "start-server",
+            ";",
+            "set-option",
+            "-g",
+            "exit-empty",
+            "off",
+            ";",
+            "set-option",
+            "-g",
+            "history-limit",
+            &limit,
+        ];
+        let out = self.run_full(&args, None, Some(env), SUBPROCESS_TIMEOUT)?;
         if !out.success {
-            return Err(Self::classify(&["start-server"], &out));
-        }
-        for opt in [
-            vec!["set-option", "-g", "exit-empty", "off"],
-            vec![
-                "set-option",
-                "-g",
-                "history-limit",
-                &self.cfg.history_limit.to_string(),
-            ],
-        ] {
-            let strs: Vec<&str> = opt.clone();
-            let out = self.run(&strs)?;
-            if !out.success {
-                return Err(Self::classify(&strs, &out));
-            }
+            return Err(Self::classify(&args, &out));
         }
         Ok(())
+    }
+
+    /// Kill the flavor server outright (scratch/test teardown; production
+    /// quit detaches instead — KTD7).
+    pub fn kill_server(&self) -> Result<(), TmuxError> {
+        let out = self.run(&["kill-server"])?;
+        if out.success {
+            return Ok(());
+        }
+        match Self::classify(&["kill-server"], &out) {
+            TmuxError::NoServer | TmuxError::EmptyServer => Ok(()),
+            e => Err(e),
+        }
     }
 
     pub fn has_session(&self, name: &str) -> Result<bool, TmuxError> {
@@ -487,6 +507,33 @@ impl Tmux {
     pub fn send_key(&self, name: &str, key: &str) -> Result<(), TmuxError> {
         validate_session_name(name).map_err(TmuxError::InvalidName)?;
         self.simple(&["send-keys", "-t", name, key])
+    }
+
+    /// Binary-safe raw input: `send-keys -H` hex bytes (tmux ≥ 2.4). The
+    /// interactive keystroke transport for tmux-backed panes (U3) —
+    /// arbitrary control sequences pass byte-exact, no `-l` quoting rules.
+    pub fn send_hex(&self, name: &str, bytes: &[u8]) -> Result<(), TmuxError> {
+        validate_session_name(name).map_err(TmuxError::InvalidName)?;
+        let mut args: Vec<String> =
+            vec!["send-keys".into(), "-t".into(), name.into(), "-H".into()];
+        args.extend(bytes.iter().map(|b| format!("{b:02x}")));
+        let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.run(&strs)?;
+        if !out.success {
+            return Err(Self::classify(&strs, &out));
+        }
+        Ok(())
+    }
+
+    /// One-shot format expansion against a session's active pane.
+    pub fn display_message(&self, name: &str, format: &str) -> Result<String, TmuxError> {
+        validate_session_name(name).map_err(TmuxError::InvalidName)?;
+        let args = ["display-message", "-t", name, "-p", format];
+        let out = self.run(&args)?;
+        if !out.success {
+            return Err(Self::classify(&args, &out));
+        }
+        Ok(out.stdout)
     }
 
     /// SIGWINCH wake for detached TUIs (KTD5 insurance): resize down-up.
@@ -701,6 +748,11 @@ mod tests {
     fn probe_classifies_healthy_dead_and_degraded() {
         let healthy = leak(FakeExec::new(vec![FakeExec::fail("can't find session")]));
         assert_eq!(tmux(healthy).probe_server_alive().unwrap(), true);
+
+        // A just-started empty server answers "no current target" — alive
+        // (hit live 2026-08-11; the Gas City ErrNoCurrentTarget case).
+        let empty = leak(FakeExec::new(vec![FakeExec::fail("no current target")]));
+        assert_eq!(tmux(empty).probe_server_alive().unwrap(), true);
 
         let dead = leak(FakeExec::new(vec![FakeExec::fail("error connecting to /run/y")]));
         assert_eq!(tmux(dead).probe_server_alive().unwrap(), false);

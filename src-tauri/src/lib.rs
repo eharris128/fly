@@ -207,6 +207,21 @@ pub fn run() {
     // consumes the Arc, so it captures this instead.
     let cfg = config.get();
     let pty_manager = Arc::new(PtyManager::new());
+    // KTD10 (tmux-substrate U3): when the rollout flag selects tmux, every
+    // leaf-keyed spawn becomes a marked session on the flavor server. The
+    // substrate handle shares the flavor name with the hook-socket dir and
+    // the FIFOs live beside that socket (same runtime-dir lifetime class).
+    if cfg.substrate == config::SubstrateKind::Tmux {
+        let runtime_dir = hook_socket_path()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        pty_manager.set_substrate(Arc::new(substrate::Substrate::new(
+            app_dir_name(),
+            session::data_dir().join("substrate-sessions.json"),
+            runtime_dir,
+        )));
+    }
     let tokens = Arc::new(TokenRegistry::new());
     let attention = Arc::new(AttentionManager::new(
         cfg.attention_debounce_ms,
