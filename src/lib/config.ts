@@ -92,6 +92,8 @@ export interface Config {
   mirrorUnfocused: boolean;
   /** Session substrate (tmux-substrate KTD10 rollout flag): "pty" | "tmux". */
   substrate: string;
+  /** Terminal emulator for the native-attach chord (tmux-substrate U7). */
+  terminal: string;
 }
 
 let cached: Config | null = null;

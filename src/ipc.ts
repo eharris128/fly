@@ -517,6 +517,12 @@ export function spawnPane(
  */
 const paneWrites = makeWriteChain<PaneId>();
 
+/** U7 (tmux-substrate KTD6): open the pane's tmux session in a real
+ * terminal. Backend refuses for PTY-backed panes (substrate off). */
+export function attachPane(paneId: PaneId): Promise<void> {
+  return invoke("attach_pane", { paneId });
+}
+
 export function ptyWrite(paneId: PaneId, data: string): Promise<void> {
   return paneWrites.run(paneId, () => invoke<void>("pty_write", { paneId, data }));
 }

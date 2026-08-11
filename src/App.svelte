@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import Terminal from "./lib/Terminal.svelte";
+  import { listen } from "@tauri-apps/api/event";
   import ControlBar from "./lib/ControlBar.svelte";
   import Sidebar from "./lib/Sidebar.svelte";
   import HotkeyMenu from "./lib/HotkeyMenu.svelte";
@@ -131,8 +132,7 @@
     type RunClosedEvent,
     type MonitorRegisteredEvent,
     type HandoffTarget,
-    type HandoffCandidate,
-  } from "./ipc";
+    type HandoffCandidate, attachPane} from "./ipc";
   import {
     buildHandoffCommand,
     handoffPrompt,
@@ -297,6 +297,10 @@
   // snapshots of their hidden xterm buffers — the engine-floor relief. Seeded
   // from config.mirrorUnfocused; `false` restores live rendering everywhere.
   let mirrorUnfocused = $state(true);
+  // U7: leaves whose tmux session has an external terminal attached
+  // (pane://attach events) — drives the badge and nothing else; the
+  // suppression side lives in the backend AttentionManager.
+  let attachedByLeaf: Record<string, boolean> = $state({});
   let keymap = $state<Keymap | null>(null);
   let menuOpen = $state(false);
   // Agent dashboard home view (U7): a hotkey-toggled main-content surface that
@@ -2083,6 +2087,15 @@
     focusUp: () => focusDir("up"),
     focusDown: () => focusDir("down"),
     focusNextPane: () => focusCycle(1),
+    // U7: native attach for the focused pane (tmux substrate only; the
+    // backend's refusal for PTY panes is logged, not surfaced — the chord
+    // is inert there by design).
+    attachTerminal: () => {
+      const leaf = activeTab?.focusedLeafKey;
+      const pid = leaf ? paneIdByLeaf[leaf] : undefined;
+      if (pid !== undefined)
+        void attachPane(pid).catch((e) => console.warn("attach refused:", e));
+    },
     focusPrevPane: () => focusCycle(-1),
     cycleAttention,
     jumpNewestUnread,
@@ -2420,6 +2433,12 @@
     // Own the notification history listener here (attention arrives prop-drilled
     // from Terminal; this is a direct App listener). Resolve paneId → leafKey at
     // ingestion via the reverse index, so the entry stores the stable key.
+    let unlistenAttach: (() => void) | undefined;
+    void listen<{ paneId: number; attached: boolean }>("pane://attach", (ev) => {
+      const leafKey = leafByPaneId[ev.payload.paneId];
+      if (!leafKey) return;
+      attachedByLeaf = { ...attachedByLeaf, [leafKey]: ev.payload.attached };
+    }).then((u) => (unlistenAttach = u));
     let unlistenNotify: (() => void) | undefined;
     void onNotificationAdded((ev) => {
       const leafKey = leafByPaneId[ev.paneId];
@@ -2487,6 +2506,7 @@
       window.removeEventListener("keydown", onWindowKeydown, true);
       stopPanePoll();
       unlistenNotify?.();
+      unlistenAttach?.();
       unlistenAgentRun?.();
       unlistenAutomationChanged?.();
       unlistenAlertPending?.();
@@ -2583,6 +2603,7 @@
               mirrored={mirrorUnfocused &&
                 p.tabId === activeTab?.id &&
                 activeTab?.focusedLeafKey !== p.key}
+              attachedElsewhere={attachedByLeaf[p.key] ?? false}
               cwd={cwdByLeaf[p.key] ?? null}
               command={resumeCommandByLeaf[p.key] ??
                 automationCommandByLeaf[p.key] ??

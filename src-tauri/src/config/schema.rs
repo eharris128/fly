@@ -279,6 +279,12 @@ pub struct Config {
     /// Local read-only agent/automation feed (feat-agent-state-local-feed).
     /// See [`FeedConfig`].
     pub feed: FeedConfig,
+    /// Terminal emulator command for the U7 native-attach chord
+    /// (tmux-substrate KTD6): launched as `<terminal> …separator… tmux -L
+    /// <flavor> attach-session -t <session>`. The separator adapts per
+    /// terminal family (`--` for gnome-terminal, none for kitty, `-e`
+    /// otherwise — see `substrate::attach_command`).
+    pub terminal: String,
     /// Render visible-but-unfocused panes as 2 Hz DOM snapshots of their
     /// hidden xterm buffers instead of live terminals (tmux-substrate plan
     /// U5/KTD2). Default ON — this is the engine-floor relief for
@@ -325,6 +331,7 @@ impl Default for Config {
             resume_default_args: vec!["--dangerously-skip-permissions".into()],
             automation_defaults: AutomationDefaults::default(),
             feed: FeedConfig::default(),
+            terminal: "x-terminal-emulator".into(),
             mirror_unfocused: true,
             substrate: SubstrateKind::default(),
         }

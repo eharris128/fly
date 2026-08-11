@@ -175,6 +175,24 @@ impl PtyManager {
         }
     }
 
+    /// The tmux backend handle for a pane (clone-out for subprocess use
+    /// outside the registry lock — KTD13). `None` for PTY-backed panes.
+    pub fn tmux_backend_of(
+        &self,
+        id: PaneId,
+    ) -> Option<(std::sync::Arc<crate::substrate::Substrate>, String)> {
+        self.panes.lock().unwrap().get(&id).and_then(|p| p.tmux_backend())
+    }
+
+    /// Resolve a marked session name to its live pane (KTD12 event ingress).
+    pub fn pane_id_by_session(&self, session: &str) -> Option<PaneId> {
+        let panes = self.panes.lock().unwrap();
+        panes
+            .iter()
+            .find(|(_, p)| p.session_name() == Some(session))
+            .map(|(id, _)| *id)
+    }
+
     /// KTD12 pane-died event ingress: force-mark the pane backed by
     /// `session` dead with `status`. Touches only pane-shared state under
     /// the registry lock; the pane's poll-loop reader surfaces the exit.

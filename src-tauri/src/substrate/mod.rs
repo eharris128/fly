@@ -116,6 +116,11 @@ impl Substrate {
         self.fifo_dir.join(format!("pane-{pane_id}.pipe"))
     }
 
+    /// The flavor's socket name (for building attach argv).
+    pub fn socket_name(&self) -> &str {
+        &self.flavor
+    }
+
     /// Probe-or-start the flavor server (KTD3). The server env is fly's own
     /// env **minus the Claude session markers** — the server's global env is
     /// the inherited baseline of every future pane (the overlay trap), so the
@@ -146,5 +151,49 @@ impl Substrate {
         }
         *ready = true;
         Ok(())
+    }
+}
+
+/// Build the argv that opens `terminal` attached to a session (U7/KTD6).
+/// The command-separator convention varies by family: gnome-terminal wants
+/// `--`, kitty takes the command positionally, most others accept `-e`
+/// followed by argv words (xterm/konsole/alacritty/x-terminal-emulator).
+/// Pure so the table is unit-tested; unknown terminals get the `-e` shape.
+pub fn attach_command(terminal: &str, socket_name: &str, session: &str) -> Vec<String> {
+    let base = terminal.rsplit('/').next().unwrap_or(terminal);
+    let mut argv: Vec<String> = vec![terminal.to_string()];
+    if base.starts_with("gnome-terminal") {
+        argv.push("--".into());
+    } else if !base.starts_with("kitty") {
+        argv.push("-e".into());
+    }
+    argv.extend(
+        ["tmux", "-L", socket_name, "attach-session", "-t", session]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+    argv
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use super::attach_command;
+
+    #[test]
+    fn attach_command_adapts_separator_per_family() {
+        let g = attach_command("/usr/bin/gnome-terminal", "fly", "fly-fly-a");
+        assert_eq!(g[1], "--");
+        let k = attach_command("kitty", "fly", "fly-fly-a");
+        assert_eq!(k[1], "tmux");
+        let x = attach_command("x-terminal-emulator", "fly-dev", "fly-fly-dev-b");
+        assert_eq!(x[1], "-e");
+        assert!(x.ends_with(&[
+            "tmux".into(),
+            "-L".into(),
+            "fly-dev".into(),
+            "attach-session".into(),
+            "-t".into(),
+            "fly-fly-dev-b".into()
+        ]));
     }
 }

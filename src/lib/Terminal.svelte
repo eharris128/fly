@@ -60,6 +60,9 @@
      * attaches while mirrored.
      */
     mirrored?: boolean;
+    /** U7: an external terminal is attached to this pane's tmux session —
+     * show the badge (the suppression side is backend-owned). */
+    attachedElsewhere?: boolean;
     keymap?: Keymap | null;
     cwd?: string | null;
     /** Program to run instead of the shell — set only when resuming a Claude
@@ -96,6 +99,7 @@
     focused,
     visible = true,
     mirrored = false,
+    attachedElsewhere = false,
     keymap,
     cwd = null,
     command = null,
@@ -505,6 +509,11 @@
          reveals the live terminal. -->
     <pre class="mirror" style="font-size:{mirrorFontSize}px" aria-hidden="true">{@html mirrorContent}</pre>
   {/if}
+  {#if attachedElsewhere}
+    <div class="attach-badge" title="an external terminal is attached to this session">
+      ⇱ attached in terminal
+    </div>
+  {/if}
   {#if attention === "raised"}
     <div class="badge">{reason ? REASON_LABEL[reason] : "needs you"}</div>
   {/if}
@@ -539,6 +548,19 @@
      takes its place. */
   .terminal.term-mirrored {
     display: none;
+  }
+  .attach-badge {
+    position: absolute;
+    top: 6px;
+    right: 8px;
+    z-index: 3;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font: 11px system-ui, sans-serif;
+    color: #9fb3d9;
+    background: #1a2740cc;
+    border: 1px solid #2b3a55;
+    pointer-events: none;
   }
   .mirror {
     width: 100%;

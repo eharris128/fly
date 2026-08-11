@@ -239,6 +239,37 @@ pub fn spawn_pane(
     }
 }
 
+/// U7 (tmux-substrate KTD6): open the focused pane's tmux session in a real
+/// terminal — the native-typing escape hatch. Refused for PTY-backed panes
+/// (nothing to attach). The terminal command is `config.terminal`; the argv
+/// shape is the tested `substrate::attach_command` table. Spawned detached:
+/// the terminal is the user's process, not fly's.
+#[tauri::command]
+pub fn attach_pane(
+    pty: State<'_, Arc<PtyManager>>,
+    config: State<'_, Arc<crate::config::ConfigStore>>,
+    pane_id: PaneId,
+) -> Result<(), String> {
+    let Some((sub, session)) = pty.tmux_backend_of(pane_id) else {
+        return Err(
+            "this pane is not tmux-backed (substrate is off) — nothing to attach".into(),
+        );
+    };
+    let argv = crate::substrate::attach_command(
+        &config.get().terminal,
+        sub.socket_name(),
+        &session,
+    );
+    std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("launching {}: {e}", argv[0]))?;
+    Ok(())
+}
+
 /// Replicate the set of visible panes — the active tab's leaves in the active
 /// workspace (U17). Generalizes the old per-pane keyboard-focus replication:
 /// any visible pane counts as "looking" for the Acknowledged transition. Also

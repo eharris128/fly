@@ -143,3 +143,39 @@ fn lifecycle_terminal_and_live_predicates() {
     assert!(!LifecycleState::Spawning.is_terminal());
     assert!(!LifecycleState::RestoredInert.is_live());
 }
+
+/// tmux-substrate U7/R9: an externally-attached pane is effectively visible
+/// + foregrounded — a raise acknowledges instantly (no OS notification path)
+/// even while the fly window is backgrounded and the pane is on a hidden
+/// tab; detach restores the true in-window state and raises ring again.
+#[test]
+fn attached_pane_suppresses_like_focused_and_detach_restores() {
+    use fly_lib::pty::PaneId;
+    use fly_lib::state::attention::AttentionState;
+    use fly_lib::state::AttentionManager;
+
+    let mgr = AttentionManager::new(0, false);
+    let pane = PaneId(1);
+    mgr.register(pane);
+    mgr.set_foreground(false); // fly window backgrounded
+    mgr.set_visible_panes(&[]); // pane on a hidden tab
+
+    // Baseline: a raise on a hidden pane raises.
+    let o = mgr.signal(pane, hook(Reason::Question)).unwrap();
+    assert_eq!(o.state, AttentionState::Raised);
+    mgr.on_input(pane); // clear
+
+    // Attached: the user is looking at the session in another terminal.
+    mgr.set_attached(pane, true);
+    let o = mgr.signal(pane, hook(Reason::Question)).unwrap();
+    assert_eq!(
+        o.state,
+        AttentionState::Acknowledged,
+        "attached-elsewhere acknowledges at birth like a viewed pane"
+    );
+
+    // Detach: back to the real (hidden, backgrounded) state — raises again.
+    mgr.set_attached(pane, false);
+    let o = mgr.signal(pane, hook(Reason::Question)).unwrap();
+    assert_eq!(o.state, AttentionState::Raised);
+}

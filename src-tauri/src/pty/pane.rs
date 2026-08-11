@@ -579,6 +579,8 @@ impl Pane {
         // the floor when arming fails or an event is lost.
         let fly_bin = substrate.fly_bin().to_string_lossy().into_owned();
         let _ = substrate.tmux().arm_pane_died_hook(&session, &fly_bin);
+        // U7: attach-state reports feed the R9 focused-elsewhere suppression.
+        let _ = substrate.tmux().arm_attach_hooks(&session, &fly_bin);
 
         let writer: Box<dyn Write + Send> = Box::new(TmuxWriter {
             substrate: Arc::clone(&substrate),

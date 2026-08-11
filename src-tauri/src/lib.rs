@@ -620,6 +620,8 @@ pub fn run() {
                 substrate_handle.as_ref().map(|sub| {
                     let sub = Arc::clone(sub);
                     let pty = Arc::clone(&pty_for_substrate);
+                    let attention = app.state::<Arc<AttentionManager>>().inner().clone();
+                    let attach_app = app.handle().clone();
                     let handler: hooks::SubstrateHandler = Arc::new(move |buf: &[u8]| {
                         let Ok(ev) =
                             serde_json::from_slice::<hooks::protocol::SubstrateEvent>(buf)
@@ -639,6 +641,29 @@ pub fn run() {
                             // a rare event, on the connection thread.
                             if let Ok(Some(status)) = sub.tmux().pane_dead(&ev.session) {
                                 pty.force_dead_by_session(&ev.session, status);
+                            }
+                        } else if ev.kind == "attach-state" {
+                            // U7/R9: attached-elsewhere = focused-elsewhere.
+                            // Hint→confirm like pane-died: the CURRENT attach
+                            // state comes from tmux, not the wire (a stale
+                            // detach event after a quick re-attach must not
+                            // un-suppress).
+                            if let Ok(attached) =
+                                sub.tmux().is_session_attached(&ev.session)
+                            {
+                                if let Some(pane) = pty.pane_id_by_session(&ev.session) {
+                                    if let Some(o) = attention.set_attached(pane, attached)
+                                    {
+                                        stream::emit_attention(&attach_app, pane, &o);
+                                    }
+                                    let _ = attach_app.emit(
+                                        "pane://attach",
+                                        serde_json::json!({
+                                            "paneId": pane.0,
+                                            "attached": attached,
+                                        }),
+                                    );
+                                }
                             }
                         }
                         true
@@ -1201,6 +1226,7 @@ pub fn run() {
             config::set_config,
             stream::spawn_pane,
             stream::set_visible_panes,
+            stream::attach_pane,
             stream::set_window_foreground,
             stream::set_panel_open,
             stream::set_muted,
