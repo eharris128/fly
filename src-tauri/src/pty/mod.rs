@@ -152,6 +152,11 @@ impl PtyManager {
         *self.substrate.lock().unwrap() = Some(substrate);
     }
 
+    /// The configured substrate handle, if the KTD10 flag selected tmux.
+    pub fn substrate_handle(&self) -> Option<std::sync::Arc<crate::substrate::Substrate>> {
+        self.substrate.lock().unwrap().clone()
+    }
+
     /// The pane's output-ring sequence (total bytes ever produced) — the
     /// cheap freshness probe the U6 verified-submit loop polls (also the
     /// perf-audit T9 accessor shape: seq without the 64 KiB ring copy).
@@ -559,7 +564,27 @@ impl PtyManager {
     }
 
     /// Close every pane (used at app shutdown, U14).
+    /// Ordinary quit (U8/KTD7): tmux-backed panes DETACH — their sessions
+    /// (and agents) keep running for the next instance to adopt — while
+    /// PTY-backed panes reap exactly as before. `Drop` after a detach is a
+    /// no-op (the reader is already joined), so nothing double-tears.
     pub fn close_all(&self) {
+        let mut drained: Vec<Pane> = {
+            let mut panes = self.panes.lock().unwrap();
+            panes.drain().map(|(_, p)| p).collect()
+        };
+        for p in &mut drained {
+            if p.session_name().is_some() {
+                p.teardown_detach();
+            } else {
+                p.teardown();
+            }
+        }
+    }
+
+    /// The destructive-confirm variant (U8): kill everything, tmux sessions
+    /// included — the pre-substrate quit semantics, now an explicit choice.
+    pub fn close_all_killing(&self) {
         let mut drained: Vec<Pane> = {
             let mut panes = self.panes.lock().unwrap();
             panes.drain().map(|(_, p)| p).collect()

@@ -166,3 +166,54 @@ mod tests {
         assert!(read_records(&path).is_empty());
     }
 }
+
+/// Load-or-mint the flavor's persisted substrate event token (U8/KTD8
+/// continuity): a tmux server outliving fly holds the token in its
+/// environment, so a NEW fly instance must present the SAME one for
+/// surviving sessions' hooks to keep authenticating. 0600 beside the
+/// session store; same at-rest trust class as `feed.token`.
+pub fn load_or_mint_server_token(path: &Path) -> String {
+    if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(t) = v.get("eventToken").and_then(|t| t.as_str()) {
+                if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return t.to_string();
+                }
+            }
+        }
+    }
+    use rand::RngCore as _;
+    let mut raw = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut raw);
+    let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    let _g = store_guard();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serde_json::json!({ "eventToken": token }).to_string());
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    token
+}
+
+#[cfg(test)]
+mod server_token_tests {
+    use super::*;
+
+    #[test]
+    fn server_token_persists_and_reloads() {
+        let dir = std::env::temp_dir().join(format!(
+            "fly-substrate-token-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("substrate-server.json");
+        let a = load_or_mint_server_token(&path);
+        let b = load_or_mint_server_token(&path);
+        assert_eq!(a, b, "second instance reuses the persisted token");
+        assert_eq!(a.len(), 64);
+        std::fs::write(&path, b"{corrupt").unwrap();
+        let c = load_or_mint_server_token(&path);
+        assert_ne!(c, a, "corrupt file re-mints");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

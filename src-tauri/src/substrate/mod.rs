@@ -62,11 +62,14 @@ impl Substrate {
             socket_name: flavor.clone(),
             history_limit: 10_000,
         });
-        // 256-bit CSPRNG hex, same class as pane tokens (KTD12).
-        let mut raw = [0u8; 32];
-        use rand::RngCore as _;
-        rand::thread_rng().fill_bytes(&mut raw);
-        let event_token = raw.iter().map(|b| format!("{b:02x}")).collect();
+        // KTD12 token, PERSISTED for continuity (U8): a tmux server that
+        // outlives fly holds the token in its env, so a new instance must
+        // present the same one for surviving sessions' hooks — persist-and-
+        // reuse sidesteps the (unverified) question of whether run-shell
+        // children observe post-hoc `set-environment -g` refreshes at all.
+        let event_token = store::load_or_mint_server_token(
+            &store_path.with_file_name("substrate-server.json"),
+        );
         Self {
             tmux,
             flavor,
@@ -119,6 +122,21 @@ impl Substrate {
     /// The flavor's socket name (for building attach argv).
     pub fn socket_name(&self) -> &str {
         &self.flavor
+    }
+
+    /// A surviving, adoptable session for a leaf (U8 reattach): the store
+    /// holds a binding AND tmux confirms the session lives. `None` means
+    /// spawn fresh. Stale records for dead sessions are left in place —
+    /// harmless (the next spawn overwrites) and KTD7-safe (an unreachable
+    /// server must never look like "no session").
+    pub fn adoptable_session(&self, leaf_key: &str) -> Option<store::SessionRecord> {
+        let record = store::read_records(&self.store_path)
+            .get(leaf_key)
+            .cloned()?;
+        match self.tmux.has_session(&record.session_name) {
+            Ok(true) => Some(record),
+            _ => None,
+        }
     }
 
     /// Probe-or-start the flavor server (KTD3). The server env is fly's own

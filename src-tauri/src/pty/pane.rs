@@ -451,7 +451,7 @@ impl Pane {
         id: PaneId,
         cfg: SpawnConfig,
         token: String,
-        sink: OutputSink,
+        mut sink: OutputSink,
         on_exit: ExitCallback,
         substrate: Arc<crate::substrate::Substrate>,
     ) -> Result<Pane, String> {
@@ -461,6 +461,11 @@ impl Pane {
             .ok_or_else(|| "tmux-backed panes require a leaf key".to_string())?;
         substrate.ensure_server().map_err(|e| e.to_string())?;
         let session = substrate.session_name(&leaf_key);
+
+        // U8 reattach: a surviving marked session for this leaf is ADOPTED,
+        // never respawned — the whole point of the substrate. The caller
+        // (stream::spawn_pane) has already re-registered the stored token.
+        let adopt = substrate.adoptable_session(&leaf_key);
 
         // Pane command: argv, or the user's shell — same resolution as the
         // PTY arm.
@@ -490,21 +495,31 @@ impl Pane {
 
         let rows = cfg.rows.max(1);
         let cols = cfg.cols.max(1);
-        substrate
-            .tmux()
-            .new_session(
-                &session,
-                cfg.cwd.as_deref().unwrap_or(""),
-                &env,
-                &command,
-                cols,
-                rows,
-            )
-            .map_err(|e| e.to_string())?;
-        // KTD4: a dead pane keeps its final screen; death is observed via
-        // `#{pane_dead}` (read-loop EOF check + the panes_status backstop),
-        // not via session teardown.
-        let _ = substrate.tmux().set_remain_on_exit(&session, true);
+        if adopt.is_none() {
+            substrate
+                .tmux()
+                .new_session(
+                    &session,
+                    cfg.cwd.as_deref().unwrap_or(""),
+                    &env,
+                    &command,
+                    cols,
+                    rows,
+                )
+                .map_err(|e| e.to_string())?;
+            // KTD4: a dead pane keeps its final screen; death is observed via
+            // `#{pane_dead}` (read-loop EOF check + the panes_status
+            // backstop), not via session teardown.
+            let _ = substrate.tmux().set_remain_on_exit(&session, true);
+        } else {
+            // Adoption housekeeping: end the ORPHANED pipe (its `cat` — a
+            // tmux-server child — survived the previous fly), re-drive the
+            // detached geometry to this pane's grid, and let the hooks be
+            // re-armed below with the CURRENT fly binary path.
+            let _ = substrate.tmux().pipe_pane_close(&session);
+            let _ = substrate.tmux().set_window_size_manual(&session);
+            let _ = substrate.tmux().resize_window(&session, cols, rows);
+        }
 
         // tmux's pane process pid — the signal target and cwd anchor.
         let pid = substrate
@@ -533,6 +548,12 @@ impl Pane {
             dims: Mutex::new((rows, cols)),
         });
 
+        // Adoption keeps the STORED token (the agent's long-lived env holds
+        // it — U8/KTD8); a fresh session uses the newly-minted one.
+        let token = match &adopt {
+            Some(record) => record.token.clone(),
+            None => token,
+        };
         // Persist the leaf ⇄ session ⇄ token binding BEFORE the read thread
         // starts (U2/KTD8): a crash after this point leaves a reattachable
         // record; a crash before it leaves an unmarked-but-marked-name
@@ -546,6 +567,21 @@ impl Pane {
                 created_at_ms: crate::notify::now_unix_ms(),
             },
         );
+
+        // U8 adopt: replay the surviving session's recent screen+history into
+        // the fresh xterm before live bytes flow (bounded — reveal speed over
+        // completeness; the full history stays in tmux for `leader t`). The
+        // capture-then-arm gap can lose a few ms of output; the alternative
+        // (arm-then-capture) duplicates instead. Loss is invisible on an
+        // idle reattach, duplication never is — capture first.
+        if adopt.is_some() {
+            if let Ok(history) = substrate.tmux().capture_pane(&session, true, 2000) {
+                let trimmed = history.trim_start_matches('\n');
+                if !trimmed.is_empty() {
+                    sink(trimmed.replace('\n', "\r\n").as_bytes());
+                }
+            }
+        }
 
         let thread_shared = Arc::clone(&shared);
         let thread_substrate = Arc::clone(&substrate);
@@ -747,6 +783,33 @@ impl Pane {
             cols,
             last_write_at_ms,
         }
+    }
+
+    /// Quit-path teardown for a tmux-backed pane (U8/KTD7): DETACH — stop
+    /// the reader, end the pipe, unlink the FIFO, and leave the session
+    /// running and the store record in place for the next instance to adopt.
+    /// No-op for PTY panes (they reap via [`Self::teardown`]).
+    pub fn teardown_detach(&mut self) {
+        let Backend::Tmux {
+            substrate,
+            session,
+            fifo,
+        } = &self.backend
+        else {
+            return;
+        };
+        if self.reader_handle.is_none() {
+            return; // already torn down
+        }
+        log::debug!("detaching pane {} (session survives)", self.id.0);
+        self.shared.stopping.store(true, Ordering::Release);
+        self.shared.pause_cv.notify_all();
+        let _ = substrate.tmux().pipe_pane_close(session);
+        let _ = std::fs::remove_file(fifo);
+        if let Some(handle) = self.reader_handle.take() {
+            let _ = handle.join();
+        }
+        // Store record deliberately KEPT (adoption key); session KEPT.
     }
 
     /// Tear down the pane: stop the child and reap it before returning, so no

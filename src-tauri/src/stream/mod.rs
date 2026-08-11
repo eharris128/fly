@@ -122,7 +122,21 @@ pub fn spawn_pane(
 ) -> Result<PaneId, String> {
     let id = pty.reserve_id();
     // Register the token before the child starts so no callback can race it.
-    let token = tokens.issue(id);
+    // U8 reattach: a leaf whose marked tmux session survives is ADOPTED — the
+    // agent's long-lived env holds the PREVIOUS instance's pane token, so
+    // that stored token is re-registered for this pane instead of minting
+    // one nothing would ever present (KTD8). The spawn path below detects
+    // the same adoptable session and skips new-session.
+    let token = match pty
+        .substrate_handle()
+        .and_then(|sub| sub.adoptable_session(&leaf_key))
+    {
+        Some(record) => match tokens.register_existing(id, &record.token) {
+            Ok(()) => record.token,
+            Err(_) => tokens.issue(id), // malformed stored token → fresh spawn path
+        },
+        None => tokens.issue(id),
+    };
     attention.register(id);
 
     // U7 (R10): link this pane to its automation run atomically BEFORE the

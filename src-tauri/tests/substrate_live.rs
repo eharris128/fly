@@ -308,3 +308,165 @@ fn pane_died_hook_reports_exit_over_the_socket() {
         "hook chain delivers Exited{{3}}, got {dbg}"
     );
 }
+
+#[test]
+#[ignore = "needs tmux + the fly binary; run with -- --ignored"]
+fn restart_roundtrip_detach_adopt_preserves_session_and_hooks() {
+    // U8 end-to-end: instance A spawns; quit DETACHES (session + child
+    // survive, store kept); instance B adopts the same leaf — same child
+    // pid, stored token preserved, scrollback replayed, live output
+    // resumes — and the re-armed pane-died hook still reports to B's
+    // socket when the child finally dies.
+    let scratch = Scratch::new("u8rt");
+    let leaf = "rt-leaf";
+
+    // ---- instance A ----
+    let sub_a = scratch.substrate();
+    let mgr_a = Arc::new(PtyManager::new());
+    mgr_a.set_substrate(Arc::clone(&sub_a));
+    let id_a = mgr_a.reserve_id();
+    let (out_a, _rx_keep) = mpsc::channel::<Vec<u8>>();
+    mgr_a
+        .spawn_with_id(
+            id_a,
+            SpawnConfig {
+                command: Some(vec![
+                    "bash".into(),
+                    "-c".into(),
+                    "echo GENERATION-A-MARKER; exec sleep 300".into(),
+                ]),
+                leaf_key: Some(leaf.into()),
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+            "aa".repeat(32),
+            Box::new(move |b: &[u8]| {
+                let _ = out_a.send(b.to_vec());
+            }),
+            Box::new(|_, _| {}),
+        )
+        .expect("A spawn");
+    let session = sub_a.session_name(leaf);
+    let stored_a = fly_lib::substrate::store::read_records(sub_a.store_path())[leaf]
+        .token
+        .clone();
+    let pid_a: u32 = sub_a
+        .tmux()
+        .display_message(&session, "#{pane_pid}")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    // Quit A: detach, not kill.
+    mgr_a.close_all();
+    drop(mgr_a);
+    assert!(
+        sub_a.tmux().has_session(&session).unwrap(),
+        "detach leaves the session running"
+    );
+
+    // ---- instance B (fresh Substrate: reloads the persisted server token) ----
+    let sub_b = scratch.substrate();
+    let mgr_b = Arc::new(PtyManager::new());
+    mgr_b.set_substrate(Arc::clone(&sub_b));
+
+    // B's hook server, wired like lib.rs — the surviving session's armed
+    // hooks must authenticate against B via the PERSISTED event token.
+    let tokens_b = Arc::new(fly_lib::hooks::TokenRegistry::new());
+    let dispatch: fly_lib::hooks::Dispatch = Arc::new(|_p, _h| {});
+    let sub_h = Arc::clone(&sub_b);
+    let mgr_h = Arc::clone(&mgr_b);
+    let handler: fly_lib::hooks::SubstrateHandler = Arc::new(move |buf: &[u8]| {
+        let Ok(ev) =
+            serde_json::from_slice::<fly_lib::hooks::protocol::SubstrateEvent>(buf)
+        else {
+            return false;
+        };
+        if !sub_h.validate_event_token(&ev.token) {
+            return false;
+        }
+        if ev.kind == "pane-died" {
+            if let Ok(Some(status)) = sub_h.tmux().pane_dead(&ev.session) {
+                mgr_h.force_dead_by_session(&ev.session, status);
+            }
+        }
+        true
+    });
+    let _server_b = fly_lib::hooks::HookServer::start_all(
+        scratch.dir.join("hook.sock"),
+        Arc::clone(&tokens_b),
+        dispatch,
+        None,
+        None,
+        None,
+        Some(handler),
+    )
+    .expect("B hook server");
+
+    // Adopt: same leaf, mirroring stream::spawn_pane's token logic.
+    let id_b = mgr_b.reserve_id();
+    let record = sub_b
+        .adoptable_session(leaf)
+        .expect("survivor is adoptable");
+    assert_eq!(record.token, stored_a, "store kept the token across quit");
+    tokens_b.register_existing(id_b, &record.token).unwrap();
+    let (out_b_tx, out_b) = mpsc::channel::<Vec<u8>>();
+    let (exit_tx, exit_rx) = mpsc::channel();
+    mgr_b
+        .spawn_with_id(
+            id_b,
+            SpawnConfig {
+                command: Some(vec!["ignored-on-adopt".into()]),
+                leaf_key: Some(leaf.into()),
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+            record.token.clone(),
+            Box::new(move |b: &[u8]| {
+                let _ = out_b_tx.send(b.to_vec());
+            }),
+            Box::new(move |p: PaneId, st| {
+                let _ = exit_tx.send((p, st));
+            }),
+        )
+        .expect("B adopt");
+
+    // Same child, zero respawns (R4).
+    let pid_b: u32 = sub_b
+        .tmux()
+        .display_message(&session, "#{pane_pid}")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(pid_a, pid_b, "adoption re-uses the surviving child");
+
+    // Scrollback replay carried generation A's output into B's sink.
+    let mut seen = String::new();
+    assert!(
+        wait_for(
+            || {
+                while let Ok(chunk) = out_b.try_recv() {
+                    seen.push_str(&String::from_utf8_lossy(&chunk));
+                }
+                seen.contains("GENERATION-A-MARKER")
+            },
+            Duration::from_secs(5)
+        ),
+        "history replay delivers A's output to B; saw {seen:?}"
+    );
+
+    // The cross-instance hook chain: kill the child; B must surface the
+    // exit via its own socket + re-armed hook (no panes_status driving).
+    // SAFETY: plain kill(2) of the long-lived sleep child.
+    unsafe {
+        libc::kill(pid_b as i32, libc::SIGKILL);
+    }
+    let (_, state) = exit_rx
+        .recv_timeout(Duration::from_secs(8))
+        .expect("hook-driven exit reaches instance B");
+    assert!(format!("{state:?}").contains("Exited"), "got {state:?}");
+}
