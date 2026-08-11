@@ -85,6 +85,13 @@ export interface Config {
   automationDefaults: AutomationDefaults;
   /** Local read-only agent/automation feed (feat-agent-state-local-feed). */
   feed: FeedConfig;
+  /** Render visible-but-unfocused panes as 2 Hz DOM snapshots of their hidden
+   * xterm buffers instead of live terminals (tmux-substrate U5/KTD2) — the
+   * engine-floor relief for multi-pane streaming. Off = every visible pane
+   * renders live, the pre-U5 behavior. */
+  mirrorUnfocused: boolean;
+  /** Session substrate (tmux-substrate KTD10 rollout flag): "pty" | "tmux". */
+  substrate: string;
 }
 
 let cached: Config | null = null;

@@ -279,6 +279,12 @@ pub struct Config {
     /// Local read-only agent/automation feed (feat-agent-state-local-feed).
     /// See [`FeedConfig`].
     pub feed: FeedConfig,
+    /// Render visible-but-unfocused panes as 2 Hz DOM snapshots of their
+    /// hidden xterm buffers instead of live terminals (tmux-substrate plan
+    /// U5/KTD2). Default ON — this is the engine-floor relief for
+    /// multi-pane streaming (63% → ~4–14% webview main-thread under the
+    /// 5-pane protocol); `false` restores live rendering everywhere.
+    pub mirror_unfocused: bool,
     /// Session substrate (tmux plan KTD10): `pty` (default) keeps the
     /// portable-pty path; `tmux` backs every leaf-keyed pane with a marked
     /// session on the flavor's tmux server. A **rollout-window flag, not a
@@ -319,6 +325,7 @@ impl Default for Config {
             resume_default_args: vec!["--dangerously-skip-permissions".into()],
             automation_defaults: AutomationDefaults::default(),
             feed: FeedConfig::default(),
+            mirror_unfocused: true,
             substrate: SubstrateKind::default(),
         }
     }

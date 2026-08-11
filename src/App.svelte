@@ -293,6 +293,10 @@
   // drives the tier transparency so a degraded resume is never passed off as exact.
   let resumeTierByLeaf = $state<Record<string, ResumeTier>>({});
   let saveScrollbackEnabled = $state(false);
+  // U5 (tmux-substrate plan): visible-but-unfocused panes render as 2 Hz DOM
+  // snapshots of their hidden xterm buffers — the engine-floor relief. Seeded
+  // from config.mirrorUnfocused; `false` restores live rendering everywhere.
+  let mirrorUnfocused = $state(true);
   let keymap = $state<Keymap | null>(null);
   let menuOpen = $state(false);
   // Agent dashboard home view (U7): a hotkey-toggled main-content surface that
@@ -2268,6 +2272,7 @@
   async function restore() {
     const cfg = await getConfig();
     saveScrollbackEnabled = cfg.saveScrollback;
+    mirrorUnfocused = cfg.mirrorUnfocused ?? true;
     leaderKey = cfg.leaderKey;
     nudgeIdleMs = cfg.nudgeIdleMs;
     feedEnabled = cfg.feed.enabled;
@@ -2575,6 +2580,9 @@
               focused={p.tabId === activeTab?.id &&
                 activeTab?.focusedLeafKey === p.key}
               visible={p.tabId === activeTab?.id}
+              mirrored={mirrorUnfocused &&
+                p.tabId === activeTab?.id &&
+                activeTab?.focusedLeafKey !== p.key}
               cwd={cwdByLeaf[p.key] ?? null}
               command={resumeCommandByLeaf[p.key] ??
                 automationCommandByLeaf[p.key] ??

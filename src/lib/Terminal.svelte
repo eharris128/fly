@@ -9,6 +9,7 @@
   import { getConfig } from "./config";
   import type { Renderer as RendererMode } from "./config";
   import { wantsWebgl } from "./renderer";
+  import { renderMirrorHtml, type MirrorBuffer } from "./mirror";
   import type { Keymap } from "./keymap";
   import { resolveSpawnRace } from "./pane-maps";
   import type { ResumeTier } from "./resume";
@@ -50,6 +51,15 @@
      * alive under the dashboard avoids a dispose/recreate churn on every
      * `leader d` toggle. */
     visible?: boolean;
+    /**
+     * Mirror mode (tmux-substrate plan U5/KTD2): the pane is visible in the
+     * tab but unfocused, and App shows a cheap DOM snapshot instead of this
+     * live terminal. The xterm stays mounted and keeps parsing bytes (the
+     * buffer is the mirror's source); its container is display:none'd so
+     * xterm's IntersectionObserver pauses rendering, and WebGL never
+     * attaches while mirrored.
+     */
+    mirrored?: boolean;
     keymap?: Keymap | null;
     cwd?: string | null;
     /** Program to run instead of the shell — set only when resuming a Claude
@@ -85,6 +95,7 @@
     leafKey,
     focused,
     visible = true,
+    mirrored = false,
     keymap,
     cwd = null,
     command = null,
@@ -137,7 +148,9 @@
 
   function syncRenderer() {
     if (!term) return;
-    if (wantsWebgl(rendererMode, visible, webglFailed)) attachWebgl();
+    // Render-visibility: a mirrored pane is user-visible but its live
+    // terminal is hidden DOM — no GL context for it (U5).
+    if (wantsWebgl(rendererMode, visible && !mirrored, webglFailed)) attachWebgl();
     else detachWebgl();
   }
 
@@ -173,7 +186,28 @@
   // `term` exists; onMount calls it once directly after the terminal opens.
   $effect(() => {
     void visible;
+    void mirrored;
     syncRenderer();
+  });
+
+  // U5 mirror snapshots: while mirrored, refresh a styled-DOM snapshot of
+  // the (hidden, still-parsing) terminal's viewport at 2 Hz. The interval
+  // exists only while mirrored — an unmirrored or hidden pane costs nothing.
+  let mirrorContent = $state("");
+  let mirrorFontSize = $state(15);
+  $effect(() => {
+    if (!mirrored) return;
+    const refresh = () => {
+      if (!term) return;
+      mirrorContent = renderMirrorHtml(
+        term.buffer.active as unknown as MirrorBuffer,
+        term.rows,
+        term.cols,
+      );
+    };
+    refresh();
+    const timer = setInterval(refresh, 500);
+    return () => clearInterval(timer);
   });
 
   const REASON_LABEL: Record<AttentionReason, string> = {
@@ -306,6 +340,7 @@
     // Renderer (KTD6/T4): after fit so the container is measured — a hidden
     // pane defers its attach to the ResizeObserver/visibility effect above.
     rendererMode = config.renderer;
+    mirrorFontSize = config.fontSize;
     syncRenderer();
     const cols = term.cols >= 2 ? term.cols : 80;
     const rows = term.rows >= 2 ? term.rows : 24;
@@ -463,7 +498,13 @@
   role="presentation"
   onpointerdown={() => onFocusRequest(leafKey)}
 >
-  <div class="terminal" bind:this={container}></div>
+  <div class="terminal" class:term-mirrored={mirrored} bind:this={container}></div>
+  {#if mirrored}
+    <!-- U5: cheap snapshot of the hidden terminal's viewport. Clicking it
+         focuses the pane (the wrapper's pointerdown), which unmirrors and
+         reveals the live terminal. -->
+    <pre class="mirror" style="font-size:{mirrorFontSize}px" aria-hidden="true">{@html mirrorContent}</pre>
+  {/if}
   {#if attention === "raised"}
     <div class="badge">{reason ? REASON_LABEL[reason] : "needs you"}</div>
   {/if}
@@ -492,6 +533,25 @@
     width: 100%;
     height: 100%;
     padding: 4px;
+  }
+  /* U5: while mirrored, the live terminal is hidden DOM (xterm keeps
+     parsing; IntersectionObserver pauses its renderer) and the snapshot
+     takes its place. */
+  .terminal.term-mirrored {
+    display: none;
+  }
+  .mirror {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 4px;
+    overflow: hidden;
+    font-family: monospace;
+    line-height: 1.2;
+    color: #c9d1d9;
+    background: #0b1020;
+    cursor: default;
+    user-select: none;
   }
   /* A subtle focus outline so the active pane is obvious. */
   .pane.focused::before {
