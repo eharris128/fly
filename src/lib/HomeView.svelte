@@ -608,11 +608,12 @@
     font-size: 16px;
     margin-top: 4px;
   }
+  /* Both regions fill the left column (the usage panel bounds it), so rows —
+     and the divider between them — use the whole available width. */
   .groups {
     display: flex;
     flex-direction: column;
     gap: 18px;
-    max-width: 720px;
   }
   .ws-name {
     display: flex;
@@ -765,7 +766,6 @@
   /* Automations panel — stacked below the agent list in the same left column,
      with a divider so the two regions read as distinct. */
   .automations {
-    max-width: 720px;
     margin-top: 28px;
     padding-top: 18px;
     border-top: 1px solid #262d44;
@@ -822,7 +822,10 @@
   }
   .auto-row {
     display: grid;
-    grid-template-columns: 72px 1fr auto;
+    /* The status column holds its own width (the longest word, SUCCEEDED, plus
+       a running row's `· 2m` suffix) instead of overflowing a fixed track into
+       the gap and colliding with the name. */
+    grid-template-columns: minmax(96px, max-content) 1fr auto;
     align-items: baseline;
     gap: 12px;
     background: #1d2336;
@@ -839,6 +842,7 @@
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.04em;
+    white-space: nowrap;
   }
   .a-status.s-succeeded {
     color: #4ade80;
