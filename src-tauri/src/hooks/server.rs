@@ -194,8 +194,28 @@ impl HookServer {
         if let Some(parent) = socket_path.parent() {
             create_private_socket_dir(parent)?;
         }
-        // Reclaim a stale socket left by a prior crash.
-        let _ = std::fs::remove_file(&socket_path);
+        // Reclaim a stale socket left by a prior crash — but only a STALE
+        // one. The path is stable across instances (tmux-substrate U2/KTD8),
+        // so an unconditional unlink could clobber a live sibling's socket
+        // and strand every agent pointed at it. Try-connect first: a socket
+        // that answers is owned; refuse to bind instead of stealing it.
+        if socket_path.exists() {
+            match std::os::unix::net::UnixStream::connect(&socket_path) {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        format!(
+                            "hook socket {} is owned by a live instance",
+                            socket_path.display()
+                        ),
+                    ));
+                }
+                Err(_) => {
+                    // Nothing accepting ⇒ crash residue; safe to reclaim.
+                    let _ = std::fs::remove_file(&socket_path);
+                }
+            }
+        }
 
         let listener = UnixListener::bind(&socket_path)?;
         // Owner-only; the peer-UID check is the real gate, but tighten anyway.

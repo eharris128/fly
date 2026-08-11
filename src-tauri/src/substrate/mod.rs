@@ -13,6 +13,7 @@
 //! silently misroute rather than erroring.
 
 pub mod naming;
+pub mod store;
 pub mod tmux;
 
 pub use naming::{leaf_session_name, session_leaf_slug, validate_session_name};

@@ -74,14 +74,19 @@ pub fn app_dir_name() -> String {
     }
 }
 
-/// Where the hook socket lives — under the XDG runtime dir, keyed by pid so
-/// instances don't collide (single-instance enforcement arrives in U14).
+/// Where the hook socket lives — under the XDG runtime dir at a **stable,
+/// per-flavor path** (tmux-substrate plan U2/KTD8). Stability is load-bearing:
+/// substrate sessions outlive the fly process, and their agents' hooks hold
+/// `FLY_SOCKET_PATH` in long-lived process env — a PID-keyed path (the
+/// pre-substrate scheme) would strand every surviving agent on restart.
+/// Same-flavor duplicate instances are prevented by the single-instance
+/// plugin; the bind path additionally refuses to unlink a socket that still
+/// answers (see `HookServer` — the ga-h9z lesson applied to our own socket).
 fn hook_socket_path() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    base.join(app_dir_name())
-        .join(format!("hook-{}.sock", std::process::id()))
+    base.join(app_dir_name()).join("hook.sock")
 }
 
 /// Surface webview errors to the app's stderr. The webview console is

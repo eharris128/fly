@@ -92,7 +92,12 @@ an iterating dev build next to an installed stable app, use **`pnpm flavor:dev`*
 - The dev window's title becomes `fly (dev)` (set at runtime in `lib.rs` setup
   when the flavor isn't `fly`) so it's distinguishable from the stable window.
 
-The per-pane hook socket is also PID-keyed, so it never collides regardless.
+The hook socket lives at a stable per-flavor path (`hook.sock` under the
+runtime dir — tmux-substrate U2/KTD8: substrate sessions outlive the process,
+so surviving agents' env must keep pointing at a live socket across restarts);
+flavors get distinct dirs, same-flavor duplicates are stopped by the
+single-instance plugin, and the bind refuses to steal a socket that still
+answers.
 
 ## Architecture
 
