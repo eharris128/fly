@@ -470,3 +470,53 @@ fn restart_roundtrip_detach_adopt_preserves_session_and_hooks() {
         .expect("hook-driven exit reaches instance B");
     assert!(format!("{state:?}").contains("Exited"), "got {state:?}");
 }
+
+#[test]
+#[ignore = "needs tmux; run with -- --ignored"]
+fn ephemeral_pane_is_killed_at_quit_not_detached() {
+    // U10: an automation/sink pane must not survive quit — kill + prune,
+    // while a durable sibling detaches and survives.
+    let scratch = Scratch::new("u10eph");
+    let substrate = scratch.substrate();
+    let mgr = PtyManager::new();
+    mgr.set_substrate(Arc::clone(&substrate));
+
+    for (leaf, ephemeral) in [("durable", false), ("ephem", true)] {
+        let id = mgr.reserve_id();
+        mgr.spawn_with_id(
+            id,
+            SpawnConfig {
+                command: Some(vec!["sleep".into(), "60".into()]),
+                leaf_key: Some(leaf.into()),
+                ephemeral,
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+            "bb".repeat(32),
+            Box::new(|_b: &[u8]| {}),
+            Box::new(|_, _| {}),
+        )
+        .expect("spawn");
+    }
+
+    mgr.close_all(); // ordinary quit
+
+    assert!(
+        substrate
+            .tmux()
+            .has_session(&substrate.session_name("durable"))
+            .unwrap(),
+        "durable pane detaches and survives"
+    );
+    assert!(
+        !substrate
+            .tmux()
+            .has_session(&substrate.session_name("ephem"))
+            .unwrap(),
+        "ephemeral pane is killed"
+    );
+    let records = fly_lib::substrate::store::read_records(substrate.store_path());
+    assert!(records.contains_key("durable"), "durable record kept for adoption");
+    assert!(!records.contains_key("ephem"), "ephemeral record pruned");
+}

@@ -34,6 +34,10 @@ export interface SpawnOpts {
    * already closed — rejects the spawn. Null/undefined for an ordinary pane.
    */
   automationRunId?: string | null;
+  /** tmux-substrate U10: an ephemeral pane (automation run tab, alerts sink)
+   * must NOT survive quit — its tmux session is killed at close_all, never
+   * detached, so ephemeral tabs can't accumulate orphaned marked sessions. */
+  ephemeral?: boolean;
 }
 
 /** Lifecycle state as serialized by the Rust `LifecycleState` enum. */
@@ -505,6 +509,7 @@ export function spawnPane(
     leafKey: opts.leafKey,
     command: opts.command ?? null,
     automationRunId: opts.automationRunId ?? null,
+    ephemeral: opts.ephemeral ?? false,
   });
 }
 

@@ -65,6 +65,10 @@ pub struct SpawnConfig {
     /// per-pane identity resume records are keyed by. `None` in tests/headless
     /// spawns that don't carry one.
     pub leaf_key: Option<String>,
+    /// tmux-substrate U10: ephemeral panes (automation tabs, alerts sink)
+    /// are killed at quit, never detached — an unrestorable leaf must not
+    /// leave an orphaned marked session or a growing store.
+    pub ephemeral: bool,
     pub rows: u16,
     pub cols: u16,
 }
@@ -78,6 +82,7 @@ impl Default for SpawnConfig {
             cwd: None,
             env: Vec::new(),
             leaf_key: None,
+            ephemeral: false,
             rows: 24,
             cols: 80,
         }
@@ -574,7 +579,7 @@ impl PtyManager {
             panes.drain().map(|(_, p)| p).collect()
         };
         for p in &mut drained {
-            if p.session_name().is_some() {
+            if p.session_name().is_some() && !p.is_ephemeral() {
                 p.teardown_detach();
             } else {
                 p.teardown();

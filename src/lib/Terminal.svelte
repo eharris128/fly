@@ -63,6 +63,9 @@
     /** U7: an external terminal is attached to this pane's tmux session —
      * show the badge (the suppression side is backend-owned). */
     attachedElsewhere?: boolean;
+    /** U10: ephemeral panes (alerts sink; automation tabs are implied by
+     * automationRunId) never survive quit under the tmux substrate. */
+    ephemeral?: boolean;
     keymap?: Keymap | null;
     cwd?: string | null;
     /** Program to run instead of the shell — set only when resuming a Claude
@@ -100,6 +103,7 @@
     visible = true,
     mirrored = false,
     attachedElsewhere = false,
+    ephemeral = false,
     keymap,
     cwd = null,
     command = null,
@@ -389,6 +393,9 @@
         leafKey,
         command,
         automationRunId,
+        // U10: automation-linked panes are ephemeral by definition; the
+        // sink/other ephemeral tabs pass the prop explicitly.
+        ephemeral: ephemeral || automationRunId !== null,
       });
     } catch (e) {
       // A spawn can be rejected — notably an automation late-link (U8/R10): the

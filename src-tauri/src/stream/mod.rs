@@ -119,6 +119,7 @@ pub fn spawn_pane(
     leaf_key: String,
     command: Option<Vec<String>>,
     automation_run_id: Option<String>,
+    ephemeral: Option<bool>,
 ) -> Result<PaneId, String> {
     let id = pty.reserve_id();
     // Register the token before the child starts so no callback can race it.
@@ -232,6 +233,9 @@ pub fn spawn_pane(
         rows,
         cols,
         leaf_key: Some(leaf_key),
+        // U10: automation-linked panes are ephemeral by definition; the
+        // frontend passes the flag for the other ephemeral tabs (sink).
+        ephemeral: ephemeral.unwrap_or(false) || automation_run_id.is_some(),
         env: vec![
             ("FLY_PANE_TOKEN".into(), token.clone()),
             ("FLY_SOCKET_PATH".into(), socket_path),

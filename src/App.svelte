@@ -2604,6 +2604,7 @@
                 p.tabId === activeTab?.id &&
                 activeTab?.focusedLeafKey !== p.key}
               attachedElsewhere={attachedByLeaf[p.key] ?? false}
+              ephemeral={sinkCommandByLeaf[p.key] !== undefined}
               cwd={cwdByLeaf[p.key] ?? null}
               command={resumeCommandByLeaf[p.key] ??
                 automationCommandByLeaf[p.key] ??

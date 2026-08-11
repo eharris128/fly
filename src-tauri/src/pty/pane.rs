@@ -310,6 +310,8 @@ pub struct Pane {
     /// The frontend's stable leaf key (U3), so the hook dispatch can key this
     /// pane's resume record. `None` for headless/test spawns.
     leaf_key: Option<String>,
+    /// U10: killed at quit, never detached (automation tabs, alerts sink).
+    ephemeral: bool,
 }
 
 impl Pane {
@@ -325,6 +327,7 @@ impl Pane {
         on_exit: ExitCallback,
     ) -> Result<Pane, String> {
         let leaf_key = cfg.leaf_key.clone();
+        let cfg_ephemeral = cfg.ephemeral;
         let pty_system = native_pty_system();
         let size = PtySize {
             rows: cfg.rows.max(1),
@@ -436,6 +439,7 @@ impl Pane {
             reader_handle: Some(handle),
             token,
             leaf_key,
+            ephemeral: cfg_ephemeral,
         })
     }
 
@@ -459,6 +463,7 @@ impl Pane {
             .leaf_key
             .clone()
             .ok_or_else(|| "tmux-backed panes require a leaf key".to_string())?;
+        let cfg_ephemeral = cfg.ephemeral;
         substrate.ensure_server().map_err(|e| e.to_string())?;
         let session = substrate.session_name(&leaf_key);
 
@@ -637,6 +642,7 @@ impl Pane {
             reader_handle: Some(handle),
             token,
             leaf_key: Some(leaf_key),
+            ephemeral: cfg_ephemeral,
         })
     }
 
@@ -693,6 +699,11 @@ impl Pane {
     /// The pane's stable frontend leaf key (U3), if it carried one.
     pub fn leaf_key(&self) -> Option<&str> {
         self.leaf_key.as_deref()
+    }
+
+    /// U10: whether this pane is ephemeral (killed at quit, never detached).
+    pub fn is_ephemeral(&self) -> bool {
+        self.ephemeral
     }
 
     /// The tmux session backing this pane, when tmux-backed (U4).
