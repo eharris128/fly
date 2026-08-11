@@ -2,7 +2,13 @@
 title: "feat: tmux as the session substrate (native-typing escape hatch)"
 type: feat
 date: 2026-08-11
-status: draft
+status: implemented behind the KTD10 flag (U1–U8, U10 overnight 2026-08-11→12;
+  every unit live-validated on scratch servers incl. the R4 restart roundtrip —
+  same child pid, token continuity, history replay, cross-instance hooks.
+  Deferred, gated on the user's dev-flavor live validation: U9 retirements
+  (pty path stays), the substrate default flip, the frontend kill-all quit
+  variant, settings-menu toggles for mirrorUnfocused/terminal, the in-app R2
+  measurement. See LIVE-CHECKLIST beside this plan.)
 origin: docs/brainstorms/2026-08-11-tmux-session-substrate-requirements.md
 evidence:
   - docs/notes/2026-08-11-webkitgtk-engine-floor.md   # why (engine floor proven)
@@ -286,6 +292,20 @@ Build order; each lands green behind KTD10's flag until U9.
   ≤3). Revisit surfacing only if the routes ever gain idempotency keys.
   The per-session delivery locks also stay app-wide for now (narrowing
   is an optimization, not correctness).
+
+- **KTD12 token persisted for continuity (U8):** `substrate-server.json`
+  (0600, `feed.token` trust class) holds the event token; a new instance
+  reloads it, so surviving sessions' armed hooks authenticate with zero
+  re-negotiation — sidestepping the unverified question of whether
+  `run-shell` children observe post-hoc `set-environment -g`. Proven by the
+  cross-instance live test.
+- **Adoption replay tradeoff (U8):** capture-then-arm — a ms-scale output
+  gap on adopt over visible duplication; ~2k lines replayed, full history
+  stays in tmux behind `leader t`.
+- **Ephemeral panes (U10):** automation tabs + alerts sink are killed at
+  quit (never detached) and their store records pruned — unrestorable
+  leaves must not orphan sessions or grow the store. Automation linkage +
+  R22 unchanged (same spawn path, link-before-spawn).
 
 ## Rollout & validation
 

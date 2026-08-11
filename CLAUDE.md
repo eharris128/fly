@@ -149,6 +149,28 @@ attention machine has **no** output-driven transition, so "resumed working" must
 come from this activity poll, not `pane://attention`). All three take
 time/inputs as arguments so they're tested without a running app.
 
+### The tmux session substrate (built 2026-08-11/12, behind a flag)
+
+`config.substrate: "pty" | "tmux"` (default `pty` until live validation —
+see `docs/plans/2026-08-11-001-tmux-substrate-LIVE-CHECKLIST.md`) selects
+what backs a pane. Under `tmux`, every leaf-keyed pane is a **marked session
+on a fly-owned per-flavor tmux server** (`substrate/` — wrapper with executor
+seam, injective naming, durable leaf⇄session⇄token store): output streams
+through a `pipe-pane` FIFO into the same sink/activity/ring machinery, input
+ships as binary-safe `send-keys -H`, exits arrive via `pane-died` hooks over
+the socket (KTD12 server-scope token, persisted for cross-instance
+continuity) with a 1.5 s poll floor, and **sessions outlive fly**: quit
+detaches (ephemeral automation/sink panes are killed instead), restart
+adopts — same child pid, stored pane token re-registered, ~2k lines
+replayed. `leader t` opens the focused session in a real terminal
+(`config.terminal`); an attached session counts as focused-elsewhere for
+suppression. Substrate-independent but born of the same plan:
+`config.mirrorUnfocused` (default on) renders visible-unfocused panes as
+2 Hz DOM snapshots of their hidden xterm buffers (`lib/mirror.ts`) — the
+WebKitGTK engine-floor relief (63% → 4–14% webview main-thread under the
+5-pane protocol). Plan:
+`docs/plans/2026-08-11-001-feat-tmux-session-substrate-plan.md`.
+
 ### Backend modules (`src-tauri/src/`)
 - `pty/` — `PtyManager` registry + `Pane`: portable-pty, one read thread per
   pane, backpressure pause/resume (watermarks), ordered reap-on-exit.
