@@ -1094,7 +1094,7 @@ pub fn run() {
                             let attention = app.state::<Arc<AttentionManager>>().inner().clone();
                             let drop_handle = app.handle().clone();
                             Arc::new(move |leaf_key, delivery| {
-                                let outcome = feed::drop::deliver_with_guards(
+                                let outcome = feed::drop::deliver_with_guards_verified(
                                     delivery.expect_pane,
                                     delivery.text,
                                     || pty.pane_by_leaf(leaf_key).map(|p| p.0),
@@ -1102,6 +1102,12 @@ pub fn run() {
                                     |pane, bytes| pty.write(crate::pty::PaneId(pane), bytes),
                                     || std::thread::sleep(feed::io::SUBMIT_DELAY),
                                     delivery.commit,
+                                    // U6: detached-TUI wake + ring-growth
+                                    // verified submit (no-ops on PTY panes /
+                                    // attached sessions; fails open).
+                                    |pane| pty.wake_if_detached(crate::pty::PaneId(pane)),
+                                    |pane| pty.pane_output_seq(crate::pty::PaneId(pane)),
+                                    std::thread::sleep,
                                 );
                                 // The drop was answered into the pane, so its
                                 // ring must drop just as a typed reply's would.
@@ -1357,7 +1363,7 @@ fn handle_peer_request(
     // would.
     let deliver = |expect: u64, leaf: &str, text: &str| {
         let _serialized = delivery_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let outcome = feed::drop::deliver_with_guards(
+        let outcome = feed::drop::deliver_with_guards_verified(
             expect,
             text,
             || pty.pane_by_leaf(leaf).map(|p| p.0),
@@ -1365,6 +1371,10 @@ fn handle_peer_request(
             |pane, bytes| pty.write(pty::PaneId(pane), bytes),
             || std::thread::sleep(feed::io::SUBMIT_DELAY),
             || Ok(()),
+            // U6: wake + verified submit, as on the drop route.
+            |pane| pty.wake_if_detached(pty::PaneId(pane)),
+            |pane| pty.pane_output_seq(pty::PaneId(pane)),
+            std::thread::sleep,
         );
         if matches!(outcome, feed::drop::DropOutcome::Delivered) {
             if let Some(attention) = app.try_state::<Arc<AttentionManager>>() {

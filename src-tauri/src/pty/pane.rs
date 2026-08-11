@@ -665,6 +665,23 @@ impl Pane {
         }
     }
 
+    /// The tmux backend handle + session, for callers that must run tmux
+    /// subprocesses OUTSIDE the registry lock (KTD13 — clone out, then call).
+    pub fn tmux_backend(&self) -> Option<(Arc<crate::substrate::Substrate>, String)> {
+        match &self.backend {
+            Backend::Tmux { substrate, session, .. } => {
+                Some((Arc::clone(substrate), session.clone()))
+            }
+            Backend::Pty { .. } => None,
+        }
+    }
+
+    /// Total output bytes ever produced (the tail ring's `seq`) — a cheap
+    /// freshness probe (U6 verified submit; audit T9 shape).
+    pub fn output_seq(&self) -> u64 {
+        self.shared.tail.lock().unwrap().seq
+    }
+
     /// Record an externally-observed pane death (U4 backstop / KTD12 hook):
     /// the FIFO gives no EOF for a dead-but-remaining pane, so the read
     /// thread polls this between reads and surfaces the exit. Idempotent;

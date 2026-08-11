@@ -152,6 +152,29 @@ impl PtyManager {
         *self.substrate.lock().unwrap() = Some(substrate);
     }
 
+    /// The pane's output-ring sequence (total bytes ever produced) — the
+    /// cheap freshness probe the U6 verified-submit loop polls (also the
+    /// perf-audit T9 accessor shape: seq without the 64 KiB ring copy).
+    pub fn pane_output_seq(&self, id: PaneId) -> Option<u64> {
+        self.panes.lock().unwrap().get(&id).map(|p| p.output_seq())
+    }
+
+    /// U6 delivery insurance: SIGWINCH-wake a detached tmux-backed pane's
+    /// TUI before programmatic input. No-op for PTY panes and attached
+    /// sessions. The tmux subprocesses run OUTSIDE the registry lock
+    /// (KTD13) — the backend handle is cloned out first.
+    pub fn wake_if_detached(&self, id: PaneId) {
+        let target = {
+            let panes = self.panes.lock().unwrap();
+            panes.get(&id).and_then(|p| p.tmux_backend())
+        };
+        if let Some((sub, session)) = target {
+            if let Ok(false) = sub.tmux().is_session_attached(&session) {
+                let _ = sub.tmux().wake_pane(&session);
+            }
+        }
+    }
+
     /// KTD12 pane-died event ingress: force-mark the pane backed by
     /// `session` dead with `status`. Touches only pane-shared state under
     /// the registry lock; the pane's poll-loop reader surfaces the exit.

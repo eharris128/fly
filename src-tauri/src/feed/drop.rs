@@ -690,9 +690,52 @@ pub fn deliver_with_guards(
     text: &str,
     resolve_pane: impl Fn() -> Option<u64>,
     is_agent: impl Fn(u64) -> bool,
+    write: impl FnMut(u64, &[u8]) -> Result<(), String>,
+    settle: impl Fn(),
+    commit: impl FnOnce() -> Result<(), String>,
+) -> DropOutcome {
+    deliver_with_guards_verified(
+        expect_pane,
+        text,
+        resolve_pane,
+        is_agent,
+        write,
+        settle,
+        commit,
+        |_| {},
+        |_| None,
+        |_| {},
+    )
+}
+
+/// Verified-submit polling knobs (tmux-substrate U6/KTD5, the ga-bwm lesson):
+/// after the Enter, wait for the pane's output ring to grow — a submitted
+/// turn produces output, a still-parked composer produces none — and re-send
+/// the Enter only while the ring stays static (a growing ring means the turn
+/// started; a second Enter must never reach a busy agent). Unconfirmed after
+/// the attempts is logged, NOT surfaced as a refusal: callers would retry the
+/// whole delivery and double-paste (Gas City preserved the same contract).
+const SUBMIT_CONFIRM_ATTEMPTS: usize = 3;
+const SUBMIT_CONFIRM_POLLS: usize = 4;
+const SUBMIT_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// [`deliver_with_guards`] plus the U6 seams: `wake` runs after commit and
+/// before the paste (the detached-TUI SIGWINCH insurance — a no-op closure
+/// for PTY-backed panes), `output_seq` samples the pane's output-ring
+/// sequence (`None` = no signal available ⇒ single-Enter legacy behavior),
+/// and `sleep` is injected so tests drive the confirm loop without a clock.
+#[allow(clippy::too_many_arguments)]
+pub fn deliver_with_guards_verified(
+    expect_pane: u64,
+    text: &str,
+    resolve_pane: impl Fn() -> Option<u64>,
+    is_agent: impl Fn(u64) -> bool,
     mut write: impl FnMut(u64, &[u8]) -> Result<(), String>,
     settle: impl Fn(),
     commit: impl FnOnce() -> Result<(), String>,
+    wake: impl Fn(u64),
+    mut output_seq: impl FnMut(u64) -> Option<u64>,
+    sleep: impl Fn(std::time::Duration),
 ) -> DropOutcome {
     let Some(pane) = resolve_pane() else {
         return DropOutcome::UnknownPane;
@@ -710,6 +753,10 @@ pub fn deliver_with_guards(
         return DropOutcome::CommitFailed(e);
     }
 
+    // U6: wake a detached TUI's event loop before bytes arrive (some
+    // versions/providers don't process stdin without a terminal event).
+    wake(pane);
+
     if let Err(e) = write(pane, &crate::feed::io::paste_payload(text)) {
         return DropOutcome::PasteFailed(e);
     }
@@ -721,10 +768,42 @@ pub fn deliver_with_guards(
             "the pane stopped running an agent before the text could be submitted".into(),
         );
     }
-    match write(pane, crate::feed::io::SUBMIT) {
-        Ok(()) => DropOutcome::Delivered,
-        Err(e) => DropOutcome::SubmitIncomplete(e),
+    // Baseline AFTER the settle so the paste's own echo has largely landed;
+    // a late echo can only false-confirm, which degrades to the legacy
+    // single-Enter behavior (the insurance fails open).
+    let baseline = output_seq(pane);
+    if let Err(e) = write(pane, crate::feed::io::SUBMIT) {
+        return DropOutcome::SubmitIncomplete(e);
     }
+    let Some(baseline) = baseline else {
+        return DropOutcome::Delivered; // no signal ⇒ legacy behavior
+    };
+    for attempt in 0..SUBMIT_CONFIRM_ATTEMPTS {
+        for _ in 0..SUBMIT_CONFIRM_POLLS {
+            match output_seq(pane) {
+                Some(seq) if seq != baseline => return DropOutcome::Delivered,
+                None => return DropOutcome::Delivered, // signal lost mid-loop
+                _ => sleep(SUBMIT_CONFIRM_POLL),
+            }
+        }
+        // Ring static ⇒ the composer is still parked; the Enter was likely
+        // swallowed racing the paste (ga-bwm). Safe to re-send: a busy agent
+        // implies a growing ring, which exits above.
+        if attempt + 1 < SUBMIT_CONFIRM_ATTEMPTS {
+            if !is_agent(pane) {
+                return DropOutcome::SubmitIncomplete(
+                    "the pane stopped running an agent during submit confirmation".into(),
+                );
+            }
+            if let Err(e) = write(pane, crate::feed::io::SUBMIT) {
+                return DropOutcome::SubmitIncomplete(e);
+            }
+        }
+    }
+    log::warn!(
+        "drop/peer delivery to pane {pane}: submit unconfirmed after {SUBMIT_CONFIRM_ATTEMPTS} Enters (text may sit drafted)"
+    );
+    DropOutcome::Delivered
 }
 
 /// Fill 8 bytes from the thread CSPRNG (the `hooks::token` / `config` idiom).
@@ -1544,6 +1623,139 @@ mod tests {
         fn writes(&self) -> Vec<Vec<u8>> {
             self.writes.borrow().clone()
         }
+    }
+
+    /// U6 verified submit: a growing output ring confirms on the first
+    /// poll — exactly one Enter, no sleeps beyond the first poll.
+    #[test]
+    fn verified_submit_confirms_on_ring_growth_without_reenter() {
+        let writes = std::cell::RefCell::new(Vec::<Vec<u8>>::new());
+        let seq = std::cell::Cell::new(100u64);
+        let out = deliver_with_guards_verified(
+            7,
+            "hi",
+            || Some(7),
+            |_| true,
+            |_, b| {
+                writes.borrow_mut().push(b.to_vec());
+                Ok(())
+            },
+            || {},
+            || Ok(()),
+            |_| {},
+            |_| {
+                let v = seq.get();
+                seq.set(v + 50); // ring grows between samples
+                Some(v)
+            },
+            |_| {},
+        );
+        assert_eq!(out, DropOutcome::Delivered);
+        let w = writes.borrow();
+        assert_eq!(w.len(), 2, "paste + exactly one Enter, got {}", w.len());
+    }
+
+    /// A parked composer (static ring) draws the ga-bwm re-Enters — capped,
+    /// and still reported Delivered (logged, never a refusal: callers would
+    /// double-paste).
+    #[test]
+    fn verified_submit_reenters_while_ring_static_then_caps() {
+        let writes = std::cell::RefCell::new(Vec::<Vec<u8>>::new());
+        let out = deliver_with_guards_verified(
+            7,
+            "hi",
+            || Some(7),
+            |_| true,
+            |_, b| {
+                writes.borrow_mut().push(b.to_vec());
+                Ok(())
+            },
+            || {},
+            || Ok(()),
+            |_| {},
+            |_| Some(42), // never grows
+            |_| {},
+        );
+        assert_eq!(out, DropOutcome::Delivered);
+        let w = writes.borrow();
+        let enters = w.iter().filter(|b| b.as_slice() == crate::feed::io::SUBMIT).count();
+        assert_eq!(enters, SUBMIT_CONFIRM_ATTEMPTS, "capped re-Enters");
+    }
+
+    /// No ring signal (None) is the legacy contract: one Enter, done —
+    /// which is also why every pre-U6 test in this module is unchanged.
+    #[test]
+    fn verified_submit_without_signal_is_legacy_single_enter() {
+        let writes = std::cell::RefCell::new(Vec::<Vec<u8>>::new());
+        let out = deliver_with_guards_verified(
+            7,
+            "hi",
+            || Some(7),
+            |_| true,
+            |_, b| {
+                writes.borrow_mut().push(b.to_vec());
+                Ok(())
+            },
+            || {},
+            || Ok(()),
+            |_| {},
+            |_| None,
+            |_| panic!("no polling without a signal"),
+        );
+        assert_eq!(out, DropOutcome::Delivered);
+        assert_eq!(writes.borrow().len(), 2);
+    }
+
+    /// The agent dying mid-confirmation aborts the re-Enter (a shell must
+    /// never receive it) and reports SubmitIncomplete.
+    #[test]
+    fn verified_submit_aborts_reenter_when_agent_dies() {
+        let agent_alive = std::cell::Cell::new(true);
+        let polls = std::cell::Cell::new(0u32);
+        let out = deliver_with_guards_verified(
+            7,
+            "hi",
+            || Some(7),
+            |_| agent_alive.get(),
+            |_, _| Ok(()),
+            || {},
+            || Ok(()),
+            |_| {},
+            |_| {
+                polls.set(polls.get() + 1);
+                if polls.get() > 2 {
+                    agent_alive.set(false);
+                }
+                Some(42)
+            },
+            |_| {},
+        );
+        assert!(matches!(out, DropOutcome::SubmitIncomplete(_)));
+    }
+
+    /// The wake seam fires after commit and before the paste.
+    #[test]
+    fn wake_runs_before_paste() {
+        let order = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let _ = deliver_with_guards_verified(
+            7,
+            "hi",
+            || Some(7),
+            |_| true,
+            |_, _| {
+                order.borrow_mut().push("write");
+                Ok(())
+            },
+            || {},
+            || {
+                order.borrow_mut().push("commit");
+                Ok(())
+            },
+            |_| order.borrow_mut().push("wake"),
+            |_| None,
+            |_| {},
+        );
+        assert_eq!(&order.borrow()[..3], &["commit", "wake", "write"]);
     }
 
     #[test]
