@@ -382,6 +382,33 @@ impl PtyManager {
     /// is never reported), a non-agent reports null timings and a zero task
     /// count, and a gone pane degrades to the empty status — never an error.
     pub fn panes_status(&self, ids: &[PaneId]) -> Vec<PaneStatus> {
+        // U4 exit-detection backstop for tmux-backed panes: one
+        // `list-panes -a` snapshot per tick; a marked session whose pane
+        // process died gets its pane force-marked dead, which the pane's
+        // poll-loop reader surfaces as an exit within ~500 ms. (EOF cannot
+        // carry this: live-pinned, a dead-but-remaining pane keeps its
+        // pipe `cat` alive and `pipe-pane` refuses dead panes.) The tmux
+        // subprocess runs BEFORE the registry lock (KTD13); `force_dead`
+        // itself touches only pane-shared state. Event-driven precision
+        // arrives with the KTD12 pane-died hook; this is the lost-hook /
+        // no-hook floor.
+        let substrate = self.substrate.lock().unwrap().clone();
+        if let Some(sub) = substrate {
+            if let Ok(dead) = sub.tmux().list_dead_marked() {
+                if !dead.is_empty() {
+                    let panes = self.panes.lock().unwrap();
+                    for pane in panes.values() {
+                        if let Some(session) = pane.session_name() {
+                            if let Some((_, status)) =
+                                dead.iter().find(|(name, _)| name == session)
+                            {
+                                pane.force_dead(*status);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let now = Instant::now();
         let mut table: Option<Vec<crate::cwd::ProcEntry>> = None;
         let out = ids

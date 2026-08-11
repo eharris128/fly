@@ -256,6 +256,12 @@ struct PaneShared {
     /// Per-pane output-activity state (U3): the "current work stretch" the agent
     /// dashboard reads. Recorded by the read thread, queried by the poll.
     activity: ActivityCell,
+    /// Tmux arm only (U4): an externally-observed pane death, set by the
+    /// `panes_status` backstop (or the KTD12 hook path). The FIFO gives no
+    /// EOF for a dead-but-remaining pane — live-pinned: `pipe-pane` refuses
+    /// a dead pane and its `cat` survives — so the read thread polls this
+    /// between reads and exits with the recorded status.
+    forced_exit: Mutex<Option<i32>>,
     /// Raw output tail (feed-question-screen-fallback U1). Its own lock, taken
     /// only by the read thread (append) and the on-demand snapshot — never by
     /// the byte path's other consumers.
@@ -409,6 +415,7 @@ impl Pane {
             paused: Mutex::new(false),
             pause_cv: Condvar::new(),
             activity: ActivityCell::new(),
+            forced_exit: Mutex::new(None),
             tail: Mutex::new(TailRing::new(TAIL_RING_CAP)),
             dims: Mutex::new((size.rows, size.cols)),
         });
@@ -494,6 +501,10 @@ impl Pane {
                 rows,
             )
             .map_err(|e| e.to_string())?;
+        // KTD4: a dead pane keeps its final screen; death is observed via
+        // `#{pane_dead}` (read-loop EOF check + the panes_status backstop),
+        // not via session teardown.
+        let _ = substrate.tmux().set_remain_on_exit(&session, true);
 
         // tmux's pane process pid — the signal target and cwd anchor.
         let pid = substrate
@@ -517,6 +528,7 @@ impl Pane {
             paused: Mutex::new(false),
             pause_cv: Condvar::new(),
             activity: ActivityCell::new(),
+            forced_exit: Mutex::new(None),
             tail: Mutex::new(TailRing::new(TAIL_RING_CAP)),
             dims: Mutex::new((rows, cols)),
         });
@@ -639,18 +651,46 @@ impl Pane {
         self.leaf_key.as_deref()
     }
 
+    /// The tmux session backing this pane, when tmux-backed (U4).
+    pub fn session_name(&self) -> Option<&str> {
+        match &self.backend {
+            Backend::Tmux { session, .. } => Some(session),
+            Backend::Pty { .. } => None,
+        }
+    }
+
+    /// Record an externally-observed pane death (U4 backstop / KTD12 hook):
+    /// the FIFO gives no EOF for a dead-but-remaining pane, so the read
+    /// thread polls this between reads and surfaces the exit. Idempotent;
+    /// no-op on the PTY arm.
+    pub fn force_dead(&self, status: i32) {
+        if matches!(self.backend, Backend::Pty { .. }) {
+            return;
+        }
+        let mut fe = self.shared.forced_exit.lock().unwrap();
+        if fe.is_none() {
+            *fe = Some(status);
+        }
+        drop(fe);
+        // Wake a paused reader so the exit isn't gated on resume.
+        self.shared.pause_cv.notify_all();
+    }
+
     /// The foreground process group leader pid, used by U10 for `/proc`-based
-    /// cwd tracking. Falls back to the child pid. Tmux arm: the pane root pid
-    /// (`#{pane_pid}`, captured at spawn) — foreground-job precision returns
-    /// with U4's `#{pane_current_path}`-based cwd, which supersedes this
-    /// consumer for tmux panes.
+    /// cwd tracking. Falls back to the child pid. Tmux arm (U4): the pane
+    /// root's controlling-tty foreground group from `/proc/<pane_pid>/stat`
+    /// `tpgid` — same precision as the PTY arm's `process_group_leader`, no
+    /// tmux round trip — falling back to the pane root pid.
     pub fn foreground_pid(&self) -> Option<u32> {
         match &self.backend {
             Backend::Pty { master } => master
                 .process_group_leader()
                 .map(|p| p as u32)
                 .or(self.pid),
-            Backend::Tmux { .. } => self.pid,
+            Backend::Tmux { .. } => self
+                .pid
+                .and_then(crate::cwd::foreground_tpgid)
+                .or(self.pid),
         }
     }
 
@@ -836,42 +876,44 @@ fn tmux_read_loop(
     on_exit: ExitCallback,
 ) {
     let mut buf = vec![0u8; READ_BUF];
+    let mut dead_status: Option<i32> = None;
     'outer: loop {
-        // Blocking open pairs with the pipe's write-end open.
-        let Ok(mut reader) = std::fs::File::open(&fifo) else {
+        // O_RDWR so the open never blocks on a writer AND the FIFO never
+        // reaches all-writers-closed EOF spuriously between `cat` restarts;
+        // end-of-pane is signalled by `forced_exit`/`stopping`, not EOF —
+        // live-pinned: a dead-but-remaining pane keeps its `cat` alive and
+        // `pipe-pane` refuses dead panes, so EOF simply never comes.
+        let Ok(reader) = std::fs::OpenOptions::new().read(true).write(true).open(&fifo)
+        else {
             break;
         };
+        set_nonblocking(&reader);
         loop {
             {
                 let mut paused = shared.paused.lock().unwrap();
                 while *paused && !shared.stopping.load(Ordering::Acquire) {
+                    if shared.forced_exit.lock().unwrap().is_some() {
+                        break;
+                    }
                     paused = shared.pause_cv.wait(paused).unwrap();
                 }
             }
             if shared.stopping.load(Ordering::Acquire) {
                 break 'outer;
             }
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    // EOF: pipe writer gone. Session dead ⇒ pane exit;
-                    // session alive ⇒ transient — re-arm and continue.
-                    if shared.stopping.load(Ordering::Acquire) {
-                        break 'outer;
-                    }
-                    match substrate.tmux().has_session(&session) {
-                        Ok(true) => {
-                            let _ = substrate
-                                .tmux()
-                                .pipe_pane_open(&session, &fifo.to_string_lossy());
-                            continue 'outer;
-                        }
-                        // Gone — or unobservable (KTD7: an observation
-                        // failure must not fabricate liveness forever; with
-                        // the pipe dead and the server unreachable this pane
-                        // is over either way — surface the exit).
-                        Ok(false) | Err(_) => break 'outer,
-                    }
-                }
+            if let Some(code) = *shared.forced_exit.lock().unwrap() {
+                dead_status = Some(code);
+                break 'outer;
+            }
+            // Wait for readability, ≤500 ms, then drain what's there. The
+            // timeout bounds how stale a forced-exit/stop check can be.
+            if !poll_readable(&reader, Duration::from_millis(500)) {
+                continue;
+            }
+            match (&reader).read(&mut buf) {
+                // O_RDWR: we hold a write end ourselves, so 0 can only mean
+                // a genuinely torn-down FIFO — treat as end.
+                Ok(0) => break 'outer,
                 Ok(n) => {
                     sink(&buf[..n]);
                     shared.activity.record(n);
@@ -881,7 +923,12 @@ fn tmux_read_loop(
                         .unwrap()
                         .write(&buf[..n], crate::notify::now_unix_ms());
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::Interrupted
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    continue
+                }
                 Err(_) => break 'outer,
             }
         }
@@ -893,11 +940,10 @@ fn tmux_read_loop(
             *lc = if shared.stopping.load(Ordering::Acquire) {
                 LifecycleState::Killed
             } else {
-                // The session's root process ended; tmux doesn't surface its
-                // wait status through this path (that arrives with U4's
-                // pane-died hook + `#{pane_dead_status}`).
+                // `#{pane_dead_status}` when the dead pane was observable
+                // (U4); 0 when the whole session vanished under us.
                 LifecycleState::Exited {
-                    code: 0,
+                    code: dead_status.unwrap_or(0),
                     signal: None,
                 }
             };
@@ -936,6 +982,30 @@ impl Write for TmuxWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// `fcntl(F_SETFL, O_NONBLOCK)` on an open file (the FIFO read handle).
+fn set_nonblocking(f: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: plain fcntl on a fd we own.
+    unsafe {
+        let fd = f.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+}
+
+/// `poll(2)` for readability with a timeout; false on timeout/error.
+fn poll_readable(f: &std::fs::File, timeout: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fds = libc::pollfd {
+        fd: f.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: valid pollfd array of length 1.
+    let rc = unsafe { libc::poll(&mut fds, 1, timeout.as_millis() as i32) };
+    rc > 0 && (fds.revents & libc::POLLIN) != 0
 }
 
 /// `#{pane_pid}` of a session's (only) pane — the signal target and the cwd

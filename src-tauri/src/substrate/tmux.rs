@@ -525,6 +525,59 @@ impl Tmux {
         Ok(())
     }
 
+    /// `remain-on-exit` for a session's window (U4/KTD4): a dead pane keeps
+    /// its final screen instead of taking the session down.
+    pub fn set_remain_on_exit(&self, name: &str, on: bool) -> Result<(), TmuxError> {
+        validate_session_name(name).map_err(TmuxError::InvalidName)?;
+        let v = if on { "on" } else { "off" };
+        self.simple(&["set-option", "-wt", name, "remain-on-exit", v])
+    }
+
+    /// Whether the session's pane process has died (`Some(exit_status)`) or
+    /// is alive (`None`). Requires `remain-on-exit on` for the dead pane to
+    /// still be observable.
+    pub fn pane_dead(&self, name: &str) -> Result<Option<i32>, TmuxError> {
+        let out = self.display_message(name, "#{pane_dead} #{pane_dead_status}")?;
+        let mut parts = out.split_whitespace();
+        match parts.next() {
+            Some("1") => Ok(Some(parts.next().and_then(|s| s.parse().ok()).unwrap_or(0))),
+            _ => Ok(None),
+        }
+    }
+
+    /// One snapshot of every marked session's death state (U4's poll
+    /// backstop): a single `list-panes -a` subprocess, returning
+    /// `(session, exit_status)` for marked sessions whose pane process has
+    /// died. Absent/empty server ⇒ empty.
+    pub fn list_dead_marked(&self) -> Result<Vec<(String, i32)>, TmuxError> {
+        let prefix = format!("fly-{}-", self.flavor_from_socket());
+        let args = [
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name} #{pane_dead} #{pane_dead_status}",
+        ];
+        let out = self.run(&args)?;
+        if !out.success {
+            return match Self::classify(&args, &out) {
+                TmuxError::NoServer | TmuxError::EmptyServer => Ok(vec![]),
+                e => Err(e),
+            };
+        }
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|l| {
+                let mut parts = l.split_whitespace();
+                let name = parts.next()?;
+                let dead = parts.next()?;
+                let status: i32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                (dead == "1" && name.starts_with(&prefix))
+                    .then(|| (name.to_string(), status))
+            })
+            .collect())
+    }
+
     /// One-shot format expansion against a session's active pane.
     pub fn display_message(&self, name: &str, format: &str) -> Result<String, TmuxError> {
         validate_session_name(name).map_err(TmuxError::InvalidName)?;

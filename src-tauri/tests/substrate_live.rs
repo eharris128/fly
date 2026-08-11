@@ -155,7 +155,7 @@ fn tmux_pane_child_exit_surfaces_exited_state() {
     let (exit_tx, exit_rx) = mpsc::channel();
     let id = mgr.reserve_id();
     let cfg = SpawnConfig {
-        command: Some(vec!["sh".into(), "-c".into(), "sleep 0.3".into()]),
+        command: Some(vec!["sh".into(), "-c".into(), "sleep 0.3; exit 7".into()]),
         leaf_key: Some("exit-leaf".into()),
         rows: 24,
         cols: 80,
@@ -172,11 +172,28 @@ fn tmux_pane_child_exit_surfaces_exited_state() {
     )
     .expect("spawn");
 
-    let (_, state) = exit_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    // remain-on-exit (U4) keeps the session alive past the child's death;
+    // the exit surfaces via pane_dead — through tmux's own pipe teardown or
+    // the panes_status backstop, whichever lands first. Drive the backstop
+    // the way the app's 1.5 s poll would.
+    let mut state = None;
+    for _ in 0..40 {
+        let _ = mgr.panes_status(&[id]);
+        if let Ok((_, s)) = exit_rx.recv_timeout(Duration::from_millis(250)) {
+            state = Some(s);
+            break;
+        }
+    }
+    let state = state.expect("exit should surface via pane_dead within 10s");
+    let dbg = format!("{state:?}");
     assert!(
-        format!("{state:?}").contains("Exited"),
-        "natural end reports Exited, got {state:?}"
+        dbg.contains("Exited") && dbg.contains("code: 7"),
+        "natural end reports Exited with pane_dead_status, got {dbg}"
     );
+
+    // KTD4: the dead pane's session survives for its final screen.
+    let session = substrate.session_name("exit-leaf");
+    assert!(substrate.tmux().has_session(&session).unwrap());
 }
 
 #[test]
