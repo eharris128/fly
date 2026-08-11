@@ -277,6 +277,16 @@ Build order; each lands green behind KTD10's flag until U9.
   `mirrorUnfocused` (default on). D8's capture-pane screen-fallback idea
   is likewise superseded — the tail ring/vte can stay until U9 decides.
 
+- **KTD5 amended at build time (U6): unconfirmed submit is retried
+  in-place and logged, never surfaced as a refusal.** A refusal invites
+  the caller to re-deliver and double-paste; Gas City preserved the same
+  handed-to-tmux contract for the same reason. The confirm signal is the
+  pane's output-ring seq (substrate-agnostic, no capture-pane): growth =
+  the turn started (never re-Enter), static = parked composer (re-Enter,
+  ≤3). Revisit surfacing only if the routes ever gain idempotency keys.
+  The per-session delivery locks also stay app-wide for now (narrowing
+  is an optimization, not correctness).
+
 ## Rollout & validation
 
 1. U1+U2 land inert (wrapper tested pure; socket/token groundwork live —
