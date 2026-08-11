@@ -90,6 +90,18 @@ impl Envelope {
         self.op == "ask/hold"
     }
 
+    /// Whether this op is a tmux-substrate event report (tmux plan
+    /// U4b/KTD12): `pane-died` / `attach-state` from a tmux `run-shell`
+    /// hook via `fly substrate-event`. Authenticated by the SERVER-scope
+    /// substrate token (the hook runs in the tmux server's context, which
+    /// holds no pane token), validated inside the substrate handler —
+    /// constant-time, silent reject, registry-lockout coupled. On an OLD
+    /// server the op falls through to notify and dies on the missing
+    /// `reason` field — the same skew rule as `ask/hold`.
+    pub fn is_substrate(&self) -> bool {
+        self.op == "substrate/event"
+    }
+
     /// Whether this op routes to the peer-messaging request handler
     /// (agent-peer-messaging U1/KTD1): `peer/list` (`fly agents`) and
     /// `peer/send` (`fly send`). Same request/response lifecycle as an
@@ -101,6 +113,23 @@ impl Envelope {
     pub fn is_peer(&self) -> bool {
         self.op.starts_with("peer/")
     }
+}
+
+/// A tmux-substrate event report (tmux plan U4b/KTD12), sent by
+/// `fly substrate-event` from a tmux hook. `kind` ∈ {"pane-died",
+/// "attach-state"}; `session` is the marked session name (re-validated
+/// against the KTD4 charset AND resolved against fly's own pane registry —
+/// the wire never directly names a pane); `status` carries
+/// `#{pane_dead_status}` or the attach flag. Events are hints: fly
+/// re-verifies against tmux where the action is destructive.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct SubstrateEvent {
+    pub token: String,
+    pub op: String,
+    pub kind: String,
+    pub session: String,
+    #[serde(default)]
+    pub status: Option<i32>,
 }
 
 /// A callback payload sent by an agent (via `fly notify`).

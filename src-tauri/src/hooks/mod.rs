@@ -10,6 +10,7 @@ pub mod token;
 
 pub use protocol::HookMessage;
 pub use server::{
-    AskHandler, AskTicket, Dispatch, HookServer, PeerHandler, RequestHandler, ValidatedHook,
+    AskHandler, AskTicket, Dispatch, HookServer, PeerHandler, RequestHandler, SubstrateHandler,
+    ValidatedHook,
 };
 pub use token::TokenRegistry;

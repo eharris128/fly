@@ -152,6 +152,20 @@ impl PtyManager {
         *self.substrate.lock().unwrap() = Some(substrate);
     }
 
+    /// KTD12 pane-died event ingress: force-mark the pane backed by
+    /// `session` dead with `status`. Touches only pane-shared state under
+    /// the registry lock; the pane's poll-loop reader surfaces the exit.
+    /// Unknown sessions are ignored (the event is a hint, panes close
+    /// concurrently).
+    pub fn force_dead_by_session(&self, session: &str, status: i32) {
+        let panes = self.panes.lock().unwrap();
+        for pane in panes.values() {
+            if pane.session_name() == Some(session) {
+                pane.force_dead(status);
+            }
+        }
+    }
+
     pub fn spawn_with_id(
         &self,
         id: PaneId,

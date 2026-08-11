@@ -35,24 +35,67 @@ pub struct Substrate {
     /// Where per-pane FIFOs live (runtime dir — same lifetime class as the
     /// hook socket).
     fifo_dir: PathBuf,
+    /// The stable hook-socket path (KTD8), injected into the server env so
+    /// tmux `run-shell` hooks can reach fly (KTD12).
+    socket_path: PathBuf,
+    /// The fly binary tmux hooks invoke. Production: `current_exe`; tests:
+    /// `CARGO_BIN_EXE_fly` (a hook must never re-enter a test harness).
+    fly_bin: PathBuf,
+    /// KTD12 server-scope event token: minted per Substrate, injected into
+    /// the tmux server env, presented back by `fly substrate-event`.
+    /// Authorizes exactly the event-report ops — nothing else.
+    event_token: String,
     /// `ensure_server` latch: probe/start once per process, under a lock so
     /// two racing spawns can't both start servers.
     server_ready: Mutex<bool>,
 }
 
 impl Substrate {
-    pub fn new(flavor: String, store_path: PathBuf, fifo_dir: PathBuf) -> Self {
+    pub fn new(
+        flavor: String,
+        store_path: PathBuf,
+        fifo_dir: PathBuf,
+        socket_path: PathBuf,
+        fly_bin: PathBuf,
+    ) -> Self {
         let tmux = Tmux::new(TmuxConfig {
             socket_name: flavor.clone(),
             history_limit: 10_000,
         });
+        // 256-bit CSPRNG hex, same class as pane tokens (KTD12).
+        let mut raw = [0u8; 32];
+        use rand::RngCore as _;
+        rand::thread_rng().fill_bytes(&mut raw);
+        let event_token = raw.iter().map(|b| format!("{b:02x}")).collect();
         Self {
             tmux,
             flavor,
             store_path,
             fifo_dir,
+            socket_path,
+            fly_bin,
+            event_token,
             server_ready: Mutex::new(false),
         }
+    }
+
+    /// The fly binary path for tmux hook commands (validated quote-free at
+    /// arm time by the wrapper).
+    pub fn fly_bin(&self) -> &std::path::Path {
+        &self.fly_bin
+    }
+
+    /// Constant-time validation of a presented substrate event token
+    /// (KTD12). Never compare with `==` — boundary rule.
+    pub fn validate_event_token(&self, presented: &str) -> bool {
+        use subtle::ConstantTimeEq as _;
+        let a = self.event_token.as_bytes();
+        let b = presented.as_bytes();
+        if a.len() != b.len() {
+            // Length is public (a fixed 64-hex format), not secret-bearing.
+            return false;
+        }
+        a.ct_eq(b).into()
     }
 
     pub fn tmux(&self) -> &Tmux {
@@ -84,11 +127,21 @@ impl Substrate {
             return Ok(());
         }
         if !self.tmux.probe_server_alive()? {
-            let env: BTreeMap<String, String> = std::env::vars()
+            let mut env: BTreeMap<String, String> = std::env::vars()
                 .filter(|(k, _)| {
                     !crate::pty::CLAUDE_SESSION_MARKERS.contains(&k.as_str())
                 })
                 .collect();
+            // KTD12: hook commands run with the SERVER env — this is how
+            // `fly substrate-event` finds the socket and authenticates.
+            env.insert(
+                "FLY_SUBSTRATE_TOKEN".into(),
+                self.event_token.clone(),
+            );
+            env.insert(
+                "FLY_SOCKET_PATH".into(),
+                self.socket_path.to_string_lossy().into_owned(),
+            );
             self.tmux.start_server(&env)?;
         }
         *ready = true;

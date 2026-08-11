@@ -90,6 +90,21 @@ here is mandatory, not a nicety.
   `docs/notes/2026-08-07-peer-messaging-live-check.md`. Re-verify this contract
   whenever the Claude Code version moves.
 
+- **Substrate event ops carry their own token class** (tmux-substrate plan
+  `U4b`/`KTD12`) — `substrate/event` reports (`pane-died`, `attach-state`)
+  come from tmux `run-shell` hooks, which hold no pane token, so they
+  authenticate against the **server-scope** `FLY_SUBSTRATE_TOKEN` (minted per
+  app instance, injected into the tmux server env at spawn) inside the
+  substrate handler: constant-time compare, silent reject, and an invalid
+  presentation is **coupled into the registry's lockout counting** so the
+  branch is not a free brute-force lane. The op routes before pane-token
+  validation but authorizes exactly the event reports — never notify,
+  `automation/*`, or `peer/*`. Events are hints: the session name is
+  charset-validated and resolved against fly's own registry, and a
+  `pane-died` report is **confirmed against tmux (`#{pane_dead}`) before
+  anything acts on it** — so a forged event (which already requires the
+  token) can at worst hasten a report of a death that is real.
+
 ## Layout
 
 - `token.rs` — `TokenRegistry`: mint / resolve tokens, constant-time compare,

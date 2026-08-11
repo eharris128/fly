@@ -211,17 +211,25 @@ pub fn run() {
     // leaf-keyed spawn becomes a marked session on the flavor server. The
     // substrate handle shares the flavor name with the hook-socket dir and
     // the FIFOs live beside that socket (same runtime-dir lifetime class).
-    if cfg.substrate == config::SubstrateKind::Tmux {
+    let substrate_handle = if cfg.substrate == config::SubstrateKind::Tmux {
         let runtime_dir = hook_socket_path()
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(std::env::temp_dir);
-        pty_manager.set_substrate(Arc::new(substrate::Substrate::new(
+        let sub = Arc::new(substrate::Substrate::new(
             app_dir_name(),
             session::data_dir().join("substrate-sessions.json"),
             runtime_dir,
-        )));
-    }
+            hook_socket_path(),
+            std::env::current_exe().unwrap_or_else(|_| "fly".into()),
+        ));
+        pty_manager.set_substrate(Arc::clone(&sub));
+        Some(sub)
+    } else {
+        None
+    };
+    // Cloned before `pty_manager` is moved below; the KTD12 handler needs it.
+    let pty_for_substrate = Arc::clone(&pty_manager);
     let tokens = Arc::new(TokenRegistry::new());
     let attention = Arc::new(AttentionManager::new(
         cfg.attention_debounce_ms,
@@ -603,13 +611,48 @@ pub fn run() {
                 )
                 .to_bytes()
             });
-            let server = HookServer::start_full(
+            // KTD12: substrate event reports (pane-died / attach-state) from
+            // tmux run-shell hooks. The handler owns the constant-time
+            // server-scope token check (never the pane TokenRegistry); the
+            // session name is charset-validated before it touches anything.
+            // attach-state is accepted-but-unused until U7 wires suppression.
+            let substrate_event_handler: Option<hooks::SubstrateHandler> =
+                substrate_handle.as_ref().map(|sub| {
+                    let sub = Arc::clone(sub);
+                    let pty = Arc::clone(&pty_for_substrate);
+                    let handler: hooks::SubstrateHandler = Arc::new(move |buf: &[u8]| {
+                        let Ok(ev) =
+                            serde_json::from_slice::<hooks::protocol::SubstrateEvent>(buf)
+                        else {
+                            return false;
+                        };
+                        if !sub.validate_event_token(&ev.token) {
+                            return false;
+                        }
+                        if substrate::validate_session_name(&ev.session).is_err() {
+                            return true; // authenticated but malformed → drop
+                        }
+                        if ev.kind == "pane-died" {
+                            // Events are hints (KTD12): confirm against tmux
+                            // before acting, so a forged-or-stale report can
+                            // never mark a live pane dead. One subprocess on
+                            // a rare event, on the connection thread.
+                            if let Ok(Some(status)) = sub.tmux().pane_dead(&ev.session) {
+                                pty.force_dead_by_session(&ev.session, status);
+                            }
+                        }
+                        true
+                    });
+                    handler
+                });
+            let server = HookServer::start_all(
                 hook_socket_path(),
                 tokens_for_hooks,
                 dispatch,
                 Some(automation_handler),
                 Some(ask_handler),
                 Some(peer_handler),
+                substrate_event_handler,
             )
             .map_err(|e| format!("failed to start hook server: {e}"))?;
             app.manage(server);

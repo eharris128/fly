@@ -239,6 +239,31 @@ Build order; each lands green behind KTD10's flag until U9.
 | `write-chain.ts` | **adapted** | order-pinning retained; flush lands as `send-keys -l` |
 | `resume.ts`, `handoff.ts` | **simplified** | flag hygiene stays (cold boot); quick/guided handoff delivery via U6 |
 
+## Build log amendments (overnight implementation, 2026-08-11/12)
+
+- **Live-pinned scar (U4): pane death does not end its pipe.** The
+  `pipe-pane` `cat` survives the pane process, and `pipe-pane` refuses a
+  dead pane ("target pane has exited") — so FIFO EOF can never carry the
+  exit. The FIFO reader is a `poll(2)` loop (O_RDWR open, 500 ms tick)
+  checking a `forced_exit` slot; the `panes_status` backstop (one
+  `list-panes -a`/tick) and the KTD12 hook both feed it. U5's focus-tier
+  pipe re-arming must use the same slot discipline, not EOF.
+- **Empty-server probe wording (U1): `has-session` against an alive, empty
+  server answers "no current target"** — Gas City's `ErrNoCurrentTarget`,
+  hit live exactly as their comment predicted; classified as a healthy
+  negative, pinned by unit test. Also: a bare `start-server` exits before
+  a follow-up `exit-empty off` can land — the options are `;`-chained into
+  the starting invocation.
+- **KTD8/KTD12 residual for U8 (reattach):** a tmux server that outlives
+  fly holds the OLD instance's `FLY_SUBSTRATE_TOKEN`/`FLY_SOCKET_PATH` in
+  its env, and armed hooks carry the old fly binary path. Reattach must
+  refresh the server env (`set-environment -g`) **and re-arm every marked
+  session's hooks**, then live-verify that `run-shell` children observe
+  the refreshed values (unverified tmux behavior — test before relying).
+- **tpgid (U4):** `/proc/<pane_pid>/stat` field 8 (`tpgid`) is the pane's
+  foreground job — full `/proc` parity for cwd/agent-detection/task-count
+  with zero tmux round trips; `#{pane_current_path}` not needed.
+
 ## Rollout & validation
 
 1. U1+U2 land inert (wrapper tested pure; socket/token groundwork live —

@@ -574,6 +574,12 @@ impl Pane {
             .pipe_pane_open(&session, &fifo.to_string_lossy())
             .map_err(|e| e.to_string())?;
 
+        // KTD12 event hooks: pane-died reports arrive over the socket for
+        // ~instant exit surfacing. Best-effort — the panes_status backstop is
+        // the floor when arming fails or an event is lost.
+        let fly_bin = substrate.fly_bin().to_string_lossy().into_owned();
+        let _ = substrate.tmux().arm_pane_died_hook(&session, &fly_bin);
+
         let writer: Box<dyn Write + Send> = Box::new(TmuxWriter {
             substrate: Arc::clone(&substrate),
             session: session.clone(),
@@ -868,8 +874,8 @@ fn read_loop(
 /// or pipe churn) re-opens and re-arms rather than declaring an exit.
 fn tmux_read_loop(
     id: PaneId,
-    substrate: Arc<crate::substrate::Substrate>,
-    session: String,
+    _substrate: Arc<crate::substrate::Substrate>,
+    _session: String,
     fifo: std::path::PathBuf,
     mut sink: OutputSink,
     shared: Arc<PaneShared>,

@@ -11,6 +11,7 @@
 //!   - `fly hooks …`   — install/remove the Claude hook
 
 pub mod automation;
+pub mod substrate;
 pub mod hooks;
 pub mod notify;
 pub mod peer;
@@ -26,7 +27,15 @@ pub mod peer;
 pub fn is_cli_subcommand(arg: &str) -> bool {
     matches!(
         arg,
-        "notify" | "hooks" | "automation" | "agents" | "send" | "help" | "--help" | "-h"
+        "notify"
+            | "hooks"
+            | "automation"
+            | "agents"
+            | "send"
+            | "substrate-event"
+            | "help"
+            | "--help"
+            | "-h"
     )
 }
 
@@ -79,6 +88,12 @@ pub fn run(args: &[String]) -> i32 {
         Some("notify") => notify::run(&args[2..]),
         Some("automation") => automation::run(&args[2..]),
         Some("agents") => peer::run_agents(&args[2..]),
+        // tmux plan U4b/KTD12: fired by tmux run-shell hooks, never humans —
+        // deliberately absent from the help text. Always exits 0.
+        Some("substrate-event") => {
+            substrate::run(&args[2..]);
+            0
+        }
         Some("send") => peer::run_send(&args[2..]),
         Some("hooks") => match args.get(2).map(String::as_str) {
             Some("setup") => hooks::run_setup(&args[3..]),

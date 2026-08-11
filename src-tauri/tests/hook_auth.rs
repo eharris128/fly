@@ -444,3 +444,82 @@ fn peer_ops_without_a_wired_handler_are_dropped_silently() {
         "a peer op must never dispatch as notify"
     );
 }
+
+/// tmux-substrate U4b/KTD12: `substrate/event` ops route to the substrate
+/// handler (which owns the server-scope token check) and never to the pane
+/// path; an invalid substrate token is silently rejected AND coupled into the
+/// registry's lockout counting; with no handler wired the op falls through to
+/// notify, where it dies on the missing `reason` — never a dispatch.
+#[test]
+fn substrate_events_route_validate_and_couple_lockout() {
+    use fly_lib::hooks::SubstrateHandler;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hook.sock");
+    let tokens = Arc::new(TokenRegistry::new());
+    let rec: Recorder = Arc::new(Mutex::new(Vec::new()));
+    let rec2 = Arc::clone(&rec);
+    let dispatch: Dispatch = Arc::new(move |pane, hook| {
+        rec2.lock().unwrap().push((pane, hook));
+    });
+    let seen: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = Arc::clone(&seen);
+    const GOOD: &str = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+    let handler: SubstrateHandler = Arc::new(move |buf: &[u8]| {
+        let ev: fly_lib::hooks::protocol::SubstrateEvent =
+            serde_json::from_slice(buf).unwrap();
+        let ok = ev.token == GOOD; // test double; production is constant-time
+        seen2.lock().unwrap().push((ev.session, ok));
+        ok
+    });
+    let server = HookServer::start_all(
+        path.clone(),
+        Arc::clone(&tokens),
+        dispatch,
+        None,
+        None,
+        None,
+        Some(handler),
+    )
+    .unwrap();
+
+    // Valid substrate token: reaches the handler, never the dispatch.
+    send(
+        &path,
+        &format!(
+            r#"{{"token":"{GOOD}","op":"substrate/event","kind":"pane-died","session":"fly-fly-a","status":7}}"#
+        ),
+    );
+    // Invalid token: handler says no; the failure must count toward lockout.
+    for _ in 0..60 {
+        send(
+            &path,
+            r#"{"token":"wrong","op":"substrate/event","kind":"pane-died","session":"fly-fly-a","status":1}"#,
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while seen.lock().unwrap().len() < 61 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let calls = seen.lock().unwrap().clone();
+    assert!(calls.len() >= 61, "handler saw all events, got {}", calls.len());
+    // Connection threads race, so assert by content, not position.
+    assert_eq!(
+        calls.iter().filter(|(_, ok)| *ok).count(),
+        1,
+        "exactly the one valid token validated"
+    );
+    // The 60 coupled failures tripped the registry lockout (MAX_FAILURES=50):
+    // a real pane token must now be rejected during the cooldown.
+    let pane_token = tokens.issue(PaneId(9));
+    send(
+        &path,
+        &format!(r#"{{"token":"{pane_token}","op":"notify","reason":"permission"}}"#),
+    );
+    assert_eq!(
+        wait_count(&rec, 1, Duration::from_millis(600)),
+        0,
+        "registry lockout applies after coupled substrate failures"
+    );
+    assert!(rec.lock().unwrap().is_empty());
+    drop(server);
+}

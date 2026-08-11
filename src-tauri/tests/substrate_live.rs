@@ -30,6 +30,8 @@ impl Scratch {
             self.flavor.clone(),
             self.dir.join("substrate-sessions.json"),
             self.dir.clone(),
+            self.dir.join("hook.sock"),
+            std::path::PathBuf::from(env!("CARGO_BIN_EXE_fly")),
         ))
     }
 }
@@ -228,4 +230,81 @@ fn server_env_is_scrubbed_of_claude_markers() {
         "server global env must not carry CLAUDECODE; got:\n{global}"
     );
     std::env::remove_var("CLAUDECODE");
+}
+
+#[test]
+#[ignore = "needs tmux + the fly binary; run with -- --ignored"]
+fn pane_died_hook_reports_exit_over_the_socket() {
+    // The full KTD12 chain, no poll assistance: child exits → tmux pane-died
+    // hook → `fly substrate-event` (auth: server-scope token from the tmux
+    // server env) → hook socket → substrate handler → force_dead → the
+    // pane's 500 ms poll loop surfaces Exited{status}.
+    let scratch = Scratch::new("u4hook");
+    let substrate = scratch.substrate();
+    let mgr = Arc::new(PtyManager::new());
+    mgr.set_substrate(Arc::clone(&substrate));
+
+    // A real HookServer at the scratch socket path with the substrate
+    // handler wired exactly as lib.rs wires it.
+    let tokens = Arc::new(fly_lib::hooks::TokenRegistry::new());
+    let dispatch: fly_lib::hooks::Dispatch = Arc::new(|_pane, _hook| {});
+    let sub_for_handler = Arc::clone(&substrate);
+    let mgr_for_handler = Arc::clone(&mgr);
+    let handler: fly_lib::hooks::SubstrateHandler = Arc::new(move |buf: &[u8]| {
+        let Ok(ev) =
+            serde_json::from_slice::<fly_lib::hooks::protocol::SubstrateEvent>(buf)
+        else {
+            return false;
+        };
+        if !sub_for_handler.validate_event_token(&ev.token) {
+            return false;
+        }
+        if fly_lib::substrate::validate_session_name(&ev.session).is_err() {
+            return true;
+        }
+        if ev.kind == "pane-died" {
+            mgr_for_handler.force_dead_by_session(&ev.session, ev.status.unwrap_or(0));
+        }
+        true
+    });
+    let _server = fly_lib::hooks::HookServer::start_all(
+        scratch.dir.join("hook.sock"),
+        tokens,
+        dispatch,
+        None,
+        None,
+        None,
+        Some(handler),
+    )
+    .expect("hook server");
+
+    let (exit_tx, exit_rx) = mpsc::channel();
+    let id = mgr.reserve_id();
+    let cfg = SpawnConfig {
+        command: Some(vec!["sh".into(), "-c".into(), "sleep 0.4; exit 3".into()]),
+        leaf_key: Some("hook-leaf".into()),
+        rows: 24,
+        cols: 80,
+        ..Default::default()
+    };
+    mgr.spawn_with_id(
+        id,
+        cfg,
+        "ef".repeat(32),
+        Box::new(|_bytes: &[u8]| {}),
+        Box::new(move |pane: PaneId, state| {
+            let _ = exit_tx.send((pane, state));
+        }),
+    )
+    .expect("spawn");
+
+    // NO panes_status driving — the hook must carry the exit end-to-end.
+    let (_, state) = exit_rx
+        .recv_timeout(Duration::from_secs(8))
+        .expect("hook-driven exit should surface without any poll");
+    let dbg = format!("{state:?}");
+    assert!(
+        dbg.contains("Exited") && dbg.contains("code: 3"),
+        "hook chain delivers Exited{{3}}, got {dbg}"
+    );
 }
