@@ -122,6 +122,7 @@
   let selectedKey = $state<string | null>(null);
   let now = $state(Date.now());
   let rowEls: Record<string, HTMLButtonElement | undefined> = {};
+  let homeEl: HTMLDivElement | undefined;
 
   // Flat row order (workspace → tab → row) for ↑/↓ navigation.
   const flatRows = $derived(model.flatMap((ws) => ws.tabs.flatMap((t) => t.rows)));
@@ -142,8 +143,12 @@
 
   // Move DOM focus to the selected row so Enter (native button click) and the
   // highlight stay in sync; runs on mount (first row) and every selection move.
+  // With NO rows (empty state), focus the container itself — the keydown
+  // handler lives on it, and without this Esc/digits are dead on an empty
+  // dashboard (nothing inside it holds focus, so no key ever reaches it).
   $effect(() => {
     if (selectedKey) rowEls[selectedKey]?.focus();
+    else homeEl?.focus();
   });
 
   // Live tick: re-render elapsed timers each second. The component is mounted
@@ -203,6 +208,7 @@
     role="listbox"
     tabindex="-1"
     aria-label="Agent dashboard"
+    bind:this={homeEl}
     onkeydown={onKeydown}
   >
   <header class="home-head">

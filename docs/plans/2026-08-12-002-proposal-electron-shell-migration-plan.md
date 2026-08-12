@@ -54,8 +54,15 @@ ack flushes before teardown), and the Electron shell's before-quit drives
 `core/shutdown` first (spawned *or* adopted core — quitting fly quits the
 backend) with SIGTERM fallback and a 10 s SIGKILL deadline. Live-verified
 both triggers: exit 0, clean-exit marker written, ordered log line.
-Remaining: U6 parity+perf gate (rest), U7 packaging/cutover, U8
-simplifications.
+KTD6 detach/adopt **live-verified under the
+Electron shell** (2026-08-12, fly-el on `substrate: "tmux"`): quit → ordered
+core shutdown → session survived on the fly-el tmux server; relaunch →
+spawn-or-adopt → same pane pid, scrollback replayed (pre-restart marker
+visible), pane resized on first show, keystrokes round-trip. Found+fixed en
+route: an *empty* dashboard held no DOM focus, so its Esc/digit keys were
+dead (pre-existing, both shells — HomeView now focuses its container when no
+row exists). Remaining: U6 parity checklist + perf gate, U7
+packaging/cutover, U8 simplifications.
 **Grounds**: `docs/notes/2026-08-12-electron-engine-probe.md` (same-box probe:
 flood main-thread 63 % → 11.7 %, echo 99 → 53 ms p50; ~50 ms xterm.js pipeline
 floor persists on any engine) and
