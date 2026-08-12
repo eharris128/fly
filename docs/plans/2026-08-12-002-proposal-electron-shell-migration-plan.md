@@ -83,7 +83,17 @@ anyway?" over `fly:close-request`; Esc cancels; idle close persists and
 quits clean. Not exercised: handoff chords end-to-end (transport-proven;
 frontend identical), peer send/drop delivery (shared deliver_with_guards
 path), KTD8 notify-rust (deferred to U7 — notify-send serves the seam).
-Remaining: U6 perf gate + Wayland pass, U7 packaging/cutover, U8
+**U6 perf gate: ALL THREE HIT** (2026-08-12, real app,
+fly-el/tmux/Electron, Vite dev frontend, X11 `--no-sandbox`,
+`mirrorUnfocused` on as shipped; same pixel-diff + per-tid method as the
+spike, ~10 ms probe overhead included; renderer found by its Compositor
+thread — `--no-sandbox` forks keep the zygote cmdline):
+echo p50 focused **47.3 ms** (36–50, n=12; gate ≤60, Tauri baseline 99) ·
+5-pane 33 Hz flood renderer main thread **13.8 % avg / 39.8 % peak / 0
+samples >50 %** (gate ≤20 %; WebKitGTK 63 %/87 %>50 %) · typing with 4
+panes flooding **47.0 ms p50 = 1.0×** (gate <2×; probe region pinned to
+the focused pane so spinner repaints can't false-trigger). Remaining: U6
+Wayland pass + send-keys input-path cost, U7 packaging/cutover, U8
 simplifications.
 **Grounds**: `docs/notes/2026-08-12-electron-engine-probe.md` (same-box probe:
 flood main-thread 63 % → 11.7 %, echo 99 → 53 ms p50; ~50 ms xterm.js pipeline

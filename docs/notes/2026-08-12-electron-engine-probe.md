@@ -65,3 +65,16 @@ not on Ink. So:
   (`--ozone-platform=wayland`) round not run (probe is X11-bound — KTD4's
   optional leg); Electron round used `--no-sandbox` (no SUID helper on this
   box) — irrelevant to render cost.
+
+## Addendum — U6 gate on the real app (2026-08-12, later the same day)
+
+Same method, but the *real* fly frontend on the Electron shell (fly-el
+flavor, tmux substrate, Vite dev frontend, `mirrorUnfocused` on as shipped):
+echo p50 focused **47.3 ms** (36–50, n=12); 5-pane flood renderer main
+thread **13.8 % avg / 39.8 % peak / 0 samples >50 %**; typing with 4 panes
+flooding **47.0 ms p50 (1.0×)** — probe region pinned to the focused pane
+so flood repaints can't false-trigger the diff. All three pre-committed
+gates hit. The real app beats the spike's echo (47 vs 53 ms) — the mirror
+throttle keeps unfocused panes off the render path entirely. Renderer
+process identification under `--no-sandbox`: forked renderers keep the
+zygote's cmdline, so find the process owning a `Compositor` thread.
