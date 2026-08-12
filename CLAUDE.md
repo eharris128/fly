@@ -157,8 +157,10 @@ what backs a pane. Under `tmux`, every leaf-keyed pane is a **marked session
 on a fly-owned per-flavor tmux server** (`substrate/` — wrapper with executor
 seam, injective naming, durable leaf⇄session⇄token store): output streams
 through a `pipe-pane` FIFO into the same sink/activity/ring machinery, input
-ships as binary-safe `send-keys -H`, exits arrive via `pane-died` hooks over
-the socket (KTD12 server-scope token, persisted for cross-instance
+ships as binary-safe `send-keys -H` through a persistent control-mode client
+(the unmarked `flyctl-input` session; ~µs/key vs ~8 ms/key subprocess —
+fire-and-forget, subprocess fallback on client death), exits arrive via
+`pane-died` hooks over the socket (KTD12 server-scope token, persisted for cross-instance
 continuity) with a 1.5 s poll floor, and **sessions outlive fly**: quit
 detaches (ephemeral automation/sink panes are killed instead), restart
 adopts — same child pid, stored pane token re-registered, ~2k lines

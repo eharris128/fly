@@ -178,10 +178,90 @@ pub struct TmuxConfig {
     pub history_limit: u32,
 }
 
+/// The utility session the persistent input client attaches to (Electron-
+/// shell migration U6, the ~8 ms/keystroke fix). Deliberately OUTSIDE the
+/// `fly-<flavor>-…` marked namespace, so discovery/adoption never sees it;
+/// its only job is giving the control-mode client something to attach to
+/// (control mode is "attach a client", and an attached marked session would
+/// read as focused-elsewhere to the suppression policy).
+const INPUT_CLIENT_SESSION: &str = "flyctl-input";
+
+/// A persistent `tmux -C` control-mode client used as the interactive
+/// keystroke transport: one long-lived process, one command line per
+/// `send-keys`, ~0.003 ms caller cost vs ~8 ms for a subprocess per
+/// keystroke (measured 2026-08-12, this box). Fire-and-forget: responses
+/// are drained (a full pipe would wedge the server's writes), errors are
+/// not read back — a keystroke to a dead session drops, exactly like a PTY
+/// write to a dead child; session death is owned by the pane-died hook +
+/// poll pipeline, not the input path. Any write failure drops the client;
+/// the caller falls back to the subprocess leg and the next call respawns.
+struct InputClient {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+}
+
+impl InputClient {
+    fn spawn(socket_name: &str) -> Option<InputClient> {
+        let mut child = Command::new("tmux")
+            .args([
+                "-u",
+                "-L",
+                socket_name,
+                "-C",
+                // NO `-d`: control mode is "attach a client" — with -d the
+                // client exits the moment the (detached) session exists, and
+                // a write can race into the dying pipe and silently drop a
+                // keystroke (caught by substrate_live on first landing).
+                "new-session",
+                "-A",
+                "-s",
+                INPUT_CLIENT_SESSION,
+                "sleep infinity",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+        // Drain everything the server sends (%begin/%end blocks, %output
+        // notifications) so the pipe never fills.
+        std::thread::Builder::new()
+            .name("fly-tmux-input-drain".into())
+            .spawn(move || {
+                use std::io::Read as _;
+                let mut sink = [0u8; 4096];
+                let mut r = stdout;
+                while matches!(r.read(&mut sink), Ok(n) if n > 0) {}
+            })
+            .ok()?;
+        Some(InputClient { child, stdin })
+    }
+
+    fn send_line(&mut self, line: &str) -> bool {
+        self.stdin.write_all(line.as_bytes()).is_ok() && self.stdin.flush().is_ok()
+    }
+}
+
+impl Drop for InputClient {
+    fn drop(&mut self) {
+        // A control client is a plain child process: kill + reap, or it
+        // would outlive fly attached to the server forever.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// The tmux driver. Construction is cheap; methods classify every failure.
 pub struct Tmux {
     cfg: TmuxConfig,
     exec: Box<dyn Executor>,
+    /// Lazily-spawned persistent input client (`None` until first use or
+    /// after a failure). Disabled under `with_executor` so unit tests with
+    /// fake executors observe every send as subprocess args.
+    input: std::sync::Mutex<Option<InputClient>>,
+    input_enabled: bool,
 }
 
 impl Tmux {
@@ -189,11 +269,18 @@ impl Tmux {
         Self {
             cfg,
             exec: Box::new(RealExecutor),
+            input: std::sync::Mutex::new(None),
+            input_enabled: true,
         }
     }
 
     pub fn with_executor(cfg: TmuxConfig, exec: Box<dyn Executor>) -> Self {
-        Self { cfg, exec }
+        Self {
+            cfg,
+            exec,
+            input: std::sync::Mutex::new(None),
+            input_enabled: false,
+        }
     }
 
     /// Base argv: `-u` always (UTF-8 regardless of locale), then the flavor
@@ -512,8 +599,16 @@ impl Tmux {
     /// Binary-safe raw input: `send-keys -H` hex bytes (tmux ≥ 2.4). The
     /// interactive keystroke transport for tmux-backed panes (U3) —
     /// arbitrary control sequences pass byte-exact, no `-l` quoting rules.
+    ///
+    /// Rides the persistent control-mode client when available (U6: ~8 ms
+    /// subprocess exec per keystroke → ~µs pipe write; see [`InputClient`]
+    /// for the fire-and-forget tradeoff), falling back to — and respawning
+    /// through — the one-subprocess leg on any client failure.
     pub fn send_hex(&self, name: &str, bytes: &[u8]) -> Result<(), TmuxError> {
         validate_session_name(name).map_err(TmuxError::InvalidName)?;
+        if self.input_enabled && self.send_hex_via_client(name, bytes) {
+            return Ok(());
+        }
         let mut args: Vec<String> =
             vec!["send-keys".into(), "-t".into(), name.into(), "-H".into()];
         args.extend(bytes.iter().map(|b| format!("{b:02x}")));
@@ -523,6 +618,39 @@ impl Tmux {
             return Err(Self::classify(&strs, &out));
         }
         Ok(())
+    }
+
+    /// Fast-path attempt: write one `send-keys` command line to the
+    /// persistent client, (re)spawning it lazily. `false` = caller must use
+    /// the subprocess leg (spawn failed or the client died mid-write; the
+    /// dead client is dropped so the next call respawns fresh).
+    fn send_hex_via_client(&self, name: &str, bytes: &[u8]) -> bool {
+        let mut line = String::with_capacity(24 + name.len() + bytes.len() * 3);
+        line.push_str("send-keys -t ");
+        line.push_str(name);
+        line.push_str(" -H");
+        for b in bytes {
+            line.push_str(&format!(" {b:02x}"));
+        }
+        line.push('\n');
+        let mut guard = match self.input.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if guard.is_none() {
+            *guard = InputClient::spawn(&self.cfg.socket_name);
+        }
+        match guard.as_mut() {
+            Some(client) => {
+                if client.send_line(&line) {
+                    true
+                } else {
+                    *guard = None; // dead client: drop (kills + reaps), respawn next call
+                    false
+                }
+            }
+            None => false,
+        }
     }
 
     /// `remain-on-exit` for a session's window (U4/KTD4): a dead pane keeps

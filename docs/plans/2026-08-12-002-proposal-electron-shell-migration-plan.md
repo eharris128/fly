@@ -92,9 +92,25 @@ echo p50 focused **47.3 ms** (36–50, n=12; gate ≤60, Tauri baseline 99) ·
 5-pane 33 Hz flood renderer main thread **13.8 % avg / 39.8 % peak / 0
 samples >50 %** (gate ≤20 %; WebKitGTK 63 %/87 %>50 %) · typing with 4
 panes flooding **47.0 ms p50 = 1.0×** (gate <2×; probe region pinned to
-the focused pane so spinner repaints can't false-trigger). Remaining: U6
-Wayland pass + send-keys input-path cost, U7 packaging/cutover, U8
-simplifications.
+the focused pane so spinner repaints can't false-trigger). Wayland pass **blocked 2026-08-12**: the box is
+booted into an X11 session today (`XDG_SESSION_TYPE=x11`, no wayland
+socket, no headless compositor installed) — `--ozone-platform=wayland` has
+nothing to connect to. To run when the box is next on a Wayland session;
+fallback story mirrors today's: Electron auto-picks X11/Xwayland, and
+`--ozone-platform=x11` is the explicit escape hatch (document beside
+`GDK_BACKEND=x11` at packaging). Send-keys input-path cost fixed
+(2026-08-12): `Tmux::send_hex` now rides a lazily-spawned persistent
+`tmux -C` control-mode client (attached to the unmarked `flyctl-input`
+utility session, outside discovery/suppression) — measured 7.65 ms/key
+subprocess → ~µs pipe write on this box; in-app echo p50 47.3 → **42 ms**.
+Fire-and-forget by design (drain thread, no error read-back — session death
+stays owned by the pane-died hook/poll pipeline); any client failure falls
+back to the subprocess leg and respawns next call; `with_executor` (tests)
+disables the fast path. Landing bug caught by `substrate_live`: `-d` on the
+control client's `new-session` makes the client exit instantly and a write
+can race into the dying pipe, silently dropping a keystroke — no `-d`.
+Remaining: U6 Wayland leg (deferred — X11 session today), U7
+packaging/cutover, U8 simplifications.
 **Grounds**: `docs/notes/2026-08-12-electron-engine-probe.md` (same-box probe:
 flood main-thread 63 % → 11.7 %, echo 99 → 53 ms p50; ~50 ms xterm.js pipeline
 floor persists on any engine) and
