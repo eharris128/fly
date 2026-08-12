@@ -111,12 +111,16 @@ answers.
 
 ## Architecture
 
-### One binary, two roles
+### One binary, three roles
 `main.rs` → `lib.rs::run()`. If argv[1] is a CLI subcommand (`notify`, `hooks`,
 `automation`, `agents`, `send`), the process runs as the **`fly` CLI** and
-exits; otherwise it launches the Tauri desktop app. The CLI and the app share
-the same `fly_lib` crate, so a `fly notify` invocation inside a pane talks to
-the running app.
+exits; `fly core` runs the **headless backend** (the full `build_backend`
+stack served over the control socket — what the Electron shell spawns and
+drives); otherwise it launches the **Tauri desktop app** (the KTD9 rollback
+shell — since the 2026-08-12 cutover the shipped product is the Electron
+shell in `electron/` + `fly core`, and the installed launcher never invokes
+the Tauri role). All roles share the same `fly_lib` crate, so a `fly notify`
+invocation inside a pane talks to whichever backend is running.
 
 `fly automation <create|update|list|show|runs|pause|resume|run|delete>` (U9)
 manages cron-scheduled runs: read ops work anywhere (they read the store file
