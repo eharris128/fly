@@ -132,8 +132,22 @@ post-install: `fly notify` hooks still fire (path unchanged),
 `ls -la /usr/bin/fly` → `/opt/fly/resources/fly`, and chrome-sandbox is
 4755 (no --no-sandbox anywhere). Rollback: quit Electron fly,
 `sudo apt install ./src-tauri/.../fly_0.1.0_amd64.deb`, relaunch.
-Remaining otherwise: U6 Wayland leg (deferred — X11 session today), U8
-simplifications.
+U8 (2026-08-12, each against a fresh
+measurement on the packaged shell): **mirrorUnfocused default flipped to
+off** — 5-pane flood with live rendering: renderer main thread 14.4 % avg
+/ 29.9 % peak / 0 >50 % (vs 13.8 % mirrored — the mirror buys nothing on
+Chromium), typing under 4-pane live flood 46.0 ms p50 (vs 47.0 mirrored);
+the mechanism stays (one config flag) because the Tauri rollback shell
+still needs it — full removal waits for Tauri retirement. **KTD6 WebGL
+disposal-on-hide: KEPT** — Chromium caps live WebGL contexts per page
+(~16), so disposal is a correctness ceiling with many panes there, not
+just a WebKitGTK cost fix; no measurement can lift a hard limit. **Hidden
+250 ms coalesce deadline: KEPT** — it only batches inactive-tab panes
+nobody sees, still saves wakeups on any engine, and its visibility
+plumbing is shared with attention suppression; removing it would add
+wakeups for zero visible benefit. Remaining: U6 Wayland leg (deferred —
+X11 session today) and the U7 cutover step (user: sudo install + quit the
+Tauri daily driver).
 **Grounds**: `docs/notes/2026-08-12-electron-engine-probe.md` (same-box probe:
 flood main-thread 63 % → 11.7 %, echo 99 → 53 ms p50; ~50 ms xterm.js pipeline
 floor persists on any engine) and

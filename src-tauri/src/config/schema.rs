@@ -287,9 +287,12 @@ pub struct Config {
     pub terminal: String,
     /// Render visible-but-unfocused panes as 2 Hz DOM snapshots of their
     /// hidden xterm buffers instead of live terminals (tmux-substrate plan
-    /// U5/KTD2). Default ON — this is the engine-floor relief for
-    /// multi-pane streaming (63% → ~4–14% webview main-thread under the
-    /// 5-pane protocol); `false` restores live rendering everywhere.
+    /// U5/KTD2). WebKitGTK engine-floor relief (63% → ~4–14% webview
+    /// main-thread under the 5-pane protocol). Default OFF since the
+    /// Electron cutover (migration U8, measured 2026-08-12): on Chromium the
+    /// 5-pane flood costs 14.4% renderer main-thread with live rendering vs
+    /// 13.8% mirrored — the mirror buys nothing there. `true` restores the
+    /// snapshots (the Tauri-shell rollback still wants them).
     pub mirror_unfocused: bool,
     /// Session substrate (tmux plan KTD10): `pty` (default) keeps the
     /// portable-pty path; `tmux` backs every leaf-keyed pane with a marked
@@ -332,7 +335,7 @@ impl Default for Config {
             automation_defaults: AutomationDefaults::default(),
             feed: FeedConfig::default(),
             terminal: "x-terminal-emulator".into(),
-            mirror_unfocused: true,
+            mirror_unfocused: false,
             substrate: SubstrateKind::default(),
         }
     }

@@ -177,10 +177,12 @@ adopts — same child pid, stored pane token re-registered, ~2k lines
 replayed. `leader t` opens the focused session in a real terminal
 (`config.terminal`); an attached session counts as focused-elsewhere for
 suppression. Substrate-independent but born of the same plan:
-`config.mirrorUnfocused` (default on) renders visible-unfocused panes as
-2 Hz DOM snapshots of their hidden xterm buffers (`lib/mirror.ts`) — the
-WebKitGTK engine-floor relief (63% → 4–14% webview main-thread under the
-5-pane protocol). Plan:
+`config.mirrorUnfocused` (default OFF since the Electron cutover — U8
+measured Chromium at ~14% renderer main-thread on the 5-pane flood with or
+without it; `true` restores it for the Tauri/WebKitGTK rollback, where it
+was the engine-floor relief: 63% → 4–14% webview main-thread) renders
+visible-unfocused panes as 2 Hz DOM snapshots of their hidden xterm
+buffers (`lib/mirror.ts`). Plan:
 `docs/plans/2026-08-11-001-feat-tmux-session-substrate-plan.md`.
 
 ### Backend modules (`src-tauri/src/`)

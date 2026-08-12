@@ -293,9 +293,11 @@
   let resumeTierByLeaf = $state<Record<string, ResumeTier>>({});
   let saveScrollbackEnabled = $state(false);
   // U5 (tmux-substrate plan): visible-but-unfocused panes render as 2 Hz DOM
-  // snapshots of their hidden xterm buffers — the engine-floor relief. Seeded
-  // from config.mirrorUnfocused; `false` restores live rendering everywhere.
-  let mirrorUnfocused = $state(true);
+  // snapshots of their hidden xterm buffers — the WebKitGTK engine-floor
+  // relief. Seeded from config.mirrorUnfocused; default OFF since the
+  // Electron cutover (migration U8 — Chromium renders 5 live flooding panes
+  // at ~14% renderer main-thread, mirror or not); `true` restores snapshots.
+  let mirrorUnfocused = $state(false);
   // U7: leaves whose tmux session has an external terminal attached
   // (pane://attach events) — drives the badge and nothing else; the
   // suppression side lives in the backend AttentionManager.
@@ -2284,7 +2286,7 @@
   async function restore() {
     const cfg = await getConfig();
     saveScrollbackEnabled = cfg.saveScrollback;
-    mirrorUnfocused = cfg.mirrorUnfocused ?? true;
+    mirrorUnfocused = cfg.mirrorUnfocused ?? false;
     leaderKey = cfg.leaderKey;
     nudgeIdleMs = cfg.nudgeIdleMs;
     feedEnabled = cfg.feed.enabled;
