@@ -109,8 +109,31 @@ back to the subprocess leg and respawns next call; `with_executor` (tests)
 disables the fast path. Landing bug caught by `substrate_live`: `-d` on the
 control client's `new-session` makes the client exit instantly and a write
 can race into the dying pipe, silently dropping a keystroke — no `-d`.
-Remaining: U6 Wayland leg (deferred — X11 session today), U7
-packaging/cutover, U8 simplifications.
+U7 packaging landed 2026-08-12:
+electron-builder .deb (`electron/dist-el/`, ~94 MB) with deb **Package:
+fly, version 0.2.0** — installing it upgrades/replaces the Tauri 0.1.0
+deb, and rollback is reinstalling that deb (kept at
+`src-tauri/target/release/bundle/deb/`). Layout: `/opt/fly/fly-shell`
+(Electron, sandboxed — postinst SUIDs chrome-sandbox, replicating the
+electron-builder default our custom script replaces), the Rust binary at
+`/opt/fly/resources/fly` with **/usr/bin/fly symlinked to it** (hooks
+embed that absolute path; CLI + `fly core` roles unchanged), frontend in
+app.asar loaded over file:// (vite `base: "./"` — same dist serves the
+Tauri asset protocol, KTD9-compatible). main.js: packaged ⇒ flavor
+defaults to `fly`, binary from resourcesPath, frontend from asar; repo
+checkout keeps the fly-el/FLY_SHELL_URL dev loop. **Unpacked build
+live-verified on fly-el**: bundled release core spawned, sessions
+adopted, echo p50 **41.8 ms** (production frontend). Remaining for U7 —
+**the cutover itself, which needs the user** (sudo install + quitting the
+live daily-driver): `sudo apt install ./electron/dist-el/fly-electron-shell_0.2.0_amd64.deb`,
+quit the running Tauri fly (sessions detach), launch fly (Electron adopts
+them — same pids, scrollback replayed; zero agent downtime). Verify
+post-install: `fly notify` hooks still fire (path unchanged),
+`ls -la /usr/bin/fly` → `/opt/fly/resources/fly`, and chrome-sandbox is
+4755 (no --no-sandbox anywhere). Rollback: quit Electron fly,
+`sudo apt install ./src-tauri/.../fly_0.1.0_amd64.deb`, relaunch.
+Remaining otherwise: U6 Wayland leg (deferred — X11 session today), U8
+simplifications.
 **Grounds**: `docs/notes/2026-08-12-electron-engine-probe.md` (same-box probe:
 flood main-thread 63 % → 11.7 %, echo 99 → 53 ms p50; ~50 ms xterm.js pipeline
 floor persists on any engine) and

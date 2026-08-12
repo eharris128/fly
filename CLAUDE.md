@@ -26,9 +26,19 @@ pnpm tauri dev                # run the app (Vite dev server + cargo run) — us
 pnpm flavor:dev               # run a dev build ALONGSIDE an installed release (see "Stable + dev side by side")
 pnpm check                    # svelte-check: type-check the frontend
 pnpm test:unit                # vitest: all frontend unit tests
-pnpm tauri build --bundles deb   # standalone .deb (skip AppImage — it needs network at bundle time)
-pnpm build:local              # .deb on the fast release-dev profile (thin LTO — ~2× faster rebuilds)
+pnpm tauri build --bundles deb   # TAURI .deb (kept buildable — KTD9 rollback; skip AppImage, needs network)
+pnpm build:local              # Tauri .deb on the fast release-dev profile (thin LTO — ~2× faster rebuilds)
 pnpm build:mac                # on a Mac: .app + .dmg (best-effort target — see docs/macos-build.md)
+
+# The ELECTRON shell (migration plan 2026-08-12-002; the packaged product as of U7):
+pnpm build && cargo build --release --offline --manifest-path src-tauri/Cargo.toml \
+  && (cd electron && npm run dist)   # → electron/dist-el/fly-electron-shell_<ver>_amd64.deb
+                                     # (deb Package: fly — installing it REPLACES the Tauri deb;
+                                     #  postinst SUIDs chrome-sandbox + symlinks /usr/bin/fly)
+# Electron dev loop (fly-el flavor beside the installed release):
+#   pnpm dev   +   (cd electron && DISPLAY=:1 FLY_APP_NAME=fly-el \
+#     FLY_SHELL_URL=http://localhost:1420 ./node_modules/.bin/electron . --no-sandbox)
+#   (--no-sandbox is dev-only: the repo checkout lacks the SUID helper; the packaged app runs sandboxed)
 
 cargo test --offline --manifest-path src-tauri/Cargo.toml          # all Rust tests
 cargo test --offline --manifest-path src-tauri/Cargo.toml --test hook_auth   # one integration-test file (src-tauri/tests/<name>.rs)

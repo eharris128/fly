@@ -12,8 +12,10 @@ const { encodeJson, encodePaneInput, FrameReader } = require('./protocol');
 
 // ---- flavor isolation (proposal KTD5) --------------------------------------
 // FLY_APP_NAME drives everything: the core's config/session/socket roots and
-// this shell's own userData/single-instance scope. Default dev flavor: fly-el.
-const FLAVOR = process.env.FLY_APP_NAME || 'fly-el';
+// this shell's own userData/single-instance scope. The packaged app IS fly
+// (default flavor); a repo checkout defaults to the fly-el dev flavor so it
+// coexists with an installed release (the flavor:dev story, U7).
+const FLAVOR = process.env.FLY_APP_NAME || (app.isPackaged ? 'fly' : 'fly-el');
 process.env.FLY_APP_NAME = FLAVOR;
 app.setPath('userData', path.join(app.getPath('appData'), `${FLAVOR}-shell`));
 
@@ -21,10 +23,13 @@ const RUNTIME_DIR =
   process.env.XDG_RUNTIME_DIR || process.env.TMPDIR || '/tmp';
 const CONTROL_SOCK = path.join(RUNTIME_DIR, FLAVOR, 'control.sock');
 
-// The fly binary: env override for dev, else the repo debug build beside this
-// checkout, else PATH.
+// The fly binary: env override for dev; the bundled resource when packaged
+// (the same Rust binary serving the CLI role — /usr/bin/fly symlinks to it,
+// see deb/postinst.sh); else the repo debug build beside this checkout; else
+// PATH.
 function flyBinary() {
   if (process.env.FLY_CORE_BIN) return process.env.FLY_CORE_BIN;
+  if (app.isPackaged) return path.join(process.resourcesPath, 'fly');
   const dev = path.join(__dirname, '..', 'src-tauri', 'target', 'debug', 'fly');
   if (require('fs').existsSync(dev)) return dev;
   return 'fly';
@@ -204,11 +209,15 @@ app.whenReady().then(async () => {
     allowClose = true;
     if (win && !win.isDestroyed()) win.destroy();
   });
-  // U5 loads the real frontend (Vite dev server or built assets); until
-  // then the probe page proves the bridge end-to-end.
+  // Packaged: the built frontend travels inside the asar (`frontend/`,
+  // copied from ../dist by the dist script — relative vite base, U7). Dev:
+  // FLY_SHELL_URL points at the Vite dev server; bare fallback is the U4
+  // bridge probe page.
   const url = process.env.FLY_SHELL_URL;
   if (url) {
     await win.loadURL(url);
+  } else if (app.isPackaged) {
+    await win.loadFile('frontend/index.html');
   } else {
     await win.loadFile('probe.html');
   }
