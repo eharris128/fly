@@ -21,27 +21,45 @@ use super::server::CommandHandler;
 use crate::automations::AutomationManager;
 use crate::config::{Config, ConfigStore};
 use crate::feed::FeedState;
+use crate::hooks::TokenRegistry;
 use crate::pty::{PaneId, PtyManager};
 use crate::state::AttentionManager;
 use crate::stream::coalesce::CoalescerRegistry;
-use crate::stream::{attention_event_payload, PANE_ATTENTION_EVENT};
+use crate::stream::{
+    attention_event_payload, spawn_pane_with, SpawnDeps, SpawnRequest, PANE_ATTENTION_EVENT,
+};
 
-/// Where a registry-dispatched command sends events (`pane://…` names, KTD1).
+/// Where a registry-dispatched command sends events (`pane://…` names, KTD1) —
+/// the canonical alias lives beside the spawn machinery in `stream`.
 /// `fly core` wires this to `ControlServer::broadcast_event`; tests record.
-pub type EventSink = Arc<dyn Fn(&str, Value) + Send + Sync>;
+pub use crate::stream::EventSink;
+
+/// Per-pane raw-output fan-out: `(paneId, bytes)` → the KTD3 binary frames.
+/// `fly core` wires this to `ControlServer::broadcast_pane_output`.
+pub type PaneBytesSink = Arc<dyn Fn(u64, Vec<u8>) + Send + Sync>;
 
 /// The shared state a registry closes over — the control-socket counterpart
-/// of the Tauri `.manage(…)` set. `automations`/`feed` are optional because
-/// the U2 core boots without the automations subsystem (it arrives with U3's
-/// full backend host); their commands answer a clear error when absent.
+/// of the Tauri `.manage(…)` set. `automations`/`alerts`/`feed` are optional
+/// because the U3 core boots without the automations subsystem and feed
+/// listener (they arrive with U3.5's full backend host); their commands
+/// answer a clear error when absent.
 pub struct CoreHandles {
     pub pty: Arc<PtyManager>,
+    pub tokens: Arc<TokenRegistry>,
     pub attention: Arc<AttentionManager>,
     pub config: Arc<ConfigStore>,
     pub coalescers: Arc<CoalescerRegistry>,
     pub automations: Option<Arc<AutomationManager>>,
+    pub alerts: Option<Arc<crate::automations::alerts::AlertsLog>>,
     pub feed: Option<Arc<FeedState>>,
+    /// Injected into every spawned pane's env as `FLY_SOCKET_PATH` — the
+    /// stable per-flavor hook-socket path (tmux-substrate KTD8). The U3 core
+    /// stamps the path before the hook *server* exists there (U3.5 boots it);
+    /// pane env must already point at the right place.
+    pub hook_socket_path: std::path::PathBuf,
+    pub launch_mode: crate::LaunchMode,
     pub events: EventSink,
+    pub pane_bytes: PaneBytesSink,
 }
 
 fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, String> {
@@ -446,10 +464,65 @@ pub fn build_registry(h: CoreHandles) -> CommandHandler {
                 to_ok(f.publish(a.payload.agents, crate::feed::now_ms()))
             }
 
-            // ---- shell-coupled: arrive with U3 --------------------------
-            "spawn_pane" | "register_alert_sink" | "get_launch_mode" => Err(format!(
-                "{cmd} is not available over the control socket yet (U3)"
-            )),
+            // ---- pane lifecycle (U3: bytes ride the 0x02 frames) --------
+            "spawn_pane" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct A {
+                    rows: u16,
+                    cols: u16,
+                    #[serde(default)]
+                    cwd: Option<String>,
+                    leaf_key: String,
+                    #[serde(default)]
+                    command: Option<Vec<String>>,
+                    #[serde(default)]
+                    automation_run_id: Option<String>,
+                    #[serde(default)]
+                    ephemeral: Option<bool>,
+                }
+                let a: A = parse(args)?;
+                let deps = SpawnDeps {
+                    pty: Arc::clone(&h.pty),
+                    tokens: Arc::clone(&h.tokens),
+                    attention: Arc::clone(&h.attention),
+                    coalescers: Arc::clone(&h.coalescers),
+                    automations: h.automations.clone(),
+                    alerts: h.alerts.clone(),
+                    hook_socket_path: h.hook_socket_path.to_string_lossy().into_owned(),
+                    events: Arc::clone(&h.events),
+                };
+                let sink = Arc::clone(&h.pane_bytes);
+                let byte_sink = Box::new(move |id: u64, bytes: Vec<u8>| sink(id, bytes));
+                let pane = spawn_pane_with(
+                    &deps,
+                    SpawnRequest {
+                        rows: a.rows,
+                        cols: a.cols,
+                        cwd: a.cwd,
+                        leaf_key: a.leaf_key,
+                        command: a.command,
+                        automation_run_id: a.automation_run_id,
+                        ephemeral: a.ephemeral,
+                    },
+                    byte_sink,
+                )?;
+                to_ok(pane)
+            }
+            "register_alert_sink" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct A {
+                    pane_id: u64,
+                }
+                let alerts = h.alerts.as_ref().ok_or("automations unavailable in this core (U3.5)")?;
+                let a: A = parse(args)?;
+                for _ in alerts.register_sink(a.pane_id) {
+                    crate::raise_alert_with(&h.events, &h.attention, a.pane_id);
+                }
+                Ok(Value::Null)
+            }
+            "get_launch_mode" => to_ok(h.launch_mode),
 
             other => Err(format!("unknown command: {other}")),
         }

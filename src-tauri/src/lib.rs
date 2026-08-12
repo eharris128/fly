@@ -125,6 +125,29 @@ fn raise_alert(app: &tauri::AppHandle, attention: &AttentionManager, pane_id: u6
     }
 }
 
+/// Shell-agnostic twin of [`raise_alert`] (Electron-shell migration U3): the
+/// control registry's `register_alert_sink` rings through the same
+/// `Signal { Alert, Cli }` seam, emitting via its event sink.
+pub(crate) fn raise_alert_with(
+    events: &stream::EventSink,
+    attention: &AttentionManager,
+    pane_id: u64,
+) {
+    let pane = pty::PaneId(pane_id);
+    if let Some(outcome) = attention.signal(
+        pane,
+        Signal {
+            reason: Reason::Alert,
+            tier: Tier::Cli,
+        },
+    ) {
+        events(
+            stream::PANE_ATTENTION_EVENT,
+            stream::attention_event_payload(pane, &outcome),
+        );
+    }
+}
+
 /// U6 command (R17): the frontend registers its "Automations" sink pane so
 /// queued and future alerts ring it. Draining the pending backlog raises one
 /// ring per alert that arrived before the pane existed (the attention debounce
@@ -171,7 +194,9 @@ fn decide_launch_mode(resume_requested: bool, prev_clean: bool) -> LaunchMode {
 
 /// Resolve the launch mode from argv + the clean-exit marker, and **clear the
 /// marker** so an unclean exit of *this* run is detectable next launch (KTD-G).
-fn resolve_launch_mode(args: &[String]) -> LaunchMode {
+/// `pub(crate)`: `fly core` resolves the same way at boot (U3) — whichever
+/// role owns the backend consumes the marker.
+pub(crate) fn resolve_launch_mode(args: &[String]) -> LaunchMode {
     let resume_requested = args.get(1).map(|s| s == "resume").unwrap_or(false);
     let marker = session::resume::clean_exit_path();
     let prev_clean = session::resume::took_clean_exit_at(&marker);

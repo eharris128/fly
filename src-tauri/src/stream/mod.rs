@@ -41,6 +41,11 @@ struct AttentionEvent {
     tier: Option<Tier>,
 }
 
+/// The `pane://exit` payload as a JSON value — one place, both shells (U3).
+pub fn pane_exit_payload(pane_id: u64, state: LifecycleState) -> serde_json::Value {
+    serde_json::to_value(PaneExitEvent { pane_id, state }).expect("exit event serializes")
+}
+
 /// The `pane://attention` payload as a JSON value — the one place the event
 /// shape is built, shared by the Tauri emit below and the control-socket
 /// registry (Electron-shell migration U2/KTD1), so the two shells cannot
@@ -127,6 +132,109 @@ pub fn spawn_pane(
     automation_run_id: Option<String>,
     ephemeral: Option<bool>,
 ) -> Result<PaneId, String> {
+    let events: EventSink = {
+        let app = app.clone();
+        Arc::new(move |name: &str, payload: serde_json::Value| {
+            let _ = app.emit(name, payload);
+        })
+    };
+    let deps = SpawnDeps {
+        pty: Arc::clone(pty.inner()),
+        tokens: Arc::clone(tokens.inner()),
+        attention: Arc::clone(attention.inner()),
+        coalescers: Arc::clone(coalescers.inner()),
+        automations: app
+            .try_state::<Arc<crate::automations::AutomationManager>>()
+            .map(|s| s.inner().clone()),
+        alerts: app
+            .try_state::<Arc<crate::automations::alerts::AlertsLog>>()
+            .map(|s| s.inner().clone()),
+        hook_socket_path: server.socket_path().to_string_lossy().into_owned(),
+        events,
+    };
+    let byte_sink: PaneByteSink = Box::new(move |_id, bytes: Vec<u8>| {
+        let _ = channel.send(InvokeResponseBody::Raw(bytes));
+    });
+    spawn_pane_with(
+        &deps,
+        SpawnRequest {
+            rows,
+            cols,
+            cwd,
+            leaf_key,
+            command,
+            automation_run_id,
+            ephemeral,
+        },
+        byte_sink,
+    )
+}
+
+/// Where a shell-agnostic spawn sends its events (`pane://…` names). The Tauri
+/// wrapper wraps `app.emit`; the control registry wraps server broadcast
+/// (Electron-shell migration U3) — canonical alias re-exported by
+/// `control::registry`.
+pub type EventSink = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
+
+/// Per-pane raw-output sink, called `(paneId, bytes)`: the Tauri wrapper
+/// feeds its per-pane `Channel` (id ignored — the channel IS the pane), the
+/// control registry feeds `broadcast_pane_output` binary frames (KTD3),
+/// which need the id on every frame.
+pub type PaneByteSink = Box<dyn Fn(u64, Vec<u8>) + Send + Sync + 'static>;
+
+/// Everything [`spawn_pane_with`] needs from its shell — the managers both
+/// shells share, the optional automation subsystems (absent in a U3 core),
+/// the hook-socket path injected into pane env, and the event sink.
+pub struct SpawnDeps {
+    pub pty: Arc<PtyManager>,
+    pub tokens: Arc<TokenRegistry>,
+    pub attention: Arc<AttentionManager>,
+    pub coalescers: Arc<CoalescerRegistry>,
+    pub automations: Option<Arc<crate::automations::AutomationManager>>,
+    pub alerts: Option<Arc<crate::automations::alerts::AlertsLog>>,
+    pub hook_socket_path: String,
+    pub events: EventSink,
+}
+
+/// The wire arguments of a spawn, shell-independent (KTD1 shapes).
+pub struct SpawnRequest {
+    pub rows: u16,
+    pub cols: u16,
+    pub cwd: Option<String>,
+    pub leaf_key: String,
+    pub command: Option<Vec<String>>,
+    pub automation_run_id: Option<String>,
+    pub ephemeral: Option<bool>,
+}
+
+/// The body behind [`spawn_pane`], shared with the control-socket registry
+/// (Electron-shell migration U3) so pane lifecycle — token adopt/issue,
+/// attention registration, automation linking, coalesced output, ordered
+/// exit teardown — is identical under either shell.
+pub fn spawn_pane_with(
+    deps: &SpawnDeps,
+    req: SpawnRequest,
+    byte_sink: PaneByteSink,
+) -> Result<PaneId, String> {
+    let SpawnDeps {
+        pty,
+        tokens,
+        attention,
+        coalescers,
+        automations,
+        alerts,
+        hook_socket_path,
+        events,
+    } = deps;
+    let SpawnRequest {
+        rows,
+        cols,
+        cwd,
+        leaf_key,
+        command,
+        automation_run_id,
+        ephemeral,
+    } = req;
     let id = pty.reserve_id();
     // Register the token before the child starts so no callback can race it.
     // U8 reattach: a leaf whose marked tmux session survives is ADOPTED — the
@@ -154,7 +262,7 @@ pub fn spawn_pane(
     // next occurrence would double up on. Clean up the token/attention
     // registration on that abort so nothing leaks for an id that never spawned.
     if let Some(run_id) = automation_run_id.as_deref() {
-        let Some(mgr) = app.try_state::<Arc<crate::automations::AutomationManager>>() else {
+        let Some(mgr) = automations.as_ref() else {
             tokens.revoke(id);
             attention.remove(id);
             return Err("automations manager unavailable".into());
@@ -167,7 +275,7 @@ pub fn spawn_pane(
         mgr.register_automation_pane(id.0);
     }
 
-    let socket_path = server.socket_path().to_string_lossy().into_owned();
+    let socket_path = hook_socket_path.clone();
 
     // Raw bytes end-to-end (KTD3) — lossless, but only literally untranscoded
     // above 1 KiB: Tauri 2.11.3 (`ipc/channel.rs:163`) re-encodes a `Raw`
@@ -180,7 +288,7 @@ pub fn spawn_pane(
     // per second instead of one per PTY read. One forwarder per pane, one
     // channel — ordering is preserved.
     let coalescer = Coalescer::spawn(id.0, move |bytes: Vec<u8>| {
-        let _ = channel.send(InvokeResponseBody::Raw(bytes));
+        byte_sink(id.0, bytes);
     });
     let sink = {
         let coalescer = Arc::clone(&coalescer);
@@ -188,11 +296,13 @@ pub fn spawn_pane(
     };
 
     let on_exit = {
-        let app = app.clone();
-        let attention = Arc::clone(attention.inner());
-        let tokens = Arc::clone(tokens.inner());
+        let events = Arc::clone(events);
+        let attention = Arc::clone(attention);
+        let tokens = Arc::clone(tokens);
         let coalescer = Arc::clone(&coalescer);
-        let coalescers = Arc::clone(coalescers.inner());
+        let coalescers = Arc::clone(coalescers);
+        let automations = automations.clone();
+        let alerts = alerts.clone();
         Box::new(move |id: PaneId, state: LifecycleState| {
             // Drain + stop the coalescer before anything is announced, so the
             // pane's final output reaches the frontend ahead of the exit note.
@@ -200,7 +310,7 @@ pub fn spawn_pane(
             coalescers.remove(id.0);
             // Exiting clears attention and tears down the pane's auth.
             if let Some(outcome) = attention.on_exit(id) {
-                emit_attention(&app, id, &outcome);
+                events(PANE_ATTENTION_EVENT, attention_event_payload(id, &outcome));
             }
             attention.remove(id);
             tokens.revoke(id);
@@ -212,24 +322,17 @@ pub fn spawn_pane(
             // (alert-sink clear + PANE_EXIT_EVENT below). on_pane_exit takes the
             // store lock, never the PTY registry lock, so the store→PTY order
             // (KTD-B) holds. A no-op for ordinary panes.
-            if let Some(mgr) = app.try_state::<Arc<crate::automations::AutomationManager>>() {
-                let mgr = mgr.inner().clone();
+            if let Some(mgr) = automations.clone() {
                 let pane_id = id.0;
                 std::thread::spawn(move || mgr.on_pane_exit(pane_id));
             }
             // U6: if this pane was the automations alert sink, clear the
             // registration so a later alert re-opens a fresh sink pane
             // (no-op for any other pane).
-            if let Some(alerts) = app.try_state::<Arc<crate::automations::alerts::AlertsLog>>() {
+            if let Some(alerts) = alerts.as_ref() {
                 alerts.clear_sink_if(id.0);
             }
-            let _ = app.emit(
-                PANE_EXIT_EVENT,
-                PaneExitEvent {
-                    pane_id: id.0,
-                    state,
-                },
-            );
+            events(PANE_EXIT_EVENT, pane_exit_payload(id.0, state));
         })
     };
 

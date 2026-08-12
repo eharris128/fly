@@ -15,7 +15,7 @@ use fly_lib::control::registry::{build_registry, CoreHandles};
 use fly_lib::control::{ControlServer, Frame};
 
 struct Rig {
-    _server: ControlServer,
+    _server: Arc<ControlServer>,
     client: UnixStream,
     _tmp: tempfile::TempDir,
 }
@@ -25,17 +25,39 @@ fn rig() -> Rig {
     let config = Arc::new(fly_lib::config::ConfigStore::load(
         tmp.path().join("config.json"),
     ));
+    let path = tmp.path().join("control.sock");
+    // Both sinks broadcast through the server, resolved via a slot filled
+    // after start — the same shape `fly core` wires.
+    let server_slot: Arc<std::sync::Mutex<Option<Arc<ControlServer>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let event_slot = Arc::clone(&server_slot);
+    let bytes_slot = Arc::clone(&server_slot);
     let handles = CoreHandles {
         pty: Arc::new(fly_lib::pty::PtyManager::new()),
+        tokens: Arc::new(fly_lib::hooks::TokenRegistry::new()),
         attention: Arc::new(fly_lib::state::AttentionManager::new(400, false)),
         config,
         coalescers: Arc::new(fly_lib::stream::coalesce::CoalescerRegistry::default()),
         automations: None,
+        alerts: None,
         feed: Some(Arc::new(fly_lib::feed::FeedState::new())),
-        events: Arc::new(|_, _| {}),
+        hook_socket_path: tmp.path().join("hook.sock"),
+        launch_mode: fly_lib::LaunchMode::Normal,
+        events: Arc::new(move |name: &str, payload: serde_json::Value| {
+            if let Some(s) = event_slot.lock().unwrap().as_ref() {
+                s.broadcast_event(name, payload);
+            }
+        }),
+        pane_bytes: Arc::new(move |pane: u64, bytes: Vec<u8>| {
+            if let Some(s) = bytes_slot.lock().unwrap().as_ref() {
+                s.broadcast_pane_output(pane, &bytes);
+            }
+        }),
     };
-    let path = tmp.path().join("control.sock");
-    let server = ControlServer::start(path.clone(), build_registry(handles), None).unwrap();
+    let server = Arc::new(
+        ControlServer::start(path.clone(), build_registry(handles), None).unwrap(),
+    );
+    *server_slot.lock().unwrap() = Some(Arc::clone(&server));
     let client = UnixStream::connect(&path).unwrap();
     client
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -187,12 +209,84 @@ fn feed_publish_works_and_automations_refuse_without_manager() {
 }
 
 #[test]
-fn shell_coupled_commands_name_their_unit() {
+fn u35_commands_name_their_unit_and_unknown_cmds_err() {
     let mut r = rig();
-    for (id, cmd) in [(1, "spawn_pane"), (2, "register_alert_sink"), (3, "get_launch_mode")] {
-        let v = call(&mut r, id, cmd, serde_json::Value::Null);
-        assert!(v["err"].as_str().unwrap().contains("U3"), "{cmd}: {v}");
-    }
-    let v = call(&mut r, 4, "no/such", serde_json::Value::Null);
+    let v = call(
+        &mut r,
+        1,
+        "register_alert_sink",
+        serde_json::json!({"paneId": 1}),
+    );
+    assert!(v["err"].as_str().unwrap().contains("U3.5"), "{v}");
+    let v = call(&mut r, 2, "no/such", serde_json::Value::Null);
     assert!(v["err"].as_str().unwrap().contains("unknown command"));
+}
+
+#[test]
+fn get_launch_mode_serializes_like_the_tauri_command() {
+    let mut r = rig();
+    let v = call(&mut r, 1, "get_launch_mode", serde_json::Value::Null);
+    assert_eq!(v["ok"], "normal"); // LaunchMode's lowercase serde shape
+}
+
+/// The U3 centerpiece: a real pane spawned over the socket, output arriving
+/// as 0x02 binary frames tagged with the pane id, and close driving the
+/// ordered teardown with a `pane://exit` event fanned out — final output
+/// strictly before the exit note (the coalescer-drain ordering guarantee).
+#[test]
+fn spawn_stream_close_lifecycle_over_the_socket() {
+    let mut r = rig();
+    let v = call(
+        &mut r,
+        1,
+        "spawn_pane",
+        serde_json::json!({
+            "rows": 24, "cols": 80,
+            "leafKey": "leaf-e2e",
+            "command": ["bash", "--norc", "-c", "echo CONTROL_MARKER; sleep 30"],
+        }),
+    );
+    let pane = v["ok"].as_u64().expect("spawned pane id");
+
+    // Collect frames until the marker shows up in this pane's output.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    while std::time::Instant::now() < deadline {
+        match read_frame(&mut r.client).unwrap().unwrap() {
+            Frame::PaneOutput { pane: p, bytes } if p == pane => {
+                out.extend_from_slice(&bytes);
+                if String::from_utf8_lossy(&out).contains("CONTROL_MARKER") {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&out).contains("CONTROL_MARKER"),
+        "pane output must ride the binary frames"
+    );
+
+    // Close → pane://exit event for this pane.
+    let body = serde_json::to_vec(
+        &serde_json::json!({"id": 2, "cmd": "close_pane", "args": {"paneId": pane}}),
+    )
+    .unwrap();
+    write_frame(&mut r.client, &Frame::Json(body)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_exit = false;
+    while std::time::Instant::now() < deadline && !saw_exit {
+        match read_frame(&mut r.client).unwrap().unwrap() {
+            Frame::Json(b) => {
+                let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+                if v.get("event").map(|e| e == "pane://exit").unwrap_or(false)
+                    && v["payload"]["paneId"] == pane
+                {
+                    saw_exit = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_exit, "close must fan out pane://exit");
 }

@@ -8,7 +8,15 @@ the seam over the real managers (config/PTY+substrate/attention/coalescers;
 shared-body extraction where a command holds logic: `pane_activity_snapshot`,
 `attach_pane_now`, `dashboard_snapshot`, `read_bundle_for`,
 `attention_event_payload`); the 3 shell-coupled stragglers (`spawn_pane`,
-`register_alert_sink`, `get_launch_mode`) answer a named-U3 error. U3 next.
+`register_alert_sink`, `get_launch_mode`) answered a named-U3 error. U3
+(landed): `spawn_pane` extracted into shell-agnostic `stream::spawn_pane_with`
+(token adopt/issue, automation linking, coalesced output, ordered exit
+teardown — one body, both shells); pane output rides the 0x02 binary frames,
+keystrokes ride 0x03 down (`fly core` wires the `PaneInputHandler` to
+write + attention-clear like `pty_write`); `pane://exit`/`pane://attention`
+fan out via the shared payload builders; `get_launch_mode` +
+`register_alert_sink` ported (core resolves its flavor's clean-exit marker at
+boot). Remaining: **U3.5** below, then U4.
 **Grounds**: `docs/notes/2026-08-12-electron-engine-probe.md` (same-box probe:
 flood main-thread 63 % → 11.7 %, echo 99 → 53 ms p50; ~50 ms xterm.js pipeline
 floor persists on any engine) and
@@ -101,6 +109,16 @@ byte `Channel` (PTY output), all defined at the `lib.rs` invoke_handler /
   the core socket; PTY output rides the binary frames (KTD3); backpressure
   semantics preserved (the pause/resume watermarks live below this seam and
   don't change).
+- **U3.5 — the full headless host** (carved out of U3 during execution —
+  2026-08-12: U3 landed the events/byte-stream seam and pane lifecycle; what
+  remains to make `fly core` a *complete* backend is extracting lib.rs's
+  setup wiring into a shell-agnostic builder: the hook server's dispatch
+  closure (attention/notify/resume-capture/feed bumps), the ask/peer/
+  automation/substrate handlers, the automations manager + sweep + alerts
+  with their event emitters, and the feed listener. Until then the U3 core
+  spawns fully functional panes whose env points at the stable hook-socket
+  path, but no hook server answers there; automations/feed commands answer a
+  named-U3.5 error.)
 - **U4 — Electron shell.** `main` + `preload`: window, single-instance
   (KTD7), core spawn/adopt with crash-restart, `fly-el` flavor wiring, dev
   loop (Vite dev server + electron, mirroring `pnpm flavor:dev`).

@@ -366,9 +366,16 @@ WebKitGTK engine-floor relief (63% → 4–14% webview main-thread under the
   real logic it was extracted into a shared fn used by both shells
   (`pty::pane_activity_snapshot`, `stream::attach_pane_now`,
   `automations::{dashboard_snapshot,read_bundle_for}`,
-  `stream::attention_event_payload`) so they cannot drift; `spawn_pane` /
-  `register_alert_sink` / `get_launch_mode` answer a named-U3 error until the
-  event/stream plumbing lands. The Tauri shell is untouched.
+  `stream::attention_event_payload`) so they cannot drift. U3: the pane
+  lifecycle is fully socket-served — `spawn_pane`'s body is the shared
+  `stream::spawn_pane_with` (`SpawnDeps` + per-pane `PaneByteSink`), output
+  rides the 0x02 binary frames, keystrokes ride 0x03 down (write +
+  attention-clear, `pty_write` parity), exits fan out as `pane://exit` via
+  the shared payload builders; `fly core` resolves its flavor's launch mode
+  (consuming the clean-exit marker, KTD-G). Automations/feed/hook-server
+  boot is **U3.5** (the lib.rs setup-wiring extraction) — until then those
+  commands answer a named-U3.5 error and spawned pane env points at a
+  hook-socket path nothing answers on yet. The Tauri shell is untouched.
 - `notify/`, `config/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
   reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the
