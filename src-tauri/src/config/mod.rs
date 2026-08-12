@@ -2,6 +2,15 @@
 //! dir, a *separate* file from the disposable session state (U12), so a corrupt
 //! session never wipes settings. Load-with-fallback mirrors U12: a corrupt file
 //! is backed up and defaults are used. No settings GUI — file plus defaults.
+//!
+//! Persistence is **sparse** (Electron-shell migration follow-up, 2026-08-12):
+//! every write prunes entries equal to their `Config::default()` value, at
+//! every nesting level, so the file records only the user's divergences and
+//! absent keys keep tracking the binary's defaults across upgrades. (The old
+//! full-struct write froze *every* default at last-save time — a default
+//! change could never reach an installed config again.) Safe because the
+//! whole schema loads partial objects: `Config` and each nested struct carry
+//! `#[serde(default)]`.
 
 mod schema;
 
@@ -78,7 +87,7 @@ fn write_atomic(path: &Path, config: &Config) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let json = serde_json::to_vec_pretty(config)
+    let json = serde_json::to_vec_pretty(&sparse_value(config))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension("json.tmp");
     #[cfg(unix)]
@@ -101,6 +110,42 @@ fn write_atomic(path: &Path, config: &Config) -> std::io::Result<()> {
     std::fs::write(&tmp, &json)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// The sparse on-disk form of `config`: the full struct serialized, then every
+/// entry equal to its `Config::default()` counterpart pruned recursively (an
+/// object emptied by pruning is dropped whole). Arrays and scalars compare
+/// wholesale — a diverged array is kept in full, never element-diffed, because
+/// element positions carry no stable identity. The result loads back to
+/// exactly `config` through the schema's pervasive `#[serde(default)]`.
+fn sparse_value(config: &Config) -> serde_json::Value {
+    let mut value = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
+    let default = serde_json::to_value(Config::default()).unwrap_or(serde_json::Value::Null);
+    if prune_equal(&mut value, &default) {
+        // Fully default (incl. equal-at-the-top, which mutates nothing): an
+        // empty object, not the untouched full dump.
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+    value
+}
+
+/// Recursively remove object entries equal to `default`'s. Returns whether
+/// `value` ended up contributing nothing (equal, or an emptied object) so the
+/// parent can drop the key.
+fn prune_equal(value: &mut serde_json::Value, default: &serde_json::Value) -> bool {
+    if value == default {
+        return true;
+    }
+    if let (serde_json::Value::Object(map), serde_json::Value::Object(dmap)) = (value, default) {
+        map.retain(|key, entry| match dmap.get(key) {
+            Some(dentry) => !prune_equal(entry, dentry),
+            // A key with no default counterpart (newer file than binary —
+            // shouldn't happen, but never destroy data) is kept as-is.
+            None => true,
+        });
+        return map.is_empty();
+    }
+    false
 }
 
 /// Default config file location: `$XDG_CONFIG_HOME/<app>/config.json`, where
@@ -257,6 +302,60 @@ mod tests {
         assert_eq!(mode(&path), 0o600, "after an unrelated rewrite");
         // The token itself survived the rewrite.
         assert!(store.get().feed.token.is_some());
+    }
+
+    #[test]
+    fn writes_are_sparse_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let store = ConfigStore::load(path.clone());
+
+        let mut cfg = store.get();
+        cfg.font_size = 21; // top-level divergence
+        cfg.reason_effects.finished.desktop = false; // nested divergence
+        cfg.substrate = SubstrateKind::Tmux; // enum divergence
+        store.set(cfg.clone()).unwrap();
+
+        // The file holds ONLY the divergences…
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let obj = raw.as_object().unwrap();
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>(),
+            vec!["fontSize", "reasonEffects", "substrate"],
+            "defaults must not be pinned"
+        );
+        // …pruned at every level: finished keeps desktop, drops sound/record;
+        // the four untouched reasons vanish entirely.
+        assert_eq!(
+            raw["reasonEffects"],
+            serde_json::json!({ "finished": { "desktop": false } })
+        );
+
+        // And it loads back to exactly the full config that was set.
+        assert_eq!(load_with_fallback(&path), cfg);
+    }
+
+    #[test]
+    fn a_setting_returned_to_its_default_disappears_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let store = ConfigStore::load(path.clone());
+
+        let mut cfg = store.get();
+        cfg.font_size = 21;
+        store.set(cfg).unwrap();
+        let mut cfg = store.get();
+        cfg.font_size = Config::default().font_size; // user reverts
+        store.set(cfg).unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw,
+            serde_json::json!({}),
+            "a reverted setting must resume tracking the binary default"
+        );
     }
 
     #[test]
