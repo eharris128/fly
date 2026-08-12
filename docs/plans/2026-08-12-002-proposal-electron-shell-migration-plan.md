@@ -61,8 +61,30 @@ spawn-or-adopt → same pane pid, scrollback replayed (pre-restart marker
 visible), pane resized on first show, keystrokes round-trip. Found+fixed en
 route: an *empty* dashboard held no DOM focus, so its Esc/digit keys were
 dead (pre-existing, both shells — HomeView now focuses its container when no
-row exists). Remaining: U6 parity checklist + perf gate, U7
-packaging/cutover, U8 simplifications.
+row exists). U6 parity checklist (2026-08-12, all
+live on fly-el/Electron/tmux, driven over CDP + the control socket):
+**attention end-to-end** — a real `claude` REPL's Stop hook and a
+borrowed-token `fly notify question --claude` both raised `pane://attention`
+(tier hook) through the *adopted* pane's re-registered token; focused →
+acknowledged, unfocused → raised (focus replication works); full UI: pane
+ring + "waiting for you" badge + tab/workspace dots + bell count. Banner
+seam = notify-send (present; not visually captured — Wayland compositor
+owns it). **feed** — healthz, silent 401, authed SSE roster with live agent
+row + automations projection, unauthenticated drop page 200; fly-el moved
+to feed port 4941 (fly keeps 4939). **peer** — `fly agents` answers over the
+hook socket. **automations** — create/update/run over the socket from a
+pane, failed and alert-classified closes, sanitized alerts log, sink
+workspace + Automations tab provisioned, dashboard panel row. **resume** —
+hook-ranked pane-precise capture into resume.json (sessionId + argv) for a
+real agent. **chords** — leader d (dashboard), leader t (real terminal
+attached the session, listed by `tmux list-clients`), Esc overlays.
+**quit-confirm** — busy agent + WM close → "1 agent is still working. Quit
+anyway?" over `fly:close-request`; Esc cancels; idle close persists and
+quits clean. Not exercised: handoff chords end-to-end (transport-proven;
+frontend identical), peer send/drop delivery (shared deliver_with_guards
+path), KTD8 notify-rust (deferred to U7 — notify-send serves the seam).
+Remaining: U6 perf gate + Wayland pass, U7 packaging/cutover, U8
+simplifications.
 **Grounds**: `docs/notes/2026-08-12-electron-engine-probe.md` (same-box probe:
 flood main-thread 63 % → 11.7 %, echo 99 → 53 ms p50; ~50 ms xterm.js pipeline
 floor persists on any engine) and
