@@ -32,7 +32,12 @@
       "target": ["deb"],
       "executableName": "fly-shell",
       "category": "Development",
-      "icon": "../src-tauri/icons/icon.png"
+      "icon": "../src-tauri/icons/icon.png",
+      "desktop": {
+        "entry": {
+          "StartupWMClass": "fly-electron-shell"
+        }
+      }
     },
     "deb": {
       "packageName": "fly",
