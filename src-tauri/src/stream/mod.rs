@@ -96,16 +96,32 @@ pub fn emit_notification_added(
 ) {
     let _ = app.emit(
         NOTIFICATION_ADDED_EVENT,
-        NotificationAddedEvent {
-            id,
-            pane_id: pane.0,
-            reason,
-            title,
-            body,
-            ts,
-            read,
-        },
+        notification_added_payload(id, pane, reason, title, body, ts, read),
     );
+}
+
+/// The `notification://added` payload as a JSON value — one place, both
+/// shells (Electron-shell migration U3.5).
+#[allow(clippy::too_many_arguments)]
+pub fn notification_added_payload(
+    id: u64,
+    pane: PaneId,
+    reason: Reason,
+    title: Option<String>,
+    body: Option<String>,
+    ts: u64,
+    read: bool,
+) -> serde_json::Value {
+    serde_json::to_value(NotificationAddedEvent {
+        id,
+        pane_id: pane.0,
+        reason,
+        title,
+        body,
+        ts,
+        read,
+    })
+    .expect("notification event serializes")
 }
 
 /// Spawn a pane: reserve its id, issue + inject its auth token, register it for

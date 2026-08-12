@@ -354,6 +354,17 @@ WebKitGTK engine-floor relief (63% → 4–14% webview main-thread under the
   messaging depends on the webview roster publisher (runs when `feed.enabled`,
   the default, or the dashboard is open) but NOT on the feed listener port.
   Tests: `tests/peer_send.rs` + peer cases in `hook_auth`/`hook_ask`.
+- `backend.rs` — **the shell-agnostic backend builder** (Electron-shell
+  migration U3.5): `build_backend(seams)` constructs everything `lib.rs`'s
+  setup used to wire inline — the hook server's dispatch closure (the
+  attention pipeline's policy/notify/resume-capture/feed-bump step), the
+  ask/peer/automation/substrate handlers, the automations manager + sweep +
+  alert surfacing, and the feed listener — against two injected seams:
+  `events` (`app.emit` under Tauri; control-socket broadcast under `fly
+  core`) and `banner` (notification plugin vs `notify-send`). `lib.rs` setup
+  is now seam construction + `.manage()` of the returned `Backend` fields;
+  `fly core` boots the identical backend. Change backend wiring HERE, never
+  by re-inlining into a shell.
 - `control/` — the core control socket (Electron-shell migration plan
   `2026-08-12-002`, U1): the transport a display shell will use to drive a
   headless fly backend (`fly core`). Same-uid peer-cred gate + never-steal
@@ -372,10 +383,11 @@ WebKitGTK engine-floor relief (63% → 4–14% webview main-thread under the
   rides the 0x02 binary frames, keystrokes ride 0x03 down (write +
   attention-clear, `pty_write` parity), exits fan out as `pane://exit` via
   the shared payload builders; `fly core` resolves its flavor's launch mode
-  (consuming the clean-exit marker, KTD-G). Automations/feed/hook-server
-  boot is **U3.5** (the lib.rs setup-wiring extraction) — until then those
-  commands answer a named-U3.5 error and spawned pane env points at a
-  hook-socket path nothing answers on yet. The Tauri shell is untouched.
+  (consuming the clean-exit marker, KTD-G). U3.5: `fly core` boots the
+  **full** backend through `backend::build_backend` — hook server (with the
+  real dispatch), automations + sweep, feed listener — so the complete
+  command surface is live headless; only the shell itself (window, U4) is
+  missing. The Tauri shell behaves identically through the same builder.
 - `notify/`, `config/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
   reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the

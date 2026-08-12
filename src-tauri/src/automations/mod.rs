@@ -48,7 +48,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use tauri::Emitter;
 
 use crate::config::{AutomationDefaults, ConfigStore};
 use model::{
@@ -464,12 +463,14 @@ impl Dispatcher for UnwiredDispatcher {
 /// prompt-threaded command, calls `spawn_pane` with the run id, and the
 /// backend links run↔pane atomically on spawn (R10).
 pub struct AgentDispatcher {
-    app: tauri::AppHandle,
+    /// Where `automation://agent-run` lands — `app.emit` under Tauri, control
+    /// broadcast under `fly core` (Electron-shell migration U3.5).
+    events: crate::stream::EventSink,
 }
 
 impl AgentDispatcher {
-    pub fn new(app: tauri::AppHandle) -> Arc<Self> {
-        Arc::new(AgentDispatcher { app })
+    pub fn new(events: crate::stream::EventSink) -> Arc<Self> {
+        Arc::new(AgentDispatcher { events })
     }
 }
 
@@ -515,9 +516,9 @@ impl Dispatcher for AgentDispatcher {
             effort: launch.effort.clone(),
             fallback_model: launch.fallback.clone(),
         };
-        self.app
-            .emit("automation://agent-run", &event)
-            .map_err(|e| format!("could not emit automation://agent-run: {e}"))?;
+        let payload = serde_json::to_value(&event)
+            .map_err(|e| format!("could not serialize automation://agent-run: {e}"))?;
+        (self.events)("automation://agent-run", payload);
         Ok(())
     }
 

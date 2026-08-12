@@ -16,7 +16,16 @@ keystrokes ride 0x03 down (`fly core` wires the `PaneInputHandler` to
 write + attention-clear like `pty_write`); `pane://exit`/`pane://attention`
 fan out via the shared payload builders; `get_launch_mode` +
 `register_alert_sink` ported (core resolves its flavor's clean-exit marker at
-boot). Remaining: **U3.5** below, then U4.
+boot). U3.5 (landed):
+`src-tauri/src/backend.rs` — the whole Tauri setup wiring (hook-server
+dispatch, ask/peer/automation/substrate handlers, automations subsystem +
+sweep + alert surfacing, feed listener) extracted into
+`backend::build_backend(seams)` against two injected seams (events sink +
+banner); `lib.rs` setup shrinks to seam construction + `.manage()` of the
+returned pieces, and `fly core` boots the identical backend (banner via
+`notify-send` pending KTD8's notify-rust) — live-verified: a real
+`fly notify` from a core-spawned pane raised `pane://attention` through the
+authenticated hook socket to a control client. U4 next.
 **Grounds**: `docs/notes/2026-08-12-electron-engine-probe.md` (same-box probe:
 flood main-thread 63 % → 11.7 %, echo 99 → 53 ms p50; ~50 ms xterm.js pipeline
 floor persists on any engine) and
