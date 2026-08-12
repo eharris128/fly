@@ -16,3 +16,7 @@ src-tauri/gen/
 *.swp
 .idea/
 .vscode/
+
+# Electron shell build artifacts (U7)
+electron/frontend/
+electron/dist-el/

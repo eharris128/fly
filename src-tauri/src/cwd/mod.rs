@@ -95,6 +95,19 @@ pub(crate) fn parse_stat_line(line: &str) -> Option<ProcEntry> {
     Some(ProcEntry { pid, ppid, pgid, state, start_time, comm })
 }
 
+/// The foreground process-group id (`tpgid`, stat field 8) of `pid`'s
+/// controlling tty — for a tmux pane's root process this is the pane's
+/// **foreground job**, which restores the PTY arm's `process_group_leader`
+/// precision without any tmux round trip (tmux-substrate U4). `None` when
+/// the process is gone or has no controlling tty (tpgid = -1).
+pub(crate) fn foreground_tpgid(pid: u32) -> Option<u32> {
+    let line = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rparen = line.rfind(')')?;
+    // After comm: state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5).
+    let tpgid: i64 = line[rparen + 1..].split_whitespace().nth(5)?.parse().ok()?;
+    u32::try_from(tpgid).ok()
+}
+
 /// Read + parse one pid's `stat`. `None` when the process is gone/unreadable —
 /// the same tolerance as [`read_proc_table`]. Shared with the headless check
 /// runner's liveness pin (headless-monitor-checks U3).

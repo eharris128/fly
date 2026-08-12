@@ -65,6 +65,10 @@ pub struct SpawnConfig {
     /// per-pane identity resume records are keyed by. `None` in tests/headless
     /// spawns that don't carry one.
     pub leaf_key: Option<String>,
+    /// tmux-substrate U10: ephemeral panes (automation tabs, alerts sink)
+    /// are killed at quit, never detached — an unrestorable leaf must not
+    /// leave an orphaned marked session or a growing store.
+    pub ephemeral: bool,
     pub rows: u16,
     pub cols: u16,
 }
@@ -78,6 +82,7 @@ impl Default for SpawnConfig {
             cwd: None,
             env: Vec::new(),
             leaf_key: None,
+            ephemeral: false,
             rows: 24,
             cols: 80,
         }
@@ -97,6 +102,9 @@ pub struct PtyManager {
     /// change (a `cd` must not serve the old dir's answer). Independent of
     /// `panes` — never held together with it.
     session_cache: Mutex<HashMap<PaneId, SessionCacheEntry>>,
+    /// The tmux substrate handle when the KTD10 flag selects it (tmux plan
+    /// U3); `None` ⇒ every spawn is PTY-backed. Set once at app setup.
+    substrate: Mutex<Option<std::sync::Arc<crate::substrate::Substrate>>>,
 }
 
 /// One pane's cached session-id resolution (poll-batching KTD4). `resolved`
@@ -126,6 +134,7 @@ impl PtyManager {
             panes: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             session_cache: Mutex::new(HashMap::new()),
+            substrate: Mutex::new(None),
         }
     }
 
@@ -140,6 +149,74 @@ impl PtyManager {
     }
 
     /// Spawn a pane under a previously reserved id.
+    /// Select the tmux substrate for every subsequent spawn (tmux plan
+    /// U3/KTD10). Set once at app setup when the `substrate` config flag says
+    /// tmux; absent (tests, the default config) every spawn is PTY-backed
+    /// exactly as before.
+    pub fn set_substrate(&self, substrate: std::sync::Arc<crate::substrate::Substrate>) {
+        *self.substrate.lock().unwrap() = Some(substrate);
+    }
+
+    /// The configured substrate handle, if the KTD10 flag selected tmux.
+    pub fn substrate_handle(&self) -> Option<std::sync::Arc<crate::substrate::Substrate>> {
+        self.substrate.lock().unwrap().clone()
+    }
+
+    /// The pane's output-ring sequence (total bytes ever produced) — the
+    /// cheap freshness probe the U6 verified-submit loop polls (also the
+    /// perf-audit T9 accessor shape: seq without the 64 KiB ring copy).
+    pub fn pane_output_seq(&self, id: PaneId) -> Option<u64> {
+        self.panes.lock().unwrap().get(&id).map(|p| p.output_seq())
+    }
+
+    /// U6 delivery insurance: SIGWINCH-wake a detached tmux-backed pane's
+    /// TUI before programmatic input. No-op for PTY panes and attached
+    /// sessions. The tmux subprocesses run OUTSIDE the registry lock
+    /// (KTD13) — the backend handle is cloned out first.
+    pub fn wake_if_detached(&self, id: PaneId) {
+        let target = {
+            let panes = self.panes.lock().unwrap();
+            panes.get(&id).and_then(|p| p.tmux_backend())
+        };
+        if let Some((sub, session)) = target {
+            if let Ok(false) = sub.tmux().is_session_attached(&session) {
+                let _ = sub.tmux().wake_pane(&session);
+            }
+        }
+    }
+
+    /// The tmux backend handle for a pane (clone-out for subprocess use
+    /// outside the registry lock — KTD13). `None` for PTY-backed panes.
+    pub fn tmux_backend_of(
+        &self,
+        id: PaneId,
+    ) -> Option<(std::sync::Arc<crate::substrate::Substrate>, String)> {
+        self.panes.lock().unwrap().get(&id).and_then(|p| p.tmux_backend())
+    }
+
+    /// Resolve a marked session name to its live pane (KTD12 event ingress).
+    pub fn pane_id_by_session(&self, session: &str) -> Option<PaneId> {
+        let panes = self.panes.lock().unwrap();
+        panes
+            .iter()
+            .find(|(_, p)| p.session_name() == Some(session))
+            .map(|(id, _)| *id)
+    }
+
+    /// KTD12 pane-died event ingress: force-mark the pane backed by
+    /// `session` dead with `status`. Touches only pane-shared state under
+    /// the registry lock; the pane's poll-loop reader surfaces the exit.
+    /// Unknown sessions are ignored (the event is a hint, panes close
+    /// concurrently).
+    pub fn force_dead_by_session(&self, session: &str, status: i32) {
+        let panes = self.panes.lock().unwrap();
+        for pane in panes.values() {
+            if pane.session_name() == Some(session) {
+                pane.force_dead(status);
+            }
+        }
+    }
+
     pub fn spawn_with_id(
         &self,
         id: PaneId,
@@ -148,7 +225,15 @@ impl PtyManager {
         sink: OutputSink,
         on_exit: ExitCallback,
     ) -> Result<PaneId, String> {
-        let pane = Pane::spawn(id, cfg, token, sink, on_exit)?;
+        let substrate = self.substrate.lock().unwrap().clone();
+        let pane = match substrate {
+            Some(sub) if cfg.leaf_key.is_some() => {
+                Pane::spawn_tmux(id, cfg, token, sink, on_exit, sub)?
+            }
+            // Leafless spawns (tests/headless) stay PTY-backed even under the
+            // flag: they have no stable identity to mark a session with.
+            _ => Pane::spawn(id, cfg, token, sink, on_exit)?,
+        };
         self.panes.lock().unwrap().insert(id, pane);
         Ok(id)
     }
@@ -362,6 +447,33 @@ impl PtyManager {
     /// is never reported), a non-agent reports null timings and a zero task
     /// count, and a gone pane degrades to the empty status — never an error.
     pub fn panes_status(&self, ids: &[PaneId]) -> Vec<PaneStatus> {
+        // U4 exit-detection backstop for tmux-backed panes: one
+        // `list-panes -a` snapshot per tick; a marked session whose pane
+        // process died gets its pane force-marked dead, which the pane's
+        // poll-loop reader surfaces as an exit within ~500 ms. (EOF cannot
+        // carry this: live-pinned, a dead-but-remaining pane keeps its
+        // pipe `cat` alive and `pipe-pane` refuses dead panes.) The tmux
+        // subprocess runs BEFORE the registry lock (KTD13); `force_dead`
+        // itself touches only pane-shared state. Event-driven precision
+        // arrives with the KTD12 pane-died hook; this is the lost-hook /
+        // no-hook floor.
+        let substrate = self.substrate.lock().unwrap().clone();
+        if let Some(sub) = substrate {
+            if let Ok(dead) = sub.tmux().list_dead_marked() {
+                if !dead.is_empty() {
+                    let panes = self.panes.lock().unwrap();
+                    for pane in panes.values() {
+                        if let Some(session) = pane.session_name() {
+                            if let Some((_, status)) =
+                                dead.iter().find(|(name, _)| name == session)
+                            {
+                                pane.force_dead(*status);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let now = Instant::now();
         let mut table: Option<Vec<crate::cwd::ProcEntry>> = None;
         let out = ids
@@ -457,7 +569,27 @@ impl PtyManager {
     }
 
     /// Close every pane (used at app shutdown, U14).
+    /// Ordinary quit (U8/KTD7): tmux-backed panes DETACH — their sessions
+    /// (and agents) keep running for the next instance to adopt — while
+    /// PTY-backed panes reap exactly as before. `Drop` after a detach is a
+    /// no-op (the reader is already joined), so nothing double-tears.
     pub fn close_all(&self) {
+        let mut drained: Vec<Pane> = {
+            let mut panes = self.panes.lock().unwrap();
+            panes.drain().map(|(_, p)| p).collect()
+        };
+        for p in &mut drained {
+            if p.session_name().is_some() && !p.is_ephemeral() {
+                p.teardown_detach();
+            } else {
+                p.teardown();
+            }
+        }
+    }
+
+    /// The destructive-confirm variant (U8): kill everything, tmux sessions
+    /// included — the pre-substrate quit semantics, now an explicit choice.
+    pub fn close_all_killing(&self) {
         let mut drained: Vec<Pane> = {
             let mut panes = self.panes.lock().unwrap();
             panes.drain().map(|(_, p)| p).collect()
@@ -661,6 +793,12 @@ pub fn pane_activity(
     manager: tauri::State<'_, Arc<PtyManager>>,
     pane_id: PaneId,
 ) -> PaneActivity {
+    pane_activity_snapshot(&manager, pane_id)
+}
+
+/// The body behind [`pane_activity`], shared with the control-socket registry
+/// (Electron-shell migration U2) so both shells compose the same snapshot.
+pub fn pane_activity_snapshot(manager: &PtyManager, pane_id: PaneId) -> PaneActivity {
     // One foreground-pid resolution gates agent-ness and roots the task count.
     let Some(live_task_count) = manager.agent_task_count(pane_id) else {
         return PaneActivity {

@@ -1,0 +1,52 @@
+{
+  "name": "fly-electron-shell",
+  "version": "0.2.0",
+  "private": true,
+  "description": "fly — a terminal for AI coding agents (Electron shell + Rust core)",
+  "author": "Evan Harris <echarris@smcm.edu>",
+  "homepage": "https://github.com/eharris128/fly",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "rm -rf frontend && cp -r ../dist frontend && electron-builder --linux deb"
+  },
+  "build": {
+    "appId": "dev.evan.fly",
+    "productName": "fly",
+    "directories": {
+      "output": "dist-el"
+    },
+    "files": [
+      "main.js",
+      "preload.cjs",
+      "protocol.js",
+      "frontend/**"
+    ],
+    "extraResources": [
+      {
+        "from": "../src-tauri/target/release/fly",
+        "to": "fly"
+      }
+    ],
+    "linux": {
+      "target": ["deb"],
+      "executableName": "fly-shell",
+      "category": "Development",
+      "icon": "../src-tauri/icons/icon.png",
+      "desktop": {
+        "entry": {
+          "StartupWMClass": "fly-electron-shell"
+        }
+      }
+    },
+    "deb": {
+      "packageName": "fly",
+      "afterInstall": "deb/postinst.sh",
+      "afterRemove": "deb/postrm.sh"
+    }
+  },
+  "devDependencies": {
+    "electron": "^37.0.0",
+    "electron-builder": "^26.0.12"
+  }
+}

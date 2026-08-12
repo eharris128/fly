@@ -58,6 +58,25 @@ impl TokenRegistry {
         token
     }
 
+    /// Re-register a token minted by a PREVIOUS fly instance for a surviving
+    /// substrate session (tmux plan U2/KTD8): the agent's long-lived process
+    /// env still holds the old token, so reattach must honor it rather than
+    /// mint a fresh one nothing would ever present. Refuses malformed input —
+    /// a corrupted store entry must not become a registered credential.
+    pub fn register_existing(&self, pane: PaneId, token: &str) -> Result<(), String> {
+        if token.len() != TOKEN_BYTES * 2 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "refusing to register malformed token ({} chars)",
+                token.len()
+            ));
+        }
+        self.entries
+            .lock()
+            .unwrap()
+            .push((token.to_string(), pane));
+        Ok(())
+    }
+
     /// Revoke every token for a pane (on close / app exit).
     pub fn revoke(&self, pane: PaneId) {
         self.entries.lock().unwrap().retain(|(_, p)| *p != pane);

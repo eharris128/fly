@@ -1180,6 +1180,7 @@ dependencies = [
  "tauri-plugin-store",
  "tempfile",
  "tiny_http",
+ "tokio",
  "vte",
 ]
 

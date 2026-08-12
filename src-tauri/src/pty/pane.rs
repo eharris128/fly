@@ -256,6 +256,12 @@ struct PaneShared {
     /// Per-pane output-activity state (U3): the "current work stretch" the agent
     /// dashboard reads. Recorded by the read thread, queried by the poll.
     activity: ActivityCell,
+    /// Tmux arm only (U4): an externally-observed pane death, set by the
+    /// `panes_status` backstop (or the KTD12 hook path). The FIFO gives no
+    /// EOF for a dead-but-remaining pane — live-pinned: `pipe-pane` refuses
+    /// a dead pane and its `cat` survives — so the read thread polls this
+    /// between reads and exits with the recorded status.
+    forced_exit: Mutex<Option<i32>>,
     /// Raw output tail (feed-question-screen-fallback U1). Its own lock, taken
     /// only by the read thread (append) and the on-demand snapshot — never by
     /// the byte path's other consumers.
@@ -265,15 +271,35 @@ struct PaneShared {
     dims: Mutex<(u16, u16)>,
 }
 
-/// A live PTY pane.
+/// What actually backs a pane's byte streams and control ops.
+///
+/// `Pty` is the original portable-pty path; `Tmux` is the session-substrate
+/// arm (tmux plan U3): the pane is a marked session on the flavor server,
+/// output arrives through a `pipe-pane` FIFO, input leaves as binary-safe
+/// `send-keys -H`, and the "child" is tmux's pane process. Every consumer
+/// above (`writer()`, resize, pause, activity, tail ring, teardown ordering)
+/// is backend-agnostic.
+enum Backend {
+    Pty {
+        /// PTY master. `resize`/`take_writer` take `&self`; only ever touched
+        /// under the registry lock, so `Send` is sufficient.
+        master: Box<dyn MasterPty + Send>,
+    },
+    Tmux {
+        substrate: Arc<crate::substrate::Substrate>,
+        session: String,
+        fifo: std::path::PathBuf,
+    },
+}
+
+/// A live pane (PTY- or tmux-backed; see [`Backend`]).
 pub struct Pane {
     pub id: PaneId,
-    /// PTY master. `resize`/`take_writer` take `&self`; only ever touched under
-    /// the registry lock, so `Send` is sufficient.
-    master: Box<dyn MasterPty + Send>,
+    backend: Backend,
     /// Writer behind its own lock so writes don't hold the registry lock.
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    /// Child pid, used to signal the process on close. Valid only while live.
+    /// Pid used to signal on close: the direct child (PTY arm) or tmux's
+    /// `#{pane_pid}` (tmux arm). Valid only while live.
     pid: Option<u32>,
     shared: Arc<PaneShared>,
     reaped_rx: Receiver<()>,
@@ -284,6 +310,8 @@ pub struct Pane {
     /// The frontend's stable leaf key (U3), so the hook dispatch can key this
     /// pane's resume record. `None` for headless/test spawns.
     leaf_key: Option<String>,
+    /// U10: killed at quit, never detached (automation tabs, alerts sink).
+    ephemeral: bool,
 }
 
 impl Pane {
@@ -299,6 +327,7 @@ impl Pane {
         on_exit: ExitCallback,
     ) -> Result<Pane, String> {
         let leaf_key = cfg.leaf_key.clone();
+        let cfg_ephemeral = cfg.ephemeral;
         let pty_system = native_pty_system();
         let size = PtySize {
             rows: cfg.rows.max(1),
@@ -389,6 +418,7 @@ impl Pane {
             paused: Mutex::new(false),
             pause_cv: Condvar::new(),
             activity: ActivityCell::new(),
+            forced_exit: Mutex::new(None),
             tail: Mutex::new(TailRing::new(TAIL_RING_CAP)),
             dims: Mutex::new((size.rows, size.cols)),
         });
@@ -401,7 +431,7 @@ impl Pane {
 
         Ok(Pane {
             id,
-            master: pair.master,
+            backend: Backend::Pty { master: pair.master },
             writer: Arc::new(Mutex::new(writer)),
             pid,
             shared,
@@ -409,6 +439,210 @@ impl Pane {
             reader_handle: Some(handle),
             token,
             leaf_key,
+            ephemeral: cfg_ephemeral,
+        })
+    }
+
+    /// Spawn a pane as a marked tmux session on the flavor server (tmux plan
+    /// U3, KTD2/KTD3/KTD4). The pane command is `cfg.command` or the user's
+    /// shell; fly's per-pane env extras ride `-e`; output arrives via a
+    /// `pipe-pane`-fed FIFO into the same sink/activity/ring machinery as the
+    /// PTY arm; input leaves through [`TmuxWriter`]. The session outlives
+    /// this process by design — `teardown` (an explicit close) kills it, but
+    /// a detach-style shutdown (U8) will simply drop the pane without
+    /// teardown-with-kill.
+    pub fn spawn_tmux(
+        id: PaneId,
+        cfg: SpawnConfig,
+        token: String,
+        mut sink: OutputSink,
+        on_exit: ExitCallback,
+        substrate: Arc<crate::substrate::Substrate>,
+    ) -> Result<Pane, String> {
+        let leaf_key = cfg
+            .leaf_key
+            .clone()
+            .ok_or_else(|| "tmux-backed panes require a leaf key".to_string())?;
+        let cfg_ephemeral = cfg.ephemeral;
+        substrate.ensure_server().map_err(|e| e.to_string())?;
+        let session = substrate.session_name(&leaf_key);
+
+        // U8 reattach: a surviving marked session for this leaf is ADOPTED,
+        // never respawned — the whole point of the substrate. The caller
+        // (stream::spawn_pane) has already re-registered the stored token.
+        let adopt = substrate.adoptable_session(&leaf_key);
+
+        // Pane command: argv, or the user's shell — same resolution as the
+        // PTY arm.
+        let command: Vec<String> = match &cfg.command {
+            Some(command) if !command.is_empty() => command.clone(),
+            _ => {
+                let shell = cfg
+                    .shell
+                    .clone()
+                    .or_else(|| std::env::var("SHELL").ok())
+                    .unwrap_or_else(|| "/bin/bash".to_string());
+                let mut v = vec![shell];
+                v.extend(cfg.args.clone());
+                v
+            }
+        };
+
+        // Per-pane env extras via `-e` (KTD8). TERM/locale identity come from
+        // the tmux server (whose env was scrubbed at start — the marker strip
+        // lives THERE for this arm); `FLY` matches the PTY arm.
+        let mut env: std::collections::BTreeMap<String, String> = cfg
+            .env
+            .iter()
+            .cloned()
+            .collect();
+        env.insert("FLY".into(), "1".into());
+
+        let rows = cfg.rows.max(1);
+        let cols = cfg.cols.max(1);
+        if adopt.is_none() {
+            substrate
+                .tmux()
+                .new_session(
+                    &session,
+                    cfg.cwd.as_deref().unwrap_or(""),
+                    &env,
+                    &command,
+                    cols,
+                    rows,
+                )
+                .map_err(|e| e.to_string())?;
+            // KTD4: a dead pane keeps its final screen; death is observed via
+            // `#{pane_dead}` (read-loop EOF check + the panes_status
+            // backstop), not via session teardown.
+            let _ = substrate.tmux().set_remain_on_exit(&session, true);
+        } else {
+            // Adoption housekeeping: end the ORPHANED pipe (its `cat` — a
+            // tmux-server child — survived the previous fly), re-drive the
+            // detached geometry to this pane's grid, and let the hooks be
+            // re-armed below with the CURRENT fly binary path.
+            let _ = substrate.tmux().pipe_pane_close(&session);
+            let _ = substrate.tmux().set_window_size_manual(&session);
+            let _ = substrate.tmux().resize_window(&session, cols, rows);
+        }
+
+        // tmux's pane process pid — the signal target and cwd anchor.
+        let pid = substrate
+            .tmux()
+            .capture_pane(&session, false, 0)
+            .ok() // not the pid source; just ensures the pane is up
+            .and_then(|_| pane_root_pid(&substrate, &session));
+
+        // FIFO for the output stream. Created 0600 before pipe-pane can open
+        // its write end; unlinked at teardown.
+        let fifo = substrate.fifo_path(id.0);
+        let _ = std::fs::remove_file(&fifo);
+        mkfifo_0600(&fifo)?;
+
+        let (reaped_tx, reaped_rx) = mpsc::channel();
+        let shared = Arc::new(PaneShared {
+            lifecycle: Mutex::new(LifecycleState::Live),
+            stopping: AtomicBool::new(false),
+            reaped: AtomicBool::new(false),
+            reaped_tx,
+            paused: Mutex::new(false),
+            pause_cv: Condvar::new(),
+            activity: ActivityCell::new(),
+            forced_exit: Mutex::new(None),
+            tail: Mutex::new(TailRing::new(TAIL_RING_CAP)),
+            dims: Mutex::new((rows, cols)),
+        });
+
+        // Adoption keeps the STORED token (the agent's long-lived env holds
+        // it — U8/KTD8); a fresh session uses the newly-minted one.
+        let token = match &adopt {
+            Some(record) => record.token.clone(),
+            None => token,
+        };
+        // Persist the leaf ⇄ session ⇄ token binding BEFORE the read thread
+        // starts (U2/KTD8): a crash after this point leaves a reattachable
+        // record; a crash before it leaves an unmarked-but-marked-name
+        // session the startup discovery will surface as unknown-dead.
+        let _ = crate::substrate::store::upsert_at(
+            substrate.store_path(),
+            &leaf_key,
+            crate::substrate::store::SessionRecord {
+                session_name: session.clone(),
+                token: token.clone(),
+                created_at_ms: crate::notify::now_unix_ms(),
+            },
+        );
+
+        // U8 adopt: replay the surviving session's recent screen+history into
+        // the fresh xterm before live bytes flow (bounded — reveal speed over
+        // completeness; the full history stays in tmux for `leader t`). The
+        // capture-then-arm gap can lose a few ms of output; the alternative
+        // (arm-then-capture) duplicates instead. Loss is invisible on an
+        // idle reattach, duplication never is — capture first.
+        if adopt.is_some() {
+            if let Ok(history) = substrate.tmux().capture_pane(&session, true, 2000) {
+                let trimmed = history.trim_start_matches('\n');
+                if !trimmed.is_empty() {
+                    sink(trimmed.replace('\n', "\r\n").as_bytes());
+                }
+            }
+        }
+
+        let thread_shared = Arc::clone(&shared);
+        let thread_substrate = Arc::clone(&substrate);
+        let thread_session = session.clone();
+        let thread_fifo = fifo.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("fly-tmux-{}", id.0))
+            .spawn(move || {
+                tmux_read_loop(
+                    id,
+                    thread_substrate,
+                    thread_session,
+                    thread_fifo,
+                    sink,
+                    thread_shared,
+                    on_exit,
+                )
+            })
+            .map_err(|e| format!("spawn read thread failed: {e}"))?;
+
+        // Arm the pipe AFTER the reader thread exists: the reader's blocking
+        // open of the FIFO's read end pairs with `cat`'s write-end open, so
+        // order alone can't deadlock; arming late just delays first bytes.
+        substrate
+            .tmux()
+            .pipe_pane_open(&session, &fifo.to_string_lossy())
+            .map_err(|e| e.to_string())?;
+
+        // KTD12 event hooks: pane-died reports arrive over the socket for
+        // ~instant exit surfacing. Best-effort — the panes_status backstop is
+        // the floor when arming fails or an event is lost.
+        let fly_bin = substrate.fly_bin().to_string_lossy().into_owned();
+        let _ = substrate.tmux().arm_pane_died_hook(&session, &fly_bin);
+        // U7: attach-state reports feed the R9 focused-elsewhere suppression.
+        let _ = substrate.tmux().arm_attach_hooks(&session, &fly_bin);
+
+        let writer: Box<dyn Write + Send> = Box::new(TmuxWriter {
+            substrate: Arc::clone(&substrate),
+            session: session.clone(),
+        });
+
+        Ok(Pane {
+            id,
+            backend: Backend::Tmux {
+                substrate,
+                session,
+                fifo,
+            },
+            writer: Arc::new(Mutex::new(writer)),
+            pid,
+            shared,
+            reaped_rx,
+            reader_handle: Some(handle),
+            token,
+            leaf_key: Some(leaf_key),
+            ephemeral: cfg_ephemeral,
         })
     }
 
@@ -418,16 +652,24 @@ impl Pane {
         Arc::clone(&self.writer)
     }
 
-    /// Resize the PTY; the kernel delivers SIGWINCH so TUIs reflow (R2).
+    /// Resize the pane; the kernel delivers SIGWINCH so TUIs reflow (R2).
+    /// Tmux arm: `resize-window` drives the detached grid (KTD2 — manual
+    /// window-size mode, set at create).
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), String> {
-        self.master
-            .resize(PtySize {
-                rows: rows.max(1),
-                cols: cols.max(1),
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| format!("resize failed: {e}"))?;
+        match &self.backend {
+            Backend::Pty { master } => master
+                .resize(PtySize {
+                    rows: rows.max(1),
+                    cols: cols.max(1),
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| format!("resize failed: {e}"))?,
+            Backend::Tmux { substrate, session, .. } => substrate
+                .tmux()
+                .resize_window(session, cols.max(1), rows.max(1))
+                .map_err(|e| e.to_string())?,
+        }
         *self.shared.dims.lock().unwrap() = (rows.max(1), cols.max(1));
         Ok(())
     }
@@ -459,13 +701,69 @@ impl Pane {
         self.leaf_key.as_deref()
     }
 
+    /// U10: whether this pane is ephemeral (killed at quit, never detached).
+    pub fn is_ephemeral(&self) -> bool {
+        self.ephemeral
+    }
+
+    /// The tmux session backing this pane, when tmux-backed (U4).
+    pub fn session_name(&self) -> Option<&str> {
+        match &self.backend {
+            Backend::Tmux { session, .. } => Some(session),
+            Backend::Pty { .. } => None,
+        }
+    }
+
+    /// The tmux backend handle + session, for callers that must run tmux
+    /// subprocesses OUTSIDE the registry lock (KTD13 — clone out, then call).
+    pub fn tmux_backend(&self) -> Option<(Arc<crate::substrate::Substrate>, String)> {
+        match &self.backend {
+            Backend::Tmux { substrate, session, .. } => {
+                Some((Arc::clone(substrate), session.clone()))
+            }
+            Backend::Pty { .. } => None,
+        }
+    }
+
+    /// Total output bytes ever produced (the tail ring's `seq`) — a cheap
+    /// freshness probe (U6 verified submit; audit T9 shape).
+    pub fn output_seq(&self) -> u64 {
+        self.shared.tail.lock().unwrap().seq
+    }
+
+    /// Record an externally-observed pane death (U4 backstop / KTD12 hook):
+    /// the FIFO gives no EOF for a dead-but-remaining pane, so the read
+    /// thread polls this between reads and surfaces the exit. Idempotent;
+    /// no-op on the PTY arm.
+    pub fn force_dead(&self, status: i32) {
+        if matches!(self.backend, Backend::Pty { .. }) {
+            return;
+        }
+        let mut fe = self.shared.forced_exit.lock().unwrap();
+        if fe.is_none() {
+            *fe = Some(status);
+        }
+        drop(fe);
+        // Wake a paused reader so the exit isn't gated on resume.
+        self.shared.pause_cv.notify_all();
+    }
+
     /// The foreground process group leader pid, used by U10 for `/proc`-based
-    /// cwd tracking. Falls back to the child pid.
+    /// cwd tracking. Falls back to the child pid. Tmux arm (U4): the pane
+    /// root's controlling-tty foreground group from `/proc/<pane_pid>/stat`
+    /// `tpgid` — same precision as the PTY arm's `process_group_leader`, no
+    /// tmux round trip — falling back to the pane root pid.
     pub fn foreground_pid(&self) -> Option<u32> {
-        self.master
-            .process_group_leader()
-            .map(|p| p as u32)
-            .or(self.pid)
+        match &self.backend {
+            Backend::Pty { master } => master
+                .process_group_leader()
+                .map(|p| p as u32)
+                .or(self.pid),
+            Backend::Tmux { .. } => self
+                .pid
+                .and_then(crate::cwd::foreground_tpgid)
+                .or(self.pid),
+        }
     }
 
     /// The pane's current output-activity snapshot (U3): the work stretch and
@@ -498,6 +796,33 @@ impl Pane {
         }
     }
 
+    /// Quit-path teardown for a tmux-backed pane (U8/KTD7): DETACH — stop
+    /// the reader, end the pipe, unlink the FIFO, and leave the session
+    /// running and the store record in place for the next instance to adopt.
+    /// No-op for PTY panes (they reap via [`Self::teardown`]).
+    pub fn teardown_detach(&mut self) {
+        let Backend::Tmux {
+            substrate,
+            session,
+            fifo,
+        } = &self.backend
+        else {
+            return;
+        };
+        if self.reader_handle.is_none() {
+            return; // already torn down
+        }
+        log::debug!("detaching pane {} (session survives)", self.id.0);
+        self.shared.stopping.store(true, Ordering::Release);
+        self.shared.pause_cv.notify_all();
+        let _ = substrate.tmux().pipe_pane_close(session);
+        let _ = std::fs::remove_file(fifo);
+        if let Some(handle) = self.reader_handle.take() {
+            let _ = handle.join();
+        }
+        // Store record deliberately KEPT (adoption key); session KEPT.
+    }
+
     /// Tear down the pane: stop the child and reap it before returning, so no
     /// orphan or zombie survives (KTD13). Idempotent.
     pub fn teardown(&mut self) {
@@ -508,6 +833,27 @@ impl Pane {
         self.shared.stopping.store(true, Ordering::Release);
         // Wake the read thread if it's parked on the pause condvar.
         self.shared.pause_cv.notify_all();
+
+        if let Backend::Tmux {
+            substrate,
+            session,
+            fifo,
+        } = &self.backend
+        {
+            // Explicit close (KTD7's kill arm): kill the session — idempotent
+            // if it already died — which ends `cat`, EOFs the FIFO, and lets
+            // the read thread wind down; then reclaim the FIFO node and the
+            // store record (an explicitly closed pane must not be reattached).
+            let _ = substrate.tmux().kill_session(session);
+            let _ = std::fs::remove_file(fifo);
+            if let Some(leaf) = self.leaf_key.as_deref() {
+                let _ = crate::substrate::store::prune_at(substrate.store_path(), leaf);
+            }
+            if let Some(handle) = self.reader_handle.take() {
+                let _ = handle.join();
+            }
+            return;
+        }
 
         if let Some(pid) = self.pid {
             // Graceful hangup unless the child is already gone. The shell is a
@@ -611,6 +957,177 @@ fn read_loop(
     let _ = shared.reaped_tx.send(());
     // Notify outside the lock; surfaces the exit to the frontend (U3).
     on_exit(id, final_state);
+}
+
+/// The tmux arm's read loop (tmux plan U3): drain the `pipe-pane` FIFO into
+/// the sink with the same activity/ring bookkeeping as the PTY loop. There is
+/// no owned child to reap — session death is observed as FIFO EOF (the
+/// `cat` writer dies with the session) and confirmed against `has-session`;
+/// a transient EOF with the session still alive (a future focus-tier re-arm,
+/// or pipe churn) re-opens and re-arms rather than declaring an exit.
+fn tmux_read_loop(
+    id: PaneId,
+    _substrate: Arc<crate::substrate::Substrate>,
+    _session: String,
+    fifo: std::path::PathBuf,
+    mut sink: OutputSink,
+    shared: Arc<PaneShared>,
+    on_exit: ExitCallback,
+) {
+    let mut buf = vec![0u8; READ_BUF];
+    let mut dead_status: Option<i32> = None;
+    'outer: loop {
+        // O_RDWR so the open never blocks on a writer AND the FIFO never
+        // reaches all-writers-closed EOF spuriously between `cat` restarts;
+        // end-of-pane is signalled by `forced_exit`/`stopping`, not EOF —
+        // live-pinned: a dead-but-remaining pane keeps its `cat` alive and
+        // `pipe-pane` refuses dead panes, so EOF simply never comes.
+        let Ok(reader) = std::fs::OpenOptions::new().read(true).write(true).open(&fifo)
+        else {
+            break;
+        };
+        set_nonblocking(&reader);
+        loop {
+            {
+                let mut paused = shared.paused.lock().unwrap();
+                while *paused && !shared.stopping.load(Ordering::Acquire) {
+                    if shared.forced_exit.lock().unwrap().is_some() {
+                        break;
+                    }
+                    paused = shared.pause_cv.wait(paused).unwrap();
+                }
+            }
+            if shared.stopping.load(Ordering::Acquire) {
+                break 'outer;
+            }
+            if let Some(code) = *shared.forced_exit.lock().unwrap() {
+                dead_status = Some(code);
+                break 'outer;
+            }
+            // Wait for readability, ≤500 ms, then drain what's there. The
+            // timeout bounds how stale a forced-exit/stop check can be.
+            if !poll_readable(&reader, Duration::from_millis(500)) {
+                continue;
+            }
+            match (&reader).read(&mut buf) {
+                // O_RDWR: we hold a write end ourselves, so 0 can only mean
+                // a genuinely torn-down FIFO — treat as end.
+                Ok(0) => break 'outer,
+                Ok(n) => {
+                    sink(&buf[..n]);
+                    shared.activity.record(n);
+                    shared
+                        .tail
+                        .lock()
+                        .unwrap()
+                        .write(&buf[..n], crate::notify::now_unix_ms());
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::Interrupted
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    continue
+                }
+                Err(_) => break 'outer,
+            }
+        }
+    }
+
+    let final_state = {
+        let mut lc = shared.lifecycle.lock().unwrap();
+        if !lc.is_terminal() {
+            *lc = if shared.stopping.load(Ordering::Acquire) {
+                LifecycleState::Killed
+            } else {
+                // `#{pane_dead_status}` when the dead pane was observable
+                // (U4); 0 when the whole session vanished under us.
+                LifecycleState::Exited {
+                    code: dead_status.unwrap_or(0),
+                    signal: None,
+                }
+            };
+        }
+        lc.clone()
+    };
+    shared.reaped.store(true, Ordering::Release);
+    let _ = shared.reaped_tx.send(());
+    on_exit(id, final_state);
+}
+
+/// Input transport for tmux-backed panes (U3/KTD5): each write ships as
+/// binary-safe `send-keys -H` hex bytes, preserving arbitrary control
+/// sequences (arrows, ESC, bracketed-paste frames) byte-exactly. One
+/// subprocess per write-chain flush — flagged in the plan for a latency
+/// measurement in U5, with the persistent hidden-attach client as fallback.
+struct TmuxWriter {
+    substrate: Arc<crate::substrate::Substrate>,
+    session: String,
+}
+
+/// Max bytes per send-keys invocation (arg-count hygiene; multiple calls
+/// preserve order — same thread, same server connection sequencing).
+const SEND_HEX_CHUNK: usize = 512;
+
+impl Write for TmuxWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        for chunk in buf.chunks(SEND_HEX_CHUNK) {
+            self.substrate
+                .tmux()
+                .send_hex(&self.session, chunk)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `fcntl(F_SETFL, O_NONBLOCK)` on an open file (the FIFO read handle).
+fn set_nonblocking(f: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: plain fcntl on a fd we own.
+    unsafe {
+        let fd = f.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+}
+
+/// `poll(2)` for readability with a timeout; false on timeout/error.
+fn poll_readable(f: &std::fs::File, timeout: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fds = libc::pollfd {
+        fd: f.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: valid pollfd array of length 1.
+    let rc = unsafe { libc::poll(&mut fds, 1, timeout.as_millis() as i32) };
+    rc > 0 && (fds.revents & libc::POLLIN) != 0
+}
+
+/// `#{pane_pid}` of a session's (only) pane — the signal target and the cwd
+/// anchor for the tmux arm.
+fn pane_root_pid(substrate: &Arc<crate::substrate::Substrate>, session: &str) -> Option<u32> {
+    substrate.tmux().display_message(session, "#{pane_pid}").ok()?.trim().parse().ok()
+}
+
+/// `mkfifo(path, 0600)` via libc (no new crates).
+fn mkfifo_0600(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "fifo path contains NUL".to_string())?;
+    // SAFETY: plain libc call with a valid NUL-terminated path.
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    if rc != 0 {
+        return Err(format!(
+            "mkfifo {} failed: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 /// Send a signal to a process. ESRCH (already gone) is ignored.

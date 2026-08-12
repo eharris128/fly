@@ -30,6 +30,7 @@ export interface KeymapActions {
   renameTab: () => void;
   renamePane: () => void;
   handoffQuick: () => void;
+  attachTerminal: () => void;
   handoffGuided: () => void;
   handoffRepick: () => void;
   /** Write one literal leader keystroke to the focused PTY (audit-remediation
@@ -80,6 +81,10 @@ export const BINDINGS: Binding[] = [
   // thinking about geometry.
   { keys: ["o"], label: "Next pane", action: "focusNextPane" },
   { keys: ["o"], upper: true, label: "Previous pane", action: "focusPrevPane" },
+  // tmux-substrate U7 (KTD6): the native-typing escape hatch — open the
+  // focused pane's tmux session in a real terminal. Backend refuses when the
+  // substrate is off, so the chord is safely inert on the PTY path.
+  { keys: ["t"], label: "Attach in terminal", action: "attachTerminal" },
   { keys: ["u"], label: "Cycle attention", action: "cycleAttention" },
   // Uppercase U is distinct from lowercase u (cycle attention) via `upper`,
   // exactly like x / X: it jumps within the notification history, not the

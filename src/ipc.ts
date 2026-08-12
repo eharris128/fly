@@ -1,6 +1,15 @@
-// Typed wrappers over the Tauri command + Channel surface (U3).
-import { invoke, Channel } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+// Typed wrappers over the backend command surface (U3) — shell-agnostic
+// since the Electron-shell migration (U5): every invoke/listen routes
+// through `lib/transport.ts`, which serves Tauri or the Electron bridge.
+import {
+  invoke,
+  listen,
+  makeOutputSink,
+  releasePaneSink,
+  spawnPaneWithSink,
+  type OutputSink,
+  type UnlistenFn,
+} from "./lib/transport";
 // Type-only (erased at runtime, so the feed.ts ↔ ipc.ts cycle is harmless).
 import type { FeedPublishPayload } from "./lib/feed";
 import { makeWriteChain } from "./lib/write-chain";
@@ -34,6 +43,10 @@ export interface SpawnOpts {
    * already closed — rejects the spawn. Null/undefined for an ordinary pane.
    */
   automationRunId?: string | null;
+  /** tmux-substrate U10: an ephemeral pane (automation run tab, alerts sink)
+   * must NOT survive quit — its tmux session is killed at close_all, never
+   * detached, so ephemeral tabs can't accumulate orphaned marked sessions. */
+  ephemeral?: boolean;
 }
 
 /** Lifecycle state as serialized by the Rust `LifecycleState` enum. */
@@ -485,26 +498,22 @@ export function setPaneWorkspace(
  */
 export function makeOutputChannel(
   onBytes: (bytes: Uint8Array) => void,
-): Channel<ArrayBuffer> {
-  const channel = new Channel<ArrayBuffer>();
-  channel.onmessage = (message) => {
-    onBytes(new Uint8Array(message));
-  };
-  return channel;
+): OutputSink {
+  return makeOutputSink(onBytes);
 }
 
 export function spawnPane(
-  channel: Channel<ArrayBuffer>,
+  sink: OutputSink,
   opts: SpawnOpts,
 ): Promise<PaneId> {
-  return invoke<PaneId>("spawn_pane", {
-    channel,
+  return spawnPaneWithSink(sink, {
     rows: opts.rows,
     cols: opts.cols,
     cwd: opts.cwd ?? null,
     leafKey: opts.leafKey,
     command: opts.command ?? null,
     automationRunId: opts.automationRunId ?? null,
+    ephemeral: opts.ephemeral ?? false,
   });
 }
 
@@ -516,6 +525,12 @@ export function spawnPane(
  * A failed write rejects its own caller but never wedges the chain.
  */
 const paneWrites = makeWriteChain<PaneId>();
+
+/** U7 (tmux-substrate KTD6): open the pane's tmux session in a real
+ * terminal. Backend refuses for PTY-backed panes (substrate off). */
+export function attachPane(paneId: PaneId): Promise<void> {
+  return invoke("attach_pane", { paneId });
+}
 
 export function ptyWrite(paneId: PaneId, data: string): Promise<void> {
   return paneWrites.run(paneId, () => invoke<void>("pty_write", { paneId, data }));
@@ -530,6 +545,7 @@ export function ptyResize(
 }
 
 export function closePane(paneId: PaneId): Promise<void> {
+  releasePaneSink(paneId);
   return invoke("close_pane", { paneId });
 }
 

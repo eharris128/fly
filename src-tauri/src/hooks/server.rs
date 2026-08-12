@@ -148,6 +148,15 @@ pub struct AskTicket {
 /// dialog proceeds normally, detection degrades to the existing chain (KTD2).
 pub type AskHandler = Arc<dyn Fn(PaneId, AskPayload) -> Option<AskTicket> + Send + Sync>;
 
+/// Handler for a tmux-substrate event report (tmux plan U4b/KTD12). Receives
+/// the RAW request bytes — including the token — because substrate events
+/// authenticate against the SERVER-scope substrate token, not the pane
+/// `TokenRegistry` (a tmux `run-shell` hook holds no pane token). The handler
+/// owns the constant-time validation; it returns `true` iff the token was
+/// valid (so the caller can couple an invalid presentation into the
+/// registry's lockout counting). Fire-and-forget: no response is written.
+pub type SubstrateHandler = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
 /// A running hook socket server. Dropping it shuts the server down and removes
 /// the socket file.
 pub struct HookServer {
@@ -191,11 +200,55 @@ impl HookServer {
         ask_handler: Option<AskHandler>,
         peer_handler: Option<PeerHandler>,
     ) -> std::io::Result<HookServer> {
+        Self::start_all(
+            socket_path,
+            tokens,
+            dispatch,
+            request_handler,
+            ask_handler,
+            peer_handler,
+            None,
+        )
+    }
+
+    /// The widest constructor: everything `start_full` takes plus the
+    /// tmux-substrate event handler (U4b/KTD12). `start_full` delegates here
+    /// with no substrate handler so pre-substrate callers are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_all(
+        socket_path: PathBuf,
+        tokens: Arc<TokenRegistry>,
+        dispatch: Dispatch,
+        request_handler: Option<RequestHandler>,
+        ask_handler: Option<AskHandler>,
+        peer_handler: Option<PeerHandler>,
+        substrate_handler: Option<SubstrateHandler>,
+    ) -> std::io::Result<HookServer> {
         if let Some(parent) = socket_path.parent() {
             create_private_socket_dir(parent)?;
         }
-        // Reclaim a stale socket left by a prior crash.
-        let _ = std::fs::remove_file(&socket_path);
+        // Reclaim a stale socket left by a prior crash — but only a STALE
+        // one. The path is stable across instances (tmux-substrate U2/KTD8),
+        // so an unconditional unlink could clobber a live sibling's socket
+        // and strand every agent pointed at it. Try-connect first: a socket
+        // that answers is owned; refuse to bind instead of stealing it.
+        if socket_path.exists() {
+            match std::os::unix::net::UnixStream::connect(&socket_path) {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        format!(
+                            "hook socket {} is owned by a live instance",
+                            socket_path.display()
+                        ),
+                    ));
+                }
+                Err(_) => {
+                    // Nothing accepting ⇒ crash residue; safe to reclaim.
+                    let _ = std::fs::remove_file(&socket_path);
+                }
+            }
+        }
 
         let listener = UnixListener::bind(&socket_path)?;
         // Owner-only; the peer-UID check is the real gate, but tighten anyway.
@@ -213,6 +266,7 @@ impl HookServer {
                     request_handler,
                     ask_handler,
                     peer_handler,
+                    substrate_handler,
                     accept_stopping,
                 )
             })?;
@@ -256,6 +310,7 @@ fn accept_loop(
     request_handler: Option<RequestHandler>,
     ask_handler: Option<AskHandler>,
     peer_handler: Option<PeerHandler>,
+    substrate_handler: Option<SubstrateHandler>,
     stopping: Arc<AtomicBool>,
 ) {
     let cap = ConnCap::new(MAX_CONNECTIONS);
@@ -277,6 +332,7 @@ fn accept_loop(
                 let request_handler = request_handler.clone();
                 let ask_handler = ask_handler.clone();
                 let peer_handler = peer_handler.clone();
+                let substrate_handler = substrate_handler.clone();
                 // Handle each callback concurrently.
                 let _ = std::thread::Builder::new()
                     .name("fly-hook-conn".into())
@@ -289,6 +345,7 @@ fn accept_loop(
                             request_handler.as_ref(),
                             ask_handler.as_ref(),
                             peer_handler.as_ref(),
+                            substrate_handler.as_ref(),
                         )
                     });
             }
@@ -340,6 +397,7 @@ fn read_request(stream: &mut UnixStream) -> Option<Vec<u8>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_conn(
     mut stream: UnixStream,
     tokens: &TokenRegistry,
@@ -347,6 +405,7 @@ fn handle_conn(
     request_handler: Option<&RequestHandler>,
     ask_handler: Option<&AskHandler>,
     peer_handler: Option<&PeerHandler>,
+    substrate_handler: Option<&SubstrateHandler>,
 ) {
     // The PTY is a trust boundary; only same-UID local peers may signal.
     if !peer_uid_matches(&stream) {
@@ -362,6 +421,24 @@ fn handle_conn(
         Ok(e) => e,
         Err(_) => return, // malformed → reject silently
     };
+    // Substrate event reports (tmux plan U4b/KTD12) authenticate against the
+    // SERVER-scope substrate token — a tmux run-shell hook holds no pane
+    // token — so they branch before pane-token validation. The handler owns
+    // the constant-time compare and rejects silently; an invalid
+    // presentation is coupled into the registry's lockout counting below so
+    // this branch cannot become a free brute-force lane. No handler wired ⇒
+    // fall through to notify, where the parse dies on the missing `reason`
+    // (the ask/hold skew rule).
+    if envelope.is_substrate() {
+        if let Some(handler) = substrate_handler {
+            if !handler(&buf) {
+                // Count the failure exactly like an unknown pane token.
+                let _ = tokens.validate(&envelope.token);
+            }
+            return;
+        }
+    }
+
     let Some(pane) = tokens.validate(&envelope.token) else {
         return; // unknown/invalid token → reject silently (lockout applies)
     };
@@ -492,7 +569,7 @@ fn hold_ask(mut stream: UnixStream, ticket: AskTicket) {
 
 /// Verify the connecting peer's UID equals ours via `SO_PEERCRED`.
 #[cfg(target_os = "linux")]
-fn peer_uid_matches(stream: &UnixStream) -> bool {
+pub(crate) fn peer_uid_matches(stream: &UnixStream) -> bool {
     let fd = stream.as_raw_fd();
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -516,7 +593,7 @@ fn peer_uid_matches(stream: &UnixStream) -> bool {
 /// macOS equivalent of Linux's `SO_PEERCRED` (same kernel-attested effective
 /// UID of the connecting peer; failure rejects, identical to the Linux arm).
 #[cfg(target_os = "macos")]
-fn peer_uid_matches(stream: &UnixStream) -> bool {
+pub(crate) fn peer_uid_matches(stream: &UnixStream) -> bool {
     let fd = stream.as_raw_fd();
     let mut euid: libc::uid_t = 0;
     let mut egid: libc::gid_t = 0;

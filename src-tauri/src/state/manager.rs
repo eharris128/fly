@@ -33,6 +33,15 @@ pub struct AttentionManager {
     muted_workspaces: Mutex<HashSet<String>>,
     /// Each pane's workspace key, so a per-workspace mute scopes to its panes.
     pane_workspace: Mutex<HashMap<PaneId, String>>,
+    /// Panes whose tmux session has an external client attached
+    /// (tmux-substrate U7/R9). An attached pane is effectively
+    /// visible-and-foregrounded — the user is literally looking at it in
+    /// another terminal — so raises acknowledge and notifications suppress
+    /// exactly as for the in-window focused pane. Fed by the KTD12
+    /// attach-state events; the raw frontend visible set is kept so a
+    /// detach restores the true in-window state.
+    attached: Mutex<HashSet<PaneId>>,
+    raw_visible: Mutex<HashSet<PaneId>>,
     debounce_ms: u64,
     epoch: Instant,
 }
@@ -46,6 +55,8 @@ impl AttentionManager {
             muted_global: Mutex::new(muted_default),
             muted_workspaces: Mutex::new(HashSet::new()),
             pane_workspace: Mutex::new(HashMap::new()),
+            attached: Mutex::new(HashSet::new()),
+            raw_visible: Mutex::new(HashSet::new()),
             debounce_ms,
             epoch: Instant::now(),
         }
@@ -55,9 +66,11 @@ impl AttentionManager {
         self.epoch.elapsed().as_millis() as u64
     }
 
-    /// Start tracking a pane, inheriting the current window-foreground state.
+    /// Start tracking a pane, inheriting the current window-foreground state
+    /// (an already-attached pane — a reattach race — counts as foregrounded).
     pub fn register(&self, pane: PaneId) {
-        let fg = *self.foregrounded.lock().unwrap();
+        let fg = *self.foregrounded.lock().unwrap()
+            || self.attached.lock().unwrap().contains(&pane);
         let mut machine = AttentionMachine::new(self.debounce_ms);
         machine.set_foreground(fg);
         self.machines.lock().unwrap().insert(pane, machine);
@@ -81,21 +94,55 @@ impl AttentionManager {
     /// mirroring [`set_foreground`].
     pub fn set_visible_panes(&self, visible: &[PaneId]) -> Vec<(PaneId, Outcome)> {
         let set: HashSet<PaneId> = visible.iter().copied().collect();
+        *self.raw_visible.lock().unwrap() = set.clone();
+        let attached = self.attached.lock().unwrap().clone();
         let mut machines = self.machines.lock().unwrap();
         machines
             .iter_mut()
-            .map(|(id, m)| (*id, m.set_visible(set.contains(id))))
+            .map(|(id, m)| {
+                (*id, m.set_visible(set.contains(id) || attached.contains(id)))
+            })
             .collect()
     }
 
-    /// Replicate the window foreground state; re-evaluates every pane.
+    /// Replicate the window foreground state; re-evaluates every pane. An
+    /// externally-attached pane stays effectively foregrounded regardless
+    /// (U7/R9).
     pub fn set_foreground(&self, foregrounded: bool) -> Vec<(PaneId, Outcome)> {
         *self.foregrounded.lock().unwrap() = foregrounded;
+        let attached = self.attached.lock().unwrap().clone();
         let mut machines = self.machines.lock().unwrap();
         machines
             .iter_mut()
-            .map(|(id, m)| (*id, m.set_foreground(foregrounded)))
+            .map(|(id, m)| {
+                (*id, m.set_foreground(foregrounded || attached.contains(id)))
+            })
             .collect()
+    }
+
+    /// Record a pane's external-attach state (tmux-substrate U7/R9, fed by
+    /// the KTD12 attach-state events). Attached ⇒ the pane is effectively
+    /// visible + foregrounded (raises acknowledge, notifications suppress);
+    /// detach restores the true in-window visibility and the global
+    /// foreground state.
+    pub fn set_attached(&self, pane: PaneId, attached: bool) -> Option<Outcome> {
+        {
+            let mut set = self.attached.lock().unwrap();
+            if attached {
+                set.insert(pane);
+            } else {
+                set.remove(&pane);
+            }
+        }
+        let raw_visible = self.raw_visible.lock().unwrap().contains(&pane);
+        let fg = *self.foregrounded.lock().unwrap();
+        let mut machines = self.machines.lock().unwrap();
+        let m = machines.get_mut(&pane)?;
+        let _ = m.set_visible(raw_visible || attached);
+        // The second call sees the machine's settled state; its outcome is
+        // the final word (state after both inputs applied), which is what
+        // the caller emits to the frontend.
+        Some(m.set_foreground(fg || attached))
     }
 
     /// The notification panel opened or closed. Affects only the policy

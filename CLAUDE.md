@@ -26,9 +26,19 @@ pnpm tauri dev                # run the app (Vite dev server + cargo run) — us
 pnpm flavor:dev               # run a dev build ALONGSIDE an installed release (see "Stable + dev side by side")
 pnpm check                    # svelte-check: type-check the frontend
 pnpm test:unit                # vitest: all frontend unit tests
-pnpm tauri build --bundles deb   # standalone .deb (skip AppImage — it needs network at bundle time)
-pnpm build:local              # .deb on the fast release-dev profile (thin LTO — ~2× faster rebuilds)
+pnpm tauri build --bundles deb   # TAURI .deb (kept buildable — KTD9 rollback; skip AppImage, needs network)
+pnpm build:local              # Tauri .deb on the fast release-dev profile (thin LTO — ~2× faster rebuilds)
 pnpm build:mac                # on a Mac: .app + .dmg (best-effort target — see docs/macos-build.md)
+
+# The ELECTRON shell (migration plan 2026-08-12-002; the packaged product as of U7):
+pnpm build && cargo build --release --offline --manifest-path src-tauri/Cargo.toml \
+  && (cd electron && npm run dist)   # → electron/dist-el/fly-electron-shell_<ver>_amd64.deb
+                                     # (deb Package: fly — installing it REPLACES the Tauri deb;
+                                     #  postinst SUIDs chrome-sandbox + symlinks /usr/bin/fly)
+# Electron dev loop (fly-el flavor beside the installed release):
+#   pnpm dev   +   (cd electron && DISPLAY=:1 FLY_APP_NAME=fly-el \
+#     FLY_SHELL_URL=http://localhost:1420 ./node_modules/.bin/electron . --no-sandbox)
+#   (--no-sandbox is dev-only: the repo checkout lacks the SUID helper; the packaged app runs sandboxed)
 
 cargo test --offline --manifest-path src-tauri/Cargo.toml          # all Rust tests
 cargo test --offline --manifest-path src-tauri/Cargo.toml --test hook_auth   # one integration-test file (src-tauri/tests/<name>.rs)
@@ -92,7 +102,12 @@ an iterating dev build next to an installed stable app, use **`pnpm flavor:dev`*
 - The dev window's title becomes `fly (dev)` (set at runtime in `lib.rs` setup
   when the flavor isn't `fly`) so it's distinguishable from the stable window.
 
-The per-pane hook socket is also PID-keyed, so it never collides regardless.
+The hook socket lives at a stable per-flavor path (`hook.sock` under the
+runtime dir — tmux-substrate U2/KTD8: substrate sessions outlive the process,
+so surviving agents' env must keep pointing at a live socket across restarts);
+flavors get distinct dirs, same-flavor duplicates are stopped by the
+single-instance plugin, and the bind refuses to steal a socket that still
+answers.
 
 ## Architecture
 
@@ -143,6 +158,32 @@ that drives the dashboard's working/idle read and the triage nudge; note the
 attention machine has **no** output-driven transition, so "resumed working" must
 come from this activity poll, not `pane://attention`). All three take
 time/inputs as arguments so they're tested without a running app.
+
+### The tmux session substrate (built 2026-08-11/12, behind a flag)
+
+`config.substrate: "pty" | "tmux"` (default `pty` until live validation —
+see `docs/plans/2026-08-11-001-tmux-substrate-LIVE-CHECKLIST.md`) selects
+what backs a pane. Under `tmux`, every leaf-keyed pane is a **marked session
+on a fly-owned per-flavor tmux server** (`substrate/` — wrapper with executor
+seam, injective naming, durable leaf⇄session⇄token store): output streams
+through a `pipe-pane` FIFO into the same sink/activity/ring machinery, input
+ships as binary-safe `send-keys -H` through a persistent control-mode client
+(the unmarked `flyctl-input` session; ~µs/key vs ~8 ms/key subprocess —
+fire-and-forget, subprocess fallback on client death), exits arrive via
+`pane-died` hooks over the socket (KTD12 server-scope token, persisted for cross-instance
+continuity) with a 1.5 s poll floor, and **sessions outlive fly**: quit
+detaches (ephemeral automation/sink panes are killed instead), restart
+adopts — same child pid, stored pane token re-registered, ~2k lines
+replayed. `leader t` opens the focused session in a real terminal
+(`config.terminal`); an attached session counts as focused-elsewhere for
+suppression. Substrate-independent but born of the same plan:
+`config.mirrorUnfocused` (default OFF since the Electron cutover — U8
+measured Chromium at ~14% renderer main-thread on the 5-pane flood with or
+without it; `true` restores it for the Tauri/WebKitGTK rollback, where it
+was the engine-floor relief: 63% → 4–14% webview main-thread) renders
+visible-unfocused panes as 2 Hz DOM snapshots of their hidden xterm
+buffers (`lib/mirror.ts`). Plan:
+`docs/plans/2026-08-11-001-feat-tmux-session-substrate-plan.md`.
 
 ### Backend modules (`src-tauri/src/`)
 - `pty/` — `PtyManager` registry + `Pane`: portable-pty, one read thread per
@@ -327,6 +368,40 @@ time/inputs as arguments so they're tested without a running app.
   messaging depends on the webview roster publisher (runs when `feed.enabled`,
   the default, or the dashboard is open) but NOT on the feed listener port.
   Tests: `tests/peer_send.rs` + peer cases in `hook_auth`/`hook_ask`.
+- `backend.rs` — **the shell-agnostic backend builder** (Electron-shell
+  migration U3.5): `build_backend(seams)` constructs everything `lib.rs`'s
+  setup used to wire inline — the hook server's dispatch closure (the
+  attention pipeline's policy/notify/resume-capture/feed-bump step), the
+  ask/peer/automation/substrate handlers, the automations manager + sweep +
+  alert surfacing, and the feed listener — against two injected seams:
+  `events` (`app.emit` under Tauri; control-socket broadcast under `fly
+  core`) and `banner` (notification plugin vs `notify-send`). `lib.rs` setup
+  is now seam construction + `.manage()` of the returned `Backend` fields;
+  `fly core` boots the identical backend. Change backend wiring HERE, never
+  by re-inlining into a shell.
+- `control/` — the core control socket (Electron-shell migration plan
+  `2026-08-12-002`, U1): the transport a display shell will use to drive a
+  headless fly backend (`fly core`). Same-uid peer-cred gate + never-steal
+  bind (the `hooks/` discipline, reused), length-prefixed frames with
+  JSON-free pane-output/input kinds (kills the KTD3 eval quirk), request/
+  response/event envelopes whose `cmd`/`event` names are exactly the Tauri
+  seam's. Wire contract in `docs/core-protocol.md` — edited only together
+  with this module. U2 (`registry.rs`): 42 of 45 commands ported
+  name-identically over the real managers — where a Tauri command body holds
+  real logic it was extracted into a shared fn used by both shells
+  (`pty::pane_activity_snapshot`, `stream::attach_pane_now`,
+  `automations::{dashboard_snapshot,read_bundle_for}`,
+  `stream::attention_event_payload`) so they cannot drift. U3: the pane
+  lifecycle is fully socket-served — `spawn_pane`'s body is the shared
+  `stream::spawn_pane_with` (`SpawnDeps` + per-pane `PaneByteSink`), output
+  rides the 0x02 binary frames, keystrokes ride 0x03 down (write +
+  attention-clear, `pty_write` parity), exits fan out as `pane://exit` via
+  the shared payload builders; `fly core` resolves its flavor's launch mode
+  (consuming the clean-exit marker, KTD-G). U3.5: `fly core` boots the
+  **full** backend through `backend::build_backend` — hook server (with the
+  real dispatch), automations + sweep, feed listener — so the complete
+  command surface is live headless; only the shell itself (window, U4) is
+  missing. The Tauri shell behaves identically through the same builder.
 - `notify/`, `config/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
   reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the
@@ -683,6 +758,16 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   shows its most urgent raised agent) over workspaces ▸
   named tabs; `lib/ControlBar.svelte` — slim top bar (sidebar toggle +
   breadcrumb + pane controls).
+- `lib/transport.ts` — **the frontend's one transport seam** (Electron-shell
+  migration U5): invoke/listen/pane-output-sink/window-close over either
+  shell — Tauri (`@tauri-apps/api`) or the Electron preload bridge
+  (`window.fly`), detected at runtime. `ipc.ts`, `lib/{config,serialize}.ts`,
+  `main.ts`, `Terminal.svelte`, and `App.svelte` all route through it; no
+  other file may import `@tauri-apps/api` directly. Bridge invokes JSON
+  round-trip their args (Svelte 5 `$state` proxies fail Electron's
+  structured clone; Tauri always JSON-serialized, so this preserves wire
+  semantics exactly). The Electron shell itself lives in `electron/`
+  (main + preload + JS frame codec, edited with `docs/core-protocol.md`).
 - `lib/{config,serialize}.ts` (`serialize.migrateSession` upgrades old sessions
   into the workspace shape), `lib/HotkeyMenu.svelte` (passive cheat-sheet).
 - `lib/SettingsMenu.svelte` — focus-taking toggle-settings modal (`leader ,`,

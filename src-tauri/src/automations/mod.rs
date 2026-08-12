@@ -48,7 +48,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use tauri::Emitter;
 
 use crate::config::{AutomationDefaults, ConfigStore};
 use model::{
@@ -464,12 +463,14 @@ impl Dispatcher for UnwiredDispatcher {
 /// prompt-threaded command, calls `spawn_pane` with the run id, and the
 /// backend links run↔pane atomically on spawn (R10).
 pub struct AgentDispatcher {
-    app: tauri::AppHandle,
+    /// Where `automation://agent-run` lands — `app.emit` under Tauri, control
+    /// broadcast under `fly core` (Electron-shell migration U3.5).
+    events: crate::stream::EventSink,
 }
 
 impl AgentDispatcher {
-    pub fn new(app: tauri::AppHandle) -> Arc<Self> {
-        Arc::new(AgentDispatcher { app })
+    pub fn new(events: crate::stream::EventSink) -> Arc<Self> {
+        Arc::new(AgentDispatcher { events })
     }
 }
 
@@ -515,9 +516,9 @@ impl Dispatcher for AgentDispatcher {
             effort: launch.effort.clone(),
             fallback_model: launch.fallback.clone(),
         };
-        self.app
-            .emit("automation://agent-run", &event)
-            .map_err(|e| format!("could not emit automation://agent-run: {e}"))?;
+        let payload = serde_json::to_value(&event)
+            .map_err(|e| format!("could not serialize automation://agent-run: {e}"))?;
+        (self.events)("automation://agent-run", payload);
         Ok(())
     }
 
@@ -3504,6 +3505,12 @@ fn monitor_infra_failures(
 pub fn list_automations(
     manager: tauri::State<'_, Arc<AutomationManager>>,
 ) -> AutomationsDashboard {
+    dashboard_snapshot(&manager)
+}
+
+/// The body behind [`list_automations`], shared with the control-socket
+/// registry (Electron-shell migration U2).
+pub fn dashboard_snapshot(manager: &AutomationManager) -> AutomationsDashboard {
     let health = manager.store_health();
     let automations = manager.list();
     let infra_failures = monitor_infra_failures(&automations);
@@ -3575,8 +3582,15 @@ pub fn read_monitor_bundle(
     manager: tauri::State<'_, Arc<AutomationManager>>,
     path: String,
 ) -> Result<String, String> {
+    read_bundle_for(&manager, &path)
+}
+
+/// The body behind [`read_monitor_bundle`], shared with the control-socket
+/// registry (Electron-shell migration U2). Scope check unchanged: the path
+/// must canonicalize inside the manager's bundle dir.
+pub fn read_bundle_for(manager: &AutomationManager, path: &str) -> Result<String, String> {
     let dir = manager.bundle_dir.lock().unwrap().clone();
-    read_bundle_scoped(dir.as_deref(), &path)
+    read_bundle_scoped(dir.as_deref(), path)
 }
 
 /// The scoped bundle read behind [`read_monitor_bundle`], split out so the

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import Terminal from "./lib/Terminal.svelte";
+  import { listen, onWindowCloseRequested, destroyWindow } from "./lib/transport";
   import ControlBar from "./lib/ControlBar.svelte";
   import Sidebar from "./lib/Sidebar.svelte";
   import HotkeyMenu from "./lib/HotkeyMenu.svelte";
@@ -131,8 +132,7 @@
     type RunClosedEvent,
     type MonitorRegisteredEvent,
     type HandoffTarget,
-    type HandoffCandidate,
-  } from "./ipc";
+    type HandoffCandidate, attachPane} from "./ipc";
   import {
     buildHandoffCommand,
     handoffPrompt,
@@ -166,7 +166,6 @@
   import { Keymap, leaderLiteralBytes, type KeymapActions } from "./lib/keymap";
   import { actionCommands, navCommands, type PaletteCommand } from "./lib/palette";
   import { getConfig, setConfig } from "./lib/config";
-  import { getCurrentWindow } from "@tauri-apps/api/window";
   import {
     saveSession,
     loadSession,
@@ -293,6 +292,16 @@
   // drives the tier transparency so a degraded resume is never passed off as exact.
   let resumeTierByLeaf = $state<Record<string, ResumeTier>>({});
   let saveScrollbackEnabled = $state(false);
+  // U5 (tmux-substrate plan): visible-but-unfocused panes render as 2 Hz DOM
+  // snapshots of their hidden xterm buffers — the WebKitGTK engine-floor
+  // relief. Seeded from config.mirrorUnfocused; default OFF since the
+  // Electron cutover (migration U8 — Chromium renders 5 live flooding panes
+  // at ~14% renderer main-thread, mirror or not); `true` restores snapshots.
+  let mirrorUnfocused = $state(false);
+  // U7: leaves whose tmux session has an external terminal attached
+  // (pane://attach events) — drives the badge and nothing else; the
+  // suppression side lives in the backend AttentionManager.
+  let attachedByLeaf: Record<string, boolean> = $state({});
   let keymap = $state<Keymap | null>(null);
   let menuOpen = $state(false);
   // Agent dashboard home view (U7): a hotkey-toggled main-content surface that
@@ -2079,6 +2088,15 @@
     focusUp: () => focusDir("up"),
     focusDown: () => focusDir("down"),
     focusNextPane: () => focusCycle(1),
+    // U7: native attach for the focused pane (tmux substrate only; the
+    // backend's refusal for PTY panes is logged, not surfaced — the chord
+    // is inert there by design).
+    attachTerminal: () => {
+      const leaf = activeTab?.focusedLeafKey;
+      const pid = leaf ? paneIdByLeaf[leaf] : undefined;
+      if (pid !== undefined)
+        void attachPane(pid).catch((e) => console.warn("attach refused:", e));
+    },
     focusPrevPane: () => focusCycle(-1),
     cycleAttention,
     jumpNewestUnread,
@@ -2268,6 +2286,7 @@
   async function restore() {
     const cfg = await getConfig();
     saveScrollbackEnabled = cfg.saveScrollback;
+    mirrorUnfocused = cfg.mirrorUnfocused ?? false;
     leaderKey = cfg.leaderKey;
     nudgeIdleMs = cfg.nudgeIdleMs;
     feedEnabled = cfg.feed.enabled;
@@ -2363,16 +2382,14 @@
     // A busy agent (working a live turn, or running a live background task —
     // busyAgentCount) gets one confirm first, via the shared destructive-confirm
     // overlay, so an accidental × doesn't silently kill in-progress work.
-    const win = getCurrentWindow();
     const closeNow = async () => {
       try {
         await persist();
       } finally {
-        await win.destroy();
+        await destroyWindow();
       }
     };
-    await win.onCloseRequested(async (event) => {
-      event.preventDefault();
+    await onWindowCloseRequested(async () => {
       const busy = busyAgentCount(homeModel);
       if (busy > 0) {
         pendingConfirm = {
@@ -2415,6 +2432,12 @@
     // Own the notification history listener here (attention arrives prop-drilled
     // from Terminal; this is a direct App listener). Resolve paneId → leafKey at
     // ingestion via the reverse index, so the entry stores the stable key.
+    let unlistenAttach: (() => void) | undefined;
+    void listen<{ paneId: number; attached: boolean }>("pane://attach", (ev) => {
+      const leafKey = leafByPaneId[ev.payload.paneId];
+      if (!leafKey) return;
+      attachedByLeaf = { ...attachedByLeaf, [leafKey]: ev.payload.attached };
+    }).then((u) => (unlistenAttach = u));
     let unlistenNotify: (() => void) | undefined;
     void onNotificationAdded((ev) => {
       const leafKey = leafByPaneId[ev.paneId];
@@ -2482,6 +2505,7 @@
       window.removeEventListener("keydown", onWindowKeydown, true);
       stopPanePoll();
       unlistenNotify?.();
+      unlistenAttach?.();
       unlistenAgentRun?.();
       unlistenAutomationChanged?.();
       unlistenAlertPending?.();
@@ -2575,6 +2599,11 @@
               focused={p.tabId === activeTab?.id &&
                 activeTab?.focusedLeafKey === p.key}
               visible={p.tabId === activeTab?.id}
+              mirrored={mirrorUnfocused &&
+                p.tabId === activeTab?.id &&
+                activeTab?.focusedLeafKey !== p.key}
+              attachedElsewhere={attachedByLeaf[p.key] ?? false}
+              ephemeral={sinkCommandByLeaf[p.key] !== undefined}
               cwd={cwdByLeaf[p.key] ?? null}
               command={resumeCommandByLeaf[p.key] ??
                 automationCommandByLeaf[p.key] ??

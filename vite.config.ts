@@ -2,6 +2,10 @@ import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
 export default defineConfig({
+  // Relative asset URLs, so the same dist/ loads over Tauri's asset protocol
+  // AND the packaged Electron shell's file:// (migration U7). Absolute '/'
+  // paths break file:// loading; relative works on both.
+  base: "./",
   plugins: [
     svelte(),
     {

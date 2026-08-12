@@ -56,6 +56,7 @@ function spyActions(): KeymapActions & { calls: string[] } {
     renameTab: mk("renameTab"),
     renamePane: mk("renamePane"),
     handoffQuick: mk("handoffQuick"),
+    attachTerminal: mk("attachTerminal"),
     handoffGuided: mk("handoffGuided"),
     handoffRepick: mk("handoffRepick"),
     sendLiteralLeader: mk("sendLiteral"),

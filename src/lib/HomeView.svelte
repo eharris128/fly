@@ -122,6 +122,7 @@
   let selectedKey = $state<string | null>(null);
   let now = $state(Date.now());
   let rowEls: Record<string, HTMLButtonElement | undefined> = {};
+  let homeEl: HTMLDivElement | undefined;
 
   // Flat row order (workspace → tab → row) for ↑/↓ navigation.
   const flatRows = $derived(model.flatMap((ws) => ws.tabs.flatMap((t) => t.rows)));
@@ -142,8 +143,12 @@
 
   // Move DOM focus to the selected row so Enter (native button click) and the
   // highlight stay in sync; runs on mount (first row) and every selection move.
+  // With NO rows (empty state), focus the container itself — the keydown
+  // handler lives on it, and without this Esc/digits are dead on an empty
+  // dashboard (nothing inside it holds focus, so no key ever reaches it).
   $effect(() => {
     if (selectedKey) rowEls[selectedKey]?.focus();
+    else homeEl?.focus();
   });
 
   // Live tick: re-render elapsed timers each second. The component is mounted
@@ -203,6 +208,7 @@
     role="listbox"
     tabindex="-1"
     aria-label="Agent dashboard"
+    bind:this={homeEl}
     onkeydown={onKeydown}
   >
   <header class="home-head">
@@ -608,11 +614,12 @@
     font-size: 16px;
     margin-top: 4px;
   }
+  /* Both regions fill the left column (the usage panel bounds it), so rows —
+     and the divider between them — use the whole available width. */
   .groups {
     display: flex;
     flex-direction: column;
     gap: 18px;
-    max-width: 720px;
   }
   .ws-name {
     display: flex;
@@ -765,7 +772,6 @@
   /* Automations panel — stacked below the agent list in the same left column,
      with a divider so the two regions read as distinct. */
   .automations {
-    max-width: 720px;
     margin-top: 28px;
     padding-top: 18px;
     border-top: 1px solid #262d44;
@@ -822,7 +828,10 @@
   }
   .auto-row {
     display: grid;
-    grid-template-columns: 72px 1fr auto;
+    /* The status column holds its own width (the longest word, SUCCEEDED, plus
+       a running row's `· 2m` suffix) instead of overflowing a fixed track into
+       the gap and colliding with the name. */
+    grid-template-columns: minmax(96px, max-content) 1fr auto;
     align-items: baseline;
     gap: 12px;
     background: #1d2336;
@@ -839,6 +848,7 @@
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.04em;
+    white-space: nowrap;
   }
   .a-status.s-succeeded {
     color: #4ade80;
