@@ -5,7 +5,7 @@
   import { WebglAddon } from "@xterm/addon-webgl";
   import { Unicode11Addon } from "@xterm/addon-unicode11";
   import { SerializeAddon } from "@xterm/addon-serialize";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { listen, type UnlistenFn } from "./transport";
   import { getConfig } from "./config";
   import type { Renderer as RendererMode } from "./config";
   import { wantsWebgl } from "./renderer";

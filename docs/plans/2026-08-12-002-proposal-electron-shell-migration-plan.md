@@ -33,9 +33,20 @@ sandboxed renderer whose only surface is the preload's `window.fly`
 (invoke/onEvent/onPaneOutput/paneInput — the main process owns the socket,
 KTD4), and a throwaway `probe.html` that live-verified spawn + byte
 streaming in a window. Dev caveat: the repo box lacks the Chromium SUID
-helper, so dev runs use `--no-sandbox` (packaging restores it). U5 next:
-`ipc.ts` re-transport onto `window.fly` + `FLY_SHELL_URL` pointing at the
-Vite frontend.
+helper, so dev runs use `--no-sandbox` (packaging restores it). U5 (landed):
+`src/lib/transport.ts` is the frontend's one transport seam — invoke/listen/
+pane-output-sink/window-close, Tauri or `window.fly`, detected at runtime;
+`ipc.ts`/`config.ts`/`serialize.ts`/`main.ts`/`Terminal.svelte`/`App.svelte`
+route through it (the only structural change: `spawn_pane`'s Channel becomes
+an `OutputSink` — Electron subscribes by pane id post-spawn with a bounded
+pre-subscription buffer). Bridge invokes JSON-round-trip their args (Svelte 5
+`$state` proxies fail Electron's structured clone; Tauri always
+JSON-serialized, so semantics are preserved exactly). Quit-confirm flows
+through `fly:close-request`/`close-now`. **Live-verified: the full fly UI —
+sidebar, dashboard, automations panel, real OAuth usage gauges — running on
+Chromium against the headless core** (`FLY_SHELL_URL=http://localhost:1420`,
+flavor `fly-el`). Remaining: U6 parity+perf gate, U7 packaging/cutover, U8
+simplifications.
 **Grounds**: `docs/notes/2026-08-12-electron-engine-probe.md` (same-box probe:
 flood main-thread 63 % → 11.7 %, echo 99 → 53 ms p50; ~50 ms xterm.js pipeline
 floor persists on any engine) and

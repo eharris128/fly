@@ -744,6 +744,16 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   shows its most urgent raised agent) over workspaces ▸
   named tabs; `lib/ControlBar.svelte` — slim top bar (sidebar toggle +
   breadcrumb + pane controls).
+- `lib/transport.ts` — **the frontend's one transport seam** (Electron-shell
+  migration U5): invoke/listen/pane-output-sink/window-close over either
+  shell — Tauri (`@tauri-apps/api`) or the Electron preload bridge
+  (`window.fly`), detected at runtime. `ipc.ts`, `lib/{config,serialize}.ts`,
+  `main.ts`, `Terminal.svelte`, and `App.svelte` all route through it; no
+  other file may import `@tauri-apps/api` directly. Bridge invokes JSON
+  round-trip their args (Svelte 5 `$state` proxies fail Electron's
+  structured clone; Tauri always JSON-serialized, so this preserves wire
+  semantics exactly). The Electron shell itself lives in `electron/`
+  (main + preload + JS frame codec, edited with `docs/core-protocol.md`).
 - `lib/{config,serialize}.ts` (`serialize.migrateSession` upgrades old sessions
   into the workspace shape), `lib/HotkeyMenu.svelte` (passive cheat-sheet).
 - `lib/SettingsMenu.svelte` — focus-taking toggle-settings modal (`leader ,`,

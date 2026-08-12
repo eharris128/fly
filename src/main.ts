@@ -1,6 +1,6 @@
 import "./app.css";
 import { mount } from "svelte";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./lib/transport";
 import App from "./App.svelte";
 
 // The webview console is invisible outside devtools, so forward uncaught

@@ -22,4 +22,12 @@ contextBridge.exposeInMainWorld('fly', {
   },
   /** Keystrokes down the 0x03 path (Uint8Array in, exact bytes). */
   paneInput: (paneId, bytes) => ipcRenderer.send('fly:pane-input', paneId, bytes),
+  /** Quit-confirm flow (U5): main intercepts close and asks the renderer… */
+  onCloseRequested: (cb) => {
+    const h = () => cb();
+    ipcRenderer.on('fly:close-request', h);
+    return () => ipcRenderer.removeListener('fly:close-request', h);
+  },
+  /** …and the renderer finishes the job once its flow decides. */
+  closeNow: () => ipcRenderer.send('fly:close-now'),
 });

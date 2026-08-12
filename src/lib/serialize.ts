@@ -1,7 +1,7 @@
 // Session serialization (U12, U16). The backend stores this blob opaquely; the
 // frontend owns the layout tree and the workspace grouping, so rehydration
 // happens here.
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./transport";
 import { leaves, type Node } from "./layout";
 import { coerceNotifications, type Notification } from "./notifications";
 import { persistedTabs, type Workspace } from "./workspaces";

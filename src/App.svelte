@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import Terminal from "./lib/Terminal.svelte";
-  import { listen } from "@tauri-apps/api/event";
+  import { listen, onWindowCloseRequested, destroyWindow } from "./lib/transport";
   import ControlBar from "./lib/ControlBar.svelte";
   import Sidebar from "./lib/Sidebar.svelte";
   import HotkeyMenu from "./lib/HotkeyMenu.svelte";
@@ -166,7 +166,6 @@
   import { Keymap, leaderLiteralBytes, type KeymapActions } from "./lib/keymap";
   import { actionCommands, navCommands, type PaletteCommand } from "./lib/palette";
   import { getConfig, setConfig } from "./lib/config";
-  import { getCurrentWindow } from "@tauri-apps/api/window";
   import {
     saveSession,
     loadSession,
@@ -2381,16 +2380,14 @@
     // A busy agent (working a live turn, or running a live background task —
     // busyAgentCount) gets one confirm first, via the shared destructive-confirm
     // overlay, so an accidental × doesn't silently kill in-progress work.
-    const win = getCurrentWindow();
     const closeNow = async () => {
       try {
         await persist();
       } finally {
-        await win.destroy();
+        await destroyWindow();
       }
     };
-    await win.onCloseRequested(async (event) => {
-      event.preventDefault();
+    await onWindowCloseRequested(async () => {
       const busy = busyAgentCount(homeModel);
       if (busy > 0) {
         pendingConfirm = {

@@ -191,6 +191,19 @@ app.whenReady().then(async () => {
   });
   win.removeMenu();
   win.on('page-title-updated', (e) => e.preventDefault());
+  // Quit-confirm flow (U5): the renderer owns the busy-agents confirm (the
+  // same shared destructive-confirm overlay as under Tauri); main only
+  // intercepts and forwards. `fly:close-now` is the renderer's verdict.
+  let allowClose = false;
+  win.on('close', (e) => {
+    if (allowClose) return;
+    e.preventDefault();
+    win.webContents.send('fly:close-request');
+  });
+  ipcMain.on('fly:close-now', () => {
+    allowClose = true;
+    if (win && !win.isDestroyed()) win.destroy();
+  });
   // U5 loads the real frontend (Vite dev server or built assets); until
   // then the probe page proves the bridge end-to-end.
   const url = process.env.FLY_SHELL_URL;

@@ -1,5 +1,5 @@
 // Typed access to the backend config substrate (U13).
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./transport";
 
 export type Renderer = "auto" | "webgl" | "dom";
 

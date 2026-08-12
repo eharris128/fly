@@ -1,6 +1,15 @@
-// Typed wrappers over the Tauri command + Channel surface (U3).
-import { invoke, Channel } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+// Typed wrappers over the backend command surface (U3) — shell-agnostic
+// since the Electron-shell migration (U5): every invoke/listen routes
+// through `lib/transport.ts`, which serves Tauri or the Electron bridge.
+import {
+  invoke,
+  listen,
+  makeOutputSink,
+  releasePaneSink,
+  spawnPaneWithSink,
+  type OutputSink,
+  type UnlistenFn,
+} from "./lib/transport";
 // Type-only (erased at runtime, so the feed.ts ↔ ipc.ts cycle is harmless).
 import type { FeedPublishPayload } from "./lib/feed";
 import { makeWriteChain } from "./lib/write-chain";
@@ -489,20 +498,15 @@ export function setPaneWorkspace(
  */
 export function makeOutputChannel(
   onBytes: (bytes: Uint8Array) => void,
-): Channel<ArrayBuffer> {
-  const channel = new Channel<ArrayBuffer>();
-  channel.onmessage = (message) => {
-    onBytes(new Uint8Array(message));
-  };
-  return channel;
+): OutputSink {
+  return makeOutputSink(onBytes);
 }
 
 export function spawnPane(
-  channel: Channel<ArrayBuffer>,
+  sink: OutputSink,
   opts: SpawnOpts,
 ): Promise<PaneId> {
-  return invoke<PaneId>("spawn_pane", {
-    channel,
+  return spawnPaneWithSink(sink, {
     rows: opts.rows,
     cols: opts.cols,
     cwd: opts.cwd ?? null,
@@ -541,6 +545,7 @@ export function ptyResize(
 }
 
 export function closePane(paneId: PaneId): Promise<void> {
+  releasePaneSink(paneId);
   return invoke("close_pane", { paneId });
 }
 
