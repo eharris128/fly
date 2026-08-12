@@ -231,7 +231,7 @@ pub fn publish_agent_feed(
 /// webview that has stopped publishing stops advancing the stamp either way),
 /// and stamping backend-side avoids trusting a client-supplied clock for a value
 /// the drop route's staleness gate depends on.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

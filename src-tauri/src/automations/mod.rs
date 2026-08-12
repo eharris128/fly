@@ -3504,6 +3504,12 @@ fn monitor_infra_failures(
 pub fn list_automations(
     manager: tauri::State<'_, Arc<AutomationManager>>,
 ) -> AutomationsDashboard {
+    dashboard_snapshot(&manager)
+}
+
+/// The body behind [`list_automations`], shared with the control-socket
+/// registry (Electron-shell migration U2).
+pub fn dashboard_snapshot(manager: &AutomationManager) -> AutomationsDashboard {
     let health = manager.store_health();
     let automations = manager.list();
     let infra_failures = monitor_infra_failures(&automations);
@@ -3575,8 +3581,15 @@ pub fn read_monitor_bundle(
     manager: tauri::State<'_, Arc<AutomationManager>>,
     path: String,
 ) -> Result<String, String> {
+    read_bundle_for(&manager, &path)
+}
+
+/// The body behind [`read_monitor_bundle`], shared with the control-socket
+/// registry (Electron-shell migration U2). Scope check unchanged: the path
+/// must canonicalize inside the manager's bundle dir.
+pub fn read_bundle_for(manager: &AutomationManager, path: &str) -> Result<String, String> {
     let dir = manager.bundle_dir.lock().unwrap().clone();
-    read_bundle_scoped(dir.as_deref(), &path)
+    read_bundle_scoped(dir.as_deref(), path)
 }
 
 /// The scoped bundle read behind [`read_monitor_bundle`], split out so the

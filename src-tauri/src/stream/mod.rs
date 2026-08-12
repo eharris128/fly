@@ -41,17 +41,23 @@ struct AttentionEvent {
     tier: Option<Tier>,
 }
 
+/// The `pane://attention` payload as a JSON value — the one place the event
+/// shape is built, shared by the Tauri emit below and the control-socket
+/// registry (Electron-shell migration U2/KTD1), so the two shells cannot
+/// drift.
+pub fn attention_event_payload(pane: PaneId, outcome: &Outcome) -> serde_json::Value {
+    serde_json::to_value(AttentionEvent {
+        pane_id: pane.0,
+        state: outcome.state,
+        reason: outcome.reason,
+        tier: outcome.tier,
+    })
+    .expect("attention event serializes")
+}
+
 /// Emit an attention-state change to the frontend.
 pub fn emit_attention(app: &AppHandle, pane: PaneId, outcome: &Outcome) {
-    let _ = app.emit(
-        PANE_ATTENTION_EVENT,
-        AttentionEvent {
-            pane_id: pane.0,
-            state: outcome.state,
-            reason: outcome.reason,
-            tier: outcome.tier,
-        },
-    );
+    let _ = app.emit(PANE_ATTENTION_EVENT, attention_event_payload(pane, outcome));
 }
 
 /// The seed event for one recorded notification (KTD16): the backend is the
@@ -266,6 +272,16 @@ pub fn spawn_pane(
 pub fn attach_pane(
     pty: State<'_, Arc<PtyManager>>,
     config: State<'_, Arc<crate::config::ConfigStore>>,
+    pane_id: PaneId,
+) -> Result<(), String> {
+    attach_pane_now(&pty, &config, pane_id)
+}
+
+/// The body behind [`attach_pane`], shared with the control-socket registry
+/// (Electron-shell migration U2).
+pub fn attach_pane_now(
+    pty: &PtyManager,
+    config: &crate::config::ConfigStore,
     pane_id: PaneId,
 ) -> Result<(), String> {
     let Some((sub, session)) = pty.tmux_backend_of(pane_id) else {

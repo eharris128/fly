@@ -793,6 +793,12 @@ pub fn pane_activity(
     manager: tauri::State<'_, Arc<PtyManager>>,
     pane_id: PaneId,
 ) -> PaneActivity {
+    pane_activity_snapshot(&manager, pane_id)
+}
+
+/// The body behind [`pane_activity`], shared with the control-socket registry
+/// (Electron-shell migration U2) so both shells compose the same snapshot.
+pub fn pane_activity_snapshot(manager: &PtyManager, pane_id: PaneId) -> PaneActivity {
     // One foreground-pid resolution gates agent-ness and roots the task count.
     let Some(live_task_count) = manager.agent_task_count(pane_id) else {
         return PaneActivity {

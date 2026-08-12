@@ -361,7 +361,14 @@ WebKitGTK engine-floor relief (63% → 4–14% webview main-thread under the
   JSON-free pane-output/input kinds (kills the KTD3 eval quirk), request/
   response/event envelopes whose `cmd`/`event` names are exactly the Tauri
   seam's. Wire contract in `docs/core-protocol.md` — edited only together
-  with this module. U1 serves only `core/ping`; the Tauri shell is untouched.
+  with this module. U2 (`registry.rs`): 42 of 45 commands ported
+  name-identically over the real managers — where a Tauri command body holds
+  real logic it was extracted into a shared fn used by both shells
+  (`pty::pane_activity_snapshot`, `stream::attach_pane_now`,
+  `automations::{dashboard_snapshot,read_bundle_for}`,
+  `stream::attention_event_payload`) so they cannot drift; `spawn_pane` /
+  `register_alert_sink` / `get_launch_mode` answer a named-U3 error until the
+  event/stream plumbing lands. The Tauri shell is untouched.
 - `notify/`, `config/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
   reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the
