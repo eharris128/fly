@@ -1,6 +1,8 @@
 # Proposal: Electron/Chromium shell migration — 2026-08-12-002
 
-**Status**: proposal — awaiting go/no-go and the open decisions at the bottom
+**Status**: in progress — U1 landed 2026-08-12 (`src-tauri/src/control/` +
+`fly core` + `docs/core-protocol.md`; transport decision resolved to the
+control socket per recommendation); U2 next
 **Grounds**: `docs/notes/2026-08-12-electron-engine-probe.md` (same-box probe:
 flood main-thread 63 % → 11.7 %, echo 99 → 53 ms p50; ~50 ms xterm.js pipeline
 floor persists on any engine) and

@@ -569,7 +569,7 @@ fn hold_ask(mut stream: UnixStream, ticket: AskTicket) {
 
 /// Verify the connecting peer's UID equals ours via `SO_PEERCRED`.
 #[cfg(target_os = "linux")]
-fn peer_uid_matches(stream: &UnixStream) -> bool {
+pub(crate) fn peer_uid_matches(stream: &UnixStream) -> bool {
     let fd = stream.as_raw_fd();
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -593,7 +593,7 @@ fn peer_uid_matches(stream: &UnixStream) -> bool {
 /// macOS equivalent of Linux's `SO_PEERCRED` (same kernel-attested effective
 /// UID of the connecting peer; failure rejects, identical to the Linux arm).
 #[cfg(target_os = "macos")]
-fn peer_uid_matches(stream: &UnixStream) -> bool {
+pub(crate) fn peer_uid_matches(stream: &UnixStream) -> bool {
     let fd = stream.as_raw_fd();
     let mut euid: libc::uid_t = 0;
     let mut egid: libc::gid_t = 0;

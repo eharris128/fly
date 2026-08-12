@@ -6,6 +6,7 @@
 pub mod automations;
 pub mod cli;
 pub mod config;
+pub mod control;
 pub mod cwd;
 pub mod feed;
 pub mod hooks;

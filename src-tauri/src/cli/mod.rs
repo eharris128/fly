@@ -11,6 +11,7 @@
 //!   - `fly hooks …`   — install/remove the Claude hook
 
 pub mod automation;
+pub mod core;
 pub mod substrate;
 pub mod hooks;
 pub mod notify;
@@ -33,6 +34,7 @@ pub fn is_cli_subcommand(arg: &str) -> bool {
             | "agents"
             | "send"
             | "substrate-event"
+            | "core"
             | "help"
             | "--help"
             | "-h"
@@ -58,6 +60,7 @@ pub fn top_level_help() -> String {
        fly automation <cmd> …   manage cron-scheduled agent/script runs\n  \
        fly agents [--json]      list the live agent roster (peer messaging)\n  \
        fly send <pane> <msg…>   deliver a message into another agent's pane\n  \
+       fly core [--socket <p>]  run the headless backend host (internal)\n  \
        fly help | --help | -h   show this help\n\
      \n\
      `fly agents` / `fly send` run inside a fly pane and talk over its\n\
@@ -95,6 +98,9 @@ pub fn run(args: &[String]) -> i32 {
             0
         }
         Some("send") => peer::run_send(&args[2..]),
+        // Electron-shell migration U1: the headless backend host — launched
+        // by a display shell, listed in help only in passing.
+        Some("core") => core::run(&args[2..]),
         Some("hooks") => match args.get(2).map(String::as_str) {
             Some("setup") => hooks::run_setup(&args[3..]),
             Some("teardown") => hooks::run_teardown(&args[3..]),

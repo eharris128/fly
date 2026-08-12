@@ -354,6 +354,14 @@ WebKitGTK engine-floor relief (63% → 4–14% webview main-thread under the
   messaging depends on the webview roster publisher (runs when `feed.enabled`,
   the default, or the dashboard is open) but NOT on the feed listener port.
   Tests: `tests/peer_send.rs` + peer cases in `hook_auth`/`hook_ask`.
+- `control/` — the core control socket (Electron-shell migration plan
+  `2026-08-12-002`, U1): the transport a display shell will use to drive a
+  headless fly backend (`fly core`). Same-uid peer-cred gate + never-steal
+  bind (the `hooks/` discipline, reused), length-prefixed frames with
+  JSON-free pane-output/input kinds (kills the KTD3 eval quirk), request/
+  response/event envelopes whose `cmd`/`event` names are exactly the Tauri
+  seam's. Wire contract in `docs/core-protocol.md` — edited only together
+  with this module. U1 serves only `core/ping`; the Tauri shell is untouched.
 - `notify/`, `config/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
   reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the
