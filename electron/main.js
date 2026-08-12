@@ -214,10 +214,42 @@ app.whenReady().then(async () => {
   }
 });
 
-app.on('before-quit', () => {
+// Ordered core shutdown on quit (migration U6): ask the core to run the same
+// teardown lifecycle.rs runs under Tauri — clean-exit marker, interrupted-run
+// closes, substrate DETACH — whether we spawned it or adopted it (quitting
+// fly means quitting the backend; sessions survive on the tmux server either
+// way). `core/shutdown` is primary; SIGTERM lands on the same flag in the
+// core; SIGKILL after a deadline is the last resort for a wedged core.
+let quitFlowDone = false;
+app.on('before-quit', (e) => {
+  if (quitFlowDone) return;
+  e.preventDefault();
+  quitFlowDone = true;
   app.isQuittingFly = true;
-  // The shell owns the core it spawned; an adopted core is left running.
-  if (coreChild) coreChild.kill('SIGTERM');
+  const finish = () => app.quit();
+  const askShutdown = invoke('core/shutdown').catch(() => {
+    // Socket down or command refused — signal the core we own instead.
+    if (coreChild) coreChild.kill('SIGTERM');
+  });
+  if (coreChild) {
+    // Wait for the ordered exit; SIGKILL a core that never finishes.
+    const deadline = setTimeout(() => {
+      try {
+        coreChild.kill('SIGKILL');
+      } catch {}
+      finish();
+    }, 10_000);
+    coreChild.once('exit', () => {
+      clearTimeout(deadline);
+      finish();
+    });
+  } else {
+    // Adopted core: we can't watch its pid; give the request a beat to land.
+    askShutdown.then(
+      () => setTimeout(finish, 500),
+      () => finish()
+    );
+  }
 });
 
 app.on('window-all-closed', () => app.quit());

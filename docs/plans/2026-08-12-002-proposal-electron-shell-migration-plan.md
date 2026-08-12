@@ -45,7 +45,16 @@ JSON-serialized, so semantics are preserved exactly). Quit-confirm flows
 through `fly:close-request`/`close-now`. **Live-verified: the full fly UI —
 sidebar, dashboard, automations panel, real OAuth usage gauges — running on
 Chromium against the headless core** (`FLY_SHELL_URL=http://localhost:1420`,
-flavor `fly-el`). Remaining: U6 parity+perf gate, U7 packaging/cutover, U8
+flavor `fly-el`). U6 (in progress): ordered shutdown for `fly core` landed
+2026-08-12 — the lifecycle.rs teardown sequence extracted into
+`backend::ordered_shutdown` (one sequence, both shells; lifecycle.rs is now a
+try_state adapter), triggered by the new `core/shutdown` control command or
+SIGTERM/SIGINT (both land on one atomic flag; the run loop polls it, so the
+ack flushes before teardown), and the Electron shell's before-quit drives
+`core/shutdown` first (spawned *or* adopted core — quitting fly quits the
+backend) with SIGTERM fallback and a 10 s SIGKILL deadline. Live-verified
+both triggers: exit 0, clean-exit marker written, ordered log line.
+Remaining: U6 parity+perf gate (rest), U7 packaging/cutover, U8
 simplifications.
 **Grounds**: `docs/notes/2026-08-12-electron-engine-probe.md` (same-box probe:
 flood main-thread 63 % → 11.7 %, echo 99 → 53 ms p50; ~50 ms xterm.js pipeline

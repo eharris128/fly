@@ -11,13 +11,23 @@
 //! never-steal probe, so a `fly core` started while a same-flavor Tauri fly
 //! runs refuses at boot instead of fighting it for the backend role.
 //!
-//! Shutdown: killing the process leaves tmux-substrate sessions alive (they
-//! outlive fly by design) and abandons plain-PTY children to reparenting —
-//! the Electron shell (U4) owns ordered shutdown, like lifecycle.rs does
-//! under Tauri. Internal-facing like `substrate-event`: launched by a
-//! display shell, not typed by humans.
+//! Shutdown (U6): ordered, exactly like the Tauri quit. `core/shutdown` from
+//! the shell — or SIGTERM/SIGINT — runs `backend::ordered_shutdown` (clean-
+//! exit marker, sweep join + interrupted-run closes, feed/ask release, pane
+//! reap with substrate DETACH) and exits 0. Only a SIGKILL skips it, and the
+//! next boot's never-steal probe reclaims the socket residue. Internal-facing
+//! like `substrate-event`: launched by a display shell, not typed by humans.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// One flag, two writers: the `core/shutdown` command and the signal
+/// handlers. An atomic store is async-signal-safe; the run loop polls it.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
 
 use crate::backend::{build_backend, BackendSeams};
 use crate::control::registry::{build_registry, CoreHandles};
@@ -118,6 +128,7 @@ pub fn run(args: &[String]) -> i32 {
         launch_mode,
         events,
         pane_bytes,
+        shutdown: Some(Arc::new(|| SHUTDOWN.store(true, Ordering::SeqCst))),
     });
 
     let server = match ControlServer::start(socket_path.clone(), handler, Some(pane_input)) {
@@ -130,11 +141,28 @@ pub fn run(args: &[String]) -> i32 {
     eprintln!("fly core: listening on {}", server.socket_path().display());
     *server_slot.lock().expect("server slot") = Some(server);
 
-    // Serve until killed; `backend` (hook server, sweep, feed listener) lives
-    // for the process. Socket residue on SIGKILL is reclaimed by the next
-    // start's never-steal probe.
-    let _backend = backend;
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
+    // Serve until asked to stop: `core/shutdown` over the socket or
+    // SIGTERM/SIGINT (the Electron shell's before-quit sends the command and
+    // falls back to SIGTERM — both land on the same flag).
+    unsafe {
+        let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
     }
+    while !SHUTDOWN.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Ordered teardown (U6) — the identical sequence lifecycle::shutdown runs
+    // under Tauri: clean-exit marker, automations sweep join + interrupted-run
+    // closes, feed/ask release, then the pane reap (tmux sessions DETACH).
+    // The poll gap above also lets the `core/shutdown` response flush before
+    // the server drops below.
+    eprintln!("fly core: shutting down (ordered)");
+    backend.shutdown();
+    // Drop the control server explicitly (unbind + close connections), then
+    // the backend (hook server / feed listener join in their Drop impls).
+    drop(server_slot.lock().expect("server slot").take());
+    drop(backend);
+    0
 }

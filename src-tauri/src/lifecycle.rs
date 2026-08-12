@@ -15,53 +15,23 @@ use crate::pty::PtyManager;
 /// left a zombie. The frontend has already flushed a final session save (via
 /// its close-requested handler) before this runs, while the shells are still
 /// alive so their cwds are captured (R13/R14).
+///
+/// The sequence itself lives in `backend::ordered_shutdown` (Electron-shell
+/// migration U6) so both shells run the identical teardown; this is the Tauri
+/// adapter resolving the pieces from managed state. The hook socket, feed
+/// server, and single-instance lock are released by their Drop impls as the
+/// managed state is dropped on exit.
 pub fn shutdown(app: &AppHandle) {
-    // Write the clean-exit marker *before* reaping (KTD-G): reaching this ordered
-    // path at all means the quit was clean, so the next launch sees the marker and
-    // stays in normal mode. An unclean exit never runs this, leaving the marker
-    // absent → the next launch offers resume (U7/U2). Best-effort; a failure to
-    // write it just makes the next launch over-offer, never under-offer.
-    let _ = crate::session::resume::set_clean_exit_at(
-        &crate::session::resume::clean_exit_path(),
-        true,
+    let sweep = app.try_state::<crate::automations::SweepHandle>();
+    let automations = app.try_state::<Arc<crate::automations::AutomationManager>>();
+    let feed = app.try_state::<Arc<crate::feed::FeedState>>();
+    let asks = app.try_state::<Arc<crate::feed::ask::AskRegistry>>();
+    let pty = app.try_state::<Arc<PtyManager>>();
+    crate::backend::ordered_shutdown(
+        sweep.as_ref().map(|s| s.inner()),
+        automations.as_ref().map(|s| s.inner()),
+        feed.as_ref().map(|s| s.inner()),
+        asks.as_ref().map(|s| s.inner()),
+        pty.as_ref().map(|s| s.inner()),
     );
-    // Automations (R5), BEFORE the PTY reap: (1) stop and join the sweep
-    // thread — joined here with no store lock held (KTD-B), and once joined no
-    // new claim can race the closes below; (2) kill in-flight script groups
-    // (the U5 killer seam) and in-flight headless monitor-check children
-    // (headless-monitor-checks R5: the check's `claude -p` child is
-    // backend-owned — SIGTERM, short seam grace, SIGKILL + descendant sweep —
-    // and nothing later in the teardown would reap it, the PTY reap only
-    // covers panes); both killers run outside the store lock, then every
-    // in-flight run row closes failed("interrupted") in one final flush.
-    // Ordered before `pty.close_all()` so an in-flight *agent* run's row
-    // closes while its pane teardown is still pending — the row must never
-    // record a pane exit as the outcome of a shutdown.
-    if let Some(sweep) = app.try_state::<crate::automations::SweepHandle>() {
-        sweep.stop_and_join();
-    }
-    if let Some(automations) = app.try_state::<Arc<crate::automations::AutomationManager>>() {
-        automations.shutdown();
-    }
-    // Local feed (feat-agent-state-local-feed): signal teardown so every blocked
-    // SSE reader thread wakes and exits promptly. The listener thread itself is
-    // joined by `FeedServer::Drop` when the managed state drops on exit (same
-    // Drop-owned pattern as the hook socket below). Ordered here so readers stop
-    // before the panes they describe are reaped.
-    if let Some(feed) = app.try_state::<Arc<crate::feed::FeedState>>() {
-        feed.shutdown();
-    }
-    // Held permission asks (hook-ask-channel R9): release every held hook
-    // connection — each `fly notify --permission-request` sees a clean close,
-    // exits with no decision, and its dialog proceeds normally. Ordered before
-    // the pane reap so no hook process is left holding a socket into teardown
-    // (no hung hooks, no zombies).
-    if let Some(asks) = app.try_state::<Arc<crate::feed::ask::AskRegistry>>() {
-        asks.shutdown();
-    }
-    if let Some(pty) = app.try_state::<Arc<PtyManager>>() {
-        pty.close_all();
-    }
-    // The hook socket, feed server, and single-instance lock are released by
-    // their Drop impls as the managed state is dropped on exit.
 }

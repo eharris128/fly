@@ -21,6 +21,10 @@ struct Rig {
 }
 
 fn rig() -> Rig {
+    rig_with(None)
+}
+
+fn rig_with(shutdown: Option<Arc<dyn Fn() + Send + Sync>>) -> Rig {
     let tmp = tempfile::tempdir().unwrap();
     let config = Arc::new(fly_lib::config::ConfigStore::load(
         tmp.path().join("config.json"),
@@ -53,6 +57,7 @@ fn rig() -> Rig {
                 s.broadcast_pane_output(pane, &bytes);
             }
         }),
+        shutdown,
     };
     let server = Arc::new(
         ControlServer::start(path.clone(), build_registry(handles), None).unwrap(),
@@ -86,6 +91,30 @@ fn call(rig: &mut Rig, id: u64, cmd: &str, args: serde_json::Value) -> serde_jso
             other => panic!("unexpected frame {other:?}"),
         }
     }
+}
+
+#[test]
+fn core_shutdown_without_a_host_hook_answers_a_clear_error() {
+    let mut r = rig();
+    let v = call(&mut r, 1, "core/shutdown", serde_json::Value::Null);
+    assert!(
+        v["err"].as_str().unwrap().contains("core/shutdown"),
+        "a host with no shutdown hook must refuse loudly, got {v}"
+    );
+}
+
+#[test]
+fn core_shutdown_triggers_the_host_hook_and_acks_before_teardown() {
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&fired);
+    let mut r = rig_with(Some(Arc::new(move || {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    })));
+    // The ack arrives on the still-open connection: the handler only requests
+    // teardown; the host exits after the response flushes (U6).
+    let v = call(&mut r, 1, "core/shutdown", serde_json::Value::Null);
+    assert_eq!(v["ok"]["shuttingDown"], true);
+    assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[test]

@@ -60,6 +60,12 @@ pub struct CoreHandles {
     pub launch_mode: crate::LaunchMode,
     pub events: EventSink,
     pub pane_bytes: PaneBytesSink,
+    /// `core/shutdown` trigger (U6): asks the host to run the ordered
+    /// teardown (`backend::ordered_shutdown`) and exit. `None` (tests, or a
+    /// host that owns its own lifetime) answers a clear error. The handler
+    /// only *requests* — the host tears down after the response has flushed,
+    /// so the caller sees its ack.
+    pub shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, String> {
@@ -94,6 +100,13 @@ pub fn build_registry(h: CoreHandles) -> CommandHandler {
                 "pong": true,
                 "version": env!("CARGO_PKG_VERSION"),
             })),
+            "core/shutdown" => match &h.shutdown {
+                Some(trigger) => {
+                    trigger();
+                    Ok(json!({ "shuttingDown": true }))
+                }
+                None => Err("this host does not accept core/shutdown".into()),
+            },
 
             // ---- shell/session glue -------------------------------------
             "frontend_log" => {

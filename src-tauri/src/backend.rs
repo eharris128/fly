@@ -59,6 +59,72 @@ pub struct Backend {
     pub feed_server: Option<feed::FeedServer>,
 }
 
+impl Backend {
+    /// Ordered shutdown for a shell-less host (Electron-shell migration U6):
+    /// the exact `lifecycle::shutdown` sequence over this backend's own
+    /// pieces. `fly core` runs it on `core/shutdown` or SIGTERM/SIGINT, so an
+    /// Electron quit tears down like a Tauri quit — clean-exit marker written,
+    /// in-flight runs closed, substrate sessions detached (not killed).
+    pub fn shutdown(&self) {
+        ordered_shutdown(
+            Some(&self.sweep),
+            Some(&self.automations),
+            Some(&self.feed_state),
+            Some(&self.ask_registry),
+            Some(&self.pty),
+        );
+    }
+}
+
+/// The one ordered teardown both shells run (U6; the sequence and rationale
+/// moved verbatim from `lifecycle.rs`, which now delegates here so the order
+/// cannot drift between shells). Every piece is optional because the Tauri
+/// path resolves them by `try_state` and an early-exit boot may not have
+/// managed them all.
+///
+/// Order (each step's reason, from the original lifecycle doc):
+/// 1. Clean-exit marker BEFORE reaping (KTD-G): reaching this ordered path at
+///    all means the quit was clean; an unclean exit never runs this, leaving
+///    the marker absent → the next launch offers resume. Best-effort.
+/// 2. Automations (R5) BEFORE the PTY reap: stop+join the sweep (no store
+///    lock held — KTD-B; once joined no new claim races the closes), kill
+///    in-flight script groups and headless children, close every in-flight
+///    row failed("interrupted") — a run row must never record a pane exit as
+///    the outcome of a shutdown.
+/// 3. Feed: wake every blocked SSE reader so listener threads exit promptly,
+///    before the panes they describe are reaped.
+/// 4. Held asks (hook-ask-channel R9): release every held hook connection so
+///    no hook process is left holding a socket into teardown.
+/// 5. PTY reap last: close every pane — tmux-backed panes DETACH (sessions
+///    outlive fly), ephemeral and plain-PTY panes reap; no zombies/orphans.
+pub fn ordered_shutdown(
+    sweep: Option<&automations::SweepHandle>,
+    automations_mgr: Option<&Arc<automations::AutomationManager>>,
+    feed_state: Option<&Arc<feed::FeedState>>,
+    asks: Option<&Arc<feed::ask::AskRegistry>>,
+    pty: Option<&Arc<PtyManager>>,
+) {
+    let _ = crate::session::resume::set_clean_exit_at(
+        &crate::session::resume::clean_exit_path(),
+        true,
+    );
+    if let Some(sweep) = sweep {
+        sweep.stop_and_join();
+    }
+    if let Some(mgr) = automations_mgr {
+        mgr.shutdown();
+    }
+    if let Some(feed) = feed_state {
+        feed.shutdown();
+    }
+    if let Some(asks) = asks {
+        asks.shutdown();
+    }
+    if let Some(pty) = pty {
+        pty.close_all();
+    }
+}
+
 /// U6 event payload: an alert arrived with no sink pane registered (R17). The
 /// frontend single-flights a background "Automations" tab that `tail -f`s
 /// `log_path`, then calls `register_alert_sink` with the new pane id.
