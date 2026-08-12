@@ -1,0 +1,57 @@
+<!doctype html>
+<!-- U4 bridge probe: proves invoke / events / pane streams end-to-end in a
+     window before U5 wires the real frontend. Throwaway by design. -->
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { background: #0d1117; color: #c9d1d9; font: 13px monospace; margin: 12px; }
+    #status { color: #7ee787; margin-bottom: 8px; }
+    #out { white-space: pre-wrap; background: #010409; border: 1px solid #30363d;
+           padding: 8px; height: 70vh; overflow-y: auto; }
+    #in { width: 60%; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; padding: 4px; }
+    #events { color: #d29922; }
+  </style>
+</head>
+<body>
+  <div id="status">connecting…</div>
+  <div id="events"></div>
+  <pre id="out"></pre>
+  <input id="in" placeholder="type here — Enter sends the line + \n to the pane" />
+  <script>
+    const dec = new TextDecoder();
+    const out = document.getElementById('out');
+    const status = document.getElementById('status');
+    const events = document.getElementById('events');
+    let pane = null;
+
+    window.fly.onEvent((event, payload) => {
+      events.textContent = `last event: ${event} ${JSON.stringify(payload)}`;
+    });
+    window.fly.onPaneOutput((paneId, bytes) => {
+      if (paneId !== pane) return;
+      out.textContent += dec.decode(bytes);
+      out.scrollTop = out.scrollHeight;
+    });
+
+    (async () => {
+      const ping = await window.fly.invoke('core/ping');
+      const mode = await window.fly.invoke('get_launch_mode');
+      pane = await window.fly.invoke('spawn_pane', {
+        rows: 30, cols: 100, leafKey: 'leaf-probe',
+        command: ['bash', '--norc'],
+      });
+      status.textContent =
+        `core v${ping.version} · launch=${mode} · pane #${pane} live (bash)`;
+    })().catch((e) => { status.textContent = `probe failed: ${e}`; });
+
+    const enc = new TextEncoder();
+    document.getElementById('in').addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && pane !== null) {
+        window.fly.paneInput(pane, enc.encode(ev.target.value + '\n'));
+        ev.target.value = '';
+      }
+    });
+  </script>
+</body>
+</html>

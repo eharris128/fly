@@ -1,0 +1,13 @@
+{
+  "name": "fly-electron-shell",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The Electron display shell for the fly backend (Electron-shell migration U4) — thin: window, single-instance, core spawn/adopt, control-socket bridge.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^37.0.0"
+  }
+}

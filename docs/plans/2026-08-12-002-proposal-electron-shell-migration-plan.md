@@ -25,7 +25,17 @@ banner); `lib.rs` setup shrinks to seam construction + `.manage()` of the
 returned pieces, and `fly core` boots the identical backend (banner via
 `notify-send` pending KTD8's notify-rust) — live-verified: a real
 `fly notify` from a core-spawned pane raised `pane://attention` through the
-authenticated hook socket to a control client. U4 next.
+authenticated hook socket to a control client. U4 (landed): `electron/` —
+thin main (window, `requestSingleInstanceLock` per flavor userData,
+spawn-or-adopt `fly core` with crash-restart + reconnect), the JS frame
+codec (`protocol.js`, edited with `docs/core-protocol.md`), a fully
+sandboxed renderer whose only surface is the preload's `window.fly`
+(invoke/onEvent/onPaneOutput/paneInput — the main process owns the socket,
+KTD4), and a throwaway `probe.html` that live-verified spawn + byte
+streaming in a window. Dev caveat: the repo box lacks the Chromium SUID
+helper, so dev runs use `--no-sandbox` (packaging restores it). U5 next:
+`ipc.ts` re-transport onto `window.fly` + `FLY_SHELL_URL` pointing at the
+Vite frontend.
 **Grounds**: `docs/notes/2026-08-12-electron-engine-probe.md` (same-box probe:
 flood main-thread 63 % → 11.7 %, echo 99 → 53 ms p50; ~50 ms xterm.js pipeline
 floor persists on any engine) and
