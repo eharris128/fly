@@ -46,19 +46,27 @@ export function isElectronShell(): boolean {
 
 // ---- invoke -----------------------------------------------------------------
 
+// JSON round-trip before any bridge IPC hop: Electron structured-clones its
+// arguments, which throws ("An object could not be cloned") on Svelte 5
+// `$state` proxies; Tauri always JSON-serialized (reading through proxies),
+// so this exactly preserves the wire semantics the commands were written
+// against. EVERY `bridge.invoke` call must pass through this — the resume
+// path shipped broken because `spawnPaneWithSink` skipped it and the replayed
+// argv arrived as a `$state` proxy.
+function plainArgs(
+  args?: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  return args === undefined
+    ? undefined
+    : (JSON.parse(JSON.stringify(args)) as Record<string, unknown>);
+}
+
 export function invoke<T = void>(
   cmd: string,
   args?: Record<string, unknown>,
 ): Promise<T> {
   if (bridge) {
-    // JSON round-trip before the IPC hop: Electron structured-clones its
-    // arguments, which throws on Svelte 5 `$state` proxies; Tauri always
-    // JSON-serialized (reading through proxies), so this exactly preserves
-    // the wire semantics the commands were written against.
-    const plain =
-      args === undefined ? undefined : (JSON.parse(JSON.stringify(args)) as
-        Record<string, unknown>);
-    return bridge.invoke(cmd, plain) as Promise<T>;
+    return bridge.invoke(cmd, plainArgs(args)) as Promise<T>;
   }
   return tauriInvoke<T>(cmd, args);
 }
@@ -161,7 +169,7 @@ export async function spawnPaneWithSink(
     return tauriInvoke<number>("spawn_pane", { channel: sink.channel, ...args });
   }
   wireBridgeOutput();
-  const paneId = (await bridge.invoke("spawn_pane", args)) as number;
+  const paneId = (await bridge.invoke("spawn_pane", plainArgs(args))) as number;
   paneSinks.set(paneId, sink);
   const buffered = preBuffers.get(paneId);
   if (buffered) {
