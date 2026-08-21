@@ -225,7 +225,6 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_store::Builder::default().build())
         .manage(launch_mode)
         .setup(move |app| {
             // A dev flavor (FLY_APP_NAME set) gets a distinct title so it's

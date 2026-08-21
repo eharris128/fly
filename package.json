@@ -1,6 +1,6 @@
 {
   "name": "fly",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A terminal for AI coding agents",
   "type": "module",
   "scripts": {
@@ -16,8 +16,6 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-notification": "^2",
-    "@tauri-apps/plugin-store": "^2",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-serialize": "^0.13.0",
     "@xterm/addon-unicode11": "^0.8.0",

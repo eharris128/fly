@@ -9,7 +9,6 @@
     "core:window:allow-destroy",
     "core:webview:default",
     "core:event:default",
-    "notification:default",
-    "store:default"
+    "notification:default"
   ]
 }

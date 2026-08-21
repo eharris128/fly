@@ -4,7 +4,7 @@
 // only through the preload's typed surface — proposal KTD4).
 'use strict';
 
-const { app, BrowserWindow, ipcMain, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain } = require('electron');
 const net = require('net');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -54,6 +54,18 @@ let sock = null;
 let nextId = 1;
 const pending = new Map(); // id -> {resolve, reject}
 let win = null;
+let quitting = false; // set by before-quit; suppresses reconnect/restart
+let rewireTimer = null; // single-flight guard: core-exit and socket-close can
+// both observe the same crash — only one reconnect chain may run, or two
+// wireCore() races overwrite `sock` and double-spawn the core.
+
+function scheduleRewire(delayMs, label) {
+  if (quitting || rewireTimer) return;
+  rewireTimer = setTimeout(() => {
+    rewireTimer = null;
+    wireCore().catch((e) => console.error(`[shell] ${label} failed: ${e}`));
+  }, delayMs);
+}
 
 function connectControl(attempt = 0) {
   return new Promise((resolve, reject) => {
@@ -96,14 +108,9 @@ async function ensureCore() {
   coreChild.on('exit', (code, sig) => {
     console.error(`[shell] core exited (code=${code} sig=${sig})`);
     coreChild = null;
-    // Crash-restart with a beat of backoff, unless we are quitting.
-    if (!app.isQuittingFly) {
-      setTimeout(() => {
-        wireCore().catch((e) =>
-          console.error(`[shell] core restart failed: ${e}`)
-        );
-      }, 500);
-    }
+    // Crash-restart with a beat of backoff, unless we are quitting. The
+    // socket-close handler sees the same crash; scheduleRewire single-flights.
+    scheduleRewire(500, 'core restart');
   });
 }
 
@@ -140,11 +147,7 @@ async function wireCore() {
     // Fail every in-flight request; reconnect (the core may be restarting).
     for (const [, p] of pending) p.reject(new Error('core connection lost'));
     pending.clear();
-    if (!app.isQuittingFly) {
-      setTimeout(() => {
-        wireCore().catch((e) => console.error(`[shell] reconnect failed: ${e}`));
-      }, 300);
-    }
+    scheduleRewire(300, 'reconnect');
   });
   console.log(`[shell] control connected: ${CONTROL_SOCK}`);
 }
@@ -162,17 +165,20 @@ function invoke(cmd, args) {
 }
 
 // ---- the preload's surface --------------------------------------------------
-ipcMain.handle('fly:invoke', (_e, cmd, args) => invoke(cmd, args));
-ipcMain.on('fly:pane-input', (_e, paneId, bytes) => {
+// Standard Electron hardening: only the shell's own window may drive these
+// channels. No remote content ever loads, so this is belt-and-suspenders.
+function fromShell(e) {
+  return win !== null && !win.isDestroyed() && e.sender === win.webContents;
+}
+ipcMain.handle('fly:invoke', (e, cmd, args) => {
+  if (!fromShell(e)) throw new Error('unexpected sender');
+  return invoke(cmd, args);
+});
+ipcMain.on('fly:pane-input', (e, paneId, bytes) => {
+  if (!fromShell(e)) return;
   if (sock && !sock.destroyed) {
     sock.write(encodePaneInput(paneId, Buffer.from(bytes)));
   }
-});
-// OS notification relay (interim: the core's own banner seam uses
-// notify-send when headless; a shell that owns the desktop session may take
-// over via this channel in U5+).
-ipcMain.on('fly:notify', (_e, title, body) => {
-  new Notification({ title, body }).show();
 });
 
 // ---- window -----------------------------------------------------------------
@@ -205,7 +211,8 @@ app.whenReady().then(async () => {
     e.preventDefault();
     win.webContents.send('fly:close-request');
   });
-  ipcMain.on('fly:close-now', () => {
+  ipcMain.on('fly:close-now', (e) => {
+    if (!fromShell(e)) return;
     allowClose = true;
     if (win && !win.isDestroyed()) win.destroy();
   });
@@ -234,7 +241,11 @@ app.on('before-quit', (e) => {
   if (quitFlowDone) return;
   e.preventDefault();
   quitFlowDone = true;
-  app.isQuittingFly = true;
+  quitting = true;
+  if (rewireTimer) {
+    clearTimeout(rewireTimer);
+    rewireTimer = null;
+  }
   const finish = () => app.quit();
   const askShutdown = invoke('core/shutdown').catch(() => {
     // Socket down or command refused — signal the core we own instead.
