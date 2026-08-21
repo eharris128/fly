@@ -8,7 +8,11 @@ also maps the sibling doc dirs: `docs/brainstorms/` for pre-plan requirements,
 `docs/notes/` for one-off evaluations); the code is cross-referenced to it by
 ID (see "Conventions"). This file is the primary agent guide; `AGENTS.md` is a
 thin pointer to it for non-Claude tools, and `src-tauri/src/hooks/CLAUDE.md`
-adds a scoped note at the socket security boundary.
+adds a scoped note at the socket security boundary. `README.md` is the
+human-facing orientation layer — when a change moves the product story (shell,
+install path, CLI surface, headline features), update it too; it goes stale
+silently otherwise. `electron/README.md` covers the shipped shell's dev loop
+and packaging.
 
 ## What this is
 
@@ -28,7 +32,7 @@ pnpm check                    # svelte-check: type-check the frontend
 pnpm test:unit                # vitest: all frontend unit tests
 pnpm tauri build --bundles deb   # TAURI .deb (kept buildable — KTD9 rollback; skip AppImage, needs network)
 pnpm build:local              # Tauri .deb on the fast release-dev profile (thin LTO — ~2× faster rebuilds)
-pnpm build:mac                # on a Mac: .app + .dmg (best-effort target — see docs/macos-build.md)
+pnpm build:mac                # on a Mac: .app + .dmg on the release-dev profile (best-effort Tauri target — see docs/macos-build.md)
 
 # The ELECTRON shell (migration plan 2026-08-12-002; the packaged product as of U7):
 pnpm build && cargo build --release --offline --manifest-path src-tauri/Cargo.toml \
@@ -85,11 +89,14 @@ independent of the source tree.
 
 ### Stable + dev side by side
 
-A normal `pnpm tauri dev` shares the installed app's Tauri **identifier**
-(`dev.evan.fly`) and its config/session/socket dirs, so the `single-instance`
-plugin (registered in `lib.rs`) would just focus the installed window instead of
-opening a second one, and the two would clobber each other's saved tabs. To run
-an iterating dev build next to an installed stable app, use **`pnpm flavor:dev`**:
+A dev build left on the default flavor shares the installed app's
+config/session/socket dirs, so it would clobber the installed app's saved tabs
+and fight it over the hook socket. (The installed Electron shell holds its own
+single-instance lock in `electron/main.js`; the Tauri `single-instance` plugin
+in `lib.rs` only guards the Tauri rollback shell — the real collision today is
+the shared `FLY_APP_NAME` state, not the window lock.) To run an iterating dev
+build next to an installed stable app, use **`pnpm flavor:dev`** (Tauri) or the
+`fly-el` Electron loop from Commands above:
 
 - `src-tauri/tauri.dev.conf.json` (merged via `tauri dev --config`) gives the
   dev build a distinct identifier `dev.evan.fly-dev` → its own single-instance
@@ -113,10 +120,14 @@ answers.
 
 ### One binary, three roles
 `main.rs` → `lib.rs::run()`. If argv[1] is a CLI subcommand (`notify`, `hooks`,
-`automation`, `agents`, `send`), the process runs as the **`fly` CLI** and
-exits; `fly core` runs the **headless backend** (the full `build_backend`
-stack served over the control socket — what the Electron shell spawns and
-drives); otherwise it launches the **Tauri desktop app** (the KTD9 rollback
+`automation`, `agents`, `send`, `substrate-event`, `core`, `help`/`--help`/`-h`
+— see `cli/mod.rs::is_cli_subcommand`), the process runs as the **`fly` CLI**
+and exits; of those, `fly core` runs the **headless backend** (the full
+`build_backend` stack served over the control socket — what the Electron shell
+spawns and drives) and `fly substrate-event` is the tmux run-shell hook
+endpoint. `fly resume` (`lib.rs::resolve_launch_mode`) is a launch-mode arg for
+the desktop role, not a CLI subcommand. Otherwise it launches the **Tauri
+desktop app** (the KTD9 rollback
 shell — since the 2026-08-12 cutover the shipped product is the Electron
 shell in `electron/` + `fly core`, and the installed launcher never invokes
 the Tauri role). All roles share the same `fly_lib` crate, so a `fly notify`
@@ -384,34 +395,57 @@ buffers (`lib/mirror.ts`). Plan:
   `fly core` boots the identical backend. Change backend wiring HERE, never
   by re-inlining into a shell.
 - `control/` — the core control socket (Electron-shell migration plan
-  `2026-08-12-002`, U1): the transport a display shell will use to drive a
+  `2026-08-12-002`, U1): the transport the Electron shell uses to drive the
   headless fly backend (`fly core`). Same-uid peer-cred gate + never-steal
   bind (the `hooks/` discipline, reused), length-prefixed frames with
   JSON-free pane-output/input kinds (kills the KTD3 eval quirk), request/
   response/event envelopes whose `cmd`/`event` names are exactly the Tauri
-  seam's. Wire contract in `docs/core-protocol.md` — edited only together
-  with this module. U2 (`registry.rs`): 42 of 45 commands ported
-  name-identically over the real managers — where a Tauri command body holds
-  real logic it was extracted into a shared fn used by both shells
+  seam's, plus the built-ins `core/ping` and `core/shutdown` (the shell's
+  ordered-quit trigger). Wire contract in `docs/core-protocol.md` — edited
+  only together with this module. `registry.rs` (U2/U3): **all 45** commands
+  ported name-identically over the real managers — where a Tauri command body
+  holds real logic it was extracted into a shared fn used by both shells
   (`pty::pane_activity_snapshot`, `stream::attach_pane_now`,
   `automations::{dashboard_snapshot,read_bundle_for}`,
-  `stream::attention_event_payload`) so they cannot drift. U3: the pane
+  `stream::attention_event_payload`) so they cannot drift. The pane
   lifecycle is fully socket-served — `spawn_pane`'s body is the shared
   `stream::spawn_pane_with` (`SpawnDeps` + per-pane `PaneByteSink`), output
   rides the 0x02 binary frames, keystrokes ride 0x03 down (write +
   attention-clear, `pty_write` parity), exits fan out as `pane://exit` via
   the shared payload builders; `fly core` resolves its flavor's launch mode
-  (consuming the clean-exit marker, KTD-G). U3.5: `fly core` boots the
-  **full** backend through `backend::build_backend` — hook server (with the
-  real dispatch), automations + sweep, feed listener — so the complete
-  command surface is live headless; only the shell itself (window, U4) is
-  missing. The Tauri shell behaves identically through the same builder.
-- `notify/`, `config/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
+  (consuming the clean-exit marker, KTD-G) and boots the **full** backend
+  through `backend::build_backend` — hook server (with the real dispatch),
+  automations + sweep, feed listener — so the complete command surface is
+  live headless. The shell itself (window, core spawn/adopt, single-instance
+  lock, socket bridge) shipped as U4–U7 in `electron/`; the Tauri shell
+  behaves identically through the same builder.
+- `config/` — the camelCase `config.json` store. **Sparse persistence** (since
+  2026-08-18, `config/mod.rs::{sparse_value,prune_equal}`): the file records
+  only divergences from `Config::default()` and preserves unknown keys, so
+  don't expect (or write) a full dump on disk. Beyond the keys covered
+  elsewhere in this file (`substrate`, `mirrorUnfocused`, `terminal`,
+  `fontSize`, `renderer`, `feed.*`, `automationDefaults.*`), `schema.rs` also
+  holds: `leaderKey`, `attentionDebounceMs` (400), `nudgeIdleMs`,
+  `notificationCoalesceThreshold`, `oscBelFallback`, `scrollbackLines`
+  (10k), `saveScrollback`, `showNotificationsIcon`,
+  `notificationsMutedDefault`, `notificationSound`, `reasonEffects`, and
+  `feed.port` (4939). Two are security-relevant: **`notificationCommand`**
+  (opt-in, default off — runs an arbitrary user command on every surfaced
+  notification; env/quoting contract in `notify::command`) and
+  **`resumeDefaultArgs`** (defaults to `--dangerously-skip-permissions` —
+  the flag floor replayed when resuming an agent whose argv wasn't captured,
+  so the permission posture isn't silently lost on resume; it means an
+  uncaptured resume runs permission-free by design).
+- `notify/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
   reap every pane, no zombies/orphans).
 - All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the
   frontend's typed wrappers for them live in `src/ipc.ts` (except the
   config/session ones, which live next to their models in `lib/config.ts` /
-  `lib/serialize.ts`). Add a command in both places.
+  `lib/serialize.ts`, and `spawn_pane`, whose wrapper is `lib/transport.ts::
+  spawnPaneWithSink`). **A new command goes in THREE places**: the
+  `invoke_handler!`, the frontend wrapper, and `control/registry.rs` — a
+  command missing from the registry works in Tauri dev but is unreachable in
+  the packaged Electron app.
 
 ### Automations (`src-tauri/src/automations/`, cross-referenced U1–U12)
 Cron-scheduled runs that either run a `claude` agent (Agent mode) or a stored
@@ -521,7 +555,8 @@ next time the account is actually at a limit. Modules:
   plan reachable only via `--paned`/knob) links run↔pane atomically in `stream::spawn_pane`
   (threading `automation_run_id`), spawns a background ephemeral tab
   (`App.svelte` `handleAgentRun` + `lib/automation-panes.ts`), and closes the run
-  on the agent's Stop / pane-exit / 30-min deadline. The **R22 recursion gate**
+  on the agent's Stop / pane-exit / 90-min deadline (`RUN_DEADLINE_MS`, raised
+  from 30 on 2026-08-07). The **R22 recursion gate**
   blocks an automation-spawned pane from creating or running automations.
 - CLI (`cli/automation.rs`, U9): read ops (`list`/`show`/`runs`) read the store
   file directly (work outside a pane); mutating ops (`create`/`update`/`pause`/
@@ -815,5 +850,18 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   referenced IDs accurate. Match the surrounding style; modules are heavily
   doc-commented.
 - Behavior-bearing units ship with tests (Rust state machines are test-first and
-  pure; frontend has vitest for layout/keymap).
+  pure; frontend has vitest for layout/keymap; `pnpm test:unit` also runs the
+  `electron/protocol.test.js` codec tests, and `src-tauri/tests/backend_build.rs`
+  smoke-builds the full shared backend).
 - Commits: conventional, with a `Co-Authored-By: Claude` trailer.
+- Repo-root oddities an agent may trip over: `spikes/electron-probe/` is the
+  retired measurement rig behind the Electron decision (kept as the record —
+  never build on it; the real shell is `electron/`); `packaging/` holds only
+  the one-shot icon toolchain (see its README — real packaging lives in
+  `electron/package.json` + `src-tauri/tauri.conf.json`); the archived
+  automations work-queue scratchpad lives at
+  `docs/notes/2026-07-02-automations-work-queue-archive.md` (historical only).
+- Versioning: keep `package.json`, `src-tauri/Cargo.toml`,
+  `src-tauri/tauri.conf.json`, and `electron/package.json` on the SAME
+  version — the Electron deb ships the Rust binary, and `fly --version` /
+  `core/ping` report the crate version while dpkg reports the deb's.

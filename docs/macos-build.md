@@ -6,6 +6,14 @@ partially-ported target** — the hook socket security boundary is fully ported
 but the `/proc`-based subsystems degrade (see "Known limitations" below).
 Linux remains the primary target.
 
+> **Post-cutover status (2026-08-21):** this doc builds the **Tauri** shell,
+> which on Linux is now the rollback path — the shipped Linux product is the
+> Electron shell + `fly core` (`electron/`). No Electron packaging exists for
+> macOS yet; on a Mac the Tauri path below is still the (only) way to run
+> fly, and it remains fully supported for that purpose. The migration plan
+> (`docs/plans/2026-08-12-002-…`) expects a future macOS Electron path to be
+> a straight port; nothing here has been adapted for it.
+
 ## Prerequisites (one-time)
 
 ```bash

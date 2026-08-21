@@ -916,7 +916,7 @@ impl Automation {
 
     /// Append a row, evicting beyond [`RUN_HISTORY_CAP`] (R8) — the oldest
     /// **terminal** row first, never a `Running` one. A long-lived agent run
-    /// (up to the 30-min deadline, U7) can outlive 20 later occurrences'
+    /// (up to the 90-min `RUN_DEADLINE_MS`, U7) can outlive 20 later occurrences'
     /// rows; evicting it blind (oldest-first) would drop the only `Running`
     /// row, silently breaking [`Automation::in_flight`] and the pane-linked
     /// close path (U7's `close_run_by_pane`). So preserve every `Running` row
@@ -1214,7 +1214,7 @@ mod tests {
         assert_eq!(a.runs.last().unwrap().id, "r24");
     }
 
-    // R8/U7: a long-lived Running row (an agent run pending up to the 30-min
+    // R8/U7: a long-lived Running row (an agent run pending up to the 90-min
     // deadline) is NEVER evicted by the history cap — only terminal rows are,
     // oldest-first. Evicting the Running row would silently break in_flight()
     // and the pane-linked close path.

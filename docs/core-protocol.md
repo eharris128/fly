@@ -73,9 +73,16 @@ contract like `automations/model.rs`).
 - A malformed JSON frame or an unknown `cmd` yields `{"id": …, "err": …}`
   when an id could be parsed, else the connection is dropped.
 
-U1 ships one built-in command, `core/ping` →
+Two built-in commands exist. `core/ping` (U1) →
 `{"pong": true, "version": "<crate version>"}` — the liveness/version probe a
-shell uses at startup (and what the never-steal connect check trips on). The
+shell uses at startup (and what the never-steal connect check trips on).
+`core/shutdown` → `{"shuttingDown": true}` — triggers the backend's ordered
+shutdown (`backend::ordered_shutdown`: clean-exit marker, sweep stop,
+automations/feed/ask-registry shutdown, then `PtyManager::close_all`). The
+Electron shell sends it on `before-quit` and waits for the core process to
+exit (SIGTERM if the command fails, SIGKILL after a 10 s deadline). A host
+built without a shutdown trigger answers it with an error rather than
+ignoring it. The
 `core/` prefix is reserved for protocol-level commands; ported app commands
 keep their bare names.
 

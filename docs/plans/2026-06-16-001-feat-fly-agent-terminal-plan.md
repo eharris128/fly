@@ -239,7 +239,7 @@ fly/
 │   ├── ipc.ts                  # invoke wrappers + Channel handlers
 │   └── main.ts
 ├── tests/                      # integration tests (PTY, throughput, restore, hook auth)
-└── packaging/                  # .deb / AppImage config, icons
+└── packaging/                  # icon toolchain only (see packaging/README.md — deb config lives in tauri.conf.json / electron/)
 ```
 
 The per-unit **Files** lists remain authoritative; the tree is a scope sketch and the implementer may adjust it.

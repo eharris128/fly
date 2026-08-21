@@ -1,6 +1,6 @@
 # Proposal: Electron/Chromium shell migration — 2026-08-12-002
 
-**Status**: in progress — U1 + U2 landed 2026-08-12 (transport decision
+**Status**: complete — U1–U8 built and the **cutover executed 2026-08-12**: the Electron deb (Package: fly 0.2.0) is the installed product and the daily driver. The paragraph below is the as-built per-unit record. (Originally: U1 + U2 landed 2026-08-12; transport decision
 resolved to the control socket per recommendation). U1:
 `src-tauri/src/control/` + `fly core` + `docs/core-protocol.md`. U2:
 `control/registry.rs` — 42 of the 45 commands ported name-identically onto
@@ -45,7 +45,7 @@ JSON-serialized, so semantics are preserved exactly). Quit-confirm flows
 through `fly:close-request`/`close-now`. **Live-verified: the full fly UI —
 sidebar, dashboard, automations panel, real OAuth usage gauges — running on
 Chromium against the headless core** (`FLY_SHELL_URL=http://localhost:1420`,
-flavor `fly-el`). U6 (in progress): ordered shutdown for `fly core` landed
+flavor `fly-el`). U6 (landed): ordered shutdown for `fly core` landed
 2026-08-12 — the lifecycle.rs teardown sequence extracted into
 `backend::ordered_shutdown` (one sequence, both shells; lifecycle.rs is now a
 try_state adapter), triggered by the new `core/shutdown` control command or

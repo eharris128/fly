@@ -173,7 +173,7 @@ pub struct FeedConfig {
     /// absolute path and freezing `$HOME` into the user's config file.
     ///
     /// Shape validation and tilde expansion therefore both live in
-    /// [`crate::feed::drop::expand_drop_dir`], applied where `lib.rs` builds the
+    /// [`crate::feed::drop::resolve_drop_dir`], applied where `backend.rs` builds the
     /// store. A bare relative path is *rejected* there rather than silently
     /// resolved against the process cwd — which for a GUI launched from a
     /// desktop file is `/`, not anywhere the user meant.

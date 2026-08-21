@@ -19,3 +19,9 @@ Quick map for the impatient:
   per plan** — resolve one against the plan its file belongs to.
 - **The security boundary** → `src-tauri/src/hooks/` has its own scoped
   `CLAUDE.md`; read it before touching the socket.
+- **The shipped shell** → `electron/` (with its own `README.md` for the dev
+  loop and packaging); its wire contract is
+  [`docs/core-protocol.md`](./docs/core-protocol.md), edited only together
+  with `src-tauri/src/control/` and `electron/protocol.js`.
+- **Human-facing orientation** → [`README.md`](./README.md); update it when a
+  change moves the product story.

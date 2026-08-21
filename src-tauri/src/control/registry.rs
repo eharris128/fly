@@ -7,10 +7,11 @@
 //! command's body holds real logic (e.g. `pty_write`'s attention clear), the
 //! logic lives in a shared fn or manager method used by both.
 //!
-//! Deliberately **not** here (U3, they need the event/stream plumbing or the
-//! shell): `spawn_pane` (byte channel + exit events), `register_alert_sink`
-//! (closes over the app handle). They answer with a distinct error so a
-//! premature shell integration fails loudly, not mysteriously.
+//! All 45 Tauri commands are here — U3 ported the last event/stream-coupled
+//! ones: `spawn_pane` runs the shared `stream::spawn_pane_with` against a
+//! per-pane `PaneByteSink`, `register_alert_sink` registers over the injected
+//! event seam instead of an app handle, and `get_launch_mode` resolves the
+//! flavor's launch mode (consuming the clean-exit marker) headless.
 
 use std::sync::Arc;
 

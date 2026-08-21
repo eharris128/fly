@@ -105,6 +105,14 @@ automation-dependencies (2026-08-07), and automation-update (2026-08-08).
 > 5. **Lock order** — `on_pane_exit`/`set_run_pane` take the store lock while holding **no** PTY lock (`on_exit` runs on the read thread free of the registry lock), preserving store→PTY (KTD-B). Documented at both call sites.
 > 6. **Tests** — added link-at-spawn, late-spawn-fails, linked-survives-ack, Stop-close (idempotent), pane-exit close, deadline+no-fanout, recursion registry, and launch-stability; plus a model test that a `Running` row survives history eviction. (89 automations tests pass.)
 
+> **2026-08-21 note:** every open item in the collapsed audit-findings
+> section below has since landed — the run deadline exists as
+> `RUN_DEADLINE_MS` (raised 30→90 min on 2026-08-07,
+> `automations/mod.rs`), pane-exit closes the linked run
+> (`AutomationManager::on_pane_exit`, tested as
+> `on_pane_exit_closes_running_run_failed_and_clears_registry_r11`), and
+> eviction preserves `Running` rows. Nothing in this file is open work.
+
 <details><summary>Original audit findings (2026-07-01) — retained for reference</summary>
 
 > **⚠️ Audit findings (2026-07-01) — the agent-run lifecycle is a stub; do NOT land U8 until this whole section is done.**

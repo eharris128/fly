@@ -4,8 +4,12 @@ A Linux desktop **terminal for AI coding agents**: real PTY-backed panes, tabs
 and splits (one agent per pane), and an attention indicator plus OS notification
 the moment an agent needs you. v1 wires **Claude Code** as the attention source.
 
-**Stack:** [Tauri v2](https://tauri.app) (Rust backend) · [Svelte 5](https://svelte.dev)
-(Vite / TypeScript frontend) · [xterm.js](https://xtermjs.org) terminal panes.
+**Stack:** Rust backend (`fly core`, a headless process serving a Unix control
+socket) · [Electron](https://electronjs.org) shell (the shipped desktop window
+since the 2026-08-12 cutover) · [Svelte 5](https://svelte.dev) (Vite /
+TypeScript frontend) · [xterm.js](https://xtermjs.org) terminal panes. The
+[Tauri v2](https://tauri.app) shell that preceded the cutover is kept buildable
+as the rollback path.
 
 > The full design lives in [`docs/plans/`](docs/plans/README.md) (indexed by ID);
 > the primary contributor guide is [`CLAUDE.md`](CLAUDE.md). This README is the
@@ -23,6 +27,11 @@ attention — so you can run a fleet and only look when there's something to do.
 - **Panes, tabs, workspaces, splits** — one agent per pane, arranged in a pure
   split tree. Leaves render flat and keyed, so splitting or resizing never
   unmounts a pane (which would respawn its agent). Workspaces group named tabs.
+- **The tmux session substrate** (opt-in: `substrate: "tmux"` in config) —
+  every pane becomes a marked session on a fly-owned tmux server, so **agents
+  outlive the app**: quitting detaches, restarting adopts the same child
+  processes and replays scrollback. `leader t` opens the focused session in a
+  real terminal for native-latency typing.
 - **The attention pipeline** — a Claude Code hook (`fly notify`) reaches the
   running app over an authenticated Unix socket; a pure state machine decides
   whether to ring the pane/tab and, unless suppressed, raise an OS notification
@@ -108,30 +117,41 @@ reliable capture signal**.
 
 ## Build & run
 
-System deps (Tauri / WebKitGTK on Ubuntu):
+The **shipped product is the Electron shell**: a thin Electron window that
+spawns (or adopts) a headless `fly core` backend and talks to it over a
+same-uid Unix control socket (`docs/core-protocol.md`). Build and package it:
+
+```bash
+pnpm install                     # frontend deps
+pnpm build                       # Vite frontend → dist/
+cargo build --release --offline --manifest-path src-tauri/Cargo.toml   # the fly binary
+(cd electron && npm install && npm run dist)   # → electron/dist-el/fly-electron-shell_<ver>_amd64.deb
+```
+
+Install the built `.deb` (`sudo apt install ./fly-electron-shell_<ver>_amd64.deb`;
+it installs as package `fly`) for a standalone `/usr/bin/fly` + launcher,
+independent of the source tree. After installing, run **`fly hooks setup`** once
+to install the Claude Code hooks (attention + the `SessionStart` capture hook);
+`fly hooks teardown` removes only fly's hooks.
+
+For the Electron dev loop and running a dev build **alongside** the installed
+release (isolated state under `FLY_APP_NAME`), see `CLAUDE.md` → Commands.
+
+### The Tauri shell (rollback path)
+
+The pre-cutover Tauri shell is kept buildable as the rollback. System deps
+(WebKitGTK on Ubuntu):
 
 ```bash
 sudo apt install libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev \
   libayatana-appindicator3-dev librsvg2-dev patchelf
 ```
 
-Then:
-
 ```bash
-pnpm install                     # frontend deps
-pnpm tauri dev                   # run the app (Vite dev server + cargo run)
-pnpm tauri build --bundles deb   # standalone .deb → src-tauri/target/release/bundle/deb/
+pnpm tauri dev                   # run the Tauri app (Vite dev server + cargo run)
+pnpm tauri build --bundles deb   # rollback .deb → src-tauri/target/release/bundle/deb/
+pnpm flavor:dev                  # Tauri dev build beside an installed release
 ```
-
-Install the built `.deb` (`sudo apt install ./fly_<ver>_amd64.deb`) for a
-standalone `/usr/bin/fly` + launcher, independent of the source tree. After
-installing, run **`fly hooks setup`** once to install the Claude Code hooks
-(attention + the `SessionStart` capture hook); `fly hooks teardown` removes only
-fly's hooks.
-
-To iterate on a dev build **alongside** an installed release without the two
-clobbering each other's state, use `pnpm flavor:dev` (a distinct Tauri identity
-and isolated on-disk state under `FLY_APP_NAME=fly-dev`).
 
 ## Testing
 
@@ -147,18 +167,31 @@ cargo test --offline --manifest-path src-tauri/Cargo.toml         # Rust (state 
   machines), `hooks/` (the socket **security boundary** — has its own scoped
   `CLAUDE.md`), `session/` (layout + resume/handoff/attribution), `automations/`
   (incl. monitors + the headless check runner), `feed/` (the loopback HTTP
-  surface), `usage/`, `cli/`.
+  surface), `peer/` (agent-to-agent messaging), `substrate/` (the tmux session
+  substrate), `control/` (the `fly core` control socket), `backend.rs` (the
+  shell-agnostic backend builder both shells boot through), `usage/`, `cli/`.
+- `electron/` — the shipped Electron shell: main process, preload bridge, and
+  the JS half of the control-socket frame codec (`protocol.js`), plus the
+  `.deb` packaging (`deb/`).
 - `src/` — Svelte frontend: `App.svelte` orchestrator, pure view-models
-  (`lib/layout.ts`, `lib/home.ts`, `lib/session-picker.ts`, …), and the
-  `Terminal.svelte` xterm leaf.
+  (`lib/layout.ts`, `lib/home.ts`, `lib/session-picker.ts`, …), the
+  `Terminal.svelte` xterm leaf, and `lib/transport.ts` — the one seam that
+  speaks either shell (Tauri IPC or the Electron preload bridge).
 - `docs/plans/` — the full design, cross-referenced to the code by ID
-  (`KTD<n>` / `R<n>` / `U<n>`).
+  (`KTD<n>` / `R<n>` / `U<n>`); `docs/notes/` — one-off evaluations and
+  live-check records; `docs/core-protocol.md` — the control-socket wire
+  contract.
+- `skills/` — the `fly-monitor-handoff` skill installed for agents;
+  `spikes/electron-probe/` — the retired measurement rig that motivated the
+  Electron shell (kept as the record of that decision).
 
 ## The CLI
 
-The same binary is both the desktop app and the `fly` CLI. Inside a pane, `fly
+The same binary is the desktop app, the headless backend (**`fly core`** — what
+the Electron shell spawns and drives), and the `fly` CLI. Inside a pane, `fly
 notify` talks to the running app; `fly hooks setup|teardown` manages the Claude
-Code hooks; `fly automation
+Code hooks; `fly substrate-event` is the tmux-hook endpoint (not for human
+use); `fly automation
 <create|update|list|show|runs|pause|resume|run|delete>`
 manages cron-scheduled runs (`create --monitor --not-before …` registers a
 monitor; `update` patches a stored automation in place, keeping its id and run

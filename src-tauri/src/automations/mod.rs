@@ -2475,7 +2475,7 @@ impl AutomationManager {
                 }
 
                 // R11 run deadline: an agent run linked to a pane but still
-                // Running past the 30-min deadline closes failed(timed out).
+                // Running past the 90-min `RUN_DEADLINE_MS` closes failed(timed out).
                 // `close` leaves `pane_id` in place, so if the pane is still
                 // alive the R7 alive-probe keeps this occurrence in flight —
                 // a genuinely stuck agent skips the next occurrence instead of
@@ -4656,7 +4656,7 @@ mod tests {
         assert!(!h.mgr.is_automation_pane(13), "registry entry cleared on exit");
     }
 
-    // R11 deadline: an agent run still Running past the 30-min deadline closes
+    // R11 deadline: an agent run still Running past the 90-min `RUN_DEADLINE_MS` closes
     // failed(timed out) with pane_id RETAINED. While the pane stays alive the
     // R7 alive-probe keeps the occurrence in flight (the next one skips — no
     // fan-out); once the pane dies the schedule resumes claiming.
@@ -4669,7 +4669,7 @@ mod tests {
         h.mgr
             .set_agent_pane_alive(Arc::new(|row: &RunRow| row.pane_id == Some(42)));
 
-        // 30 min later the deadline fires; the same tick finds the next
+        // 90 min later the deadline fires; the same tick finds the next
         // occurrence due but the stuck-alive pane keeps it in flight → Skipped,
         // never a second dispatch.
         h.set_now(T0 + FIVE_MIN + RUN_DEADLINE_MS);

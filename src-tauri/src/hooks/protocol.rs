@@ -139,7 +139,7 @@ pub struct SubstrateEvent {
 /// independently (U1, KTD-F). `hook_event` carries the triggering event name
 /// (e.g. "Stop", "SubagentStop") for the U7 agent-run closure (KTD-F): a bare
 /// `Finished` with no `hook_event` does not close the run, falling through to
-/// the 30-min deadline (matches "hooks not installed" degradation).
+/// the run deadline (`RUN_DEADLINE_MS`, 90 min; matches "hooks not installed" degradation).
 /// `capture_only` (fix-attribution U2/KTD1, also `#[serde(default)]`) is set by
 /// `fly notify --capture` — the `SessionStart` capture path that must never
 /// raise; the dispatch equally treats a `SessionStart` `hook_event` as capture,

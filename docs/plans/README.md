@@ -62,12 +62,14 @@ lag behind the code.
 | `2026-08-08-003-perf-pane-status-poll-batching` | Batched per-tick pane status: one async `panes_status` command (one `/proc` snapshot per call, ~5 s TTL on the project-dir session scan) replaces the 3–4-sync-invokes-per-pane poll storm that stalled the GTK main thread 200–300 ms every 1.5 s; nudge rewired off its 1 Hz `/proc` walk; `pty_write` async with per-pane keystroke order pinned by a pure write chain — the audit-T2 half of the 2026-08-08 typing-latency diagnosis (`docs/notes/2026-08-08-typing-latency-diagnosis.md`) | `pty/mod.rs`, `ipc.ts`, `lib/write-chain.ts`, `App.svelte` |
 | `2026-08-11-001-feat-tmux-session-substrate` | **tmux as the session substrate** (implemented behind `config.substrate`, U1–U8+U10 live-validated; default flip + U9 retirements gated on the LIVE-CHECKLIST) — panes become sessions on a fly-owned per-flavor tmux server: native-typing attach escape hatch, three-tier mirrors (focused = `pipe-pane` into the existing stream path; visible-unfocused = 2 Hz `capture-pane` snapshots, S2-bounded ≤14% worst-case vs 63% today; hidden = on-demand), sessions outlive fly (restart reattaches, quit detaches), stable hook-socket path + persisted per-session tokens, verified-submit delivery ladder, never-adopt-unmarked identity. Forced by the WebKitGTK engine floor (`docs/notes/2026-08-11-webkitgtk-engine-floor.md`); spikes + decision memos in `docs/notes/2026-08-11-tmux-substrate-stage1-and-memos.md`; external scar tissue in `docs/notes/2026-08-11-gascity-tmux-reference-mining.md` | `substrate/{mod,naming,store,tmux}.rs`, `pty/{mod,pane}.rs`, `stream/mod.rs`, `hooks/{server,protocol,token}.rs`, `cli/substrate.rs`, `state/manager.rs`, `feed/drop.rs`, `config/schema.rs`, `lib.rs`, `lib/{mirror,keymap,config}.ts`, `Terminal.svelte`, `App.svelte`, `tests/substrate_live.rs` |
 | `2026-08-12-001-spike-electron-engine-probe` | **Spike: Electron engine probe** (executed 2026-08-12) — the camp-3 decision instrument: a throwaway Electron rig (same `@xterm/xterm` 5.5 + WebGL stack, `node-pty`, command-socket injection at `pty.write`) measured with the same-day pixel-diff/flood probes against a pre-committed gate. **Result 2/3**: flood main-thread 11.7 % avg vs WebKitGTK's 63 % (wall eliminated, 0 samples >50 %), echo halved (99 → 53 ms p50 focused) but missed the ≤40 ms gate — a bash-pane control pinned a ~50 ms xterm.js frame/batching floor that no engine swap removes; only native attach (camp 2, shipped as `leader t`) or a native surface reaches terminal feel. Verdict: an Electron swap fixes scaling + halves echo, not typing nativeness | `spikes/electron-probe/` (rig), results in `docs/notes/2026-08-12-electron-engine-probe.md` |
+| `2026-08-12-002-proposal-electron-shell-migration` | **Electron/Chromium shell migration** (U1–U8 built 2026-08-12; **cutover executed the same day** — the Electron deb is the installed product, merged as `d86e920`) — three-process shape: the same Rust binary gains a headless **`fly core`** role serving the existing command/event/byte-stream seam over a same-uid control socket (security boundary unmoved, KTD2; ordered shutdown via `core/shutdown`/SIGTERM through the shared `backend::ordered_shutdown`); a thin Electron main (single-instance, window, core spawn-or-adopt, quit drives core shutdown); the unchanged Svelte renderer over `lib/transport.ts`. PTY bytes binary end-to-end (kills the old KTD3 eval quirk); renderer fully sandboxed; keystrokes ride a persistent tmux control-mode client (~8 ms/key → ~µs). **U6 gates all hit on the real app**: echo p50 47 ms focused (Tauri 99), 5-pane flood renderer main-thread 13.8 % (WebKitGTK 63 %), under-load 1.0×; detach/adopt + parity checklist live-verified on fly-el. **U7**: electron-builder deb (Package: fly 0.2.0 — replaces the Tauri deb; /usr/bin/fly symlink keeps hooks/CLI; sandboxed, no --no-sandbox packaged). **U8**: mirrorUnfocused default off (measured no-op on Chromium); WebGL disposal + hidden coalesce deadline kept deliberately. Wayland leg deferred (box on X11 today) | `control/`, `cli/core.rs`, `backend.rs`, `electron/` (+ `deb/`), `src/lib/transport.ts`, `docs/core-protocol.md` |
 
-| `2026-08-12-002-proposal-electron-shell-migration` | **Electron/Chromium shell migration** (U1–U8 built 2026-08-12; cutover pending — needs the sudo deb install + quitting the live Tauri app) — three-process shape: the same Rust binary gains a headless **`fly core`** role serving the existing command/event/byte-stream seam over a same-uid control socket (security boundary unmoved, KTD2; ordered shutdown via `core/shutdown`/SIGTERM through the shared `backend::ordered_shutdown`); a thin Electron main (single-instance, window, core spawn-or-adopt, quit drives core shutdown); the unchanged Svelte renderer over `lib/transport.ts`. PTY bytes binary end-to-end (kills the old KTD3 eval quirk); renderer fully sandboxed; keystrokes ride a persistent tmux control-mode client (~8 ms/key → ~µs). **U6 gates all hit on the real app**: echo p50 47 ms focused (Tauri 99), 5-pane flood renderer main-thread 13.8 % (WebKitGTK 63 %), under-load 1.0×; detach/adopt + parity checklist live-verified on fly-el. **U7**: electron-builder deb (Package: fly 0.2.0 — replaces the Tauri deb; /usr/bin/fly symlink keeps hooks/CLI; sandboxed, no --no-sandbox packaged). **U8**: mirrorUnfocused default off (measured no-op on Chromium); WebGL disposal + hidden coalesce deadline kept deliberately. Wayland leg deferred (box on X11 today) | `control/`, `cli/core.rs`, `backend.rs`, `electron/` (+ `deb/`), `src/lib/transport.ts`, `docs/core-protocol.md` |
-
-The plan dir also holds one non-plan artifact:
+The plan dir also holds two non-plan artifacts:
 `2026-07-03-002-automations-workspace-and-model-LIVE-CHECKLIST.md`, the
-live-validation checklist that accompanied the workspace-and-model plan.
+live-validation checklist that accompanied the workspace-and-model plan, and
+`2026-08-11-001-tmux-substrate-LIVE-CHECKLIST.md` — **load-bearing**: it gates
+the `config.substrate` default flip from `pty` to `tmux` (and the U9
+retirements) on recorded live validation.
 
 Not every merge has a plan. Small QoL features and fixes are documented in
 `CLAUDE.md` only: the settings-menu overlay (`leader ,`); quit-confirm while
@@ -88,12 +90,16 @@ in the *game* repo's Ambient Wall plan) is recorded in
 ## Brainstorms
 
 `docs/brainstorms/` holds the requirements captured before a plan was written —
-the upstream `origin:` a plan's header points at (seven plans have one, from
-dashboard-home-base through phone-screenshot-drop). Start from the plan; drop to
-the brainstorm for the "why".
+the upstream `origin:` a plan's header points at (eight plans have one, from
+dashboard-home-base through tmux-session-substrate). Start from the plan; drop
+to the brainstorm for the "why".
 
 ## Other doc directories
 
+- Two standalone docs live directly in `docs/`: **`docs/core-protocol.md`**,
+  the control-socket wire contract (edited only together with
+  `src-tauri/src/control/` and `electron/protocol.js`), and
+  **`docs/macos-build.md`**, the best-effort Tauri macOS build notes.
 - `docs/residual-review-findings/` — per-branch remainders from multi-agent
   code reviews: the deliberately-deferred findings (design calls a human still
   owns) plus suppressed lower-confidence risks worth keeping visible. Check
@@ -102,7 +108,9 @@ the brainstorm for the "why".
 - `docs/notes/` — one-off evaluations and research notes that are neither a
   plan nor a brainstorm (e.g. the conductor-oss evaluation, the
   fix-feed-question-detection-gaps root-cause post-mortem, the
-  feed-monitor-enrichment record). Two carry content you'd otherwise hunt for:
+  feed-monitor-enrichment record, and the archived automations work-queue
+  scratchpad `2026-07-02-automations-work-queue-archive.md` — historical
+  only, nothing in it is open work). Two carry content you'd otherwise hunt for:
   **`2026-07-24-phone-drop-live-check.md` holds the phone drop's operator setup**
   (the `tailscale serve` mount, the token, the identity knob) under its
   "Operator setup (U8)" heading, and `2026-07-23-performance-audit-follow-ups.md`
