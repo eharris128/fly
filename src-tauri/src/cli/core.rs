@@ -34,6 +34,32 @@ use crate::control::registry::{build_registry, CoreHandles};
 use crate::control::{control_socket_path, ControlServer};
 use crate::pty::PaneId;
 
+/// The `notify-send` argv for one banner: title and body ride as separate
+/// argv entries (never through a shell), `--app-name=fly` so the daemon
+/// groups them under the app.
+fn banner_command(title: &str, body: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("notify-send");
+    cmd.arg("--app-name=fly").arg(title).arg(body);
+    cmd
+}
+
+/// In-flight `notify-send` helpers. The banner seam runs on the hook
+/// dispatch / reaper path, so the child is reaped on its own short-lived
+/// thread (`notify::spawn_detached_capped`) rather than waited inline — and
+/// it IS reaped: the 2026-08-22 incident core had 233 `<defunct>`
+/// `notify-send` children from a fire-and-forget `spawn()` that never
+/// `wait`ed. Own slot counter, distinct from the chime's pool (see the
+/// helper's doc); the `NotificationGate` already coalesces and rate-limits
+/// upstream, so the cap only backstops a runaway daemon.
+static BANNER_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const BANNER_CAP: usize = 16;
+
+/// Fire one desktop banner, non-blocking, child reaped. Returns the reaper
+/// handle so a test can await the `wait()`; production ignores it.
+fn send_banner(title: &str, body: &str) -> Option<std::thread::JoinHandle<()>> {
+    crate::notify::spawn_detached_capped(banner_command(title, body), &BANNER_INFLIGHT, BANNER_CAP)
+}
+
 pub fn run(args: &[String]) -> i32 {
     // `--socket <path>` moves only the CONTROL socket (tests / side-by-side
     // dev). The hook socket stays at the flavor's stable path regardless —
@@ -67,14 +93,7 @@ pub fn run(args: &[String]) -> i32 {
     // data). The proposal's KTD8 endpoint (notify-rust over DBus) can replace
     // this without touching the seam.
     let banner: Arc<dyn Fn(&str, &str) + Send + Sync> = Arc::new(|title: &str, body: &str| {
-        let _ = std::process::Command::new("notify-send")
-            .arg("--app-name=fly")
-            .arg(title)
-            .arg(body)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        send_banner(title, body);
     });
 
     let backend = match build_backend(BackendSeams {
@@ -165,4 +184,46 @@ pub fn run(args: &[String]) -> i32 {
     drop(server_slot.lock().expect("server slot").take());
     drop(backend);
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn banner_argv_passes_title_and_body_as_data() {
+        let cmd = banner_command("fly: pane 3", "needs you; $(rm -rf /) `x`");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(cmd.get_program(), "notify-send");
+        assert_eq!(
+            args,
+            vec!["--app-name=fly", "fly: pane 3", "needs you; $(rm -rf /) `x`"],
+            "no shell: title/body are argv entries verbatim"
+        );
+    }
+
+    #[test]
+    fn banner_helpers_are_reaped_not_left_defunct() {
+        // The incident shape: many banners from one long-lived core. Every
+        // spawned child must be waited on (the reaper handle joins only after
+        // `child.wait()` returned) and every slot released.
+        use std::sync::atomic::Ordering;
+        static INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut handles = Vec::new();
+        for i in 0..6 {
+            let mut cmd = std::process::Command::new("true");
+            cmd.arg(format!("banner-{i}"));
+            if let Some(h) = crate::notify::spawn_detached_capped(cmd, &INFLIGHT, BANNER_CAP) {
+                handles.push(h);
+            }
+        }
+        assert_eq!(handles.len(), 6, "under the cap nothing is dropped");
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(INFLIGHT.load(Ordering::SeqCst), 0, "every child waited, no slot leak");
+    }
 }

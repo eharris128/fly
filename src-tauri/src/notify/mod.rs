@@ -170,7 +170,13 @@ pub(crate) fn spawn_detached(command: Command) -> Option<JoinHandle<()>> {
     spawn_detached_capped(command, detached_inflight(), MAX_DETACHED)
 }
 
-fn spawn_detached_capped(
+/// [`spawn_detached`] against a caller-owned slot counter — for a helper
+/// family that must not share the chime's cap (the `fly core` banner,
+/// `cli::core::send_banner`: a burst of raises fires a chime AND a banner per
+/// pane, so one shared pool of 8 would drop banners under a 5-pane flood).
+/// Same reaping contract: every spawned child is `wait`ed on its own thread,
+/// never left `<defunct>`.
+pub(crate) fn spawn_detached_capped(
     mut command: Command,
     inflight: &'static AtomicUsize,
     cap: usize,
