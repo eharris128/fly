@@ -11,11 +11,18 @@ renderer running the unchanged Svelte frontend over the preload bridge.
 
 - `main.js` — window + single-instance, core spawn/adopt + crash
   reconnect (single-flighted through `scheduleRewire`), the control-socket
-  bridge, and the ordered quit flow (`core/shutdown` → wait → SIGTERM/SIGKILL
-  ladder).
+  bridge, renderer-crash recovery (below), and the ordered quit flow
+  (`core/shutdown` → wait → SIGTERM/SIGKILL ladder).
+- `recovery.js` — the pure half of renderer-crash recovery (reload budget,
+  frame-delivery guard, close plan), tested in `recovery.test.js`.
+- `crashed.html` — the page shown when the reload budget is exhausted
+  (inert; `R` retries, handled in main).
 - `preload.cjs` — the renderer's whole surface (`window.fly`): `invoke`,
-  `onEvent`, `onPaneOutput`, `paneInput`, and the quit-confirm pair. The
-  renderer is sandboxed with no node integration; nothing else is reachable.
+  `onEvent`, `onPaneOutput`, `paneInput`, and the quit-confirm pair — plus
+  the preload-level close **ack** (`fly:close-ack`, carrying whether the app
+  wired a close handler) that keeps main from waiting on a renderer that
+  can't answer. The renderer is sandboxed with no node integration; nothing
+  else is reachable.
 - `protocol.js` — the JS half of the control-socket frame codec.
   **Edited only together with `src-tauri/src/control/` and
   `docs/core-protocol.md`** (the wire contract).
@@ -52,6 +59,42 @@ FLY_APP_NAME=fly-el FLY_SHELL_URL=http://localhost:1420 \
   `$XDG_RUNTIME_DIR/<flavor>/control.sock` is adopted (tmux-substrate
   sessions and their backend survive shell restarts); a dead one is
   reclaimed by spawning our own core.
+
+## Renderer crash recovery
+
+The 2026-08-22 incident: under memory pressure (swap full) the Chromium
+**renderer** died and the shell sat on a blank window for over an hour while
+`fly core` and nine agents kept working; the window could not even be closed.
+Now:
+
+- **Reload, re-attach.** `render-process-gone` reloads the frontend (same
+  load path as first launch). The core is untouched; on mount every restored
+  leaf first asks `adopt_live_pane` and re-attaches to the pane the core
+  still owns — same pane id, token, attention registration — sizing its
+  xterm to the pane's grid and painting the pane's 64 KiB output tail. Only
+  a leaf nobody owns
+  spawns. This holds on **both** substrates (a naive reload would orphan
+  every pty-backed agent behind a fresh shell).
+- **Bounded.** At most 3 reloads per 60 s (`ReloadBudget`); after that the
+  window shows `crashed.html` — press `R` to retry, or close the window to
+  quit with the ordered core shutdown (tmux sessions survive; the next launch
+  re-adopts them).
+- **No frame flood.** Control-socket events and pane output go through one
+  guarded `sendToRenderer` (frame crashed/destroyed ⇒ drop, one log line per
+  outage) instead of 2,000+ "Render frame was disposed" throws.
+- **Close always works.** A crashed, hung, never-loaded or crash-page
+  renderer gets no say — the close proceeds. A live renderer must ack the
+  close request within 3 s (preload-level, so a live event loop always acks);
+  no ack ⇒ closed anyway; ack without an app handler ⇒ closed at once; ack
+  with a handler ⇒ the busy-agents confirm runs on the user's time as before.
+- What is lost: a few ms of pane output in the capture-then-subscribe gap
+  (never duplicated), the last ≤ 800 ms of unsaved layout changes, and any
+  in-renderer-only state (scroll position, an open overlay). `unresponsive`
+  is logged, not reloaded — a renderer mid-way through a huge write recovers
+  on its own, and its state is the user's.
+
+The trigger was renderer OOM; memory-limit tuning of the renderer is not
+done here. If the crash page keeps coming back, check free memory and swap.
 
 ## Logs
 

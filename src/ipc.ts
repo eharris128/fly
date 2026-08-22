@@ -9,6 +9,8 @@ import {
   spawnPaneWithSink,
   type OutputSink,
   type UnlistenFn,
+  adoptLivePaneWithSink,
+  type AdoptedPane as TransportAdoptedPane,
 } from "./lib/transport";
 // Type-only (erased at runtime, so the feed.ts ↔ ipc.ts cycle is harmless).
 import type { FeedPublishPayload } from "./lib/feed";
@@ -515,6 +517,29 @@ export function spawnPane(
     automationRunId: opts.automationRunId ?? null,
     ephemeral: opts.ephemeral ?? false,
   });
+}
+
+/** A re-attached live pane (renderer-crash recovery) — `adopt_live_pane`'s
+ * answer with the attention fields typed as the rest of this module types
+ * them. */
+export interface AdoptedPane extends Omit<TransportAdoptedPane, "attention" | "reason"> {
+  attention: AttentionState;
+  reason: AttentionReason | null;
+}
+
+/**
+ * Re-attach to the live pane the backend still owns for a leaf, binding the
+ * output sink to its existing id (no spawn). Null when no live pane owns the
+ * leaf — or under Tauri, where a pane's Channel can't be re-bound — so the
+ * caller spawns as usual. The answer carries the pane's current grid (size
+ * the xterm to it first) and its output tail for the first paint. See
+ * `transport.adoptLivePaneWithSink`.
+ */
+export function adoptLivePane(
+  sink: OutputSink,
+  opts: { leafKey: string },
+): Promise<AdoptedPane | null> {
+  return adoptLivePaneWithSink(sink, opts) as Promise<AdoptedPane | null>;
 }
 
 /**

@@ -5,7 +5,7 @@
   import { WebglAddon } from "@xterm/addon-webgl";
   import { Unicode11Addon } from "@xterm/addon-unicode11";
   import { SerializeAddon } from "@xterm/addon-serialize";
-  import { listen, type UnlistenFn } from "./transport";
+  import { listen, releasePaneSink, type UnlistenFn } from "./transport";
   import { getConfig } from "./config";
   import type { Renderer as RendererMode } from "./config";
   import { wantsWebgl } from "./renderer";
@@ -25,6 +25,7 @@
   import "@xterm/xterm/css/xterm.css";
   import {
     spawnPane,
+    adoptLivePane,
     ptyWrite,
     ptyResize,
     closePane,
@@ -353,11 +354,40 @@
     const cols = term.cols >= 2 ? term.cols : 80;
     const rows = term.rows >= 2 ? term.rows : 24;
 
+    const channel = makeOutputChannel(onOutput);
+
+    // Renderer-crash recovery: if the backend still owns a LIVE pane for this
+    // leaf — the Electron shell reloaded us after the Chromium renderer died,
+    // and the core with every agent in it kept running — re-attach to it
+    // instead of spawning a second one. A spawn here would orphan the working
+    // agent behind a fresh shell (pty substrate) or double-register its tmux
+    // session. The backend hands back the pane's current grid and its output
+    // tail: the xterm is sized to THAT grid before the replay (restored panes
+    // mount hidden behind the dashboard at xterm's default 80×24 — a replay
+    // into the wrong width soft-wraps and then reflows into a smear on the
+    // first fit), and the pane itself is left at its size until this pane is
+    // shown and the ResizeObserver below fits it, so a live agent's TUI is
+    // not bounced through the hidden-mount geometry. `command` (a resume
+    // argv) is moot for an adopted pane — the agent never stopped. Automation-linked and ephemeral
+    // panes always spawn fresh: their leaves are minted per run, and a run
+    // must link a pane of its own. Null under Tauri (no Channel re-bind) and
+    // for any leaf nobody owns — the normal case — so this is one cheap
+    // round-trip per mount that changes nothing on a clean boot.
+    let adopted: Awaited<ReturnType<typeof adoptLivePane>> = null;
+    if (automationRunId === null && !ephemeral) {
+      try {
+        adopted = await adoptLivePane(channel, { leafKey });
+      } catch {
+        adopted = null; // a refused probe degrades to the spawn path
+      }
+    }
+
     // Replay prior scrollback as inert text before the live shell starts — no
     // command is ever re-run (R14, KTD10). Skipped when resuming an agent
     // (command set): the resumed claude TUI repaints the screen, so stale inert
-    // scrollback under it would just be noise.
-    if (saveScrollback && !command) {
+    // scrollback under it would just be noise — and when re-attaching, where
+    // the live pane's own tail is the fresher replay.
+    if (saveScrollback && !command && !adopted) {
       const prev = await loadScrollback(leafKey);
       if (prev) {
         term.write(prev);
@@ -381,41 +411,56 @@
       }, INJECT_TICK_MS);
     }
 
-    const channel = makeOutputChannel(onOutput);
-    // A missing/stale cwd falls back to $HOME (portable-pty filters non-dirs).
-    // `command` (resume only) runs a known `claude` invocation instead of the
-    // shell — the scoped KTD10 auto-run exception (KTD-E).
-    try {
-      paneId = await spawnPane(channel, {
-        rows,
-        cols,
-        cwd,
-        leafKey,
-        command,
-        automationRunId,
-        // U10: automation-linked panes are ephemeral by definition; the
-        // sink/other ephemeral tabs pass the prop explicitly.
-        ephemeral: ephemeral || automationRunId !== null,
-      });
-    } catch (e) {
-      // A spawn can be rejected — notably an automation late-link (U8/R10): the
-      // run already closed, so the backend refuses to link this pane rather
-      // than orphan it. Surface it in the pane instead of leaving a blank one.
-      endInjection(); // nothing will ever inject — release the registry entry
-      term.write(`\r\n\x1b[31m[failed to start: ${String(e)}]\x1b[0m\r\n`);
-      return;
-    }
-    // Audit-remediation U9/KTD9: the component can be destroyed while the
-    // spawn await is in flight (close-during-spawn) — onDestroy saw paneId
-    // null and closed nothing, so this fresh pane has no owner. Close it now
-    // and never announce it; without this it lives until shutdown reap.
-    {
-      const race = resolveSpawnRace(destroyed);
-      if (race.closeNow) {
-        const orphan = paneId;
+    if (adopted) {
+      // Re-attached (see above): paint the tail the backend handed back, then
+      // the live bytes follow through the sink bound in adoptLivePane.
+      paneId = adopted.paneId;
+      if (adopted.cols >= 2 && adopted.rows >= 2) term.resize(adopted.cols, adopted.rows);
+      if (adopted.tail) term.write(adopted.tail);
+      if (destroyed) {
+        // Close-during-mount on an ADOPTED pane: the backend (and the agent)
+        // own it, not this component — unlike the U9/KTD9 fresh-spawn race
+        // below, closing it would kill live work. Just let go of it.
+        releasePaneSink(adopted.paneId);
         paneId = null;
-        if (orphan !== null) void closePane(orphan);
         return;
+      }
+    } else {
+      // A missing/stale cwd falls back to $HOME (portable-pty filters non-dirs).
+      // `command` (resume only) runs a known `claude` invocation instead of the
+      // shell — the scoped KTD10 auto-run exception (KTD-E).
+      try {
+        paneId = await spawnPane(channel, {
+          rows,
+          cols,
+          cwd,
+          leafKey,
+          command,
+          automationRunId,
+          // U10: automation-linked panes are ephemeral by definition; the
+          // sink/other ephemeral tabs pass the prop explicitly.
+          ephemeral: ephemeral || automationRunId !== null,
+        });
+      } catch (e) {
+        // A spawn can be rejected — notably an automation late-link (U8/R10): the
+        // run already closed, so the backend refuses to link this pane rather
+        // than orphan it. Surface it in the pane instead of leaving a blank one.
+        endInjection(); // nothing will ever inject — release the registry entry
+        term.write(`\r\n\x1b[31m[failed to start: ${String(e)}]\x1b[0m\r\n`);
+        return;
+      }
+      // Audit-remediation U9/KTD9: the component can be destroyed while the
+      // spawn await is in flight (close-during-spawn) — onDestroy saw paneId
+      // null and closed nothing, so this fresh pane has no owner. Close it now
+      // and never announce it; without this it lives until shutdown reap.
+      {
+        const race = resolveSpawnRace(destroyed);
+        if (race.closeNow) {
+          const orphan = paneId;
+          paneId = null;
+          if (orphan !== null) void closePane(orphan);
+          return;
+        }
       }
     }
     term.onData((data) => {
@@ -475,6 +520,15 @@
     // queued rings — is never missed (the listeners filter on the now-known
     // paneId).
     onSpawned?.(leafKey, paneId);
+
+    // An adopted pane may have raised while no renderer was listening —
+    // `pane://attention` carries only transitions, so seed the ring from the
+    // backend's snapshot (after onSpawned: App keys its maps by pane id).
+    if (adopted && adopted.attention !== "idle") {
+      attention = adopted.attention;
+      reason = adopted.reason;
+      onAttention?.(leafKey, adopted.attention, adopted.reason);
+    }
 
     if (focused) {
       term.focus();

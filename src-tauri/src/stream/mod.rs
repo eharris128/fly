@@ -382,6 +382,85 @@ pub fn spawn_pane_with(
     }
 }
 
+/// What a renderer gets back when it re-attaches to a pane the backend still
+/// owns (renderer-crash recovery): the live pane's id, its recent raw output
+/// to repaint from, and the attention it may have raised while nobody was
+/// listening.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptedPane {
+    pub pane_id: u64,
+    /// The pane's CURRENT grid — the renderer sizes its xterm to this
+    /// before replaying `tail`, so the bytes land on the geometry they were
+    /// produced for (a replay into a differently sized grid soft-wraps
+    /// wrongly and then reflows into a smear on the first fit). The pane is
+    /// deliberately NOT resized here: the frontend mounts restored panes
+    /// hidden behind the dashboard with a default 80×24 xterm, and driving
+    /// a live agent's TUI to that and back would cost two full re-layouts;
+    /// the pane's ResizeObserver fits and resizes it once it is shown.
+    pub rows: u16,
+    pub cols: u16,
+    /// The pane's raw-output tail ring (`pty::pane::TailRing`, ≤ 64 KiB —
+    /// the same bytes the feed's screen fallback replays through `vte`),
+    /// UTF-8 lossy: the ring starts at an arbitrary byte, so a split
+    /// multibyte char at the cut is replaced rather than refused.
+    pub tail: String,
+    pub attention: AttentionState,
+    pub reason: Option<Reason>,
+}
+
+/// Re-attach a renderer to the **live** pane already owning `leaf_key`,
+/// instead of spawning a second one (renderer-crash recovery, 2026-08-22).
+/// When the Chromium renderer dies the backend and its panes survive — the
+/// Electron shell reloads the frontend, which restores its saved layout and
+/// would otherwise `spawn_pane` every leaf again: under the pty substrate
+/// that orphans each working agent behind a fresh shell (invisible until
+/// shutdown reap); under tmux it adopts the session but leaves the previous
+/// `Pane` registered for the same leaf. This is the one path that makes a
+/// reload a re-attach on both substrates: same pane id (the token, the
+/// attention registration, the automation link, the coalescer all stay),
+/// the pane's grid reported so the xterm can match it, and the tail ring
+/// returned for the initial paint.
+///
+/// Capture-then-subscribe, like the tmux U8 adopt replay: the renderer
+/// discards frames buffered before its sink binds and paints the tail, so a
+/// few ms of output in the gap can be lost but never duplicated — loss is
+/// invisible on an idle reattach, duplication never is. `None` ⇒ no live
+/// pane for that leaf: the caller spawns as usual. Live only
+/// (`pane_by_leaf`'s `is_live` gate): an exited-but-unreaped pane would
+/// accept no input and is about to announce `pane://exit` to nobody.
+pub fn adopt_live_pane_with(
+    pty: &PtyManager,
+    attention: &AttentionManager,
+    leaf_key: &str,
+) -> Option<AdoptedPane> {
+    let id = pty.pane_by_leaf(leaf_key)?;
+    let tail = pty.screen_tail_by_leaf(leaf_key)?;
+    let (state, reason) = attention
+        .snapshot(id)
+        .unwrap_or((AttentionState::Idle, None));
+    Some(AdoptedPane {
+        pane_id: id.0,
+        rows: tail.rows,
+        cols: tail.cols,
+        tail: String::from_utf8_lossy(&tail.bytes).into_owned(),
+        attention: state,
+        reason,
+    })
+}
+
+/// Registered for command-surface parity (a command lives in THREE places)
+/// but answers `None` under Tauri: this shell threads a per-pane `Channel`
+/// through `spawn_pane` and bakes it into the pane's coalescer, so a
+/// pane's output can't be re-bound to a new webview. The Tauri webview is
+/// never reloaded in practice; a respawn there behaves exactly as before.
+/// The Electron registry arm is the real implementation
+/// ([`adopt_live_pane_with`]).
+#[tauri::command]
+pub fn adopt_live_pane(_leaf_key: String) -> Result<Option<AdoptedPane>, String> {
+    Ok(None)
+}
+
 /// U7 (tmux-substrate KTD6): open the focused pane's tmux session in a real
 /// terminal — the native-typing escape hatch. Refused for PTY-backed panes
 /// (nothing to attach). The terminal command is `config.terminal`; the argv

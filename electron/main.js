@@ -9,6 +9,12 @@ const net = require('net');
 const path = require('path');
 const { spawn } = require('child_process');
 const { encodeJson, encodePaneInput, FrameReader } = require('./protocol');
+const {
+  ReloadBudget,
+  canDeliver,
+  closePlan,
+  needsRecovery,
+} = require('./recovery');
 
 // ---- flavor isolation (proposal KTD5) --------------------------------------
 // FLY_APP_NAME drives everything: the core's config/session/socket roots and
@@ -58,6 +64,61 @@ let quitting = false; // set by before-quit; suppresses reconnect/restart
 let rewireTimer = null; // single-flight guard: core-exit and socket-close can
 // both observe the same crash — only one reconnect chain may run, or two
 // wireCore() races overwrite `sock` and double-spawn the core.
+
+// ---- renderer health (renderer-crash recovery, 2026-08-22) ------------------
+// What the send sites and the close flow need to know about the renderer.
+// The core and its panes are NOT affected by any of this: a renderer death
+// is a display outage, and recovery is reload + re-attach (the frontend's
+// `adopt_live_pane` on mount), never a respawn.
+const renderer = { crashed: false, hung: false, loaded: false };
+const reloads = new ReloadBudget({ max: 3, windowMs: 60_000 });
+let onErrorPage = false; // crashed.html is up (budget exhausted)
+let closePending = null; // {ackTimer} while a close waits on the renderer
+let allowClose = false; // the close flow's verdict: let the next `close` through
+let droppedLogged = false; // one "frames dropped" line per outage, not 2,119
+
+function rendererCrashed() {
+  if (!win || win.isDestroyed()) return true;
+  const wc = win.webContents;
+  return (
+    renderer.crashed ||
+    wc.isDestroyed() ||
+    (typeof wc.isCrashed === 'function' && wc.isCrashed())
+  );
+}
+
+/** The ONE path to the renderer for control-socket traffic (events and
+ * pane-output frames). A crashed render frame is not a destroyed window —
+ * `webContents.send` throws "Render frame was disposed" on every call until
+ * the reload lands — so guard on the frame and swallow the race. */
+function sendToRenderer(channel, ...args) {
+  if (!win || win.isDestroyed()) return;
+  const wc = win.webContents;
+  if (!canDeliver({ destroyed: wc.isDestroyed(), crashed: rendererCrashed() })) {
+    if (!droppedLogged) {
+      droppedLogged = true;
+      console.error('[shell] renderer unreachable — dropping frames until it reloads');
+    }
+    return;
+  }
+  try {
+    wc.send(channel, ...args);
+  } catch (e) {
+    if (!droppedLogged) {
+      droppedLogged = true;
+      console.error(`[shell] send to renderer failed (dropping until reload): ${e}`);
+    }
+  }
+}
+
+function forceClose() {
+  allowClose = true;
+  if (closePending) {
+    if (closePending.ackTimer) clearTimeout(closePending.ackTimer);
+    closePending = null;
+  }
+  if (win && !win.isDestroyed()) win.destroy();
+}
 
 function scheduleRewire(delayMs, label) {
   if (quitting || rewireTimer) return;
@@ -126,16 +187,12 @@ async function wireCore() {
         if ('ok' in msg) p.resolve(msg.ok);
         else p.reject(new Error(msg.err ?? 'unknown error'));
       } else if (msg.event !== undefined) {
-        if (win && !win.isDestroyed()) {
-          win.webContents.send('fly:event', msg.event, msg.payload);
-        }
+        sendToRenderer('fly:event', msg.event, msg.payload);
       }
     },
     (paneId, bytes) => {
-      if (win && !win.isDestroyed()) {
-        // Transferable-free but structured-clone efficient; exact bytes.
-        win.webContents.send('fly:pane-output', paneId, bytes);
-      }
+      // Transferable-free but structured-clone efficient; exact bytes.
+      sendToRenderer('fly:pane-output', paneId, bytes);
     },
     (err) => {
       console.error(`[shell] control protocol error: ${err}`);
@@ -202,33 +259,130 @@ app.whenReady().then(async () => {
   });
   win.removeMenu();
   win.on('page-title-updated', (e) => e.preventDefault());
+  const wc = win.webContents;
+
   // Quit-confirm flow (U5): the renderer owns the busy-agents confirm (the
   // same shared destructive-confirm overlay as under Tauri); main only
-  // intercepts and forwards. `fly:close-now` is the renderer's verdict.
-  let allowClose = false;
+  // intercepts and forwards. `fly:close-now` is the renderer's verdict —
+  // but a verdict needs a renderer that can answer (recovery, bug 3): a
+  // crashed/hung/never-loaded one gets no say and the close proceeds; a
+  // live one must ACK the request (preload-level, before any page script)
+  // within CLOSE_ACK_MS or it is treated as dead. An ack carrying "no app
+  // handler" (probe/crash page, a frontend that failed before wiring)
+  // closes at once; "handler present" waits for the app's flow — on the
+  // user's time, since the confirm is theirs to answer.
+  const CLOSE_ACK_MS = 3000;
   win.on('close', (e) => {
     if (allowClose) return;
+    const plan = closePlan({
+      crashed: rendererCrashed(),
+      hung: renderer.hung,
+      loaded: renderer.loaded,
+      onErrorPage,
+    });
+    if (plan === 'destroy') {
+      console.error('[shell] closing without the renderer (it cannot answer)');
+      allowClose = true;
+      return; // let this close proceed
+    }
     e.preventDefault();
-    win.webContents.send('fly:close-request');
+    if (closePending?.ackTimer) clearTimeout(closePending.ackTimer);
+    closePending = {
+      ackTimer: setTimeout(() => {
+        console.error('[shell] renderer never acknowledged the close — closing anyway');
+        forceClose();
+      }, CLOSE_ACK_MS),
+    };
+    sendToRenderer('fly:close-request');
+  });
+  ipcMain.on('fly:close-ack', (e, hasHandler) => {
+    if (!fromShell(e) || !closePending) return;
+    if (closePending.ackTimer) clearTimeout(closePending.ackTimer);
+    if (!hasHandler) {
+      forceClose(); // nobody will ever send fly:close-now
+      return;
+    }
+    closePending = { ackTimer: null }; // live + wired: its verdict decides
   });
   ipcMain.on('fly:close-now', (e) => {
     if (!fromShell(e)) return;
-    allowClose = true;
-    if (win && !win.isDestroyed()) win.destroy();
+    forceClose();
   });
-  // Packaged: the built frontend travels inside the asar (`frontend/`,
-  // copied from ../dist by the dist script — relative vite base, U7). Dev:
-  // FLY_SHELL_URL points at the Vite dev server; bare fallback is the U4
-  // bridge probe page.
-  const url = process.env.FLY_SHELL_URL;
-  if (url) {
-    await win.loadURL(url);
-  } else if (app.isPackaged) {
-    await win.loadFile('frontend/index.html');
-  } else {
-    await win.loadFile('probe.html');
-  }
+
+  // Renderer-crash recovery (bug 1 of the 2026-08-22 incident): reload the
+  // frontend when the render process dies. The core is untouched; the
+  // reloaded frontend re-attaches to the live panes (`adopt_live_pane`).
+  // Bounded by `reloads` so a renderer that dies on every load lands on
+  // the crash page instead of a loop; a pending close on a dead renderer
+  // can never get its verdict, so it closes instead.
+  wc.on('render-process-gone', (_e, details) => {
+    renderer.crashed = true;
+    renderer.loaded = false;
+    console.error(
+      `[shell] renderer gone: reason=${details.reason} exitCode=${details.exitCode}`
+    );
+    if (quitting || allowClose || win.isDestroyed()) return;
+    if (closePending) {
+      console.error('[shell] close was waiting on the renderer — closing now');
+      forceClose();
+      return;
+    }
+    if (!needsRecovery({ reason: details.reason, loading: wc.isLoading() })) return;
+    if (reloads.note(Date.now())) {
+      console.error('[shell] reloading the frontend (core and panes untouched)');
+      loadFrontend().catch((err) => console.error(`[shell] reload failed: ${err}`));
+    } else {
+      console.error(
+        `[shell] renderer died ${reloads.max}× within ${reloads.windowMs / 1000}s — showing the crash page`
+      );
+      onErrorPage = true;
+      win.loadFile('crashed.html').catch((err) =>
+        console.error(`[shell] crash page failed: ${err}`)
+      );
+    }
+  });
+  wc.on('did-finish-load', () => {
+    renderer.crashed = false;
+    renderer.loaded = true;
+    droppedLogged = false;
+  });
+  // Hung is not dead: a renderer busy with a huge synchronous write can trip
+  // this and recover. Log, let a pending close through, otherwise wait —
+  // a hung renderer's state is still the user's; a reload would discard it.
+  wc.on('unresponsive', () => {
+    renderer.hung = true;
+    console.error('[shell] renderer unresponsive');
+    if (closePending) forceClose();
+  });
+  wc.on('responsive', () => {
+    renderer.hung = false;
+    console.error('[shell] renderer responsive again');
+  });
+  // R on the crash page: one manual retry, budget forgiven.
+  wc.on('before-input-event', (_e, input) => {
+    if (!onErrorPage || input.type !== 'keyDown') return;
+    if ((input.key || '').toLowerCase() !== 'r') return;
+    onErrorPage = false;
+    reloads.reset();
+    reloads.note(Date.now());
+    console.error('[shell] manual reload from the crash page');
+    loadFrontend().catch((err) => console.error(`[shell] reload failed: ${err}`));
+  });
+
+  await loadFrontend();
 });
+
+// Packaged: the built frontend travels inside the asar (`frontend/`, copied
+// from ../dist by the dist script — relative vite base, U7). Dev:
+// FLY_SHELL_URL points at the Vite dev server; bare fallback is the U4
+// bridge probe page. Also the renderer-crash reload path — the same load,
+// so recovery can never diverge from first launch.
+function loadFrontend() {
+  const url = process.env.FLY_SHELL_URL;
+  if (url) return win.loadURL(url);
+  if (app.isPackaged) return win.loadFile('frontend/index.html');
+  return win.loadFile('probe.html');
+}
 
 // Ordered core shutdown on quit (migration U6): ask the core to run the same
 // teardown lifecycle.rs runs under Tauri — clean-exit marker, interrupted-run

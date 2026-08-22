@@ -1,0 +1,39 @@
+<!doctype html>
+<!-- The renderer-crash page: shown only after the auto-reload budget is
+     exhausted (electron/recovery.js ReloadBudget). Inert — no scripts, no
+     bridge use; main.js handles R via before-input-event. Loaded with the
+     same preload, so the window's close flow still gets its ack (and,
+     carrying no app handler, closes immediately). -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>fly — renderer crashed</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9;
+        font: 15px/1.5 ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; }
+      main { max-width: 46rem; margin: 0 auto; padding: 4rem 2rem; }
+      h1 { font-size: 1.25rem; color: #f0b429; margin: 0 0 1rem; }
+      kbd { background: #161b22; border: 1px solid #30363d; border-radius: 4px;
+        padding: 0 .4em; color: #e6edf3; }
+      p { margin: .6rem 0; }
+      .dim { color: #8b949e; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>fly's window crashed repeatedly</h1>
+      <p>The renderer (the Chromium process drawing this window) died several
+        times in a row, so fly stopped auto-reloading it.</p>
+      <p><strong>Your agents are not affected.</strong> The fly backend
+        (<code>fly core</code>) and every pane in it keep running; reloading
+        re-attaches to them.</p>
+      <p>Press <kbd>R</kbd> to try again now.</p>
+      <p>Closing this window quits fly with the ordered shutdown (under the
+        tmux substrate the sessions survive and the next launch re-adopts
+        them). Relaunch from the launcher or with <code>fly</code>.</p>
+      <p class="dim">The usual cause is memory pressure — check free memory
+        and swap before reloading. Details are in the shell log
+        (<code>journalctl --user</code> for a desktop launch).</p>
+    </main>
+  </body>
+</html>

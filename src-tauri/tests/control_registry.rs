@@ -319,3 +319,113 @@ fn spawn_stream_close_lifecycle_over_the_socket() {
     }
     assert!(saw_exit, "close must fan out pane://exit");
 }
+
+/// `call` for a rig with a streaming pane: pane-output frames (0x02) can
+/// interleave with the response and are not the answer — nor is a late
+/// response to an earlier raw-written request (a close whose `pane://exit`
+/// was read first); those are skipped rather than asserted against.
+fn call_skipping_output(
+    rig: &mut Rig,
+    id: u64,
+    cmd: &str,
+    args: serde_json::Value,
+) -> serde_json::Value {
+    let body =
+        serde_json::to_vec(&serde_json::json!({"id": id, "cmd": cmd, "args": args})).unwrap();
+    write_frame(&mut rig.client, &Frame::Json(body)).unwrap();
+    loop {
+        match read_frame(&mut rig.client).unwrap().unwrap() {
+            Frame::Json(b) => {
+                let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+                if v.get("id").map(|i| i == id).unwrap_or(false) {
+                    return v;
+                }
+            }
+            Frame::PaneOutput { .. } => {}
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+}
+
+/// Renderer-crash recovery: a second client (the reloaded renderer) asks to
+/// adopt the live pane for a leaf and gets the SAME pane id back with the
+/// pane's current grid and recent output as the tail — no second spawn, so the agent behind
+/// the leaf is neither orphaned (pty substrate) nor doubled (tmux). A leaf
+/// nobody owns answers null, which is the caller's cue to spawn.
+#[test]
+fn adopt_live_pane_reattaches_the_same_pane_with_its_tail() {
+    let mut r = rig();
+    let v = call_skipping_output(
+        &mut r,
+        1,
+        "spawn_pane",
+        serde_json::json!({
+            "rows": 24, "cols": 80,
+            "leafKey": "leaf-adopt",
+            "command": ["bash", "--norc", "-c", "echo ADOPT_MARKER; sleep 30"],
+        }),
+    );
+    let pane = v["ok"].as_u64().expect("spawned pane id");
+
+    // Wait for the marker to have flowed (it lands in the tail ring on the
+    // way to the broadcast sink).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut seen = false;
+    while std::time::Instant::now() < deadline && !seen {
+        if let Frame::PaneOutput { pane: p, bytes } = read_frame(&mut r.client).unwrap().unwrap() {
+            seen = p == pane && String::from_utf8_lossy(&bytes).contains("ADOPT_MARKER");
+        }
+    }
+    assert!(seen, "marker must have been emitted before adopting");
+
+    // Nobody owns this leaf → null → spawn.
+    let v = call_skipping_output(
+        &mut r,
+        2,
+        "adopt_live_pane",
+        serde_json::json!({"leafKey": "leaf-nobody"}),
+    );
+    assert!(v["ok"].is_null(), "unknown leaf answers null, got {v}");
+
+    // The live leaf → same id, tail carries the marker, attention idle.
+    let v = call_skipping_output(
+        &mut r,
+        3,
+        "adopt_live_pane",
+        serde_json::json!({"leafKey": "leaf-adopt"}),
+    );
+    assert_eq!(v["ok"]["paneId"], pane, "re-attach returns the live pane, not a new one");
+    assert!(
+        v["ok"]["tail"].as_str().unwrap().contains("ADOPT_MARKER"),
+        "tail ring replays recent output: {v}"
+    );
+    assert_eq!(v["ok"]["rows"], 24, "the pane's own grid rides along: {v}");
+    assert_eq!(v["ok"]["cols"], 80);
+    assert_eq!(v["ok"]["attention"], "idle");
+    assert!(v["ok"]["reason"].is_null());
+
+    // Closing it makes the leaf un-adoptable again (live-only gate). Raw
+    // write: the exit event and the close response arrive in either order.
+    let body = serde_json::to_vec(
+        &serde_json::json!({"id": 4, "cmd": "close_pane", "args": {"paneId": pane}}),
+    )
+    .unwrap();
+    write_frame(&mut r.client, &Frame::Json(body)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut gone = false;
+    while std::time::Instant::now() < deadline && !gone {
+        if let Frame::Json(b) = read_frame(&mut r.client).unwrap().unwrap() {
+            let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            gone = v.get("event").map(|e| e == "pane://exit").unwrap_or(false)
+                && v["payload"]["paneId"] == pane;
+        }
+    }
+    assert!(gone, "close must fan out pane://exit");
+    let v = call_skipping_output(
+        &mut r,
+        5,
+        "adopt_live_pane",
+        serde_json::json!({"leafKey": "leaf-adopt"}),
+    );
+    assert!(v["ok"].is_null(), "an exited pane is not adoptable: {v}");
+}

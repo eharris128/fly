@@ -179,6 +179,50 @@ export async function spawnPaneWithSink(
   return paneId;
 }
 
+/** The `adopt_live_pane` answer (stream.rs `AdoptedPane`, camelCase). */
+export interface AdoptedPane {
+  paneId: number;
+  /** The pane's current grid — size the xterm to it BEFORE writing `tail`. */
+  rows: number;
+  cols: number;
+  /** The pane's raw-output tail ring (≤ 64 KiB), for the initial paint. */
+  tail: string;
+  attention: "idle" | "raised" | "acknowledged";
+  reason: string | null;
+}
+
+/**
+ * Re-attach to the LIVE pane the backend still owns for `leafKey` instead
+ * of spawning a second one — renderer-crash recovery: the Electron shell
+ * reloads the frontend after the Chromium renderer dies, and the core with
+ * every agent in it is still running. Null ⇒ nobody owns that leaf: spawn.
+ *
+ * Electron only. Under Tauri a pane's output Channel is bound at spawn and
+ * baked into its coalescer — there is no re-bind, and the Tauri webview is
+ * never reloaded in practice — so this answers null without a round-trip
+ * (the Tauri command exists for surface parity and answers null too).
+ *
+ * Capture-then-subscribe: frames that reached the bridge before the sink
+ * binds predate (or overlap) the tail snapshot, so they are DISCARDED — a
+ * few ms of output in the gap can be lost, never duplicated (the tmux U8
+ * adopt replay makes the same call, for the same reason).
+ */
+export async function adoptLivePaneWithSink(
+  sink: OutputSink,
+  args: { leafKey: string },
+): Promise<AdoptedPane | null> {
+  if (!bridge) return null;
+  wireBridgeOutput();
+  const adopted = (await bridge.invoke(
+    "adopt_live_pane",
+    plainArgs(args),
+  )) as AdoptedPane | null;
+  if (!adopted) return null;
+  preBuffers.delete(adopted.paneId);
+  paneSinks.set(adopted.paneId, sink);
+  return adopted;
+}
+
 /** Drop a pane's sink (close path) so a reused map entry can't leak. */
 export function releasePaneSink(paneId: number): void {
   paneSinks.delete(paneId);

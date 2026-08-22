@@ -5,6 +5,19 @@
 
 const { contextBridge, ipcRenderer } = require('electron');
 
+// Close-request ack (renderer-crash recovery): main must not wait forever on
+// a renderer that can't answer. Every `fly:close-request` is acknowledged
+// from here — registered before any page script runs, so a live event loop
+// always acks — carrying whether the app has a close handler at all. No ack
+// within main's deadline ⇒ the renderer is dead/hung ⇒ main closes anyway;
+// an ack with `false` (the probe page, the crash page, a frontend that
+// failed before wiring its handler) ⇒ nobody will ever send `fly:close-now`
+// ⇒ main closes at once. `true` ⇒ the app's flow decides, on its own time.
+let closeHandlers = 0;
+ipcRenderer.on('fly:close-request', () => {
+  ipcRenderer.send('fly:close-ack', closeHandlers > 0);
+});
+
 contextBridge.exposeInMainWorld('fly', {
   /** invoke(cmd, args) — the KTD1 command surface, exact Tauri names/shapes. */
   invoke: (cmd, args) => ipcRenderer.invoke('fly:invoke', cmd, args),
@@ -25,8 +38,12 @@ contextBridge.exposeInMainWorld('fly', {
   /** Quit-confirm flow (U5): main intercepts close and asks the renderer… */
   onCloseRequested: (cb) => {
     const h = () => cb();
+    closeHandlers += 1;
     ipcRenderer.on('fly:close-request', h);
-    return () => ipcRenderer.removeListener('fly:close-request', h);
+    return () => {
+      closeHandlers -= 1;
+      ipcRenderer.removeListener('fly:close-request', h);
+    };
   },
   /** …and the renderer finishes the job once its flow decides. */
   closeNow: () => ipcRenderer.send('fly:close-now'),

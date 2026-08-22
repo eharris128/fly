@@ -402,7 +402,7 @@ buffers (`lib/mirror.ts`). Plan:
   response/event envelopes whose `cmd`/`event` names are exactly the Tauri
   seam's, plus the built-ins `core/ping` and `core/shutdown` (the shell's
   ordered-quit trigger). Wire contract in `docs/core-protocol.md` — edited
-  only together with this module. `registry.rs` (U2/U3): **all 45** commands
+  only together with this module. `registry.rs` (U2/U3): **all 46** commands
   ported name-identically over the real managers — where a Tauri command body
   holds real logic it was extracted into a shared fn used by both shells
   (`pty::pane_activity_snapshot`, `stream::attach_pane_now`,
@@ -412,7 +412,13 @@ buffers (`lib/mirror.ts`). Plan:
   `stream::spawn_pane_with` (`SpawnDeps` + per-pane `PaneByteSink`), output
   rides the 0x02 binary frames, keystrokes ride 0x03 down (write +
   attention-clear, `pty_write` parity), exits fan out as `pane://exit` via
-  the shared payload builders; `fly core` resolves its flavor's launch mode
+  the shared payload builders — and `adopt_live_pane` (renderer-crash
+  recovery, 2026-08-22) re-binds a reloaded renderer to the **live** pane
+  the core still owns for a leaf (`stream::adopt_live_pane_with`: same id,
+  token, attention; the pane's grid + 64 KiB tail returned, the xterm
+  sized to that grid before the replay), so an Electron renderer reload re-attaches instead of respawning
+  on either substrate — the Tauri arm of that command answers `None` (a
+  per-spawn `Channel` can't be re-bound); `fly core` resolves its flavor's launch mode
   (consuming the clean-exit marker, KTD-G) and boots the **full** backend
   through `backend::build_backend` — hook server (with the real dispatch),
   automations + sweep, feed listener — so the complete command surface is
@@ -805,8 +811,14 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   other file may import `@tauri-apps/api` directly. Bridge invokes JSON
   round-trip their args (Svelte 5 `$state` proxies fail Electron's
   structured clone; Tauri always JSON-serialized, so this preserves wire
-  semantics exactly). The Electron shell itself lives in `electron/`
-  (main + preload + JS frame codec, edited with `docs/core-protocol.md`).
+  semantics exactly). `adoptLivePaneWithSink` is the re-attach half of
+  renderer-crash recovery (Electron only — binds the sink to the existing
+  pane id, discarding pre-bind frames: capture-then-subscribe, loss over
+  duplication); `Terminal.svelte` tries it before every non-automation,
+  non-ephemeral spawn. The Electron shell itself lives in `electron/`
+  (main + preload + JS frame codec, edited with `docs/core-protocol.md`;
+  `recovery.js` + `crashed.html` are the renderer-crash recovery — see
+  `electron/README.md` "Renderer crash recovery").
 - `lib/{config,serialize}.ts` (`serialize.migrateSession` upgrades old sessions
   into the workspace shape), `lib/HotkeyMenu.svelte` (passive cheat-sheet).
 - `lib/SettingsMenu.svelte` — focus-taking toggle-settings modal (`leader ,`,

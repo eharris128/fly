@@ -20,6 +20,8 @@
       "main.js",
       "preload.cjs",
       "protocol.js",
+      "recovery.js",
+      "crashed.html",
       "frontend/**"
     ],
     "extraResources": [

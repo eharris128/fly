@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use super::attention::{AttentionMachine, Outcome, Signal};
+use super::attention::{AttentionMachine, AttentionState, Outcome, Reason, Signal};
 use super::policy::{self, is_user_viewing, Effects, PolicyInputs, ReasonEffects};
 use crate::pty::PaneId;
 
@@ -79,6 +79,20 @@ impl AttentionManager {
     pub fn remove(&self, pane: PaneId) {
         self.machines.lock().unwrap().remove(&pane);
         self.pane_workspace.lock().unwrap().remove(&pane);
+    }
+
+    /// The pane's current attention state + reason, read without feeding
+    /// the machine — for a renderer that re-attaches to a live pane
+    /// (`stream::adopt_live_pane_with`) and needs to paint the ring it
+    /// missed; `pane://attention` carries only *transitions*, so a pane
+    /// raised while no renderer was listening would otherwise read Idle
+    /// until its next event. `None` if the pane is unknown.
+    pub fn snapshot(&self, pane: PaneId) -> Option<(AttentionState, Option<Reason>)> {
+        self.machines
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .map(|m| (m.state(), m.reason()))
     }
 
     /// Feed an authenticated agent signal; `None` if the pane is gone.

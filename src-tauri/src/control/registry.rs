@@ -7,7 +7,7 @@
 //! command's body holds real logic (e.g. `pty_write`'s attention clear), the
 //! logic lives in a shared fn or manager method used by both.
 //!
-//! All 45 Tauri commands are here — U3 ported the last event/stream-coupled
+//! All 46 Tauri commands are here — U3 ported the last event/stream-coupled
 //! ones: `spawn_pane` runs the shared `stream::spawn_pane_with` against a
 //! per-pane `PaneByteSink`, `register_alert_sink` registers over the injected
 //! event seam instead of an app handle, and `get_launch_mode` resolves the
@@ -537,6 +537,25 @@ pub fn build_registry(h: CoreHandles) -> CommandHandler {
                 Ok(Value::Null)
             }
             "get_launch_mode" => to_ok(h.launch_mode),
+            // Renderer-crash recovery: the reloaded frontend re-attaches to
+            // the pane the core still owns for a leaf instead of spawning a
+            // second one. The real implementation lives here — the bytes
+            // keep riding the same per-pane broadcast sink (0x02 frames,
+            // keyed by pane id), which is exactly why a re-bind is possible
+            // under this shell and not under Tauri's per-spawn Channel.
+            "adopt_live_pane" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct A {
+                    leaf_key: String,
+                }
+                let a: A = parse(args)?;
+                to_ok(crate::stream::adopt_live_pane_with(
+                    &h.pty,
+                    &h.attention,
+                    &a.leaf_key,
+                ))
+            }
 
             other => Err(format!("unknown command: {other}")),
         }

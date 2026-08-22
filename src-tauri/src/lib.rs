@@ -283,6 +283,7 @@ pub fn run() {
             config::get_config,
             config::set_config,
             stream::spawn_pane,
+            stream::adopt_live_pane,
             stream::set_visible_panes,
             stream::attach_pane,
             stream::set_window_foreground,
