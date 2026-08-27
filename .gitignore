@@ -4,7 +4,6 @@ dist/
 
 # Rust / Tauri
 src-tauri/target/
-src-tauri/gen/
 
 # Tauri build artifacts
 *.deb

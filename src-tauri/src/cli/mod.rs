@@ -3,12 +3,14 @@
 //! `hooks setup` / `hooks teardown`, and `automation …` (U9).
 //!
 //! `fly resume` is deliberately **not** a CLI subcommand: it launches the
-//! desktop window (in resume mode) rather than running and exiting, so it falls
-//! through this check to `lib.rs::run` (KTD-B). Usage:
+//! desktop app (in resume mode) rather than running and exiting, so it falls
+//! through this check to `lib.rs::run`, which execs the installed Electron
+//! shell (KTD-B; 2026-08-27-001 KTD7). Usage:
 //!   - `fly`           — launch normally (fresh shells)
 //!   - `fly resume`    — launch and re-attach detected Claude agents
 //!   - `fly notify …`  — report attention (used by the Claude hook)
 //!   - `fly hooks …`   — install/remove the Claude hook
+//!   - `fly --version` — print the version
 
 pub mod automation;
 pub mod core;
@@ -38,6 +40,9 @@ pub fn is_cli_subcommand(arg: &str) -> bool {
             | "help"
             | "--help"
             | "-h"
+            | "version"
+            | "--version"
+            | "-V"
     )
 }
 
@@ -47,9 +52,9 @@ pub fn is_cli_subcommand(arg: &str) -> bool {
 pub fn top_level_help() -> String {
     "fly — a terminal for AI coding agents.\n\
      \n\
-     Running bare `fly` launches the desktop app; the subcommands below run as a\n\
-     CLI and exit. Inside a fly pane they talk to the running app over its\n\
-     authenticated socket.\n\
+     Running bare `fly` launches the desktop app (the Electron shell installed\n\
+     beside this binary); the subcommands below run as a CLI and exit. Inside a\n\
+     fly pane they talk to the running app over its authenticated socket.\n\
      \n\
      Usage:\n  \
        fly                      launch the desktop app (fresh shells)\n  \
@@ -61,7 +66,8 @@ pub fn top_level_help() -> String {
        fly agents [--json]      list the live agent roster (peer messaging)\n  \
        fly send <pane> <msg…>   deliver a message into another agent's pane\n  \
        fly core [--socket <p>]  run the headless backend host (internal)\n  \
-       fly help | --help | -h   show this help\n\
+       fly help | --help | -h   show this help\n  \
+       fly --version | -V       print the version\n\
      \n\
      `fly agents` / `fly send` run inside a fly pane and talk over its\n\
      authenticated socket; a target pane receives only after the human toggles\n\
@@ -86,6 +92,12 @@ pub fn run(args: &[String]) -> i32 {
     match args.get(1).map(String::as_str) {
         Some("help") | Some("--help") | Some("-h") | None => {
             print!("{}", top_level_help());
+            0
+        }
+        // R6 (2026-08-27-001): the crate version — the same string `core/ping`
+        // reports; the lockstep test keeps it equal to the package versions.
+        Some("version") | Some("--version") | Some("-V") => {
+            println!("fly {}", env!("CARGO_PKG_VERSION"));
             0
         }
         Some("notify") => notify::run(&args[2..]),

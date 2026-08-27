@@ -116,23 +116,38 @@ fn decide_launch_mode(resume_requested: bool, prev_clean: bool) -> LaunchMode {
     }
 }
 
-/// Resolve the launch mode from argv + the clean-exit marker, and **clear the
-/// marker** so an unclean exit of *this* run is detectable next launch (KTD-G).
-/// `pub(crate)`: `fly core` resolves the same way at boot (U3) — whichever
-/// role owns the backend consumes the marker.
-pub(crate) fn resolve_launch_mode(args: &[String]) -> LaunchMode {
-    let resume_requested = args.get(1).map(|s| s == "resume").unwrap_or(false);
+/// Resolve the launch mode from the `resume` request + the clean-exit marker,
+/// and **clear the marker** so an unclean exit of *this* run is detectable
+/// next launch (KTD-G). `fly core` resolves it at boot (U3) — the role that
+/// owns the backend consumes the marker; the shell forwards `resume` to the
+/// core it spawns (2026-08-27-001 KTD7).
+pub(crate) fn resolve_launch_mode(resume_requested: bool) -> LaunchMode {
     let marker = session::resume::clean_exit_path();
     let prev_clean = session::resume::took_clean_exit_at(&marker);
     let _ = session::resume::set_clean_exit_at(&marker, false);
     decide_launch_mode(resume_requested, prev_clean)
 }
 
+/// Where the desktop shell lives relative to this binary in the packaged
+/// layout (2026-08-27-001 KTD7): `/usr/bin/fly` → `/opt/fly/resources/fly`
+/// (this binary, an electron-builder extraResource) and the shell executable
+/// is `/opt/fly/fly-shell` — one directory up. Pure so the derivation is
+/// unit-tested; `None` when the layout doesn't hold (a repo build, a bare
+/// copy of the binary). `FLY_SHELL_BIN` overrides for dev.
+pub(crate) fn shell_binary_beside(exe: &std::path::Path) -> Option<PathBuf> {
+    let resources = exe.parent()?;
+    let root = resources.parent()?;
+    Some(root.join("fly-shell"))
+}
+
 /// Run a `fly` CLI subcommand if argv selects one (KTD12); otherwise this is
 /// a bare `fly` / `fly resume` — the desktop launch, which the Electron shell
-/// owns (2026-08-27-001 KTD7: U3 wires the exec into the installed shell).
-/// Until then a bare `fly` prints the overview and exits 2 rather than
-/// pretending to open a window.
+/// owns (2026-08-27-001 KTD7): `exec` the installed shell beside this binary
+/// with argv passed through (so `fly resume` reaches it; the shell forwards
+/// it to the core it spawns, and a second launch just focuses the running
+/// window via the shell's single-instance lock). With no shell installed
+/// beside us, print the overview and exit 2 rather than pretend to open a
+/// window.
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(first) = args.get(1) {
@@ -140,8 +155,21 @@ pub fn run() {
             std::process::exit(cli::run(&args));
         }
     }
+    let shell = std::env::var_os("FLY_SHELL_BIN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+            shell_binary_beside(&exe)
+        })
+        .filter(|p| p.is_file());
+    if let Some(shell) = shell {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&shell).args(&args[1..]).exec();
+        eprintln!("fly: launching {}: {err}", shell.display());
+        std::process::exit(1);
+    }
     eprintln!("{}", cli::top_level_help());
-    eprintln!("fly: the desktop app is launched by the Electron shell (fly-shell); this binary serves the CLI and `fly core`.");
+    eprintln!("fly: no desktop shell found beside this binary (expected the packaged layout /opt/fly/fly-shell, or FLY_SHELL_BIN); this binary serves the CLI and `fly core`.");
     std::process::exit(2);
 }
 
@@ -609,6 +637,32 @@ mod tests {
         assert!(cli::is_cli_subcommand("notify"));
         assert!(cli::is_cli_subcommand("hooks"));
         assert!(cli::is_cli_subcommand("automation"));
+    }
+
+    #[test]
+    fn version_is_a_cli_subcommand() {
+        // `fly --version` prints the crate version and exits as a CLI (R6).
+        assert!(cli::is_cli_subcommand("--version"));
+        assert!(cli::is_cli_subcommand("-V"));
+        assert!(cli::is_cli_subcommand("version"));
+    }
+
+    // ---- the desktop launcher (2026-08-27-001 KTD7) --------------------------
+
+    #[test]
+    fn shell_binary_is_one_level_above_the_resources_dir() {
+        // /usr/bin/fly → /opt/fly/resources/fly (this binary) ⇒ /opt/fly/fly-shell.
+        let exe = std::path::Path::new("/opt/fly/resources/fly");
+        assert_eq!(
+            shell_binary_beside(exe),
+            Some(PathBuf::from("/opt/fly/fly-shell"))
+        );
+    }
+
+    #[test]
+    fn shell_binary_derivation_abstains_without_two_parents() {
+        // A bare `/fly` has no resources dir above it: no guess, no exec.
+        assert_eq!(shell_binary_beside(std::path::Path::new("/fly")), None);
     }
 
     #[test]

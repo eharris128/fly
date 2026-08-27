@@ -40,7 +40,7 @@ pub fn run(args: &[String]) -> i32 {
         Some(i) => match args.get(i + 1) {
             Some(p) => std::path::PathBuf::from(p),
             None => {
-                eprintln!("usage: fly core [--socket <path>]");
+                eprintln!("usage: fly core [--socket <path>] [resume]");
                 return 2;
             }
         },
@@ -48,8 +48,10 @@ pub fn run(args: &[String]) -> i32 {
     };
 
     // Consumes this flavor's clean-exit marker (KTD-G): the role that owns
-    // the backend owns crash detection.
-    let launch_mode = crate::resolve_launch_mode(args);
+    // the backend owns crash detection. `resume` arrives as a plain arg the
+    // shell forwards from its own argv (`fly resume` → exec shell → spawn
+    // `fly core resume`; 2026-08-27-001 KTD7).
+    let launch_mode = crate::resolve_launch_mode(args.iter().any(|a| a == "resume"));
 
     // Both sinks broadcast through the server, resolved via a slot filled
     // after start (the server needs the handler first).

@@ -42,6 +42,11 @@ function flyBinary() {
   return 'fly';
 }
 
+// The user-facing argv: packaged `fly-shell <args>` vs dev `electron . <args>`.
+function launchArgs() {
+  return process.argv.slice(app.isPackaged ? 1 : 2);
+}
+
 // ---- single instance -------------------------------------------------------
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -162,8 +167,14 @@ async function ensureCore() {
     /* no live core — spawn one */
   }
   const bin = flyBinary();
-  console.log(`[shell] starting core: ${bin} core (flavor ${FLAVOR})`);
-  coreChild = spawn(bin, ['core'], {
+  // `fly resume` (2026-08-27-001 KTD7): the CLI binary execs this shell with
+  // its argv, and the launch mode is the core's to resolve — so forward the
+  // word to the core we spawn. Only a spawned core can honor it: an adopted
+  // one already resolved its mode at boot, and a second shell launch never
+  // gets here (single-instance lock focuses the running window).
+  const coreArgs = launchArgs().includes('resume') ? ['core', 'resume'] : ['core'];
+  console.log(`[shell] starting core: ${bin} ${coreArgs.join(' ')} (flavor ${FLAVOR})`);
+  coreChild = spawn(bin, coreArgs, {
     env: { ...process.env, FLY_APP_NAME: FLAVOR },
     stdio: ['ignore', 'inherit', 'inherit'],
   });
