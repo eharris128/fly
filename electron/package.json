@@ -2,13 +2,14 @@
   "name": "fly-electron-shell",
   "version": "0.2.0",
   "private": true,
-  "description": "fly — a terminal for AI coding agents (Electron shell + Rust core)",
+  "description": "fly \u2014 a terminal for AI coding agents (Electron shell + Rust core)",
   "author": "Evan Harris <echarris@smcm.edu>",
   "homepage": "https://github.com/eharris128/fly",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist": "test -f ../dist/index.html || { echo 'electron/dist: ../dist missing — run pnpm build first' >&2; exit 1; }; rm -rf frontend && cp -r ../dist frontend && electron-builder --linux deb"
+    "dev": "electron . --no-sandbox",
+    "dist": "test -f ../dist/index.html || { echo 'electron/dist: ../dist missing \u2014 run pnpm build first' >&2; exit 1; }; rm -rf frontend && cp -r ../dist frontend && electron-builder --linux deb"
   },
   "build": {
     "appId": "dev.evan.fly",
@@ -31,7 +32,9 @@
       }
     ],
     "linux": {
-      "target": ["deb"],
+      "target": [
+        "deb"
+      ],
       "executableName": "fly-shell",
       "category": "Development",
       "icon": "../src-tauri/icons/icon.png",

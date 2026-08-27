@@ -25,24 +25,19 @@ source. Stack: **Tauri v2** (Rust backend) + **Svelte 5** (Vite/TS frontend) +
 ## Commands
 
 ```bash
-pnpm install                  # frontend deps
-pnpm tauri dev                # run the app (Vite dev server + cargo run) — use this, not a bare cargo build
-pnpm flavor:dev               # run a dev build ALONGSIDE an installed release (see "Stable + dev side by side")
+pnpm install                  # all JS deps — the frontend AND the Electron shell (one pnpm workspace)
 pnpm check                    # svelte-check: type-check the frontend
-pnpm test:unit                # vitest: all frontend unit tests
-pnpm tauri build --bundles deb   # TAURI .deb (kept buildable — KTD9 rollback; skip AppImage, needs network)
-pnpm build:local              # Tauri .deb on the fast release-dev profile (thin LTO — ~2× faster rebuilds)
-pnpm build:mac                # on a Mac: .app + .dmg on the release-dev profile (best-effort Tauri target — see docs/macos-build.md)
+pnpm test:unit                # vitest: frontend unit tests + electron/*.test.js + the version-lockstep test
+pnpm build:deb                # the product: vite build → cargo build --release → electron-builder
+                              #   → electron/dist-el/fly-electron-shell_<ver>_amd64.deb (deb Package: fly;
+                              #   postinst SUIDs chrome-sandbox + symlinks /usr/bin/fly → the Rust binary)
+pnpm build:core               # just the Rust binary (release, offline) — src-tauri/target/release/fly
 
-# The ELECTRON shell (migration plan 2026-08-12-002; the packaged product as of U7):
-pnpm build && cargo build --release --offline --manifest-path src-tauri/Cargo.toml \
-  && (cd electron && npm run dist)   # → electron/dist-el/fly-electron-shell_<ver>_amd64.deb
-                                     # (deb Package: fly — installing it REPLACES the Tauri deb;
-                                     #  postinst SUIDs chrome-sandbox + symlinks /usr/bin/fly)
-# Electron dev loop (fly-el flavor beside the installed release):
-#   pnpm dev   +   (cd electron && DISPLAY=:1 FLY_APP_NAME=fly-el \
-#     FLY_SHELL_URL=http://localhost:1420 ./node_modules/.bin/electron . --no-sandbox)
-#   (--no-sandbox is dev-only: the repo checkout lacks the SUID helper; the packaged app runs sandboxed)
+# Dev loop — the fly-el flavor beside the installed release (see "Stable + dev side by side"):
+pnpm dev                      # Vite on :1420 (terminal 1)
+cargo build --manifest-path src-tauri/Cargo.toml   # the debug core the shell spawns (target/debug/fly)
+pnpm shell:dev                # Electron with FLY_APP_NAME=fly-el FLY_SHELL_URL=http://localhost:1420 (terminal 2)
+                              #   (--no-sandbox is dev-only: the checkout lacks the SUID helper; the packaged app runs sandboxed)
 
 cargo test --offline --manifest-path src-tauri/Cargo.toml          # all Rust tests
 cargo test --offline --manifest-path src-tauri/Cargo.toml --test hook_auth   # one integration-test file (src-tauri/tests/<name>.rs)
@@ -52,9 +47,10 @@ pnpm vitest run src/lib/keymap.test.ts          # one frontend test file
 pnpm vitest run -t "leader"                      # frontend tests matching a name
 ```
 
-**System deps** (Tauri/WebKitGTK on Ubuntu): `libwebkit2gtk-4.1-dev
-build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
-patchelf`.
+**System deps** (Ubuntu): building needs `build-essential pkg-config
+libssl-dev` (reqwest's TLS); at runtime `libnotify-bin` (`notify-send`, the
+OS banner — best-effort, silent without it) and `tmux` (only for
+`substrate: "tmux"`).
 
 ### Environment gotchas (important — these will bite)
 

@@ -1,2 +1,12 @@
+# One package manager (2026-08-27-001 U4/KTD11): the Electron shell is a
+# workspace member; its only deps (electron, electron-builder) are dev-only
+# and nothing under node_modules ships in the deb, so pnpm's linked layout is
+# fine for electron-builder.
+packages:
+  - electron
+
 allowBuilds:
   esbuild: true
+  electron: true
+  # Windows-only installer tooling pulled in by electron-builder; never runs here.
+  electron-winstaller: false

@@ -37,9 +37,10 @@ renderer running the unchanged Svelte frontend over the preload bridge.
   an app that refuses to launch), the `/usr/bin/fly` symlink that keeps the
   CLI/hooks contract across the Tauri→Electron cutover, and its guarded
   removal.
-- `package-lock.json` — **committed**; this package builds with npm (it is
-  deliberately outside the pnpm workspace so electron-builder sees a plain
-  node_modules), and the lockfile is what makes the shipped .deb reproducible.
+- This package is a member of the root pnpm workspace (2026-08-27-001 U4):
+  `pnpm install` at the repo root installs it, and the root `pnpm-lock.yaml`
+  is what makes the shipped .deb reproducible. Its only deps are dev-only
+  (`electron`, `electron-builder`) and nothing under `node_modules` ships.
 
 ## Dev loop
 
@@ -109,14 +110,15 @@ directly; a desktop launch lands them in the session journal
 ## Packaging
 
 ```bash
-pnpm build   # repo root — the dist/ the shell packages; the dist script refuses to run without it
-cargo build --release --offline --manifest-path src-tauri/Cargo.toml
-cd electron && npm run dist   # → dist-el/fly-electron-shell_<ver>_amd64.deb
+pnpm build:deb   # repo root: vite build → cargo build --release → electron-builder
+                 # → electron/dist-el/fly-electron-shell_<ver>_amd64.deb
 ```
 
-The deb installs as **package `fly`** (deliberately colliding with the Tauri
-deb's name so installing one replaces the other; version must be higher for
-apt to treat it as an upgrade — rolling back to the Tauri deb is a manual
-downgrade). Keep `version` here in lockstep with the root `package.json`,
-`src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` — the bundled Rust
-binary's `fly --version` (and `core/ping`) reports the crate version.
+(`pnpm build` / `pnpm build:core` / `pnpm --filter fly-electron-shell dist`
+are the three steps; the dist step refuses to run without a built `../dist`.)
+The deb installs as **package `fly`**; the version must be higher than the
+installed one for apt to treat it as an upgrade. `version` here, the root
+`package.json`, and `src-tauri/Cargo.toml` must agree —
+`src/version-lockstep.test.ts` fails otherwise — since the bundled Rust
+binary's `fly --version` (and `core/ping`) reports the crate version while
+dpkg reports this file's.
