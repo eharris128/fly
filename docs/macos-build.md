@@ -35,12 +35,12 @@ pnpm build:mac        # bundle: .app + .dmg (fast release-dev profile)
 ```
 
 `pnpm build:mac` produces
-`src-tauri/target/release-dev/bundle/macos/fly.app` and a `.dmg` next to it in
+`core/target/release-dev/bundle/macos/fly.app` and a `.dmg` next to it in
 `bundle/dmg/`. Drag the `.app` to `/Applications` or run it in place. For a
 full fat-LTO build use `pnpm tauri build --bundles app dmg` instead.
 
 To wire up the attention pipeline, run `fly hooks setup` from the built
-binary once (e.g. `src-tauri/target/release-dev/fly hooks setup` or
+binary once (e.g. `core/target/release-dev/fly hooks setup` or
 `/Applications/fly.app/Contents/MacOS/fly hooks setup`). Hook setup writes the
 binary's **absolute path** into `~/.claude/settings.json`, so `fly` does not
 need to be on `PATH` — but re-run setup if you move the binary.
@@ -77,4 +77,4 @@ the macOS discussion in the repo history before starting that work.
 this target: the `objc2-exception-helper` dependency compiles Objective-C in
 its build script, which needs a Darwin toolchain. The first `cargo` build on
 an actual Mac is the real compile gate; if it fails, the fix likely belongs in
-one of the files listed by `grep -rl 'libc::' src-tauri/src`.
+one of the files listed by `grep -rl 'libc::' core/src`.

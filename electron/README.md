@@ -24,7 +24,7 @@ renderer running the unchanged Svelte frontend over the preload bridge.
   can't answer. The renderer is sandboxed with no node integration; nothing
   else is reachable.
 - `protocol.js` — the JS half of the control-socket frame codec.
-  **Edited only together with `src-tauri/src/control/` and
+  **Edited only together with `core/src/control/` and
   `docs/core-protocol.md`** (the wire contract).
 - `no-frontend.html` — inert dev-only page shown when the unpackaged shell
   has neither `FLY_SHELL_URL` nor a built `../dist/` to load. (The U4 bridge
@@ -58,7 +58,7 @@ FLY_APP_NAME=fly-el FLY_SHELL_URL=http://localhost:1420 \
   and drives the core's config/session/socket roots and this shell's
   userData.
 - The fly binary: `FLY_CORE_BIN` env override → the bundled resource
-  (packaged) → `../src-tauri/target/debug/fly` → `fly` on PATH.
+  (packaged) → `../core/target/debug/fly` → `fly` on PATH.
 - Adopt-or-spawn: a live control socket at
   `$XDG_RUNTIME_DIR/<flavor>/control.sock` is adopted (tmux-substrate
   sessions and their backend survive shell restarts); a dead one is
@@ -118,7 +118,7 @@ pnpm build:deb   # repo root: vite build → cargo build --release → electron-
 are the three steps; the dist step refuses to run without a built `../dist`.)
 The deb installs as **package `fly`**; the version must be higher than the
 installed one for apt to treat it as an upgrade. `version` here, the root
-`package.json`, and `src-tauri/Cargo.toml` must agree —
+`package.json`, and `core/Cargo.toml` must agree —
 `src/version-lockstep.test.ts` fails otherwise — since the bundled Rust
 binary's `fly --version` (and `core/ping`) reports the crate version while
 dpkg reports this file's.

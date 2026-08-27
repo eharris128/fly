@@ -1,5 +1,5 @@
 // The control-socket wire codec, JS side (docs/core-protocol.md — edited
-// only together with src-tauri/src/control/). u32 LE length | u8 kind |
+// only together with core/src/control/). u32 LE length | u8 kind |
 // payload; kinds: 0x01 JSON, 0x02 pane output (u64 LE id + bytes, server→
 // client), 0x03 pane input (client→server).
 'use strict';

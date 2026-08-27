@@ -25,7 +25,7 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
     // Don't watch the Rust side — cargo handles that.
-    watch: { ignored: ["**/src-tauri/**"] },
+    watch: { ignored: ["**/core/**"] },
   },
   test: {
     // Explicit (2026-08-27-001 KTD12): the shell's codec/recovery tests ride

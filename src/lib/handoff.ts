@@ -175,7 +175,7 @@ export function buildMonitorPickupCommand(
 // (docs/plans/2026-07-02-001-feat-session-handoff-plan.md, U3/R9.) Guided
 // handoff spawns bare `claude`; this pure state machine decides when — and
 // whether — to pre-type the stock prompt into its composer, unsent. Repo
-// convention (src-tauri/src/state/attention.rs, layout.ts): time and inputs
+// convention (core/src/state/attention.rs, layout.ts): time and inputs
 // are arguments, never sampled here, so every transition is unit-testable.
 // The wiring (Terminal.svelte) feeds real timestamps plus a ticker and
 // performs the single `inject` effect via the `ptyWrite` IPC.

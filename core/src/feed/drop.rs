@@ -872,7 +872,7 @@ mod tests {
         PathBuf::from("/home/tester")
     }
 
-    /// Fixtures live in `src-tauri/tests/fixtures/images/`. PNG/JPEG/GIF/WebP/
+    /// Fixtures live in `core/tests/fixtures/images/`. PNG/JPEG/GIF/WebP/
     /// AVIF are genuine encoder output (ffmpeg); the HEIC fixture is a
     /// hand-built ISO-BMFF `ftyp` box, because no encoder on this machine muxes
     /// HEIC — its first 16 bytes are byte-identical to a real HEIC's, which is

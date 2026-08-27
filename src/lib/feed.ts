@@ -1,6 +1,6 @@
 // Feed wire contract (U1). A pure data module like `home.ts` — no DOM, no
 // Svelte — so it is unit-tested without an app. It mirrors the Rust wire shape
-// in `src-tauri/src/feed/wire.rs`: the frontend PUSHES the agent roster (which
+// in `core/src/feed/wire.rs`: the frontend PUSHES the agent roster (which
 // only the webview computes, folding topology + status + debounce), and the
 // backend fills the automations half + `version`/`emittedAt` before it streams
 // the snapshot to the local `game` consumer over SSE.

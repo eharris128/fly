@@ -2,7 +2,7 @@
 
 Wire contract for the Electron shell migration
 (`docs/plans/2026-08-12-002-proposal-electron-shell-migration-plan.md`, U1;
-KTD1/KTD3). Implemented in `src-tauri/src/control/`. This document and that
+KTD1/KTD3). Implemented in `core/src/control/`. This document and that
 module are edited only together.
 
 ## Transport

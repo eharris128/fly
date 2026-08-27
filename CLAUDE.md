@@ -7,7 +7,7 @@ also maps the sibling doc dirs: `docs/brainstorms/` for pre-plan requirements,
 `docs/residual-review-findings/` for deferred code-review findings,
 `docs/notes/` for one-off evaluations); the code is cross-referenced to it by
 ID (see "Conventions"). This file is the primary agent guide; `AGENTS.md` is a
-thin pointer to it for non-Claude tools, and `src-tauri/src/hooks/CLAUDE.md`
+thin pointer to it for non-Claude tools, and `core/src/hooks/CLAUDE.md`
 adds a scoped note at the socket security boundary. `README.md` is the
 human-facing orientation layer — when a change moves the product story (shell,
 install path, CLI surface, headline features), update it too; it goes stale
@@ -31,17 +31,17 @@ pnpm test:unit                # vitest: frontend unit tests + electron/*.test.js
 pnpm build:deb                # the product: vite build → cargo build --release → electron-builder
                               #   → electron/dist-el/fly-electron-shell_<ver>_amd64.deb (deb Package: fly;
                               #   postinst SUIDs chrome-sandbox + symlinks /usr/bin/fly → the Rust binary)
-pnpm build:core               # just the Rust binary (release, offline) — src-tauri/target/release/fly
+pnpm build:core               # just the Rust binary (release, offline) — core/target/release/fly
 
 # Dev loop — the fly-el flavor beside the installed release (see "Stable + dev side by side"):
 pnpm dev                      # Vite on :1420 (terminal 1)
-cargo build --manifest-path src-tauri/Cargo.toml   # the debug core the shell spawns (target/debug/fly)
+cargo build --manifest-path core/Cargo.toml   # the debug core the shell spawns (target/debug/fly)
 pnpm shell:dev                # Electron with FLY_APP_NAME=fly-el FLY_SHELL_URL=http://localhost:1420 (terminal 2)
                               #   (--no-sandbox is dev-only: the checkout lacks the SUID helper; the packaged app runs sandboxed)
 
-cargo test --offline --manifest-path src-tauri/Cargo.toml          # all Rust tests
-cargo test --offline --manifest-path src-tauri/Cargo.toml --test hook_auth   # one integration-test file (src-tauri/tests/<name>.rs)
-cargo test --offline --manifest-path src-tauri/Cargo.toml <substr> # tests whose name matches <substr>
+cargo test --offline --manifest-path core/Cargo.toml          # all Rust tests
+cargo test --offline --manifest-path core/Cargo.toml --test hook_auth   # one integration-test file (core/tests/<name>.rs)
+cargo test --offline --manifest-path core/Cargo.toml <substr> # tests whose name matches <substr>
 
 pnpm vitest run src/lib/keymap.test.ts          # one frontend test file
 pnpm vitest run -t "leader"                      # frontend tests matching a name
@@ -79,7 +79,7 @@ OS banner — best-effort, silent without it) and `tmux` (only for
 ## Packaging & running a stable build
 
 `pnpm tauri build --bundles deb` produces
-`src-tauri/target/release/bundle/deb/fly_<ver>_amd64.deb`. Install it
+`core/target/release/bundle/deb/fly_<ver>_amd64.deb`. Install it
 (`sudo apt install ./…deb`) for a standalone `/usr/bin/fly` + launcher,
 independent of the source tree.
 
@@ -94,7 +94,7 @@ the shared `FLY_APP_NAME` state, not the window lock.) To run an iterating dev
 build next to an installed stable app, use **`pnpm flavor:dev`** (Tauri) or the
 `fly-el` Electron loop from Commands above:
 
-- `src-tauri/tauri.dev.conf.json` (merged via `tauri dev --config`) gives the
+- `core/tauri.dev.conf.json` (merged via `tauri dev --config`) gives the
   dev build a distinct identifier `dev.evan.fly-dev` → its own single-instance
   lock, so both windows coexist.
 - `FLY_APP_NAME=fly-dev` (set by the script) isolates its on-disk state. All
@@ -193,7 +193,7 @@ the WebKitGTK engine-floor relief — was removed with the Tauri shell,
 Plan:
 `docs/plans/2026-08-11-001-feat-tmux-session-substrate-plan.md`.
 
-### Backend modules (`src-tauri/src/`)
+### Backend modules (`core/src/`)
 - `pty/` — `PtyManager` registry + `Pane`: portable-pty, one read thread per
   pane, backpressure pause/resume (watermarks), ordered reap-on-exit.
 - `stream/` — `spawn_pane`, raw-byte PTY output over a Tauri `Channel`, and the
@@ -446,7 +446,7 @@ Plan:
   command missing from the registry works in Tauri dev but is unreachable in
   the packaged Electron app.
 
-### Automations (`src-tauri/src/automations/`, cross-referenced U1–U12)
+### Automations (`core/src/automations/`, cross-referenced U1–U12)
 Cron-scheduled runs that either run a `claude` agent (Agent mode) or a stored
 script with no model spend (Script mode). **Agent runs dispatch closed-loop
 headless by default**
@@ -856,7 +856,7 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   doc-commented.
 - Behavior-bearing units ship with tests (Rust state machines are test-first and
   pure; frontend has vitest for layout/keymap; `pnpm test:unit` also runs the
-  `electron/protocol.test.js` codec tests, and `src-tauri/tests/backend_build.rs`
+  `electron/protocol.test.js` codec tests, and `core/tests/backend_build.rs`
   smoke-builds the full shared backend).
 - Commits: conventional, with a `Co-Authored-By: Claude` trailer.
 - Repo-root oddities an agent may trip over: the archived automations
@@ -867,7 +867,7 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   `fly-monitor-handoff` skill were removed from the tree 2026-08-27 (git
   history has them; the spike's results are in
   `docs/notes/2026-08-12-electron-engine-probe.md`).
-- Versioning: keep `package.json`, `src-tauri/Cargo.toml`,
-  `src-tauri/tauri.conf.json`, and `electron/package.json` on the SAME
+- Versioning: keep `package.json`, `core/Cargo.toml`,
+  `core/tauri.conf.json`, and `electron/package.json` on the SAME
   version — the Electron deb ships the Rust binary, and `fly --version` /
   `core/ping` report the crate version while dpkg reports the deb's.

@@ -37,7 +37,7 @@ const CONTROL_SOCK = path.join(RUNTIME_DIR, FLAVOR, 'control.sock');
 function flyBinary() {
   if (process.env.FLY_CORE_BIN) return process.env.FLY_CORE_BIN;
   if (app.isPackaged) return path.join(process.resourcesPath, 'fly');
-  const dev = path.join(__dirname, '..', 'src-tauri', 'target', 'debug', 'fly');
+  const dev = path.join(__dirname, '..', 'core', 'target', 'debug', 'fly');
   if (require('fs').existsSync(dev)) return dev;
   return 'fly';
 }

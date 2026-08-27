@@ -3,7 +3,7 @@ node_modules/
 dist/
 
 # Rust / Tauri
-src-tauri/target/
+core/target/
 
 # Tauri build artifacts
 *.deb

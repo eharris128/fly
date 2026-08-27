@@ -5,7 +5,7 @@
 import { describe, it, expect } from "vitest";
 import rootPkg from "../package.json";
 import shellPkg from "../electron/package.json";
-import cargoToml from "../src-tauri/Cargo.toml?raw";
+import cargoToml from "../core/Cargo.toml?raw";
 
 describe("version lockstep", () => {
   it("package.json, electron/package.json, and Cargo.toml agree", () => {

@@ -125,7 +125,7 @@ same-uid Unix control socket (`docs/core-protocol.md`). Build and package it:
 ```bash
 pnpm install                     # frontend deps
 pnpm build                       # Vite frontend → dist/
-cargo build --release --offline --manifest-path src-tauri/Cargo.toml   # the fly binary
+cargo build --release --offline --manifest-path core/Cargo.toml   # the fly binary
 (cd electron && npm install && npm run dist)   # → electron/dist-el/fly-electron-shell_<ver>_amd64.deb
 ```
 
@@ -150,7 +150,7 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev \
 
 ```bash
 pnpm tauri dev                   # run the Tauri app (Vite dev server + cargo run)
-pnpm tauri build --bundles deb   # rollback .deb → src-tauri/target/release/bundle/deb/
+pnpm tauri build --bundles deb   # rollback .deb → core/target/release/bundle/deb/
 pnpm flavor:dev                  # Tauri dev build beside an installed release
 ```
 
@@ -159,12 +159,12 @@ pnpm flavor:dev                  # Tauri dev build beside an installed release
 ```bash
 pnpm check                                                          # svelte-check (types)
 pnpm test:unit                                                     # vitest (frontend)
-cargo test --offline --manifest-path src-tauri/Cargo.toml         # Rust (state machines, socket auth, …)
+cargo test --offline --manifest-path core/Cargo.toml         # Rust (state machines, socket auth, …)
 ```
 
 ## Repository layout
 
-- `src-tauri/src/` — Rust backend: `pty/`, `stream/`, `state/` (pure state
+- `core/src/` — Rust backend: `pty/`, `stream/`, `state/` (pure state
   machines), `hooks/` (the socket **security boundary** — has its own scoped
   `CLAUDE.md`), `session/` (layout + resume/handoff/attribution), `automations/`
   (incl. monitors + the headless check runner), `feed/` (the loopback HTTP

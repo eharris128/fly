@@ -27,7 +27,7 @@
     ],
     "extraResources": [
       {
-        "from": "../src-tauri/target/release/fly",
+        "from": "../core/target/release/fly",
         "to": "fly"
       }
     ],
@@ -37,7 +37,7 @@
       ],
       "executableName": "fly-shell",
       "category": "Development",
-      "icon": "../src-tauri/icons/icon.png",
+      "icon": "build/icon.png",
       "desktop": {
         "entry": {
           "StartupWMClass": "fly-electron-shell"

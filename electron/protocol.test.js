@@ -1,5 +1,5 @@
 // Tests for the JS half of the control-socket frame codec. Its Rust twin
-// (src-tauri/src/control/frame.rs) carries its own unit tests; the two are
+// (core/src/control/frame.rs) carries its own unit tests; the two are
 // edited only together with docs/core-protocol.md, and these tests pin the
 // JS side to the same wire facts: u32 LE length (excluding the kind byte),
 // u8 kind, 0x01 JSON / 0x02 pane output (u64 LE id + bytes) / 0x03 pane

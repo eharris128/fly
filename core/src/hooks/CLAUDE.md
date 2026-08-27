@@ -128,9 +128,9 @@ here is mandatory, not a nicety.
 The boundary has an integration test — run it after any change here:
 
 ```bash
-cargo test --offline --manifest-path src-tauri/Cargo.toml --test hook_auth
-cargo test --offline --manifest-path src-tauri/Cargo.toml --test hook_ask
-cargo test --offline --manifest-path src-tauri/Cargo.toml --test peer_send
+cargo test --offline --manifest-path core/Cargo.toml --test hook_auth
+cargo test --offline --manifest-path core/Cargo.toml --test hook_ask
+cargo test --offline --manifest-path core/Cargo.toml --test peer_send
 ```
 
 Add cases whenever you touch the token compare, peer-cred check, lockout,
