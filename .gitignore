@@ -2,10 +2,10 @@
 node_modules/
 dist/
 
-# Rust / Tauri
+# Rust
 core/target/
 
-# Tauri build artifacts
+# Package artifacts
 *.deb
 *.AppImage
 *.rpm

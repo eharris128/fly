@@ -1,6 +1,6 @@
 //! agent-peer-messaging U7: end-to-end `peer/list` / `peer/send` over the real
 //! socket — a `HookServer` with the peer handler wired exactly like `lib.rs`
-//! (parse → `dispatch_peer_op` with live ports), minus Tauri. The refusal
+//! (parse → `dispatch_peer_op` with live ports), minus the shell. The refusal
 //! table mirrors KTD9's flowchart, one case per terminal node; the pure gate
 //! *ordering* is pinned in `peer/mod.rs`'s unit tests — here the same codes
 //! are proven reachable through the boundary.
@@ -40,7 +40,7 @@ fn agent(leaf: &str, pane: u64, opt_in: bool) -> AgentEntry {
     }
 }
 
-/// The lib.rs handler wiring, minus Tauri: shared mutable world (roster,
+/// The backend's handler wiring, minus the shell: shared mutable world (roster,
 /// pane→leaf map, ask flag, agent-ness, PTY log) the tests poke per case.
 #[derive(Default)]
 struct World {

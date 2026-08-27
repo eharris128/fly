@@ -23,9 +23,10 @@ result under the check; abstain-honest — an unexercised check stays unticked.
 >   plan, not ticked here.
 >
 > Setup on the Electron shell: use the `fly-el` dev loop (CLAUDE.md →
-> Commands) with `"substrate": "tmux"` in `~/.config/fly-el/config.json`;
-> `pnpm flavor:dev` remains the Tauri-shell variant. Substitute the flavor
-> name in the `tmux -L …` commands below accordingly.
+> Commands, `pnpm shell:dev`) with `"substrate": "tmux"` in
+> `~/.config/fly-el/config.json`. Substitute the flavor name in the
+> `tmux -L …` commands below accordingly. (The Tauri-shell variant of this
+> setup went with the Tauri shell, 2026-08-27.)
 
 Everything below runs on a **dev flavor** so the installed release stays
 untouched. U1–U8 + U10 are implemented behind the flag and live-validated at
@@ -36,11 +37,10 @@ checklist is the app-level pass that gates the default flip and U9.
 
 ```bash
 # 1. Flip the dev flavor's config (NOT the release one):
-#    ~/.config/fly-el/config.json  (or fly-dev for the Tauri shell)
+#    ~/.config/fly-el/config.json
 #    →  add: "substrate": "tmux"
 # 2. Run the dev build alongside the installed release:
-#    Electron: the fly-el dev loop (CLAUDE.md → Commands)
-#    Tauri:    pnpm flavor:dev
+#    the fly-el dev loop (CLAUDE.md → Commands: pnpm dev + pnpm shell:dev)
 ```
 
 ## Checks (R-mapped)
@@ -53,10 +53,9 @@ checklist is the app-level pass that gates the default flip and U9.
       `docs/notes/2026-08-11-webkitgtk-engine-floor.md`): with ~5 panes
       streaming, sample the renderer main thread.
       Target: < 20% avg, no sustained >50%.
-- [ ] 3. **Mirrors look right** (only with `mirrorUnfocused: true` — default
-      off since the cutover). Unfocused panes show colored, current content;
-      clicking one focuses it and reveals the live terminal seamlessly; the
-      spinner in a mirror updates ~2×/s.
+- [x] 3. ~~**Mirrors look right**~~ — N/A: the `mirrorUnfocused` mechanism
+      was removed with the Tauri shell (2026-08-27-001 KTD8; the migration's
+      U8 measured it a no-op on Chromium).
 - [ ] 4. **`leader t` native attach (R1).** Focused claude pane → `leader t`
       → your terminal opens attached to the session. Typing there is native.
       The fly pane shows the "attached in terminal" badge; a raise while

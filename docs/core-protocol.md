@@ -42,9 +42,10 @@ Kinds:
 | `0x02` | pane output | `u64 LE paneId` + raw PTY bytes | server → client |
 | `0x03` | pane input | `u64 LE paneId` + raw keystroke bytes | client → server |
 
-Kinds `0x02`/`0x03` exist so PTY bytes never touch JSON (proposal KTD3 — this
-replaces both the Tauri `Channel` and the old eval/number-array quirk, and
-gives keystrokes a JSON-free path down as well). Unknown kinds drop the
+Kinds `0x02`/`0x03` exist so PTY bytes never touch JSON (proposal KTD3 — the
+pre-socket transport re-encoded sub-1 KiB chunks through a JSON number array;
+this path never transcodes, and gives keystrokes a JSON-free path down as
+well). Unknown kinds drop the
 connection (version-skew fail-closed).
 
 ## JSON envelopes
@@ -65,9 +66,9 @@ contract like `automations/model.rs`).
 
 - `id` is client-chosen, opaque to the server, echoed verbatim; the client is
   responsible for uniqueness among its in-flight requests.
-- `cmd` names are **exactly** today's Tauri command names (proposal KTD1);
-  `args` is the same serde shape the command takes today. Porting a command
-  must not rename anything.
+- `cmd` names are **exactly** the names `src/ipc.ts` sends (proposal KTD1),
+  pinned by `core/tests/control_registry.rs`; `args` is the command's serde
+  shape. Renaming either is a wire change.
 - `event` names are exactly today's event names (`pane://…`,
   `automation://…`).
 - A malformed JSON frame or an unknown `cmd` yields `{"id": …, "err": …}`

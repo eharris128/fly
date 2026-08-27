@@ -35,8 +35,8 @@ renderer running the unchanged Svelte frontend over the preload bridge.
 - `deb/postinst.sh` / `deb/postrm.sh` — .deb lifecycle: SUID
   `chrome-sandbox` (fails the install if it can't — a silent skip would ship
   an app that refuses to launch), the `/usr/bin/fly` symlink that keeps the
-  CLI/hooks contract across the Tauri→Electron cutover, and its guarded
-  removal.
+  CLI/hooks contract (installed hooks embed that absolute path; bare `fly`
+  execs `/opt/fly/fly-shell` from it), and its guarded removal.
 - This package is a member of the root pnpm workspace (2026-08-27-001 U4):
   `pnpm install` at the repo root installs it, and the root `pnpm-lock.yaml`
   is what makes the shipped .deb reproducible. Its only deps are dev-only
@@ -45,10 +45,9 @@ renderer running the unchanged Svelte frontend over the preload bridge.
 ## Dev loop
 
 ```bash
-pnpm dev            # in the repo root: Vite dev server on :1420
-cd electron && npm install
-FLY_APP_NAME=fly-el FLY_SHELL_URL=http://localhost:1420 \
-  ./node_modules/.bin/electron . --no-sandbox
+pnpm install        # repo root, once — installs this package too (workspace)
+pnpm dev            # repo root: Vite dev server on :1420
+pnpm shell:dev      # repo root: this shell, FLY_APP_NAME=fly-el, FLY_SHELL_URL=http://localhost:1420, --no-sandbox
 ```
 
 - `--no-sandbox` is **dev-only**: the repo checkout has no SUID helper; the

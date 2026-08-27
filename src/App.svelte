@@ -2165,7 +2165,7 @@
 
     // Probe the `--continue` candidate's freshness for each imprecise (no-id) leaf
     // — a precise (`--resume <id>`) leaf bypasses the guard, so it needs no probe.
-    // The probes run in PARALLEL (each is a Tauri round-trip + a transcript read),
+    // The probes run in PARALLEL (each is a backend round-trip + a transcript read),
     // and each is ISOLATED: a rejection degrades that leaf to a null candidate →
     // stale → bare shell, never aborting the whole restore (fix-003 review). The
     // candidate runs in the leaf's spawn cwd (`cwds[key]`, since an imprecise leaf

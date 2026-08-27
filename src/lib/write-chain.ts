@@ -3,7 +3,7 @@
 // in-flight invokes can complete out of order across runtime workers —
 // per-pane keystroke order is pinned here instead, by starting each key's
 // task only after that key's previous task settles. Pure and framework-free
-// (the repo's lib convention) so ordering is testable without mocking Tauri.
+// (the repo's lib convention) so ordering is testable without mocking the transport.
 
 /**
  * A per-key task serializer. `run(key, task)` starts `task` only after every

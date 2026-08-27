@@ -1,7 +1,7 @@
 //! hook-ask-channel U9: end-to-end held-ask round-trips over the real socket —
 //! the `fly notify --permission-request` client (`cli::notify::hold_ask`)
 //! against a `HookServer` wired to a real `AskRegistry` exactly like `lib.rs`
-//! (minus Tauri): register → ack → hold; local kill → drop → clear; remote
+//! (minus the shell): register → ack → hold; local kill → drop → clear; remote
 //! answer → decision line; skew fast-fail; shutdown release.
 
 use std::io::{BufRead, BufReader, Write};
@@ -27,7 +27,7 @@ fn no_dispatch() -> Dispatch {
     Arc::new(|_, _| {})
 }
 
-/// The lib.rs ask-handler wiring, minus Tauri: pane → `leaf-<id>`, register,
+/// The backend's ask-handler wiring, minus the shell: pane → `leaf-<id>`, register,
 /// arm the generation-guarded drop.
 fn handler(registry: Arc<AskRegistry>) -> AskHandler {
     Arc::new(move |pane, payload: AskPayload| {
@@ -229,7 +229,7 @@ use fly_lib::peer::{self, rate, PeerPorts};
 
 type PtyLog = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
 
-/// The lib.rs peer wiring, minus Tauri: a real `FallbackResolver` whose ask
+/// The backend's peer wiring, minus the shell: a real `FallbackResolver` whose ask
 /// leg reads the same `AskRegistry` the socket's ask handler registers into,
 /// gated through the real `drop_blocked_by_question` predicate.
 fn peer_handler_with_real_ask_gate(

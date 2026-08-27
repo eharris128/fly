@@ -1,6 +1,5 @@
-// Typed wrappers over the backend command surface (U3) — shell-agnostic
-// since the Electron-shell migration (U5): every invoke/listen routes
-// through `lib/transport.ts`, which serves Tauri or the Electron bridge.
+// Typed wrappers over the backend command surface (U3): every invoke/listen
+// routes through `lib/transport.ts` (the Electron preload bridge, U5).
 import {
   invoke,
   listen,

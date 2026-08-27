@@ -274,8 +274,7 @@ app.whenReady().then(async () => {
   const wc = win.webContents;
 
   // Quit-confirm flow (U5): the renderer owns the busy-agents confirm (the
-  // same shared destructive-confirm overlay as under Tauri); main only
-  // intercepts and forwards. `fly:close-now` is the renderer's verdict —
+  // shared destructive-confirm overlay); main only intercepts and forwards. `fly:close-now` is the renderer's verdict —
   // but a verdict needs a renderer that can answer (recovery, bug 3): a
   // crashed/hung/never-loaded one gets no say and the close proceeds; a
   // live one must ACK the request (preload-level, before any page script)
@@ -399,9 +398,9 @@ function loadFrontend() {
   return win.loadFile('no-frontend.html');
 }
 
-// Ordered core shutdown on quit (migration U6): ask the core to run the same
-// teardown lifecycle.rs runs under Tauri — clean-exit marker, interrupted-run
-// closes, substrate DETACH — whether we spawned it or adopted it (quitting
+// Ordered core shutdown on quit (migration U6): ask the core to run its
+// ordered teardown (`backend::ordered_shutdown`) — clean-exit marker,
+// interrupted-run closes, substrate DETACH — whether we spawned it or adopted it (quitting
 // fly means quitting the backend; sessions survive on the tmux server either
 // way). `core/shutdown` is primary; SIGTERM lands on the same flag in the
 // core; SIGKILL after a deadline is the last resort for a wedged core.

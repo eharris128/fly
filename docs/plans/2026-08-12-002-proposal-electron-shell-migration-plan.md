@@ -308,5 +308,8 @@ handlers) is even a standalone code-quality win if the migration stalls.
    latest?
 3. **Tauri retirement horizon** — one stable release after cutover, or keep
    dual-shell indefinitely as a hedge?
+   → **Answered 2026-08-27:** retired, before the repo goes public
+   (`docs/plans/2026-08-27-001-refactor-electron-only-retire-tauri-plan.md`).
+   The rollback is the `tauri-shell-final` git tag, not a build target.
 4. **Go/no-go itself** — U6's gate numbers are the tripwire; agree on them
    now so the decision at that point is mechanical.

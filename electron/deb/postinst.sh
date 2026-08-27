@@ -10,10 +10,12 @@ set -e
 # to launch with no explanation — fail the install instead.
 chmod 4755 '/opt/fly/chrome-sandbox'
 
-# The same /usr/bin/fly story as the Tauri package: the bundled Rust binary
-# serves the CLI (`fly notify|hooks|automation|agents|send`) and the headless
-# core (`fly core`). Hooks installed by `fly hooks setup` embed this absolute
-# path, so it must stay valid across the Tauri→Electron cutover.
+# /usr/bin/fly → the bundled Rust binary: the CLI (`fly notify|hooks|
+# automation|agents|send`), the headless core (`fly core`), and — run bare —
+# the launcher that execs /opt/fly/fly-shell (it derives that path from its
+# own canonical location, so this symlink target is load-bearing). Hooks
+# installed by `fly hooks setup` embed the absolute path, so it must stay
+# valid across upgrades.
 ln -sf '/opt/fly/resources/fly' /usr/bin/fly
 
 if command -v update-desktop-database >/dev/null 2>&1; then

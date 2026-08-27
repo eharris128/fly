@@ -5,7 +5,7 @@
 //! A small, crash-durable, backend-owned store of per-leaf resume records,
 //! separate from the debounced layout blob (`session/mod.rs`, KTD-D). Each upsert
 //! flushes immediately (atomic temp + rename), so the last-known agent mapping is
-//! on disk even when an unclean shutdown (OOM kill, `SIGKILL`, power loss, WebKit
+//! on disk even when an unclean shutdown (OOM kill, `SIGKILL`, power loss, a
 //! renderer crash) skips fly's ordered teardown.
 //!
 //! Three writers feed the `session_id`, ranked by **trust** (KTD2): the

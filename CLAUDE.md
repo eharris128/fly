@@ -19,8 +19,9 @@ and packaging.
 **fly** is a Linux desktop "terminal for AI coding agents": real PTY-backed
 panes, tabs + splits (one agent per pane), and an attention indicator + OS
 notification when an agent needs you. v1 wires **Claude Code** as the attention
-source. Stack: **Tauri v2** (Rust backend) + **Svelte 5** (Vite/TS frontend) +
-**xterm.js** terminal panes.
+source. Stack: a **Rust** backend (`fly core`, headless, served over a Unix
+control socket) + an **Electron** shell (the window) + **Svelte 5** (Vite/TS
+frontend) + **xterm.js** terminal panes. Linux only.
 
 ## Commands
 
@@ -60,74 +61,74 @@ OS banner — best-effort, silent without it) and `tmux` (only for
   build/test --offline` works sandboxed. (Caution: `dangerouslyDisableSandbox`
   + a foreground `sleep` in the same Bash call has been seen to abort with exit
   144 — keep sleeps out of sandbox-disabled commands.)
-- **Run via `pnpm tauri dev`, never a bare debug `cargo build` binary** — the
-  debug binary loads the frontend from the Vite `devUrl`, so standalone it shows
-  a blank window. The release build embeds the frontend and runs standalone.
-- **Release builds render fine here** (verified on this 24.04 box, Wayland +
-  X11). An earlier blank-window issue on WebKitGTK 2.52 was the `crossorigin`
-  module-script attribute failing to load over Tauri's custom asset protocol;
-  the `fly-strip-crossorigin` Vite plugin in `vite.config.ts` strips it and
-  fixes it. If a release build ever shows blank on Wayland, `GDK_BACKEND=x11
-  fly` is a proven fallback.
+- **A bare `fly` binary is a launcher, not the app.** With no CLI subcommand
+  it execs the Electron shell installed beside it (`/opt/fly/fly-shell`) and
+  otherwise prints help and exits 2. The window comes from `pnpm shell:dev`
+  (dev) or the installed deb — never from `cargo run`.
+- **The packaged shell loads the frontend over `file://`**, which is why
+  `vite.config.ts` keeps `base: "./"` and the `fly-strip-crossorigin` plugin
+  (a `crossorigin` module script under an opaque origin fails CORS → blank
+  window). Don't remove either.
 - **Wayland screenshots are locked down** (GNOME 46: `org.gnome.Shell.Screenshot`
   → AccessDenied; x11grab of rootless Xwayland is black). To capture the app,
-  launch it with `GDK_BACKEND=x11` (makes it an Xwayland client), then
-  `xwd -id <winid> -out f.xwd && ffmpeg -i f.xwd f.png`.
-- **The webview console is invisible.** The frontend forwards uncaught errors to
-  app stderr via the `frontend_log` command — grep stderr for `[fly-webview]`.
+  run the shell as an X11 client (`--ozone-platform=x11`; the default on this
+  box's X11 session), then `xwd -id <winid> -out f.xwd && ffmpeg -i f.xwd f.png`.
+- **Where the logs are.** The shell's `[shell]` lines and the core's stderr
+  (incl. uncaught renderer errors, forwarded via `frontend_log` as
+  `[fly-webview]`) go to the launching terminal, or to `journalctl --user`
+  for a desktop launch. There is no log file (see `electron/README.md`).
 
 ## Packaging & running a stable build
 
-`pnpm tauri build --bundles deb` produces
-`core/target/release/bundle/deb/fly_<ver>_amd64.deb`. Install it
-(`sudo apt install ./…deb`) for a standalone `/usr/bin/fly` + launcher,
-independent of the source tree.
+`pnpm build:deb` produces `electron/dist-el/fly-electron-shell_<ver>_amd64.deb`
+(deb `Package: fly`). Install it (`sudo apt install ./…deb`) for
+`/opt/fly/fly-shell` + a desktop launcher + `/usr/bin/fly` (symlink to the
+bundled Rust binary — the CLI, `fly core`, and the launcher), independent of
+the source tree; then `fly hooks setup` once. The version must be higher than
+the installed one for apt to upgrade in place.
 
 ### Stable + dev side by side
 
 A dev build left on the default flavor shares the installed app's
 config/session/socket dirs, so it would clobber the installed app's saved tabs
-and fight it over the hook socket. (The installed Electron shell holds its own
-single-instance lock in `electron/main.js`; the Tauri `single-instance` plugin
-in `lib.rs` only guards the Tauri rollback shell — the real collision today is
-the shared `FLY_APP_NAME` state, not the window lock.) To run an iterating dev
-build next to an installed stable app, use **`pnpm flavor:dev`** (Tauri) or the
-`fly-el` Electron loop from Commands above:
+and fight it over the hook socket. To run an iterating dev build next to an
+installed stable app, use the `fly-el` loop from Commands above
+(`pnpm shell:dev`):
 
-- `core/tauri.dev.conf.json` (merged via `tauri dev --config`) gives the
-  dev build a distinct identifier `dev.evan.fly-dev` → its own single-instance
-  lock, so both windows coexist.
-- `FLY_APP_NAME=fly-dev` (set by the script) isolates its on-disk state. All
-  three path roots derive from `lib.rs::app_dir_name()` (default `fly`,
-  overridable via `FLY_APP_NAME`): config `~/.config/<app>/`, session/scrollback
-  `~/.local/share/<app>/`, and the hook socket under `$XDG_RUNTIME_DIR/<app>/`.
-  The installed release leaves `FLY_APP_NAME` unset → stays on `fly`.
-- The dev window's title becomes `fly (dev)` (set at runtime in `lib.rs` setup
-  when the flavor isn't `fly`) so it's distinguishable from the stable window.
+- `FLY_APP_NAME` is the whole isolation mechanism. The shell defaults it to
+  `fly-el` for a repo checkout and `fly` when packaged (`electron/main.js`),
+  scopes its own userData and single-instance lock by it, and passes it to
+  the core it spawns. All three core path roots derive from
+  `lib.rs::app_dir_name()`: config `~/.config/<app>/`, session/scrollback
+  `~/.local/share/<app>/`, and the hook + control sockets under
+  `$XDG_RUNTIME_DIR/<app>/`. The installed release stays on `fly`.
+- The window title carries the flavor (`fly (fly-el)`) so the dev window is
+  distinguishable from the stable one.
 
 The hook socket lives at a stable per-flavor path (`hook.sock` under the
 runtime dir — tmux-substrate U2/KTD8: substrate sessions outlive the process,
 so surviving agents' env must keep pointing at a live socket across restarts);
-flavors get distinct dirs, same-flavor duplicates are stopped by the
-single-instance plugin, and the bind refuses to steal a socket that still
-answers.
+flavors get distinct dirs, same-flavor duplicates are stopped by the shell's
+single-instance lock and by the bind refusing to steal a socket that still
+answers (a second `fly core` on a live flavor exits at boot).
 
 ## Architecture
 
-### One binary, three roles
+### One binary, two roles (and a launcher)
 `main.rs` → `lib.rs::run()`. If argv[1] is a CLI subcommand (`notify`, `hooks`,
-`automation`, `agents`, `send`, `substrate-event`, `core`, `help`/`--help`/`-h`
-— see `cli/mod.rs::is_cli_subcommand`), the process runs as the **`fly` CLI**
-and exits; of those, `fly core` runs the **headless backend** (the full
-`build_backend` stack served over the control socket — what the Electron shell
-spawns and drives) and `fly substrate-event` is the tmux run-shell hook
-endpoint. `fly resume` (`lib.rs::resolve_launch_mode`) is a launch-mode arg for
-the desktop role, not a CLI subcommand. Otherwise it launches the **Tauri
-desktop app** (the KTD9 rollback
-shell — since the 2026-08-12 cutover the shipped product is the Electron
-shell in `electron/` + `fly core`, and the installed launcher never invokes
-the Tauri role). All roles share the same `fly_lib` crate, so a `fly notify`
-invocation inside a pane talks to whichever backend is running.
+`automation`, `agents`, `send`, `substrate-event`, `core`, `help`/`--help`/`-h`,
+`--version`/`-V` — see `cli/mod.rs::is_cli_subcommand`), the process runs as
+the **`fly` CLI** and exits; of those, `fly core` runs the **headless backend**
+(the full `build_backend` stack served over the control socket — what the
+Electron shell spawns and drives) and `fly substrate-event` is the tmux
+run-shell hook endpoint. Otherwise (bare `fly`, `fly resume`) it is the
+**launcher**: it execs the Electron shell installed beside it with argv passed
+through (2026-08-27-001 KTD7), and prints help + exits 2 when no shell is
+there. `resume` is a launch-mode word, not a subcommand: the shell forwards it
+to the core it spawns (`fly core resume` → `lib.rs::resolve_launch_mode`),
+which consumes the clean-exit marker. Both roles share the same `fly_lib`
+crate, so a `fly notify` invocation inside a pane talks to whichever core is
+running.
 
 `fly automation <create|update|list|show|runs|pause|resume|run|delete>` (U9)
 manages cron-scheduled runs: read ops work anywhere (they read the store file
@@ -196,16 +197,16 @@ Plan:
 ### Backend modules (`core/src/`)
 - `pty/` — `PtyManager` registry + `Pane`: portable-pty, one read thread per
   pane, backpressure pause/resume (watermarks), ordered reap-on-exit.
-- `stream/` — `spawn_pane`, raw-byte PTY output over a Tauri `Channel`, and the
-  pane↔attention/focus wiring + Tauri commands. ("No transcoding" (KTD3) is
-  **lossless but not literal**: tauri 2.11.3 re-encodes a `Raw` chunk under
-  1024 bytes as a JSON number array in an `eval()` — exact bytes, ~3.4× wire
-  cost. See the foundation plan's 2026-07-28 KTD3 addendum.) `coalesce.rs`
+- `stream/` — `spawn_pane_with` (the pane lifecycle: token, attention
+  registration, automation linking, coalesced output, exit teardown), the
+  raw-byte PTY output path (KTD3 — untranscoded end to end over the control
+  socket's binary frames), `adopt_live_pane_with`, and the plain command
+  bodies the registry dispatches to (`write_input`, `set_visible_panes`,
+  `set_window_foreground`, `attach_pane_now`). `coalesce.rs`
   (performance-audit T1, landed 2026-08-04) batches PTY reads per pane before
-  the channel on a **visibility-aware deadline** — ~4 ms visible, ~250 ms
-  hidden (retuned by `set_visible_panes`), 64 KiB size trip — so interactive
-  repaints ride the ≥ 1 KiB raw path instead of one eval per read, and hidden
-  panes cost ~4 main-thread wakeups/s each under flood.
+  the sink on a **visibility-aware deadline** — ~4 ms visible, ~250 ms
+  hidden (retuned by `set_visible_panes`), 64 KiB size trip — so a flood
+  costs a few renderer wakeups per pane per second instead of one per read.
 - `state/` — the pure state machines (`lifecycle`, `attention`) + the output
   `activity` tracker + suppression policy (`policy.rs`) + per-pane `manager`.
 - `hooks/` — the authenticated socket **(the security boundary)**: `token`,
@@ -376,53 +377,46 @@ Plan:
   messaging depends on the webview roster publisher (runs when `feed.enabled`,
   the default, or the dashboard is open) but NOT on the feed listener port.
   Tests: `tests/peer_send.rs` + peer cases in `hook_auth`/`hook_ask`.
-- `backend.rs` — **the shell-agnostic backend builder** (Electron-shell
-  migration U3.5): `build_backend(seams)` constructs everything `lib.rs`'s
-  setup used to wire inline — the hook server's dispatch closure (the
-  attention pipeline's policy/notify/resume-capture/feed-bump step), the
-  ask/peer/automation/substrate handlers, the automations manager + sweep +
-  alert surfacing, and the feed listener — against two injected seams:
-  `events` (`app.emit` under Tauri; control-socket broadcast under `fly
-  core`) and `banner` (notification plugin vs `notify-send`). `lib.rs` setup
-  is now seam construction + `.manage()` of the returned `Backend` fields;
-  `fly core` boots the identical backend. Change backend wiring HERE, never
-  by re-inlining into a shell.
+- `backend.rs` — **the backend builder** (Electron-shell migration U3.5):
+  `build_backend(seams)` constructs the whole backend — the hook server's
+  dispatch closure (the attention pipeline's policy/notify/resume-capture/
+  feed-bump step), the ask/peer/automation/substrate handlers, the
+  automations manager + sweep + alert surfacing, and the feed listener —
+  against two injected seams: `events` (control-socket broadcast under `fly
+  core`; a recorder in tests) and `banner` (`notify::banner` → `notify-send`).
+  `fly core` boots it; `tests/backend_build.rs` boots it headless. Change
+  backend wiring HERE, never by inlining into a host.
 - `control/` — the core control socket (Electron-shell migration plan
   `2026-08-12-002`, U1): the transport the Electron shell uses to drive the
   headless fly backend (`fly core`). Same-uid peer-cred gate + never-steal
   bind (the `hooks/` discipline, reused), length-prefixed frames with
-  JSON-free pane-output/input kinds (kills the KTD3 eval quirk), request/
-  response/event envelopes whose `cmd`/`event` names are exactly the Tauri
-  seam's, plus the built-ins `core/ping` and `core/shutdown` (the shell's
-  ordered-quit trigger). Wire contract in `docs/core-protocol.md` — edited
-  only together with this module. `registry.rs` (U2/U3): **all 46** commands
-  ported name-identically over the real managers — where a Tauri command body
-  holds real logic it was extracted into a shared fn used by both shells
-  (`pty::pane_activity_snapshot`, `stream::attach_pane_now`,
-  `automations::{dashboard_snapshot,read_bundle_for}`,
-  `stream::attention_event_payload`) so they cannot drift. The pane
-  lifecycle is fully socket-served — `spawn_pane`'s body is the shared
-  `stream::spawn_pane_with` (`SpawnDeps` + per-pane `PaneByteSink`), output
-  rides the 0x02 binary frames, keystrokes ride 0x03 down (write +
-  attention-clear, `pty_write` parity), exits fan out as `pane://exit` via
-  the shared payload builders — and `adopt_live_pane` (renderer-crash
+  JSON-free pane-output/input kinds, request/response/event envelopes whose
+  `cmd`/`event` names are exactly what `src/ipc.ts` sends (pinned by
+  `tests/control_registry.rs`), plus the built-ins `core/ping` and
+  `core/shutdown` (the shell's ordered-quit trigger). Wire contract in
+  `docs/core-protocol.md` — edited only together with this module.
+  `registry.rs` is **the one command table** (2026-08-27-001 KTD3): a
+  dispatch table, not a home for logic — each arm parses its args and calls
+  a manager method or a plain fn in the owning module
+  (`stream::{write_input,set_visible_panes,set_window_foreground,
+  attach_pane_now,spawn_pane_with,adopt_live_pane_with}`,
+  `pty::pane_activity_snapshot`,
+  `automations::{dashboard_snapshot,read_bundle_for}`, …). Output rides the
+  0x02 binary frames, keystrokes ride 0x03 down (write + attention-clear),
+  exits fan out as `pane://exit`; `adopt_live_pane` (renderer-crash
   recovery, 2026-08-22) re-binds a reloaded renderer to the **live** pane
-  the core still owns for a leaf (`stream::adopt_live_pane_with`: same id,
-  token, attention; the pane's grid + 64 KiB tail returned, the xterm
-  sized to that grid before the replay), so an Electron renderer reload re-attaches instead of respawning
-  on either substrate — the Tauri arm of that command answers `None` (a
-  per-spawn `Channel` can't be re-bound); `fly core` resolves its flavor's launch mode
-  (consuming the clean-exit marker, KTD-G) and boots the **full** backend
-  through `backend::build_backend` — hook server (with the real dispatch),
-  automations + sweep, feed listener — so the complete command surface is
-  live headless. The shell itself (window, core spawn/adopt, single-instance
-  lock, socket bridge) shipped as U4–U7 in `electron/`; the Tauri shell
-  behaves identically through the same builder.
+  the core still owns for a leaf (same id, token, attention; the pane's grid
+  + 64 KiB tail returned, the xterm sized to that grid before the replay),
+  so a renderer reload re-attaches instead of respawning on either
+  substrate. `fly core` resolves its flavor's launch mode (consuming the
+  clean-exit marker, KTD-G) and boots the **full** backend through
+  `backend::build_backend`. The shell itself (window, core spawn/adopt,
+  single-instance lock, socket bridge) lives in `electron/`.
 - `config/` — the camelCase `config.json` store. **Sparse persistence** (since
   2026-08-18, `config/mod.rs::{sparse_value,prune_equal}`): the file records
   only divergences from `Config::default()` and preserves unknown keys, so
   don't expect (or write) a full dump on disk. Beyond the keys covered
-  elsewhere in this file (`substrate`, `mirrorUnfocused`, `terminal`,
+  elsewhere in this file (`substrate`, `terminal`,
   `fontSize`, `renderer`, `feed.*`, `automationDefaults.*`), `schema.rs` also
   holds: `leaderKey`, `attentionDebounceMs` (400), `nudgeIdleMs`,
   `notificationCoalesceThreshold`, `oscBelFallback`, `scrollbackLines`
@@ -435,16 +429,15 @@ Plan:
   the flag floor replayed when resuming an agent whose argv wasn't captured,
   so the permission posture isn't silently lost on resume; it means an
   uncaptured resume runs permission-free by design).
-- `notify/`, `cwd/` (via `/proc`), `lifecycle.rs` (ordered shutdown —
-  reap every pane, no zombies/orphans).
-- All Tauri commands are registered in the `invoke_handler!` in `lib.rs`; the
-  frontend's typed wrappers for them live in `src/ipc.ts` (except the
+- `notify/` (sanitize, the `notify-send` banner, chime, the opt-in
+  notification command), `cwd/` (via `/proc`); ordered shutdown is
+  `backend::ordered_shutdown` (reap every pane, no zombies/orphans).
+- The frontend's typed command wrappers live in `src/ipc.ts` (except the
   config/session ones, which live next to their models in `lib/config.ts` /
-  `lib/serialize.ts`, and `spawn_pane`, whose wrapper is `lib/transport.ts::
-  spawnPaneWithSink`). **A new command goes in THREE places**: the
-  `invoke_handler!`, the frontend wrapper, and `control/registry.rs` — a
-  command missing from the registry works in Tauri dev but is unreachable in
-  the packaged Electron app.
+  `lib/serialize.ts`, and `spawn_pane`/`adopt_live_pane`, whose wrappers are
+  in `lib/transport.ts`). **A new command goes in TWO places**: the frontend
+  wrapper and `control/registry.rs` (a plain fn in the owning module holds
+  any real logic — the registry only dispatches).
 
 ### Automations (`core/src/automations/`, cross-referenced U1–U12)
 Cron-scheduled runs that either run a `claude` agent (Agent mode) or a stored
@@ -701,7 +694,7 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   A record's `cwd` is the hook's **live** cwd, which drifts when the agent `cd`s
   away from its launch dir — but `claude --resume <id>` searches only the
   *launch* dir's project folder, so restore relocates it:
-  `transcript.rs::resolve_resume_spawn_cwd` (a Tauri command, probed in parallel
+  `transcript.rs::resolve_resume_spawn_cwd` (a command, probed in parallel
   per precise leaf) verifies the recorded cwd's project folder actually holds
   the transcript, else scans the projects root for the file and recovers the
   launch cwd from the transcript's own `cwd` entries (the folder name can't be
@@ -797,16 +790,16 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   named tabs; `lib/ControlBar.svelte` — slim top bar (sidebar toggle +
   breadcrumb + pane controls).
 - `lib/transport.ts` — **the frontend's one transport seam** (Electron-shell
-  migration U5): invoke/listen/pane-output-sink/window-close over either
-  shell — Tauri (`@tauri-apps/api`) or the Electron preload bridge
-  (`window.fly`), detected at runtime. `ipc.ts`, `lib/{config,serialize}.ts`,
+  migration U5): invoke/listen/pane-output-sink/window-close over the
+  Electron preload bridge (`window.fly`, required — resolved lazily with a
+  clear error in a bare browser tab). `ipc.ts`, `lib/{config,serialize}.ts`,
   `main.ts`, `Terminal.svelte`, and `App.svelte` all route through it; no
-  other file may import `@tauri-apps/api` directly. Bridge invokes JSON
-  round-trip their args (Svelte 5 `$state` proxies fail Electron's
-  structured clone; Tauri always JSON-serialized, so this preserves wire
-  semantics exactly). `adoptLivePaneWithSink` is the re-attach half of
-  renderer-crash recovery (Electron only — binds the sink to the existing
-  pane id, discarding pre-bind frames: capture-then-subscribe, loss over
+  other file may touch `window.fly`. Bridge invokes JSON round-trip their
+  args (Svelte 5 `$state` proxies fail Electron's structured clone; the
+  commands were written against JSON-serialized args — a source-lint test
+  pins the rule). `adoptLivePaneWithSink` is the re-attach half of
+  renderer-crash recovery (binds the sink to the existing pane id,
+  discarding pre-bind frames: capture-then-subscribe, loss over
   duplication); `Terminal.svelte` tries it before every non-automation,
   non-ephemeral spawn. The Electron shell itself lives in `electron/`
   (main + preload + JS frame codec, edited with `docs/core-protocol.md`;
@@ -867,7 +860,7 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   `fly-monitor-handoff` skill were removed from the tree 2026-08-27 (git
   history has them; the spike's results are in
   `docs/notes/2026-08-12-electron-engine-probe.md`).
-- Versioning: keep `package.json`, `core/Cargo.toml`,
-  `core/tauri.conf.json`, and `electron/package.json` on the SAME
-  version — the Electron deb ships the Rust binary, and `fly --version` /
+- Versioning: keep `package.json`, `core/Cargo.toml`, and
+  `electron/package.json` on the SAME version — `src/version-lockstep.test.ts`
+  fails otherwise. The deb ships the Rust binary: `fly --version` /
   `core/ping` report the crate version while dpkg reports the deb's.

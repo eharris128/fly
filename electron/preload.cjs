@@ -19,7 +19,7 @@ ipcRenderer.on('fly:close-request', () => {
 });
 
 contextBridge.exposeInMainWorld('fly', {
-  /** invoke(cmd, args) — the KTD1 command surface, exact Tauri names/shapes. */
+  /** invoke(cmd, args) — the KTD1 command surface: the names/shapes `control/registry.rs` pins. */
   invoke: (cmd, args) => ipcRenderer.invoke('fly:invoke', cmd, args),
   /** Subscribe to backend events (`pane://…`, `automation://…`, …). */
   onEvent: (cb) => {

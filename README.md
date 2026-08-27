@@ -5,11 +5,11 @@ and splits (one agent per pane), and an attention indicator plus OS notification
 the moment an agent needs you. v1 wires **Claude Code** as the attention source.
 
 **Stack:** Rust backend (`fly core`, a headless process serving a Unix control
-socket) · [Electron](https://electronjs.org) shell (the shipped desktop window
-since the 2026-08-12 cutover) · [Svelte 5](https://svelte.dev) (Vite /
-TypeScript frontend) · [xterm.js](https://xtermjs.org) terminal panes. The
-[Tauri v2](https://tauri.app) shell that preceded the cutover is kept buildable
-as the rollback path.
+socket) · [Electron](https://electronjs.org) shell (the desktop window) ·
+[Svelte 5](https://svelte.dev) (Vite / TypeScript frontend) ·
+[xterm.js](https://xtermjs.org) terminal panes. **Linux only.** (The Tauri
+shell fly started on, and its best-effort macOS build, were retired on
+2026-08-27 — tag `tauri-shell-final` if you ever need them.)
 
 > The full design lives in [`docs/plans/`](docs/plans/README.md) (indexed by ID);
 > the primary contributor guide is [`CLAUDE.md`](CLAUDE.md). This README is the
@@ -123,10 +123,9 @@ spawns (or adopts) a headless `fly core` backend and talks to it over a
 same-uid Unix control socket (`docs/core-protocol.md`). Build and package it:
 
 ```bash
-pnpm install                     # frontend deps
-pnpm build                       # Vite frontend → dist/
-cargo build --release --offline --manifest-path core/Cargo.toml   # the fly binary
-(cd electron && npm install && npm run dist)   # → electron/dist-el/fly-electron-shell_<ver>_amd64.deb
+pnpm install     # every JS dep — frontend and shell (one pnpm workspace)
+pnpm build:deb   # vite build → cargo build --release → electron-builder
+                 # → electron/dist-el/fly-electron-shell_<ver>_amd64.deb
 ```
 
 Install the built `.deb` (`sudo apt install ./fly-electron-shell_<ver>_amd64.deb`;
@@ -137,22 +136,6 @@ to install the Claude Code hooks (attention + the `SessionStart` capture hook);
 
 For the Electron dev loop and running a dev build **alongside** the installed
 release (isolated state under `FLY_APP_NAME`), see `CLAUDE.md` → Commands.
-
-### The Tauri shell (rollback path)
-
-The pre-cutover Tauri shell is kept buildable as the rollback. System deps
-(WebKitGTK on Ubuntu):
-
-```bash
-sudo apt install libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev \
-  libayatana-appindicator3-dev librsvg2-dev patchelf
-```
-
-```bash
-pnpm tauri dev                   # run the Tauri app (Vite dev server + cargo run)
-pnpm tauri build --bundles deb   # rollback .deb → core/target/release/bundle/deb/
-pnpm flavor:dev                  # Tauri dev build beside an installed release
-```
 
 ## Testing
 
@@ -169,15 +152,16 @@ cargo test --offline --manifest-path core/Cargo.toml         # Rust (state machi
   `CLAUDE.md`), `session/` (layout + resume/handoff/attribution), `automations/`
   (incl. monitors + the headless check runner), `feed/` (the loopback HTTP
   surface), `peer/` (agent-to-agent messaging), `substrate/` (the tmux session
-  substrate), `control/` (the `fly core` control socket), `backend.rs` (the
-  shell-agnostic backend builder both shells boot through), `usage/`, `cli/`.
+  substrate), `control/` (the `fly core` control socket + the one command
+  table, `registry.rs`), `backend.rs` (the backend builder `fly core` boots
+  through), `usage/`, `cli/`.
 - `electron/` — the shipped Electron shell: main process, preload bridge, and
   the JS half of the control-socket frame codec (`protocol.js`), plus the
   `.deb` packaging (`deb/`).
 - `src/` — Svelte frontend: `App.svelte` orchestrator, pure view-models
   (`lib/layout.ts`, `lib/home.ts`, `lib/session-picker.ts`, …), the
   `Terminal.svelte` xterm leaf, and `lib/transport.ts` — the one seam that
-  speaks either shell (Tauri IPC or the Electron preload bridge).
+  speaks to the shell (the Electron preload bridge, `window.fly`).
 - `docs/plans/` — the full design, cross-referenced to the code by ID
   (`KTD<n>` / `R<n>` / `U<n>`); `docs/notes/` — one-off evaluations and
   live-check records; `docs/core-protocol.md` — the control-socket wire
@@ -185,8 +169,9 @@ cargo test --offline --manifest-path core/Cargo.toml         # Rust (state machi
 
 ## The CLI
 
-The same binary is the desktop app, the headless backend (**`fly core`** — what
-the Electron shell spawns and drives), and the `fly` CLI. Inside a pane, `fly
+The same binary is the `fly` CLI, the headless backend (**`fly core`** — what
+the Electron shell spawns and drives), and — run bare, or as `fly resume` —
+the launcher that execs the installed desktop shell. Inside a pane, `fly
 notify` talks to the running app; `fly hooks setup|teardown` manages the Claude
 Code hooks; `fly substrate-event` is the tmux-hook endpoint (not for human
 use); `fly automation

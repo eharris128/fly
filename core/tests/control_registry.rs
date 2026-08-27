@@ -133,7 +133,7 @@ fn config_roundtrips_through_the_store() {
 #[test]
 fn unknown_panes_answer_gracefully_with_camel_case_args() {
     let mut r = rig();
-    // Accessors: null-ish, never an error (the Tauri behavior).
+    // Accessors: null-ish, never an error (the pre-socket command behavior).
     let v = call(&mut r, 1, "pane_cwd", serde_json::json!({"paneId": 999}));
     assert!(v["ok"].is_null());
     let v = call(&mut r, 2, "pane_activity", serde_json::json!({"paneId": 999}));
@@ -252,7 +252,7 @@ fn u35_commands_name_their_unit_and_unknown_cmds_err() {
 }
 
 #[test]
-fn get_launch_mode_serializes_like_the_tauri_command() {
+fn get_launch_mode_serializes_lowercase() {
     let mut r = rig();
     let v = call(&mut r, 1, "get_launch_mode", serde_json::Value::Null);
     assert_eq!(v["ok"], "normal"); // LaunchMode's lowercase serde shape
