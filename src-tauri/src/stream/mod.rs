@@ -1,21 +1,21 @@
 //! Output streaming + the pane↔attention wiring.
 //!
-//! Bridges a pane's PTY read thread to the frontend over a raw-byte Channel
-//! (KTD3), and connects panes to the authenticated hook channel: each pane gets
-//! a token (injected into its env), is registered with the attention manager,
-//! and is cleaned up on exit.
+//! Bridges a pane's PTY read thread to the shell over a raw-byte sink (KTD3 —
+//! under `fly core` the control socket's binary pane-output frames), and
+//! connects panes to the authenticated hook channel: each pane gets a token
+//! (injected into its env), is registered with the attention manager, and is
+//! cleaned up on exit. The command bodies here are plain fns the control
+//! registry dispatches to (`control::registry`, the one command surface).
 
 pub mod coalesce;
 
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{AppHandle, Emitter, Manager, State};
 
 use coalesce::{Coalescer, CoalescerRegistry};
 
-use crate::hooks::{HookServer, TokenRegistry};
+use crate::hooks::TokenRegistry;
 use crate::pty::{PaneId, PtyManager, SpawnConfig};
 use crate::state::attention::{AttentionState, Outcome, Reason, Tier};
 use crate::state::lifecycle::LifecycleState;
@@ -47,9 +47,7 @@ pub fn pane_exit_payload(pane_id: u64, state: LifecycleState) -> serde_json::Val
 }
 
 /// The `pane://attention` payload as a JSON value — the one place the event
-/// shape is built, shared by the Tauri emit below and the control-socket
-/// registry (Electron-shell migration U2/KTD1), so the two shells cannot
-/// drift.
+/// shape is built (Electron-shell migration U2/KTD1).
 pub fn attention_event_payload(pane: PaneId, outcome: &Outcome) -> serde_json::Value {
     serde_json::to_value(AttentionEvent {
         pane_id: pane.0,
@@ -58,11 +56,6 @@ pub fn attention_event_payload(pane: PaneId, outcome: &Outcome) -> serde_json::V
         tier: outcome.tier,
     })
     .expect("attention event serializes")
-}
-
-/// Emit an attention-state change to the frontend.
-pub fn emit_attention(app: &AppHandle, pane: PaneId, outcome: &Outcome) {
-    let _ = app.emit(PANE_ATTENTION_EVENT, attention_event_payload(pane, outcome));
 }
 
 /// The seed event for one recorded notification (KTD16): the backend is the
@@ -79,25 +72,6 @@ struct NotificationAddedEvent {
     body: Option<String>,
     ts: u64,
     read: bool,
-}
-
-/// Emit a recorded notification to the frontend. Title/body are already
-/// sanitized (R16/R24) by the caller.
-#[allow(clippy::too_many_arguments)]
-pub fn emit_notification_added(
-    app: &AppHandle,
-    id: u64,
-    pane: PaneId,
-    reason: Reason,
-    title: Option<String>,
-    body: Option<String>,
-    ts: u64,
-    read: bool,
-) {
-    let _ = app.emit(
-        NOTIFICATION_ADDED_EVENT,
-        notification_added_payload(id, pane, reason, title, body, ts, read),
-    );
 }
 
 /// The `notification://added` payload as a JSON value — one place, both
@@ -124,83 +98,19 @@ pub fn notification_added_payload(
     .expect("notification event serializes")
 }
 
-/// Spawn a pane: reserve its id, issue + inject its auth token, register it for
-/// attention, stream raw output over `channel`, and clean everything up on exit.
-///
-/// U7: `automation_run_id` threads the run id for atomically linking run↔pane
-/// (R10) — if supplied, the backend links the pane to the run before the child
-/// spawns, marking the pane in the recursion registry (R22).
-#[tauri::command]
-#[allow(clippy::too_many_arguments)] // a Tauri command surface — each arg is a wire field
-pub fn spawn_pane(
-    app: AppHandle,
-    pty: State<'_, Arc<PtyManager>>,
-    tokens: State<'_, Arc<TokenRegistry>>,
-    attention: State<'_, Arc<AttentionManager>>,
-    server: State<'_, HookServer>,
-    coalescers: State<'_, Arc<CoalescerRegistry>>,
-    channel: Channel<InvokeResponseBody>,
-    rows: u16,
-    cols: u16,
-    cwd: Option<String>,
-    leaf_key: String,
-    command: Option<Vec<String>>,
-    automation_run_id: Option<String>,
-    ephemeral: Option<bool>,
-) -> Result<PaneId, String> {
-    let events: EventSink = {
-        let app = app.clone();
-        Arc::new(move |name: &str, payload: serde_json::Value| {
-            let _ = app.emit(name, payload);
-        })
-    };
-    let deps = SpawnDeps {
-        pty: Arc::clone(pty.inner()),
-        tokens: Arc::clone(tokens.inner()),
-        attention: Arc::clone(attention.inner()),
-        coalescers: Arc::clone(coalescers.inner()),
-        automations: app
-            .try_state::<Arc<crate::automations::AutomationManager>>()
-            .map(|s| s.inner().clone()),
-        alerts: app
-            .try_state::<Arc<crate::automations::alerts::AlertsLog>>()
-            .map(|s| s.inner().clone()),
-        hook_socket_path: server.socket_path().to_string_lossy().into_owned(),
-        events,
-    };
-    let byte_sink: PaneByteSink = Box::new(move |_id, bytes: Vec<u8>| {
-        let _ = channel.send(InvokeResponseBody::Raw(bytes));
-    });
-    spawn_pane_with(
-        &deps,
-        SpawnRequest {
-            rows,
-            cols,
-            cwd,
-            leaf_key,
-            command,
-            automation_run_id,
-            ephemeral,
-        },
-        byte_sink,
-    )
-}
-
-/// Where a shell-agnostic spawn sends its events (`pane://…` names). The Tauri
-/// wrapper wraps `app.emit`; the control registry wraps server broadcast
-/// (Electron-shell migration U3) — canonical alias re-exported by
-/// `control::registry`.
+/// Where a spawn sends its events (`pane://…` names): `fly core` wraps
+/// `ControlServer::broadcast_event` (Electron-shell migration U3), tests
+/// record — canonical alias re-exported by `control::registry`.
 pub type EventSink = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
-/// Per-pane raw-output sink, called `(paneId, bytes)`: the Tauri wrapper
-/// feeds its per-pane `Channel` (id ignored — the channel IS the pane), the
-/// control registry feeds `broadcast_pane_output` binary frames (KTD3),
-/// which need the id on every frame.
+/// Per-pane raw-output sink, called `(paneId, bytes)`: the control registry
+/// feeds `broadcast_pane_output` binary frames (KTD3), which need the id on
+/// every frame.
 pub type PaneByteSink = Box<dyn Fn(u64, Vec<u8>) + Send + Sync + 'static>;
 
-/// Everything [`spawn_pane_with`] needs from its shell — the managers both
-/// shells share, the optional automation subsystems (absent in a U3 core),
-/// the hook-socket path injected into pane env, and the event sink.
+/// Everything [`spawn_pane_with`] needs from its host — the shared managers,
+/// the optional automation subsystems (absent in a U3 core), the hook-socket
+/// path injected into pane env, and the event sink.
 pub struct SpawnDeps {
     pub pty: Arc<PtyManager>,
     pub tokens: Arc<TokenRegistry>,
@@ -223,10 +133,9 @@ pub struct SpawnRequest {
     pub ephemeral: Option<bool>,
 }
 
-/// The body behind [`spawn_pane`], shared with the control-socket registry
-/// (Electron-shell migration U3) so pane lifecycle — token adopt/issue,
-/// attention registration, automation linking, coalesced output, ordered
-/// exit teardown — is identical under either shell.
+/// The `spawn_pane` command body (Electron-shell migration U3): pane
+/// lifecycle — token adopt/issue, attention registration, automation linking,
+/// coalesced output, ordered exit teardown — in one place.
 pub fn spawn_pane_with(
     deps: &SpawnDeps,
     req: SpawnRequest,
@@ -293,12 +202,9 @@ pub fn spawn_pane_with(
 
     let socket_path = hook_socket_path.clone();
 
-    // Raw bytes end-to-end (KTD3) — lossless, but only literally untranscoded
-    // above 1 KiB: Tauri 2.11.3 (`ipc/channel.rs:163`) re-encodes a `Raw`
-    // chunk **< 1024 bytes** as a JSON number array inside an `eval()` (~3.4×
-    // wire cost, exact bytes), and interactive repaints are exactly many
-    // sub-1 KiB reads. The per-pane coalescer (T1 of the 2026-07-23
-    // performance audit — see `coalesce.rs`) batches reads on a
+    // Raw bytes end-to-end (KTD3): the control socket's binary pane-output
+    // frames carry them untranscoded. The per-pane coalescer (T1 of the
+    // 2026-07-23 performance audit — see `coalesce.rs`) batches reads on a
     // visibility-aware deadline before they hit the channel, so most traffic
     // rides the ≥ 1 KiB raw path and the webview sees a few messages per pane
     // per second instead of one per PTY read. One forwarder per pane, one
@@ -449,34 +355,11 @@ pub fn adopt_live_pane_with(
     })
 }
 
-/// Registered for command-surface parity (a command lives in THREE places)
-/// but answers `None` under Tauri: this shell threads a per-pane `Channel`
-/// through `spawn_pane` and bakes it into the pane's coalescer, so a
-/// pane's output can't be re-bound to a new webview. The Tauri webview is
-/// never reloaded in practice; a respawn there behaves exactly as before.
-/// The Electron registry arm is the real implementation
-/// ([`adopt_live_pane_with`]).
-#[tauri::command]
-pub fn adopt_live_pane(_leaf_key: String) -> Result<Option<AdoptedPane>, String> {
-    Ok(None)
-}
-
 /// U7 (tmux-substrate KTD6): open the focused pane's tmux session in a real
 /// terminal — the native-typing escape hatch. Refused for PTY-backed panes
 /// (nothing to attach). The terminal command is `config.terminal`; the argv
 /// shape is the tested `substrate::attach_command` table. Spawned detached:
-/// the terminal is the user's process, not fly's.
-#[tauri::command]
-pub fn attach_pane(
-    pty: State<'_, Arc<PtyManager>>,
-    config: State<'_, Arc<crate::config::ConfigStore>>,
-    pane_id: PaneId,
-) -> Result<(), String> {
-    attach_pane_now(&pty, &config, pane_id)
-}
-
-/// The body behind [`attach_pane`], shared with the control-socket registry
-/// (Electron-shell migration U2).
+/// the terminal is the user's process, not fly's. The `attach_pane` command.
 pub fn attach_pane_now(
     pty: &PtyManager,
     config: &crate::config::ConfigStore,
@@ -506,63 +389,46 @@ pub fn attach_pane_now(
 /// workspace (U17). Generalizes the old per-pane keyboard-focus replication:
 /// any visible pane counts as "looking" for the Acknowledged transition. Also
 /// retunes every pane's output-coalescing deadline (fast for visible panes,
-/// slow for hidden — see `coalesce.rs`).
-#[tauri::command]
+/// slow for hidden — see `coalesce.rs`). The `set_visible_panes` command body
+/// (2026-08-27-001 KTD3: the registry dispatches here, it holds no logic).
 pub fn set_visible_panes(
-    app: AppHandle,
-    attention: State<'_, Arc<AttentionManager>>,
-    coalescers: State<'_, Arc<CoalescerRegistry>>,
-    pane_ids: Vec<PaneId>,
+    attention: &AttentionManager,
+    coalescers: &CoalescerRegistry,
+    events: &EventSink,
+    pane_ids: &[PaneId],
 ) {
     let ids: Vec<u64> = pane_ids.iter().map(|p| p.0).collect();
     coalescers.set_visible_panes(&ids);
-    for (pane, outcome) in attention.set_visible_panes(&pane_ids) {
-        emit_attention(&app, pane, &outcome);
+    for (pane, outcome) in attention.set_visible_panes(pane_ids) {
+        events(PANE_ATTENTION_EVENT, attention_event_payload(pane, &outcome));
     }
 }
 
-/// Replicate the window foreground state to the backend (KTD8).
-#[tauri::command]
-pub fn set_window_foreground(
-    app: AppHandle,
-    attention: State<'_, Arc<AttentionManager>>,
-    foregrounded: bool,
-) {
+/// Replicate the window foreground state to the backend (KTD8). The
+/// `set_window_foreground` command body.
+pub fn set_window_foreground(attention: &AttentionManager, events: &EventSink, foregrounded: bool) {
     for (pane, outcome) in attention.set_foreground(foregrounded) {
-        emit_attention(&app, pane, &outcome);
+        events(PANE_ATTENTION_EVENT, attention_event_payload(pane, &outcome));
     }
 }
 
-/// Replicate whether the notification panel is open (a desktop/sound suppressor
-/// while foregrounded — KTD15). Affects only the policy, not attention state.
-#[tauri::command]
-pub fn set_panel_open(attention: State<'_, Arc<AttentionManager>>, open: bool) {
-    attention.set_panel_open(open);
-}
-
-/// Toggle global do-not-disturb (R17).
-#[tauri::command]
-pub fn set_muted(attention: State<'_, Arc<AttentionManager>>, muted: bool) {
-    attention.set_muted(muted);
-}
-
-/// Mute or unmute a single workspace (R18), scoped via the pane→workspace map.
-#[tauri::command]
-pub fn set_workspace_muted(
-    attention: State<'_, Arc<AttentionManager>>,
-    workspace: String,
-    muted: bool,
-) {
-    attention.set_workspace_muted(workspace, muted);
-}
-
-/// Record which workspace a pane belongs to, for per-workspace mute scoping.
-/// Pushed by the frontend once the pane's id is known (U17).
-#[tauri::command]
-pub fn set_pane_workspace(
-    attention: State<'_, Arc<AttentionManager>>,
+/// Write input to a pane and clear its attention — the `pty_write` command
+/// body (2026-08-27-001 KTD3). xterm.js `onData` yields a string whose UTF-8
+/// bytes (including control bytes like Ctrl-C `0x03`) are written verbatim;
+/// typing also clears the pane's attention (stage two of the two-stage
+/// clear). A full kernel PTY buffer can block the write, which is why the
+/// shell serializes writes per pane (`lib/write-chain.ts`, poll-batching
+/// KTD5/R5) and the control socket serves each connection on its own thread.
+pub fn write_input(
+    pty: &PtyManager,
+    attention: &AttentionManager,
+    events: &EventSink,
     pane_id: PaneId,
-    workspace: String,
-) {
-    attention.set_pane_workspace(pane_id, workspace);
+    data: &str,
+) -> Result<(), String> {
+    pty.write(pane_id, data.as_bytes())?;
+    if let Some(outcome) = attention.on_input(pane_id) {
+        events(PANE_ATTENTION_EVENT, attention_event_payload(pane_id, &outcome));
+    }
+    Ok(())
 }

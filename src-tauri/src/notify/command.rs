@@ -21,7 +21,7 @@
 //!   fixed allowlist pins "neither token reaches the command" so a future
 //!   refactor cannot silently arm the leak.
 //! - Concurrency is capped, and the child is reaped via `Child::wait` on a
-//!   short-lived thread (not process-global `SIGCHLD`, which Tauri/GTK may own).
+//!   short-lived thread (not process-global `SIGCHLD`, which a host may own).
 
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};

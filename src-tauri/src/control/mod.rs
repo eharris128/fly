@@ -9,7 +9,7 @@
 //! - [`frame`] — the length-prefixed binary framing (JSON / pane-output /
 //!   pane-input frames; KTD3's no-JSON byte path).
 //! - [`envelope`] — the JSON request/response/event envelopes (KTD1: command
-//!   and event names are exactly the Tauri seam's names).
+//!   and event names are exactly the names `src/ipc.ts` sends).
 //! - [`server`] — bind/accept/dispatch/broadcast; U2 registers the real
 //!   command table, U1 ships only `core/ping`.
 //!

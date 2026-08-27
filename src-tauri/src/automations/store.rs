@@ -3,7 +3,7 @@
 //!
 //! **The in-memory map is the authority; the file is a write-through mirror.**
 //! Writers span the sweep thread, per-connection socket threads, the hook
-//! dispatch path, and Tauri commands (KTD-B), so a `session/resume.rs`-style
+//! dispatch path, and control-socket commands (KTD-B), so a `session/resume.rs`-style
 //! file read-modify-write would lose updates — a claim flush racing a pause
 //! drops the pause. Instead [`Store`] holds a `Mutex<BTreeMap>` and every
 //! mutation runs under the lock and flushes the **full document** atomically

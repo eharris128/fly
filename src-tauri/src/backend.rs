@@ -1,20 +1,20 @@
-//! The shell-agnostic backend builder (Electron-shell migration U3.5).
+//! The backend builder (Electron-shell migration U3.5).
 //!
-//! Everything `lib.rs`'s Tauri setup used to wire inline — the hook server's
-//! dispatch (attention → policy → notify, resume capture, feed bumps), the
-//! ask/peer/automation/substrate handlers, the automations manager + sweep +
-//! alert surfacing, and the feed listener — is constructed HERE, against two
-//! injected seams:
+//! Everything the backend is — the hook server's dispatch (attention →
+//! policy → notify, resume capture, feed bumps), the ask/peer/automation/
+//! substrate handlers, the automations manager + sweep + alert surfacing,
+//! and the feed listener — is constructed HERE, against two injected seams:
 //!
 //! - [`BackendSeams::events`] — where `pane://…` / `automation://…` /
-//!   `notification://…` events land (`app.emit` under Tauri, control-socket
-//!   broadcast under `fly core`);
+//!   `notification://…` events land (control-socket broadcast under `fly
+//!   core`; a recorder in tests);
 //! - [`BackendSeams::banner`] — the desktop-notification surface
-//!   (`notify::banner` under Tauri; `notify-send` under `fly core`).
+//!   (`notify::banner` under `fly core`; a no-op in tests).
 //!
-//! The Tauri setup calls [`build_backend`] and `.manage()`s the returned
-//! pieces; `fly core` calls it and serves them over the control socket. One
-//! constructor, both shells — the wiring cannot drift (KTD1/KTD2).
+//! `fly core` calls [`build_backend`] and serves the pieces over the control
+//! socket; `tests/backend_build.rs` boots the same thing headless. One
+//! constructor, so the wiring cannot drift (KTD1/KTD2). Change backend
+//! wiring here, never by inlining into a host.
 
 use std::sync::Arc;
 
@@ -61,10 +61,10 @@ pub struct Backend {
 
 impl Backend {
     /// Ordered shutdown for a shell-less host (Electron-shell migration U6):
-    /// the exact `lifecycle::shutdown` sequence over this backend's own
-    /// pieces. `fly core` runs it on `core/shutdown` or SIGTERM/SIGINT, so an
-    /// Electron quit tears down like a Tauri quit — clean-exit marker written,
-    /// in-flight runs closed, substrate sessions detached (not killed).
+    /// the ordered sequence over this backend's own pieces. `fly core` runs
+    /// it on `core/shutdown` or SIGTERM/SIGINT, so an Electron quit tears
+    /// down in order — clean-exit marker written, in-flight runs closed,
+    /// substrate sessions detached (not killed).
     pub fn shutdown(&self) {
         ordered_shutdown(
             Some(&self.sweep),
@@ -76,11 +76,9 @@ impl Backend {
     }
 }
 
-/// The one ordered teardown both shells run (U6; the sequence and rationale
-/// moved verbatim from `lifecycle.rs`, which now delegates here so the order
-/// cannot drift between shells). Every piece is optional because the Tauri
-/// path resolves them by `try_state` and an early-exit boot may not have
-/// managed them all.
+/// The one ordered teardown (U6; the sequence and rationale moved verbatim
+/// from the original `lifecycle.rs`). Every piece is optional so an
+/// early-exit boot that never constructed them all can still run it.
 ///
 /// Order (each step's reason, from the original lifecycle doc):
 /// 1. Clean-exit marker BEFORE reaping (KTD-G): reaching this ordered path at
@@ -185,8 +183,8 @@ pub fn build_backend(seams: BackendSeams) -> Result<Backend, String> {
     // ---- automations subsystem (U4–U7 of its plan) --------------------------
     // Manager first (with the unwired placeholder dispatcher), runners next,
     // seams injected post-construction exactly as before. The changed-emitter
-    // both fans the event out and bumps the feed (replacing the Tauri-side
-    // `app.listen` bridge — same behavior, one hop fewer).
+    // both fans the event out and bumps the feed (one hop, no listener
+    // bridge).
     let changed_events = Arc::clone(&events);
     let feed_for_changed = Arc::clone(&feed_state);
     let automations_mgr = Arc::new(automations::AutomationManager::new(
@@ -334,7 +332,7 @@ pub fn build_backend(seams: BackendSeams) -> Result<Backend, String> {
     automations_mgr.set_usage_gate(Arc::new(move |now_ms: u64| usage_gate.defer_floor(now_ms)));
 
     // ---- the hook dispatch (the attention pipeline's step 4/5) --------------
-    // Verbatim behavior from the Tauri-era closure; `try_state` lookups are
+    // Verbatim behavior from the original inline closure; the pieces are
     // direct Arcs now that construction order allows it.
     let dispatch: hooks::Dispatch = {
         let attention = Arc::clone(&attention);

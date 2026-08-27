@@ -6,27 +6,25 @@ authors = ["Evan"]
 edition = "2021"
 rust-version = "1.77"
 
-# The library powers both the Tauri app and the `fly` CLI subcommands.
-# `rlib` lets integration tests and the binary link against it.
+# The library powers the `fly` CLI subcommands and the `fly core` headless
+# backend the Electron shell drives; `rlib` lets integration tests and the
+# binary link against it. (The Tauri shell that once needed staticlib/cdylib
+# was retired by docs/plans/2026-08-27-001 — its `libfly_lib.a` alone was
+# 870 MB of target dir.)
 [lib]
 name = "fly_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
+crate-type = ["rlib"]
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-notification = "2"
-tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Electron-shell migration U2: the control-socket registry runs the async
-# usage fetch on a local current-thread runtime (already in-tree via tauri).
-tokio = { version = "1", features = ["rt"] }
+# The one async runtime in a deliberately synchronous crate: the usage fetch
+# (`usage::block_on`, 2026-08-27-001 KTD5) — dashboard one-shot and the
+# automations usage gate — runs on a lazily-built, crate-owned runtime.
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 # Usage panel (dashboard) — calls Claude Code's own /api/oauth/usage endpoint.
-# reqwest is already in the tree via Tauri but built without TLS; `json` keeps
-# default features (incl. default-tls via system openssl, already a build dep).
+# default-tls (system openssl, already a runtime dep of the deb) is a
+# deliberate choice (2026-08-27-001 KTD6); rustls is a possible follow-up.
 reqwest = { version = "0.13", features = ["json"] }
 portable-pty = "0.9"
 # Automations (docs/plans/2026-07-01-002, KTD-A): croner is the 5-field cron
@@ -73,9 +71,9 @@ opt-level = "s"
 panic = "abort"
 strip = true
 
-# Fast local release bundle (`pnpm build:local`): thin LTO + parallel codegen
-# trade a few % binary size for a much shorter build. Shipping builds keep
-# the fat-LTO `release` profile above.
+# Fast local release build (`cargo build --profile release-dev`): thin LTO +
+# parallel codegen trade a few % binary size for a much shorter build.
+# Shipping builds keep the fat-LTO `release` profile above.
 #
 # Semantics DELIBERATELY diverge from `release` on one axis (audit-remediation
 # U3/KTD3): overflow-checks are ON here so local iteration catches silent

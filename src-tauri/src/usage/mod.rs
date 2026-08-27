@@ -187,7 +187,6 @@ fn snapshot_from_json(body: &str, plan: Option<String>) -> Result<UsageSnapshot,
 /// Returns `Err(message)` for any failure — not signed in, network error,
 /// non-2xx, unparseable — so the dashboard shows a one-line reason instead of a
 /// blank panel. Called on dashboard open only (KTD-C), never on a timer.
-#[tauri::command]
 pub async fn usage_snapshot() -> Result<UsageSnapshot, String> {
     fetch_snapshot(REQUEST_TIMEOUT).await
 }
@@ -230,6 +229,29 @@ pub(crate) async fn fetch_snapshot(timeout: Duration) -> Result<UsageSnapshot, S
         .await
         .map_err(|e| format!("couldn't read usage response: {e}"))?;
     snapshot_from_json(&body, plan)
+}
+
+/// The crate's one async runtime (2026-08-27-001 KTD5): lazily built, owned
+/// here because the usage fetch is the only async code in a deliberately
+/// synchronous crate. Multi-thread with a single worker so `block_on` can be
+/// called concurrently from the automations sweep thread (the gate) and a
+/// control-connection thread (the dashboard one-shot) without serializing
+/// one behind the other's timeout.
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("fly-usage-rt")
+            .enable_all()
+            .build()
+            .expect("usage runtime")
+    })
+}
+
+/// Run a future to completion on the crate runtime from a plain thread.
+pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    runtime().block_on(f)
 }
 
 #[cfg(test)]

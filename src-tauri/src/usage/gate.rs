@@ -81,8 +81,8 @@ pub fn defer_floor_ms(snap: &UsageSnapshot, now_ms: u64) -> Option<u64> {
 
 /// The impure shell: shared request core + TTL cache. Blocking by design —
 /// the sweep is a plain thread in a deliberately non-async crate, so the
-/// async core runs to completion on the app's async runtime
-/// (`tauri::async_runtime` initializes its own if the app hasn't yet).
+/// async core runs to completion on the crate's lazily-built runtime
+/// (`usage::block_on`, 2026-08-27-001 KTD5).
 pub struct OauthUsageGate {
     /// Last fetch outcome (`None` = it failed) and when it landed.
     cache: Mutex<Option<(Instant, Option<UsageSnapshot>)>>,
@@ -114,7 +114,7 @@ impl OauthUsageGate {
                 return snap.clone();
             }
         }
-        let fetched = tauri::async_runtime::block_on(fetch_snapshot(GATE_TIMEOUT)).ok();
+        let fetched = super::block_on(fetch_snapshot(GATE_TIMEOUT)).ok();
         *cache = Some((Instant::now(), fetched.clone()));
         fetched
     }
@@ -252,13 +252,16 @@ mod tests {
     }
 
     #[test]
-    fn block_on_initializes_a_runtime_off_the_app() {
+    fn block_on_initializes_the_crate_runtime_lazily() {
         // [`OauthUsageGate::snapshot`] blocks the sweep thread on
-        // `tauri::async_runtime` — which must lazily initialize its own
-        // runtime when no app has set one (tests; any pre-setup call). Probe
-        // exactly that mechanism, so the gate can't panic on a missing
-        // runtime. (The fetch itself stays untested here: it would hit the
-        // live endpoint with this box's real credentials.)
-        assert_eq!(tauri::async_runtime::block_on(async { 41 + 1 }), 42);
+        // `usage::block_on` — which must lazily build the crate runtime on
+        // first use from any plain thread, and serve a second thread
+        // concurrently. Probe exactly that mechanism, so the gate can't panic
+        // on a missing runtime. (The fetch itself stays untested here: it
+        // would hit the live endpoint with this box's real credentials.)
+        assert_eq!(crate::usage::block_on(async { 41 + 1 }), 42);
+        let t = std::thread::spawn(|| crate::usage::block_on(async { 2 + 2 }));
+        assert_eq!(crate::usage::block_on(async { 1 + 1 }), 2);
+        assert_eq!(t.join().unwrap(), 4);
     }
 }

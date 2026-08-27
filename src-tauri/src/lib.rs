@@ -1,7 +1,8 @@
 //! fly — a terminal for AI coding agents.
 //!
-//! This library backs both the desktop app and the `fly` CLI subcommands
-//! (KTD12); `main.rs` is a thin shim over [`run`].
+//! This library backs the `fly` CLI subcommands (KTD12) and the `fly core`
+//! headless backend the Electron shell drives; `main.rs` is a thin shim over
+//! [`run`].
 
 pub mod automations;
 pub mod backend;
@@ -11,7 +12,6 @@ pub mod control;
 pub mod cwd;
 pub mod feed;
 pub mod hooks;
-pub mod lifecycle;
 pub mod notify;
 pub mod peer;
 pub mod pty;
@@ -22,36 +22,9 @@ pub mod substrate;
 pub mod usage;
 
 use std::path::PathBuf;
-use std::sync::Arc;
-
-use tauri::{Emitter, Manager};
 
 use state::attention::{Reason, Signal, Tier};
 use state::AttentionManager;
-
-/// Apply Linux-specific webview workarounds before the webview initializes.
-///
-/// The WebKitGTK DMABUF renderer causes blank windows on Wayland/NVIDIA
-/// (KTD11). Disabling it is the documented fix, but it forces software
-/// compositing — and on non-NVIDIA GPUs (Intel/AMD) that adds visible
-/// per-keystroke render lag in the terminal panes for no benefit. So we only
-/// apply the workaround when the NVIDIA driver is actually loaded, and only
-/// when the user hasn't already chosen a value (it stays env-overridable).
-#[cfg(target_os = "linux")]
-fn apply_linux_webview_env() {
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() && nvidia_driver_active() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-    }
-}
-
-/// Whether the NVIDIA kernel driver is loaded (the only case where the DMABUF
-/// blank-window workaround is needed). On hybrid laptops rendering on the Intel
-/// iGPU these nodes are absent, so the webview keeps hardware compositing.
-#[cfg(target_os = "linux")]
-fn nvidia_driver_active() -> bool {
-    std::path::Path::new("/proc/driver/nvidia/version").exists()
-        || std::path::Path::new("/dev/nvidiactl").exists()
-}
 
 /// The per-flavor directory name used under the XDG config/data/runtime dirs.
 ///
@@ -77,9 +50,10 @@ pub fn app_dir_name() -> String {
 /// substrate sessions outlive the fly process, and their agents' hooks hold
 /// `FLY_SOCKET_PATH` in long-lived process env — a PID-keyed path (the
 /// pre-substrate scheme) would strand every surviving agent on restart.
-/// Same-flavor duplicate instances are prevented by the single-instance
-/// plugin; the bind path additionally refuses to unlink a socket that still
-/// answers (see `HookServer` — the ga-h9z lesson applied to our own socket).
+/// Same-flavor duplicate instances are prevented by the shell's single-
+/// instance lock and, independently, by the bind path refusing to unlink a
+/// socket that still answers (see `HookServer` — the ga-h9z lesson applied
+/// to our own socket).
 pub(crate) fn hook_socket_path() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -87,35 +61,13 @@ pub(crate) fn hook_socket_path() -> PathBuf {
     base.join(app_dir_name()).join("hook.sock")
 }
 
-/// Surface webview errors to the app's stderr. The webview console is
-/// otherwise invisible when running outside a browser devtools session, so the
-/// frontend forwards uncaught errors here.
-#[tauri::command]
-fn frontend_log(msg: String) {
-    eprintln!("[fly-webview] {msg}");
-}
-
-/// U6 (R18): ring a pane through the attention pipeline for an automation alert
-/// — the same seam the hook dispatch uses (`Signal { reason, tier }` →
-/// `emit_attention`), so an alert surfaces exactly like an agent raise. The
+/// U6 (R18): ring a pane through the attention pipeline for an automation
+/// alert — the same seam the hook dispatch uses (`Signal { reason, tier }` →
+/// the event sink), so an alert surfaces exactly like an agent raise. The
 /// attention manager's lock is independent of the automations store lock
 /// (KTD-B), so this is safe to call from the reaper thread's sink closure.
-fn raise_alert(app: &tauri::AppHandle, attention: &AttentionManager, pane_id: u64) {
-    let pane = pty::PaneId(pane_id);
-    if let Some(outcome) = attention.signal(
-        pane,
-        Signal {
-            reason: Reason::Alert,
-            tier: Tier::Cli,
-        },
-    ) {
-        stream::emit_attention(app, pane, &outcome);
-    }
-}
-
-/// Shell-agnostic twin of [`raise_alert`] (Electron-shell migration U3): the
-/// control registry's `register_alert_sink` rings through the same
-/// `Signal { Alert, Cli }` seam, emitting via its event sink.
+/// The control registry's `register_alert_sink` drains the pending backlog
+/// through here.
 pub(crate) fn raise_alert_with(
     events: &stream::EventSink,
     attention: &AttentionManager,
@@ -136,25 +88,9 @@ pub(crate) fn raise_alert_with(
     }
 }
 
-/// U6 command (R17): the frontend registers its "Automations" sink pane so
-/// queued and future alerts ring it. Draining the pending backlog raises one
-/// ring per alert that arrived before the pane existed (the attention debounce
-/// collapses a burst into a single visible ring, which is the intent).
-#[tauri::command]
-fn register_alert_sink(
-    app: tauri::AppHandle,
-    attention: tauri::State<'_, Arc<AttentionManager>>,
-    alerts: tauri::State<'_, Arc<automations::alerts::AlertsLog>>,
-    pane_id: u64,
-) {
-    for _ in alerts.register_sink(pane_id) {
-        raise_alert(&app, &attention, pane_id);
-    }
-}
-
 /// How the app was launched (U7, KTD-B/G), read once by the frontend at restore.
 /// `resume` is an app *launch mode*, not a CLI subcommand: it falls through the
-/// `is_cli_subcommand` check and launches a window like a bare `fly`.
+/// `is_cli_subcommand` check and launches the app like a bare `fly`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LaunchMode {
@@ -192,14 +128,11 @@ pub(crate) fn resolve_launch_mode(args: &[String]) -> LaunchMode {
     decide_launch_mode(resume_requested, prev_clean)
 }
 
-/// Command: the frontend reads how it was launched to decide whether to resume.
-#[tauri::command]
-fn get_launch_mode(mode: tauri::State<'_, LaunchMode>) -> LaunchMode {
-    *mode
-}
-
-/// Run the fly desktop application — or a `fly` CLI subcommand if argv selects
-/// one (KTD12).
+/// Run a `fly` CLI subcommand if argv selects one (KTD12); otherwise this is
+/// a bare `fly` / `fly resume` — the desktop launch, which the Electron shell
+/// owns (2026-08-27-001 KTD7: U3 wires the exec into the installed shell).
+/// Until then a bare `fly` prints the overview and exits 2 rather than
+/// pretending to open a window.
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(first) = args.get(1) {
@@ -207,134 +140,10 @@ pub fn run() {
             std::process::exit(cli::run(&args));
         }
     }
-
-    // `resume` falls through here (it launches a window, not a CLI subcommand).
-    // Resolve the launch mode and clear the clean-exit marker up front (KTD-B/G).
-    let launch_mode = resolve_launch_mode(&args);
-
-    #[cfg(target_os = "linux")]
-    apply_linux_webview_env();
-
-    tauri::Builder::default()
-        // single-instance must be registered first; a second launch focuses
-        // the existing window instead of corrupting the shared session state.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
-        }))
-        .plugin(tauri_plugin_notification::init())
-        .manage(launch_mode)
-        .setup(move |app| {
-            // A dev flavor (FLY_APP_NAME set) gets a distinct title so it's
-            // obvious which window is the throwaway dev build next to a stable
-            // install. The identifier (single-instance) + dirs are isolated
-            // separately; this is just the visible marker.
-            let flavor = app_dir_name();
-            if flavor != "fly" {
-                if let Some(win) = app.get_webview_window("main") {
-                    let suffix = flavor.strip_prefix("fly-").unwrap_or(&flavor);
-                    let _ = win.set_title(&format!("fly ({suffix})"));
-                }
-            }
-
-            // U3.5 (Electron-shell migration): the whole backend — managers,
-            // hook server + dispatch, automations subsystem, feed listener —
-            // is built by the shared `backend::build_backend`, against Tauri
-            // seams (events → app.emit, banner → the notification plugin),
-            // so this shell and `fly core` construct identically and cannot
-            // drift.
-            let events: stream::EventSink = {
-                let h = app.handle().clone();
-                Arc::new(move |name: &str, payload: serde_json::Value| {
-                    let _ = h.emit(name, payload);
-                })
-            };
-            let banner: Arc<dyn Fn(&str, &str) + Send + Sync> = {
-                let h = app.handle().clone();
-                Arc::new(move |title: &str, body: &str| notify::banner(&h, title, body))
-            };
-            let backend = backend::build_backend(backend::BackendSeams { events, banner })?;
-
-            // Manage exactly what the Tauri commands and lifecycle::shutdown
-            // resolve by type — the same set the inline wiring managed.
-            app.manage(backend.config);
-            app.manage(backend.pty);
-            app.manage(backend.tokens);
-            app.manage(backend.attention);
-            app.manage(backend.coalescers);
-            app.manage(backend.pending_signals);
-            app.manage(backend.ask_registry);
-            app.manage(backend.hook_server);
-            app.manage(backend.alerts);
-            app.manage(backend.script_runner);
-            app.manage(backend.automations);
-            app.manage(backend.sweep);
-            app.manage(backend.feed_state);
-            if let Some(feed_server) = backend.feed_server {
-                app.manage(feed_server);
-            }
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            frontend_log,
-            get_launch_mode,
-            config::get_config,
-            config::set_config,
-            stream::spawn_pane,
-            stream::adopt_live_pane,
-            stream::set_visible_panes,
-            stream::attach_pane,
-            stream::set_window_foreground,
-            stream::set_panel_open,
-            stream::set_muted,
-            stream::set_workspace_muted,
-            stream::set_pane_workspace,
-            pty::pty_write,
-            pty::pty_resize,
-            pty::close_pane,
-            pty::pty_pause,
-            pty::pty_resume,
-            pty::pane_cwd,
-            pty::pane_command,
-            pty::pane_session_id,
-            pty::pane_activity,
-            pty::panes_status,
-            session::save_session,
-            session::load_session,
-            session::save_scrollback,
-            session::load_scrollback,
-            session::resume::load_resume_records,
-            session::resume::save_resume_record,
-            session::resume::save_resume_session,
-            session::resume::save_session_pick,
-            session::resume::reset_pane_attribution,
-            session::resume::prune_resume_records,
-            session::transcript::continue_target,
-            session::transcript::qualifying_session_count,
-            session::transcript::resolve_resume_spawn_cwd,
-            session::handoff::resolve_handoff_target,
-            session::handoff::list_handoff_candidates,
-            usage::usage_snapshot,
-            automations::automations_frontend_ready,
-            automations::list_automations,
-            automations::delete_automation,
-            automations::monitor_pickup_check,
-            automations::read_monitor_bundle,
-            feed::publish_agent_feed,
-            register_alert_sink,
-        ])
-        .build(tauri::generate_context!())
-        .expect("error while building fly")
-        // Ordered teardown on quit: reap every pane (no zombies/orphans, R4).
-        .run(|app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                lifecycle::shutdown(app_handle);
-            }
-        });
+    eprintln!("{}", cli::top_level_help());
+    eprintln!("fly: the desktop app is launched by the Electron shell (fly-shell); this binary serves the CLI and `fly core`.");
+    std::process::exit(2);
 }
-
 
 /// monitor-handoff U4 (R11): flatten a qualified [`session::handoff::HandoffTarget`]
 /// into the [`automations::model::MonitorPointers`] stored on a monitor. The
@@ -766,12 +575,13 @@ pub fn dispatch_automation_op(
 /// `automation://agent-run` emission (headless-monitor-checks R1) — while an
 /// explicitly-paned agent automation keeps the pane path via the
 /// frontend-emitting [`automations::AgentDispatcher`]. The `agent` arm is
-/// `dyn` so the routing tests below can inject a recorder without a Tauri
-/// `AppHandle`.
+/// `dyn` so the routing tests below can inject a recorder without a live
+/// event sink.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn explicit_resume_always_resumes() {
@@ -857,7 +667,7 @@ mod tests {
     // ---- headless-monitor-checks U5: the CompositeDispatcher monitor fork ----
 
     /// A recording stand-in for the pane-path agent arm (the real
-    /// `AgentDispatcher` needs a Tauri `AppHandle`, which no unit test has —
+    /// `AgentDispatcher` needs a live event sink, which no unit test has —
     /// exactly why `CompositeDispatcher.agent` is `dyn`).
     #[derive(Default)]
     struct RecordingAgentArm {

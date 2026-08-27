@@ -115,7 +115,6 @@ pub fn resolve_target_now(leaf_key: &str, live_cwd: Option<&str>) -> Option<Hand
 /// file, or no real conversation turn (R4/R5; the `None` feeds the R6 notice).
 /// Reads the resume store at call time, never from a snapshot. `live_cwd` is
 /// the pane's current cwd, used only as the derivation fallback above.
-#[tauri::command]
 pub fn resolve_handoff_target(
     leaf_key: String,
     live_cwd: Option<String>,
@@ -204,7 +203,6 @@ pub fn list_candidates_in_root(
 /// Command: the cwd's qualifying sessions for the pick-list (U5; R6/R7/R11),
 /// last-activity first, aged-out targets included. An empty vec drives the
 /// existing "no previous session" notice — never an empty picker (R11).
-#[tauri::command]
 pub fn list_handoff_candidates(
     leaf_key: String,
     live_cwd: Option<String>,

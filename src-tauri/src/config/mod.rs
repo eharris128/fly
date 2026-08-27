@@ -215,25 +215,6 @@ fn mint_feed_token() -> String {
     s
 }
 
-/// Command: the frontend reads settings (leader key, renderer, …) from here.
-#[tauri::command]
-pub fn get_config(store: tauri::State<'_, std::sync::Arc<ConfigStore>>) -> Config {
-    store.get()
-}
-
-/// Command: the settings menu writes settings back here. Persists atomically and
-/// updates the live config so subsequent [`get_config`] calls (and the running
-/// app) observe the change without a restart. Returns the stored config so the
-/// frontend cache can sync to exactly what landed on disk.
-#[tauri::command]
-pub fn set_config(
-    store: tauri::State<'_, std::sync::Arc<ConfigStore>>,
-    config: Config,
-) -> Result<Config, String> {
-    store.set(config.clone())?;
-    Ok(config)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

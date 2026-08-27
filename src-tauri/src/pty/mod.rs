@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -36,12 +36,13 @@ pub struct PaneActivitySnapshot {
 }
 
 /// Raw PTY output sink. The read thread calls this for each chunk of bytes.
-/// U3 wires a `tauri::ipc::Channel`; tests wire an mpsc sender.
+/// `stream` wires the shell's byte sink through the coalescer; tests wire an
+/// mpsc sender.
 pub type OutputSink = Box<dyn FnMut(&[u8]) + Send>;
 
 /// Called once by the read thread after the child is reaped, with the pane's
-/// final lifecycle state. U3 wires this to a Tauri event so the frontend can
-/// surface the exit; tests pass a no-op.
+/// final lifecycle state. `stream` wires this to the `pane://exit` event so
+/// the frontend can surface the exit; tests pass a no-op.
 pub type ExitCallback = Box<dyn FnOnce(PaneId, LifecycleState) + Send>;
 
 /// How to spawn a pane's shell.
@@ -604,115 +605,6 @@ fn no_such(id: PaneId) -> String {
     format!("no such pane: {}", id.0)
 }
 
-// ---- Tauri command surface -------------------------------------------------
-// Thin wrappers over `PtyManager`. `spawn_pane` (which needs an `ipc::Channel`
-// for output) lands in U3; these control-plane commands are independent of it.
-
-/// Write input to a pane. xterm.js `onData` yields a string whose UTF-8 bytes
-/// (including control bytes like Ctrl-C `0x03`) are written verbatim. Typing
-/// also clears the pane's attention (stage two of the two-stage clear).
-///
-/// Async (poll-batching plan KTD5/R4): as a sync command this ran on the GTK
-/// main thread, so every keystroke queued behind whatever main-thread work was
-/// in flight — measured at 200–300 ms poll-storm bursts before the batching
-/// plan. The PTY write runs under `spawn_blocking` because a full kernel PTY
-/// buffer can block the write. Two async invokes may complete out of order
-/// across tokio workers, so **write ordering is the caller's job**: the
-/// `ipc.ts::ptyWrite` wrapper serializes writes per pane (KTD5/R5) — do not
-/// call this command concurrently for one pane from new code paths.
-#[tauri::command]
-pub async fn pty_write(
-    app: tauri::AppHandle,
-    manager: tauri::State<'_, Arc<PtyManager>>,
-    attention: tauri::State<'_, Arc<crate::state::AttentionManager>>,
-    pane_id: PaneId,
-    data: String,
-) -> Result<(), String> {
-    let m = Arc::clone(manager.inner());
-    tauri::async_runtime::spawn_blocking(move || m.write(pane_id, data.as_bytes()))
-        .await
-        .map_err(|e| format!("pty_write: {e}"))??;
-    // Attention clear + emit are thread-safe (they run from hook dispatch
-    // threads today), so staying off the main thread here is fine.
-    if let Some(outcome) = attention.on_input(pane_id) {
-        crate::stream::emit_attention(&app, pane_id, &outcome);
-    }
-    Ok(())
-}
-
-/// Resize a pane's PTY to the given grid.
-#[tauri::command]
-pub fn pty_resize(
-    manager: tauri::State<'_, Arc<PtyManager>>,
-    pane_id: PaneId,
-    rows: u16,
-    cols: u16,
-) -> Result<(), String> {
-    manager.resize(pane_id, rows, cols)
-}
-
-/// Close a pane and reap its child.
-#[tauri::command]
-pub fn close_pane(
-    manager: tauri::State<'_, Arc<PtyManager>>,
-    pane_id: PaneId,
-) -> Result<(), String> {
-    manager.close(pane_id)
-}
-
-/// Pause a pane's output (frontend flow control, KTD4): called when unacked
-/// bytes exceed the high watermark.
-#[tauri::command]
-pub fn pty_pause(
-    manager: tauri::State<'_, Arc<PtyManager>>,
-    pane_id: PaneId,
-) -> Result<(), String> {
-    manager.pause(pane_id)
-}
-
-/// Resume a paused pane when unacked bytes drain below the low watermark.
-#[tauri::command]
-pub fn pty_resume(
-    manager: tauri::State<'_, Arc<PtyManager>>,
-    pane_id: PaneId,
-) -> Result<(), String> {
-    manager.resume(pane_id)
-}
-
-/// The pane's live working directory, for session restore (U10, R13).
-#[tauri::command]
-pub fn pane_cwd(
-    manager: tauri::State<'_, Arc<PtyManager>>,
-    pane_id: PaneId,
-) -> Option<String> {
-    manager.cwd(pane_id).map(|p| p.to_string_lossy().into_owned())
-}
-
-/// The pane's foreground argv when it is a Claude agent, else `None` (U4). The
-/// always-on cwd poll reads this to capture each agent's launch flags
-/// write-through into the resume store; a bare shell or gone pane yields `None`,
-/// so a non-agent's argv is never persisted.
-#[tauri::command]
-pub fn pane_command(
-    manager: tauri::State<'_, Arc<PtyManager>>,
-    pane_id: PaneId,
-) -> Option<Vec<String>> {
-    manager.pane_command(pane_id)
-}
-
-/// The pane's active Claude `session_id` from the transcript store, else `None`
-/// (fix-resume-session-selection U1). The always-on poll reads this to capture
-/// each agent's precise session id write-through into the resume store —
-/// hook-independent, so it works under installed-binary version skew (KTD-A). A
-/// bare shell or gone pane yields `None`, so a non-agent never gets an id.
-#[tauri::command]
-pub fn pane_session_id(
-    manager: tauri::State<'_, Arc<PtyManager>>,
-    pane_id: PaneId,
-) -> Option<String> {
-    manager.pane_session_id(pane_id)
-}
-
 /// The agent dashboard payload for one pane (U4; running-state U3): whether it is
 /// a Claude Code agent, its current work stretch and last-output age, and the
 /// count of live background task groups beneath it. `working_for_ms` is `None`
@@ -731,7 +623,10 @@ pub struct PaneActivity {
 /// union of `pane_cwd` + `pane_command` + `pane_session_id` + `pane_activity`,
 /// with each field keeping its per-pane command's exact semantics (agent-only
 /// `argv`/`session_id`, null timings for a non-agent, empty status for a gone
-/// pane). This shape crosses the IPC boundary to `ipc.ts::panesStatus`.
+/// pane). This shape crosses the control socket to `ipc.ts::panesStatus`;
+/// the `panes_status` command is one batched call per poll tick (KTD1/KTD2 —
+/// it replaced a 3–4-invokes-per-pane fan-out), served off the connection
+/// thread so its `/proc` walks never stall input.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneStatus {
@@ -762,42 +657,13 @@ impl PaneStatus {
     }
 }
 
-/// Batched per-tick pane status (poll-batching plan U1, KTD1/KTD2): **one**
-/// invoke per poll tick replaces the per-pane
-/// `pane_cwd`/`pane_command`/`pane_session_id`/`pane_activity` fan-out (~3–4 ×
-/// pane count). Async deliberately: sync commands run on the GTK main thread,
-/// where this poll's `/proc` walks and project-dir scans were measured stalling
-/// input 200–300 ms every tick (`docs/notes/2026-08-08-typing-latency-diagnosis.md`);
-/// the blocking work runs under `spawn_blocking` so it also never ties up the
-/// shared tokio pool (KTD2). The per-pane commands stay registered for one-off
-/// probes (spawn, on-close persist), but no repeating poller calls them (R1).
-#[tauri::command]
-pub async fn panes_status(
-    manager: tauri::State<'_, Arc<PtyManager>>,
-    pane_ids: Vec<PaneId>,
-) -> Result<Vec<PaneStatus>, String> {
-    let manager = Arc::clone(manager.inner());
-    tauri::async_runtime::spawn_blocking(move || manager.panes_status(&pane_ids))
-        .await
-        .map_err(|e| format!("panes_status: {e}"))
-}
-
-/// Per-pane agent state for the dashboard poll. Composes `/proc` agent detection
-/// (U2) and the background-task-group count (running-state U3) — both from a
-/// single `foreground_pid` resolution via [`agent_task_count`](PtyManager::agent_task_count) —
-/// with the output-activity snapshot (U3 of the dashboard plan). A non-agent or
-/// gone pane reports `is_agent: false`, null timings, and `live_task_count: 0` —
+/// Per-pane agent state for the dashboard poll — the `pane_activity` command
+/// body. Composes `/proc` agent detection (U2) and the background-task-group
+/// count (running-state U3) — both from a single `foreground_pid` resolution
+/// via [`agent_task_count`](PtyManager::agent_task_count) — with the
+/// output-activity snapshot (U3 of the dashboard plan). A non-agent or gone
+/// pane reports `is_agent: false`, null timings, and `live_task_count: 0` —
 /// never a panic.
-#[tauri::command]
-pub fn pane_activity(
-    manager: tauri::State<'_, Arc<PtyManager>>,
-    pane_id: PaneId,
-) -> PaneActivity {
-    pane_activity_snapshot(&manager, pane_id)
-}
-
-/// The body behind [`pane_activity`], shared with the control-socket registry
-/// (Electron-shell migration U2) so both shells compose the same snapshot.
 pub fn pane_activity_snapshot(manager: &PtyManager, pane_id: PaneId) -> PaneActivity {
     // One foreground-pid resolution gates agent-ness and roots the task count.
     let Some(live_task_count) = manager.agent_task_count(pane_id) else {

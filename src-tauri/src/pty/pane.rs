@@ -31,8 +31,8 @@ use crate::state::lifecycle::LifecycleState;
 /// below this — a single 1 MiB `write()` into the slave came back as reads of
 /// median 2048 and max 8193 bytes, so 64 KiB never fills and an 8 KiB buffer
 /// would behave identically. The size is harmless headroom, not the source of
-/// the coalescing. What matters downstream is that flood reads stay ≥ 1 KiB,
-/// which keeps them on Tauri's raw channel path (see `stream/mod.rs`).
+/// the coalescing — the per-pane coalescer in `stream/coalesce.rs` batches
+/// these reads before they hit the wire.
 const READ_BUF: usize = 64 * 1024;
 /// How long to wait after SIGHUP before escalating to SIGKILL on close.
 const GRACE: Duration = Duration::from_millis(200);

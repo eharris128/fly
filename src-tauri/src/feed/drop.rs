@@ -7,7 +7,7 @@
 //! (`DropStore`, U2), and the exact text the agent sees (`compose_drop_prompt`,
 //! U3). The route that drives it lives in `server.rs` (U6).
 //!
-//! Everything here is pure or filesystem-only — no Tauri, no PTY, no HTTP — so
+//! Everything here is pure or filesystem-only — no shell, no PTY, no HTTP — so
 //! it is unit-testable without a running app.
 
 use std::fmt;

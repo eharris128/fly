@@ -1,17 +1,15 @@
-//! The ported command table (Electron-shell migration U2): every Tauri
-//! command that doesn't need the display shell itself, registered under its
-//! **exact** Tauri name with its exact camelCase argument keys (KTD1 — the
-//! wire shapes are the same ones `src/ipc.ts` already sends). Each entry is
-//! the same delegation the `#[tauri::command]` wrapper makes, over the same
-//! shared managers, so the two shells cannot diverge in behavior — where a
-//! command's body holds real logic (e.g. `pty_write`'s attention clear), the
-//! logic lives in a shared fn or manager method used by both.
+//! **The** command table (Electron-shell migration U2; the sole surface
+//! since the Tauri shell's retirement, 2026-08-27-001): every command the
+//! frontend invokes, registered under the exact name and camelCase argument
+//! keys `src/ipc.ts` sends (KTD1 — `tests/control_registry.rs` pins them; a
+//! rename is a wire change). This file is a dispatch table, not a home for
+//! logic (2026-08-27-001 KTD3): each arm parses its args and calls a manager
+//! method or a plain fn in the owning module — `stream::write_input`,
+//! `stream::set_visible_panes`, `automations::dashboard_snapshot`, … — so
+//! behavior is testable without the socket.
 //!
-//! All 46 Tauri commands are here — U3 ported the last event/stream-coupled
-//! ones: `spawn_pane` runs the shared `stream::spawn_pane_with` against a
-//! per-pane `PaneByteSink`, `register_alert_sink` registers over the injected
-//! event seam instead of an app handle, and `get_launch_mode` resolves the
-//! flavor's launch mode (consuming the clean-exit marker) headless.
+//! A new command goes in TWO places: the frontend wrapper (`src/ipc.ts` or
+//! the lib/ model next to it) and here.
 
 use std::sync::Arc;
 
@@ -26,9 +24,7 @@ use crate::hooks::TokenRegistry;
 use crate::pty::{PaneId, PtyManager};
 use crate::state::AttentionManager;
 use crate::stream::coalesce::CoalescerRegistry;
-use crate::stream::{
-    attention_event_payload, spawn_pane_with, SpawnDeps, SpawnRequest, PANE_ATTENTION_EVENT,
-};
+use crate::stream::{spawn_pane_with, SpawnDeps, SpawnRequest};
 
 /// Where a registry-dispatched command sends events (`pane://…` names, KTD1) —
 /// the canonical alias lives beside the spawn machinery in `stream`.
@@ -39,8 +35,8 @@ pub use crate::stream::EventSink;
 /// `fly core` wires this to `ControlServer::broadcast_pane_output`.
 pub type PaneBytesSink = Arc<dyn Fn(u64, Vec<u8>) + Send + Sync>;
 
-/// The shared state a registry closes over — the control-socket counterpart
-/// of the Tauri `.manage(…)` set. `automations`/`alerts`/`feed` are optional
+/// The shared state a registry closes over (the `Backend` fields).
+/// `automations`/`alerts`/`feed` are optional
 /// because the U3 core boots without the automations subsystem and feed
 /// listener (they arrive with U3.5's full backend host); their commands
 /// answer a clear error when absent.
@@ -116,8 +112,8 @@ pub fn build_registry(h: CoreHandles) -> CommandHandler {
                     msg: String,
                 }
                 let a: A = parse(args)?;
-                // Same line as lib.rs::frontend_log — the webview console is
-                // invisible, stderr is the log.
+                // Uncaught renderer errors land in the core's stderr, where
+                // the shell's log capture can see them.
                 eprintln!("[fly-webview] {}", a.msg);
                 Ok(Value::Null)
             }
@@ -143,13 +139,7 @@ pub fn build_registry(h: CoreHandles) -> CommandHandler {
                     data: String,
                 }
                 let a: A = parse(args)?;
-                h.pty.write(a.pane_id, a.data.as_bytes())?;
-                if let Some(outcome) = h.attention.on_input(a.pane_id) {
-                    (h.events)(
-                        PANE_ATTENTION_EVENT,
-                        attention_event_payload(a.pane_id, &outcome),
-                    );
-                }
+                crate::stream::write_input(&h.pty, &h.attention, &h.events, a.pane_id, &a.data)?;
                 Ok(Value::Null)
             }
             "pty_resize" => {
@@ -218,11 +208,7 @@ pub fn build_registry(h: CoreHandles) -> CommandHandler {
                     pane_ids: Vec<PaneId>,
                 }
                 let a: A = parse(args)?;
-                let ids: Vec<u64> = a.pane_ids.iter().map(|p| p.0).collect();
-                h.coalescers.set_visible_panes(&ids);
-                for (pane, outcome) in h.attention.set_visible_panes(&a.pane_ids) {
-                    (h.events)(PANE_ATTENTION_EVENT, attention_event_payload(pane, &outcome));
-                }
+                crate::stream::set_visible_panes(&h.attention, &h.coalescers, &h.events, &a.pane_ids);
                 Ok(Value::Null)
             }
             "set_window_foreground" => {
@@ -231,9 +217,7 @@ pub fn build_registry(h: CoreHandles) -> CommandHandler {
                     foregrounded: bool,
                 }
                 let a: A = parse(args)?;
-                for (pane, outcome) in h.attention.set_foreground(a.foregrounded) {
-                    (h.events)(PANE_ATTENTION_EVENT, attention_event_payload(pane, &outcome));
-                }
+                crate::stream::set_window_foreground(&h.attention, &h.events, a.foregrounded);
                 Ok(Value::Null)
             }
             "set_panel_open" => {
@@ -418,15 +402,11 @@ pub fn build_registry(h: CoreHandles) -> CommandHandler {
             }
 
             // ---- usage --------------------------------------------------
-            // Async under Tauri; here a small current-thread runtime blocks
-            // the connection thread for the fetch's own short timeout — the
-            // dashboard-open one-shot (KTD-C), not a hot path.
+            // Blocks the connection thread for the fetch's own short timeout
+            // on the crate runtime (KTD5) — the dashboard-open one-shot
+            // (KTD-C), not a hot path.
             "usage_snapshot" => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("usage runtime: {e}"))?;
-                to_ok(rt.block_on(crate::usage::usage_snapshot())?)
+                to_ok(crate::usage::block_on(crate::usage::usage_snapshot())?)
             }
 
             // ---- automations / feed (absent until the U3 full host) -----
@@ -539,10 +519,9 @@ pub fn build_registry(h: CoreHandles) -> CommandHandler {
             "get_launch_mode" => to_ok(h.launch_mode),
             // Renderer-crash recovery: the reloaded frontend re-attaches to
             // the pane the core still owns for a leaf instead of spawning a
-            // second one. The real implementation lives here — the bytes
-            // keep riding the same per-pane broadcast sink (0x02 frames,
-            // keyed by pane id), which is exactly why a re-bind is possible
-            // under this shell and not under Tauri's per-spawn Channel.
+            // second one — the bytes keep riding the same per-pane broadcast
+            // sink (0x02 frames, keyed by pane id), which is what makes a
+            // re-bind possible.
             "adopt_live_pane" => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]

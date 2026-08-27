@@ -450,7 +450,6 @@ fn continue_target_in_dir(dir: &Path) -> Option<ContinueTarget> {
 /// Command: the session `claude --continue` would re-open in `cwd`, plus its last
 /// real-turn time, so the frontend's stale-guard can decide keep-vs-bare-shell in
 /// one round-trip (U3, KTD-C). `None` when the project dir is unresolvable/empty.
-#[tauri::command]
 pub fn continue_target(cwd: String) -> Option<ContinueTarget> {
     let dir = claude_project_dir(Path::new(&cwd))?;
     continue_target_in_dir(&dir)
@@ -478,7 +477,6 @@ fn qualifying_count_in_dir(dir: &Path) -> u32 {
 /// (fix-attribution U9). The resume offer marks a `Poll`/unset-source leaf in a
 /// cwd counting >1 as higher-risk — its `--resume`/`--continue` could re-attach
 /// a sibling's session (R13/AE5). 0 for an unresolvable/missing dir.
-#[tauri::command]
 pub fn qualifying_session_count(cwd: String) -> u32 {
     match claude_project_dir(Path::new(&cwd)) {
         Some(dir) => qualifying_count_in_dir(&dir),
@@ -548,7 +546,6 @@ fn resolve_spawn_cwd_in_root(root: &Path, session_id: &str, recorded_cwd: &str) 
 /// scopes `--resume` to the launch dir's project folder, so replaying in the
 /// drifted cwd fails with "No conversation found". `None` when the transcript
 /// can't be located (the caller keeps the recorded cwd — no worse than before).
-#[tauri::command]
 pub fn resolve_resume_spawn_cwd(session_id: String, recorded_cwd: String) -> Option<String> {
     let root = claude_projects_root()?;
     resolve_spawn_cwd_in_root(&root, &session_id, &recorded_cwd)

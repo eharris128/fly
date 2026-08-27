@@ -1,17 +1,18 @@
-//! Per-pane output coalescing between the PTY read thread and the Tauri
-//! channel (T1 of `docs/notes/2026-07-23-performance-audit-follow-ups.md`).
+//! Per-pane output coalescing between the PTY read thread and the shell's
+//! byte sink (T1 of `docs/notes/2026-07-23-performance-audit-follow-ups.md`).
 //!
-//! Why this exists: tauri 2.11.3 re-encodes a `Raw` channel chunk **< 1024
-//! bytes** as a JSON decimal-number array (~3.4× expansion) inside an `eval()`
-//! parsed on the webview main thread, and interactive TUI output is exactly
-//! many small writes (measured: 60/60 reads under 1024 B during spinner
-//! repaints, median 49 B). With several busy agents that per-chunk cost
-//! saturates the single webview main thread — visible as multi-second input
-//! lag and, on a workspace switch, queued keystrokes retargeting to the newly
-//! focused pane. Batching here collapses the storm to a few messages per pane
-//! per second and pushes most traffic onto the ≥ 1 KiB raw path. Batching must
-//! live in this sink, not the read buffer: the kernel PTY layer caps a read at
-//! ~2–8 KiB regardless of fly's buffer size (see `pty/pane.rs::READ_BUF`).
+//! Why this exists: interactive TUI output is many small writes (measured:
+//! 60/60 reads under 1024 B during spinner repaints, median 49 B), and every
+//! chunk that reaches the renderer costs a main-thread wakeup plus an
+//! xterm.js parse. With several busy agents that per-chunk cost was measured
+//! saturating the renderer main thread (originally on WebKitGTK, where it
+//! was also multiplied by a per-chunk JSON re-encode — the transport that
+//! quirk belonged to is retired, the wakeup cost is engine-independent) —
+//! visible as input lag and, on a workspace switch, queued keystrokes
+//! retargeting to the newly focused pane. Batching here collapses the storm
+//! to a few messages per pane per second. Batching must live in this sink,
+//! not the read buffer: the kernel PTY layer caps a read at ~2–8 KiB
+//! regardless of fly's buffer size (see `pty/pane.rs::READ_BUF`).
 //!
 //! Visibility-aware: a **visible** pane flushes on a ~[`VISIBLE_FLUSH`]
 //! deadline (imperceptible on a keystroke echo), a **hidden** one on
@@ -72,7 +73,7 @@ struct Shared {
 }
 
 /// One pane's coalescing sink: the read thread `push`es raw chunks, a
-/// dedicated forwarder thread flushes them to the Tauri channel on a
+/// dedicated forwarder thread flushes them to the pane's byte sink on a
 /// visibility-dependent deadline.
 pub struct Coalescer {
     shared: Arc<Shared>,

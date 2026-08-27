@@ -1,22 +1,20 @@
 //! `fly core` — the headless backend host (Electron-shell migration
-//! U1/U2/U3/U3.5). Boots the **full** backend through the same
-//! `backend::build_backend` the Tauri shell uses — hook server + dispatch,
-//! automations subsystem + sweep, feed listener, substrate — then serves the
-//! complete command table over the control socket. The two shells differ
-//! only in their seams: events broadcast to control clients instead of
-//! `app.emit`, and desktop banners go through `notify-send` instead of the
-//! Tauri notification plugin.
+//! U1/U2/U3/U3.5). Boots the **full** backend through
+//! `backend::build_backend` — hook server + dispatch, automations subsystem +
+//! sweep, feed listener, substrate — then serves the complete command table
+//! over the control socket. Its seams: events broadcast to control clients,
+//! desktop banners go through `notify::banner` (`notify-send`).
 //!
 //! Flavor safety: the hook server binds the flavor's stable socket with the
-//! never-steal probe, so a `fly core` started while a same-flavor Tauri fly
-//! runs refuses at boot instead of fighting it for the backend role.
+//! never-steal probe, so a `fly core` started while a same-flavor core runs
+//! refuses at boot instead of fighting it for the backend role.
 //!
-//! Shutdown (U6): ordered, exactly like the Tauri quit. `core/shutdown` from
-//! the shell — or SIGTERM/SIGINT — runs `backend::ordered_shutdown` (clean-
-//! exit marker, sweep join + interrupted-run closes, feed/ask release, pane
-//! reap with substrate DETACH) and exits 0. Only a SIGKILL skips it, and the
-//! next boot's never-steal probe reclaims the socket residue. Internal-facing
-//! like `substrate-event`: launched by a display shell, not typed by humans.
+//! Shutdown (U6): ordered. `core/shutdown` from the shell — or
+//! SIGTERM/SIGINT — runs `backend::ordered_shutdown` (clean-exit marker,
+//! sweep join + interrupted-run closes, feed/ask release, pane reap with
+//! substrate DETACH) and exits 0. Only a SIGKILL skips it, and the next
+//! boot's never-steal probe reclaims the socket residue. Internal-facing like
+//! `substrate-event`: launched by a display shell, not typed by humans.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,32 +32,6 @@ use crate::control::registry::{build_registry, CoreHandles};
 use crate::control::{control_socket_path, ControlServer};
 use crate::pty::PaneId;
 
-/// The `notify-send` argv for one banner: title and body ride as separate
-/// argv entries (never through a shell), `--app-name=fly` so the daemon
-/// groups them under the app.
-fn banner_command(title: &str, body: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new("notify-send");
-    cmd.arg("--app-name=fly").arg(title).arg(body);
-    cmd
-}
-
-/// In-flight `notify-send` helpers. The banner seam runs on the hook
-/// dispatch / reaper path, so the child is reaped on its own short-lived
-/// thread (`notify::spawn_detached_capped`) rather than waited inline — and
-/// it IS reaped: the 2026-08-22 incident core had 233 `<defunct>`
-/// `notify-send` children from a fire-and-forget `spawn()` that never
-/// `wait`ed. Own slot counter, distinct from the chime's pool (see the
-/// helper's doc); the `NotificationGate` already coalesces and rate-limits
-/// upstream, so the cap only backstops a runaway daemon.
-static BANNER_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-const BANNER_CAP: usize = 16;
-
-/// Fire one desktop banner, non-blocking, child reaped. Returns the reaper
-/// handle so a test can await the `wait()`; production ignores it.
-fn send_banner(title: &str, body: &str) -> Option<std::thread::JoinHandle<()>> {
-    crate::notify::spawn_detached_capped(banner_command(title, body), &BANNER_INFLIGHT, BANNER_CAP)
-}
-
 pub fn run(args: &[String]) -> i32 {
     // `--socket <path>` moves only the CONTROL socket (tests / side-by-side
     // dev). The hook socket stays at the flavor's stable path regardless —
@@ -75,8 +47,8 @@ pub fn run(args: &[String]) -> i32 {
         None => control_socket_path(),
     };
 
-    // Consumes this flavor's clean-exit marker exactly like the Tauri boot
-    // (KTD-G): whichever role owns the backend owns crash detection.
+    // Consumes this flavor's clean-exit marker (KTD-G): the role that owns
+    // the backend owns crash detection.
     let launch_mode = crate::resolve_launch_mode(args);
 
     // Both sinks broadcast through the server, resolved via a slot filled
@@ -89,11 +61,10 @@ pub fn run(args: &[String]) -> i32 {
                 server.broadcast_event(name, payload);
             }
         });
-    // Desktop banners via `notify-send` (argv-passed, no shell — content is
-    // data). The proposal's KTD8 endpoint (notify-rust over DBus) can replace
-    // this without touching the seam.
+    // Desktop banners via `notify::banner` (`notify-send`, argv-passed, no
+    // shell — content is data; 2026-08-27-001 KTD4).
     let banner: Arc<dyn Fn(&str, &str) + Send + Sync> = Arc::new(|title: &str, body: &str| {
-        send_banner(title, body);
+        crate::notify::banner(title, body);
     });
 
     let backend = match build_backend(BackendSeams {
@@ -172,9 +143,9 @@ pub fn run(args: &[String]) -> i32 {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    // Ordered teardown (U6) — the identical sequence lifecycle::shutdown runs
-    // under Tauri: clean-exit marker, automations sweep join + interrupted-run
-    // closes, feed/ask release, then the pane reap (tmux sessions DETACH).
+    // Ordered teardown (U6): clean-exit marker, automations sweep join +
+    // interrupted-run closes, feed/ask release, then the pane reap (tmux
+    // sessions DETACH).
     // The poll gap above also lets the `core/shutdown` response flush before
     // the server drops below.
     eprintln!("fly core: shutting down (ordered)");
@@ -184,46 +155,4 @@ pub fn run(args: &[String]) -> i32 {
     drop(server_slot.lock().expect("server slot").take());
     drop(backend);
     0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn banner_argv_passes_title_and_body_as_data() {
-        let cmd = banner_command("fly: pane 3", "needs you; $(rm -rf /) `x`");
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(cmd.get_program(), "notify-send");
-        assert_eq!(
-            args,
-            vec!["--app-name=fly", "fly: pane 3", "needs you; $(rm -rf /) `x`"],
-            "no shell: title/body are argv entries verbatim"
-        );
-    }
-
-    #[test]
-    fn banner_helpers_are_reaped_not_left_defunct() {
-        // The incident shape: many banners from one long-lived core. Every
-        // spawned child must be waited on (the reaper handle joins only after
-        // `child.wait()` returned) and every slot released.
-        use std::sync::atomic::Ordering;
-        static INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let mut handles = Vec::new();
-        for i in 0..6 {
-            let mut cmd = std::process::Command::new("true");
-            cmd.arg(format!("banner-{i}"));
-            if let Some(h) = crate::notify::spawn_detached_capped(cmd, &INFLIGHT, BANNER_CAP) {
-                handles.push(h);
-            }
-        }
-        assert_eq!(handles.len(), 6, "under the cap nothing is dropped");
-        for h in handles {
-            h.join().unwrap();
-        }
-        assert_eq!(INFLIGHT.load(Ordering::SeqCst), 0, "every child waited, no slot leak");
-    }
 }

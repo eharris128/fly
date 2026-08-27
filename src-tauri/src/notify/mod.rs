@@ -1,5 +1,5 @@
-//! OS notification surfacing + window urgency (U11 backend half; U18 per-effect
-//! split).
+//! OS notification surfacing (U11 backend half; U18 per-effect split). Window
+//! urgency is the shell's job (Electron `flashFrame` on the attention event).
 //!
 //! All notification text is untrusted (it can originate from agent output), so
 //! it is stripped of control characters and length-capped before display (R16).
@@ -18,9 +18,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-use tauri::{AppHandle, Manager};
-use tauri_plugin_notification::NotificationExt;
 
 use crate::state::attention::Reason;
 use crate::state::policy::Effects;
@@ -97,21 +94,37 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Fire an OS notification (no sound — the chime is decoupled into
-/// [`play_sound`], U18) and flash the window. Best-effort: with no notification
-/// daemon present it no-ops rather than erroring.
-pub fn banner(app: &AppHandle, title: &str, body: &str) {
+/// The `notify-send` argv for one banner: title and body ride as separate
+/// argv entries (never through a shell), `--app-name=fly` so the daemon
+/// groups them under the app.
+fn banner_command(title: &str, body: &str) -> Command {
+    let mut cmd = Command::new("notify-send");
+    cmd.arg("--app-name=fly").arg(title).arg(body);
+    cmd
+}
+
+/// In-flight `notify-send` helpers. The banner seam runs on the hook
+/// dispatch / reaper path, so the child is reaped on its own short-lived
+/// thread ([`spawn_detached_capped`]) rather than waited inline — and it IS
+/// reaped: the 2026-08-22 incident core had 233 `<defunct>` `notify-send`
+/// children from a fire-and-forget `spawn()` that never `wait`ed. Own slot
+/// counter, distinct from the chime's pool (see the helper's doc); the
+/// [`NotificationGate`] already coalesces and rate-limits upstream, so the
+/// cap only backstops a runaway daemon.
+static BANNER_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+const BANNER_CAP: usize = 16;
+
+/// Fire an OS notification via `notify-send` (no sound — the chime is
+/// decoupled into [`play_sound`], U18): argv-passed, no shell (content is
+/// data), sanitized (R16), non-blocking, child reaped. Best-effort: with no
+/// notification daemon present it no-ops rather than erroring. Returns the
+/// reaper handle so a test can await the `wait()`; production ignores it.
+/// (2026-08-27-001 KTD4: this replaced the Tauri notification plugin; the
+/// window-urgency hint that plugin also set is the Electron shell's job.)
+pub fn banner(title: &str, body: &str) -> Option<JoinHandle<()>> {
     let title = sanitize(title, TITLE_CAP);
     let body = sanitize(body, BODY_CAP);
-    let _ = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show();
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
-    }
+    spawn_detached_capped(banner_command(&title, &body), &BANNER_INFLIGHT, BANNER_CAP)
 }
 
 /// A human-readable subtitle for a reason, used as `FLY_NOTIFICATION_SUBTITLE`
@@ -161,9 +174,9 @@ fn detached_inflight() -> &'static AtomicUsize {
 }
 
 /// Spawn a best-effort background process, bounded by a concurrency cap and
-/// reaped on a short-lived thread so it never lingers as a zombie. Tauri/GTK may
-/// own process-global `SIGCHLD`, so each child is `wait`ed explicitly rather than
-/// via a global reaper. Returns the reaper handle (tests await it); callers
+/// reaped on a short-lived thread so it never lingers as a zombie. No
+/// process-global `SIGCHLD` reaper is assumed (a host may own it), so each
+/// child is `wait`ed explicitly. Returns the reaper handle (tests await it); callers
 /// ignore it. Used by [`play_sound`] (the notification command runner has its
 /// own equivalent cap in [`command`], U19).
 pub(crate) fn spawn_detached(command: Command) -> Option<JoinHandle<()>> {
@@ -460,5 +473,46 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(INFLIGHT.load(Ordering::SeqCst), 0, "all slots released, no leak");
+    }
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::*;
+
+    #[test]
+    fn banner_argv_passes_title_and_body_as_data() {
+        let cmd = banner_command("fly: pane 3", "needs you; $(rm -rf /) `x`");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(cmd.get_program(), "notify-send");
+        assert_eq!(
+            args,
+            vec!["--app-name=fly", "fly: pane 3", "needs you; $(rm -rf /) `x`"],
+            "no shell: title/body are argv entries verbatim"
+        );
+    }
+
+    #[test]
+    fn banner_helpers_are_reaped_not_left_defunct() {
+        // The incident shape: many banners from one long-lived core. Every
+        // spawned child must be waited on (the reaper handle joins only after
+        // `child.wait()` returned) and every slot released.
+        static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+        let mut handles = Vec::new();
+        for i in 0..6 {
+            let mut cmd = Command::new("true");
+            cmd.arg(format!("banner-{i}"));
+            if let Some(h) = spawn_detached_capped(cmd, &INFLIGHT, BANNER_CAP) {
+                handles.push(h);
+            }
+        }
+        assert_eq!(handles.len(), 6, "under the cap nothing is dropped");
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(INFLIGHT.load(Ordering::SeqCst), 0, "every child waited, no slot leak");
     }
 }

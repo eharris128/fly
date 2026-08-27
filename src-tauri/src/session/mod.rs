@@ -110,24 +110,20 @@ fn safe_key(key: &str) -> String {
     }
 }
 
-// ---- Tauri command surface -------------------------------------------------
+// ---- Command surface (dispatched by `control::registry`) --------------------
 
-#[tauri::command]
 pub fn save_session(layout: Value) -> Result<(), String> {
     write_session(&session_path(), &layout).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
 pub fn load_session() -> Option<Value> {
     read_session(&session_path())
 }
 
-#[tauri::command]
 pub fn save_scrollback(pane_key: String, data: String) -> Result<(), String> {
     write_scrollback(&scrollback_dir(), &pane_key, &data).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
 pub fn load_scrollback(pane_key: String) -> Option<String> {
     read_scrollback(&scrollback_dir(), &pane_key)
 }

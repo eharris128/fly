@@ -1,5 +1,5 @@
 //! JSON envelopes (`docs/core-protocol.md` "JSON envelopes"). KTD1: `cmd`
-//! and `event` values are exactly the Tauri seam's names — this file defines
+//! and `event` values are exactly the names `src/ipc.ts` sends — this file defines
 //! only the *carrier*, never per-command shapes (those stay with their
 //! commands, as today).
 

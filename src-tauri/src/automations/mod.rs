@@ -10,7 +10,7 @@
 //!
 //! **KTD-B lock discipline (load-bearing).** The store mutex is the single
 //! authority every writer contends on (sweep thread, socket handler threads,
-//! Tauri commands), so nothing slow or re-entrant may ever run under it:
+//! control-socket commands), so nothing slow or re-entrant may ever run under it:
 //!
 //! - the sweep decides + mutates + **flushes** each tick's claims under one
 //!   [`store::Store::mutate`] hold, then **releases the lock, then
@@ -172,11 +172,11 @@ pub const SKIP_CAPACITY: &str = "capacity";
 /// visible as the automation's next run, not in the reason.
 pub const SKIP_USAGE_LIMIT: &str = "usage limit";
 
-/// The Tauri event emitted after every mutation (payload: the automation id).
+/// The event emitted after every mutation (payload: the automation id).
 /// The dashboard (U10) refetches on it.
 pub const AUTOMATION_CHANGED_EVENT: &str = "automation://changed";
 
-/// The Tauri event emitted after a successful **monitor** create's store
+/// The event emitted after a successful **monitor** create's store
 /// flush (monitor-handoff U4 — the backend half of R13). Payload:
 /// [`MonitorRegisteredEvent`] `{ paneId, automationId }`. The frontend (U6)
 /// maps the registering pane → leaf → tab and closes it — the parent session
@@ -250,8 +250,8 @@ const ID_LEN: usize = 10;
 pub type Clock = Box<dyn Fn() -> u64 + Send + Sync>;
 
 /// Injected `automation://changed` emitter, called with the automation id
-/// **after** the store lock is released (KTD-B). The app wires a Tauri
-/// `AppHandle::emit`; tests wire a Vec collector.
+/// **after** the store lock is released (KTD-B). `backend.rs` wires the
+/// event sink; tests wire a Vec collector.
 pub type ChangedEmitter = Box<dyn Fn(&str) + Send + Sync>;
 
 /// U5 seam: kill the in-flight script process group for a **run id**. Called
@@ -341,8 +341,8 @@ pub struct RunClosedEvent {
 /// U5 seam: emit `automation://run-closed` after an **agent** run closes, so the
 /// frontend tab lifecycle (U8) can auto-close a `succeeded` run's tab or keep a
 /// `failed` one. Called only for agent-run closes, always **after** the store
-/// mutation returns (lock released, KTD-B). Default no-op; `lib.rs` wires the
-/// Tauri emit, tests wire a collector.
+/// mutation returns (lock released, KTD-B). Default no-op; `backend.rs` wires
+/// the event sink, tests wire a collector.
 pub type RunClosedEmitter = Arc<dyn Fn(&RunClosedEvent) + Send + Sync>;
 
 /// Monitor-handoff U4 event payload (the backend half of R13): a monitor was
@@ -359,7 +359,7 @@ pub struct MonitorRegisteredEvent {
 /// successful monitor create — invoked by the socket create arm
 /// (`lib.rs::dispatch_automation_op`) strictly **after** [`AutomationManager::create`]
 /// returned, i.e. after the store flush and off the store lock (KTD-B).
-/// Default no-op; `lib.rs` wires the Tauri emit, tests wire a collector.
+/// Default no-op; `backend.rs` wires the event sink, tests wire a collector.
 pub type MonitorRegisteredEmitter = Arc<dyn Fn(&MonitorRegisteredEvent) + Send + Sync>;
 
 /// One run that a prior app instance's crash/restart left `Running`, closed
@@ -463,8 +463,8 @@ impl Dispatcher for UnwiredDispatcher {
 /// prompt-threaded command, calls `spawn_pane` with the run id, and the
 /// backend links run↔pane atomically on spawn (R10).
 pub struct AgentDispatcher {
-    /// Where `automation://agent-run` lands — `app.emit` under Tauri, control
-    /// broadcast under `fly core` (Electron-shell migration U3.5).
+    /// Where `automation://agent-run` lands — the control-socket broadcast
+    /// under `fly core` (Electron-shell migration U3.5).
     events: crate::stream::EventSink,
 }
 
@@ -814,11 +814,11 @@ pub struct AutomationManager {
     /// [`OutputCapturer`]). Default no-op; `lib.rs` injects the real reader.
     output_capturer: Mutex<OutputCapturer>,
     /// U5: emit `automation://run-closed` on agent-run close (see
-    /// [`RunClosedEmitter`]). Default no-op; `lib.rs` injects the Tauri emit.
+    /// [`RunClosedEmitter`]). Default no-op; `backend.rs` injects the event sink.
     emit_run_closed: Mutex<RunClosedEmitter>,
     /// Monitor-handoff U4 (R13): emit `automation://monitor-registered` after
     /// a successful monitor create (see [`MonitorRegisteredEmitter`]).
-    /// Default no-op; `lib.rs` injects the Tauri emit.
+    /// Default no-op; `backend.rs` injects the event sink.
     emit_monitor_registered: Mutex<MonitorRegisteredEmitter>,
     /// Interrupt-resilience U2: surface an interrupted run through the alert
     /// pipeline (see [`InterruptSink`]). Default no-op; `lib.rs` injects the
@@ -3378,9 +3378,9 @@ fn mint_id() -> String {
 
 // ---- the sweep thread (KTD-C) -------------------------------------------------
 
-/// Handle to the running `fly-automation-sweep` thread, managed by Tauri so
-/// `lifecycle::shutdown` can stop and join it (outside any store lock,
-/// KTD-B).
+/// Handle to the running `fly-automation-sweep` thread, held by the
+/// `Backend` so `backend::ordered_shutdown` can stop and join it (outside any
+/// store lock, KTD-B).
 pub struct SweepHandle {
     manager: Arc<AutomationManager>,
     handle: Mutex<Option<JoinHandle<()>>>,
@@ -3433,17 +3433,7 @@ pub fn start_sweep(manager: Arc<AutomationManager>) -> std::io::Result<SweepHand
     })
 }
 
-// ---- Tauri command surface -----------------------------------------------------
-
-/// R5: the frontend signals it has finished restore and is listening for
-/// automation events. Until this arrives the sweep defers due **agent**
-/// automations (script automations run regardless — see
-/// [`AutomationManager::sweep_once`]). Registered in `lib.rs`; the frontend
-/// caller arrives with U8.
-#[tauri::command]
-pub fn automations_frontend_ready(manager: tauri::State<'_, Arc<AutomationManager>>) {
-    manager.set_frontend_ready();
-}
+// ---- Command surface (dispatched by `control::registry`) ---------------------
 
 /// The read-only automations dashboard payload (U10, R25/R6). `automations` is
 /// the raw list in the model's serde-camelCase shape — the same shape that
@@ -3497,19 +3487,10 @@ fn monitor_infra_failures(
         .collect()
 }
 
-/// List every automation plus store health for the dashboard panel (U10). A
-/// pure read over the manager (no mutation, no lock held past the snapshot), so
-/// it is cheap enough to call on dashboard open and refetch on every
-/// `automation://changed`.
-#[tauri::command]
-pub fn list_automations(
-    manager: tauri::State<'_, Arc<AutomationManager>>,
-) -> AutomationsDashboard {
-    dashboard_snapshot(&manager)
-}
-
-/// The body behind [`list_automations`], shared with the control-socket
-/// registry (Electron-shell migration U2).
+/// List every automation plus store health for the dashboard panel (U10) —
+/// the `list_automations` command body. A pure read over the manager (no
+/// mutation, no lock held past the snapshot), so it is cheap enough to call
+/// on dashboard open and refetch on every `automation://changed`.
 pub fn dashboard_snapshot(manager: &AutomationManager) -> AutomationsDashboard {
     let health = manager.store_health();
     let automations = manager.list();
@@ -3523,23 +3504,6 @@ pub fn dashboard_snapshot(manager: &AutomationManager) -> AutomationsDashboard {
         corrupt_bak: health.corrupt_bak.map(|p| p.display().to_string()),
         flush_error: health.flush_error,
     }
-}
-
-/// Delete an automation from the dashboard panel — the webview counterpart of
-/// the CLI's `automation/delete` socket op, sharing [`AutomationManager::delete`]
-/// and its R23 teardown (record + stored script removed, open rows closed
-/// failed, an in-flight script group / headless check killed). User-initiated
-/// from the dashboard UI, so the R22 recursion gate doesn't apply: that gate
-/// blocks automation-spawned *panes* mutating over the socket, and the webview
-/// is not a pane. No return payload — the manager emits `automation://changed`
-/// on success and the panel refetches; the Err string (unknown id — a raced
-/// CLI delete) is surfaced as a transient notice.
-#[tauri::command]
-pub fn delete_automation(
-    manager: tauri::State<'_, Arc<AutomationManager>>,
-    id: String,
-) -> Result<(), String> {
-    manager.delete(&id).map(|_| ())
 }
 
 /// R17 pickup validation (monitor-handoff U7): whether a failed monitor's
@@ -3556,7 +3520,6 @@ pub struct PickupCheck {
 
 /// Check a pickup target's transcript + cwd existence (monitor-handoff U7,
 /// R17). Read-only by construction: `Path::is_file` / `Path::is_dir` only.
-#[tauri::command]
 pub fn monitor_pickup_check(transcript_path: String, cwd: String) -> PickupCheck {
     PickupCheck {
         transcript_exists: std::path::Path::new(&transcript_path).is_file(),
@@ -3571,30 +3534,20 @@ pub fn monitor_pickup_check(transcript_path: String, cwd: String) -> PickupCheck
 const BUNDLE_READ_CAP_BYTES: usize = 256 * 1024;
 
 /// Read a monitor failure bundle's text for the dashboard's R17 fallback
-/// (monitor-handoff U7): when pickup can't spawn (transcript/cwd gone), the
-/// panel shows the raw bundle instead. Read-only, and **scoped**: the path
-/// must canonicalize to a file inside the app's monitor-bundles dir — the
-/// webview only ever echoes back a `bundlePath` the backend stamped on a run
-/// row, so anything outside the bundle dir is a forged or corrupted path and
-/// is refused, never read. Errors are one-line strings for the panel.
-#[tauri::command]
-pub fn read_monitor_bundle(
-    manager: tauri::State<'_, Arc<AutomationManager>>,
-    path: String,
-) -> Result<String, String> {
-    read_bundle_for(&manager, &path)
-}
-
-/// The body behind [`read_monitor_bundle`], shared with the control-socket
-/// registry (Electron-shell migration U2). Scope check unchanged: the path
-/// must canonicalize inside the manager's bundle dir.
+/// (monitor-handoff U7) — the `read_monitor_bundle` command body: when pickup
+/// can't spawn (transcript/cwd gone), the panel shows the raw bundle
+/// instead. Read-only, and **scoped**: the path must canonicalize to a file
+/// inside the app's monitor-bundles dir — the webview only ever echoes back
+/// a `bundlePath` the backend stamped on a run row, so anything outside the
+/// bundle dir is a forged or corrupted path and is refused, never read.
+/// Errors are one-line strings for the panel.
 pub fn read_bundle_for(manager: &AutomationManager, path: &str) -> Result<String, String> {
     let dir = manager.bundle_dir.lock().unwrap().clone();
     read_bundle_scoped(dir.as_deref(), path)
 }
 
-/// The scoped bundle read behind [`read_monitor_bundle`], split out so the
-/// scope check is testable without Tauri state. Canonicalizes both sides so
+/// The scoped bundle read behind [`read_bundle_for`], split out so the
+/// scope check is testable without a manager. Canonicalizes both sides so
 /// `..` traversal and symlinks out of the bundle dir are refused.
 fn read_bundle_scoped(
     bundle_dir: Option<&std::path::Path>,

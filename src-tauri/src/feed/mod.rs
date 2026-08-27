@@ -27,10 +27,10 @@ pub mod wire;
 
 pub use server::FeedServer;
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
-use wire::{AgentEntry, AutomationEntry, FeedPublishPayload, FeedSnapshot};
+use wire::{AgentEntry, AutomationEntry, FeedSnapshot};
 
 /// The backend cache the webview pushes into and the SSE server reads from
 /// (KTD1/KTD5). Holds the latest pushed agent roster plus a monotonic `version`
@@ -212,18 +212,6 @@ impl FeedState {
     }
 }
 
-/// Command: the webview pushes its assembled agent roster here each poll (U5).
-/// Always available (managed even when the feed listener is disabled), so the
-/// publisher never errors on a disabled feed — the roster is simply cached and
-/// never served.
-#[tauri::command]
-pub fn publish_agent_feed(
-    payload: FeedPublishPayload,
-    state: tauri::State<'_, Arc<FeedState>>,
-) -> bool {
-    state.publish(payload.agents, now_ms())
-}
-
 /// Epoch ms, saturating at 0 if the clock is before the epoch.
 ///
 /// The publish stamp is taken **here, at receipt**, rather than being carried in
@@ -241,6 +229,7 @@ pub(crate) fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn agent(leaf: &str, status: &str) -> AgentEntry {
         AgentEntry {

@@ -349,7 +349,6 @@ pub fn clean_exit_path() -> PathBuf {
 
 /// Command: the frontend loads the resume map at restore (U8). Returns an empty
 /// map when the store is missing/corrupt — never an error.
-#[tauri::command]
 pub fn load_resume_records() -> ResumeRecords {
     read_records(&resume_path())
 }
@@ -357,7 +356,6 @@ pub fn load_resume_records() -> ResumeRecords {
 /// Command: the always-on poll captures an agent leaf's launch argv (U4). The
 /// poll only calls this for a detected Claude pane, so `is_agent` is implied
 /// `true`. Field-merging, so it never clobbers the hook writer's session id/cwd.
-#[tauri::command]
 pub fn save_resume_record(leaf_key: String, argv: Vec<String>) -> Result<(), String> {
     upsert_at(
         &resume_path(),
@@ -379,12 +377,12 @@ pub fn save_resume_record(leaf_key: String, argv: Vec<String>) -> Result<(), Str
 /// before the first `Notification`/`Stop`. Stamped `Poll`, the lowest trust
 /// rank (fix-session-pane-attribution KTD2): the poll's cwd-level guess never
 /// overwrites a hook-precise or human-picked id, and this command — reachable
-/// only from the frontend, never the socket — is the sole `Poll` writer.
+/// only from the shell's control socket, never the pane-facing hook socket —
+/// is the sole `Poll` writer.
 /// Field-merging, so it never clobbers the poll's `argv`/`is_agent`. Returns
 /// the effective stored record so the caller sees whether the write took.
 /// Writes through `resume_path()` under the `FLY_APP_NAME` root, so
 /// `fly`/`fly-dev` stay isolated (R7).
-#[tauri::command]
 pub fn save_resume_session(
     leaf_key: String,
     session_id: String,
@@ -406,11 +404,10 @@ pub fn save_resume_session(
 /// Command: bind a user-picked session to a leaf (fix-session-pane-attribution
 /// U6, R10). Stamped `Pick`, the highest trust rank (KTD2): an explicit human
 /// decision supersedes anything stored and is itself superseded only by another
-/// explicit action (a later pick, or the U8 reset). Frontend-only like
-/// `save_resume_session` — no socket path can reach this rank. Returns the
+/// explicit action (a later pick, or the U8 reset). Shell-only like
+/// `save_resume_session` — no hook-socket path can reach this rank. Returns the
 /// effective stored record (`session_source`/`divergence_pending`) so the pick
 /// flow can confirm the bind and drive the re-pick prompt.
-#[tauri::command]
 pub fn save_session_pick(
     leaf_key: String,
     session_id: String,
@@ -431,16 +428,14 @@ pub fn save_session_pick(
 
 /// Command: at restore the frontend prunes the store to the live layout leaves
 /// (U8), dropping records orphaned by a closed pane or a pre-crash layout.
-#[tauri::command]
 pub fn prune_resume_records(live_leaf_keys: Vec<String>) -> Result<(), String> {
     let live: std::collections::HashSet<String> = live_leaf_keys.into_iter().collect();
     retain_at(&resume_path(), &live).map_err(|e| e.to_string())
 }
 
 /// Command: the user-initiated attribution reset (fix-session-pane-attribution
-/// U8, KTD7/R14) — see [`reset_attribution_at`]. Frontend-only, like the other
-/// explicit-action writers: no socket path can clear an id.
-#[tauri::command]
+/// U8, KTD7/R14) — see [`reset_attribution_at`]. Shell-only, like the other
+/// explicit-action writers: no hook-socket path can clear an id.
 pub fn reset_pane_attribution(leaf_key: String) -> Result<(), String> {
     reset_attribution_at(&resume_path(), &leaf_key).map_err(|e| e.to_string())
 }

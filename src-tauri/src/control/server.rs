@@ -1,8 +1,8 @@
 //! The control-socket server (U1 scaffold): never-steal bind, same-uid gate,
 //! per-connection read loop dispatching JSON requests, and broadcast fan-out
 //! for events + pane-output frames. U2 replaced the U1 stub command table
-//! with the ported Tauri commands (`registry.rs`); the seam between the two
-//! is [`CommandHandler`].
+//! with the real one (`registry.rs`); the seam between the two is
+//! [`CommandHandler`].
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
