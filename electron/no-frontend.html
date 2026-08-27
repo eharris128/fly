@@ -1,0 +1,32 @@
+<!doctype html>
+<!-- Dev-only fallback page: shown when the shell is launched unpackaged with
+     no FLY_SHELL_URL and no built ../dist/. Inert — no scripts, no bridge use.
+     Loaded with the same preload, so the window's close flow still gets its
+     ack (and, carrying no app handler, closes immediately). Never reached in
+     the packaged app, which always has frontend/index.html. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>fly — no frontend build</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9;
+        font: 15px/1.5 ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace; }
+      main { max-width: 46rem; margin: 0 auto; padding: 4rem 2rem; }
+      h1 { font-size: 1.25rem; color: #f0b429; margin: 0 0 1rem; }
+      code { background: #161b22; border: 1px solid #30363d; border-radius: 4px;
+        padding: 0 .4em; color: #e6edf3; }
+      p { margin: .6rem 0; }
+      .dim { color: #8b949e; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>No frontend build found</h1>
+      <p>This is the unpackaged shell with nothing to load. Either:</p>
+      <p>• run the Vite dev server and point the shell at it:
+        <code>pnpm dev</code> then <code>FLY_SHELL_URL=http://localhost:1420</code>, or</p>
+      <p>• build the frontend once: <code>pnpm build</code> (the shell loads <code>../dist/index.html</code>).</p>
+      <p class="dim">The packaged app never shows this page.</p>
+    </main>
+  </body>
+</html>

@@ -10,14 +10,17 @@
 //! (`AutomationManager`), not here.
 //!
 //! **The verdict-block contract lives in exactly one place**:
-//! [`VERDICT_BLOCK_SPEC`]. The U8 skill quotes it verbatim so the parser and
-//! the prompt contract cannot drift; [`parse_verdict`] is its implementation.
-//! The two now differ by **exactly one outcome, on purpose**: the parser also
-//! accepts `DECLINED` (fly-dag-primitives G1, for verdict-gated non-monitor
-//! legs), while the spec deliberately still lists only PASS/FAIL, because a
-//! monitor is a done/not-done instrument and never retires on a decline (G1
-//! KTD6 — filtered at the monitor close path in [`super`]). Keep it to that
-//! one difference: spec and skill stay byte-identical to each other.
+//! [`VERDICT_BLOCK_SPEC`]. The manager appends it to every monitor check
+//! prompt, so the parser and the prompt contract cannot drift;
+//! [`parse_verdict`] is its implementation. (The U8 skill that once
+//! re-quoted it for the registering agent left the repo 2026-08-27 — it was
+//! a personal workflow, not a product surface.) The two differ by **exactly
+//! one outcome, on purpose**: the parser also accepts `DECLINED`
+//! (fly-dag-primitives G1, for verdict-gated non-monitor legs), while the
+//! spec deliberately still lists only PASS/FAIL, because a monitor is a
+//! done/not-done instrument and never retires on a decline (G1 KTD6 —
+//! filtered at the monitor close path in [`super`]). Keep it to that one
+//! difference.
 //!
 //! Parsing follows the repo's abstain-on-surprise convention (R2/R5):
 //! anything that is not exactly one well-formed block is a not-done check —
@@ -27,8 +30,8 @@
 
 use super::model::{MonitorPointers, Verdict, VerdictOutcome};
 
-/// The prompt-side verdict-block contract (R2). Quoted **verbatim** by the U8
-/// skill file — edit here and there together, nowhere else. The example block
+/// The prompt-side verdict-block contract (R2) — the one and only home of the
+/// contract text; nothing else quotes it. The example block
 /// inside it deliberately does **not** parse: its note is
 /// [`SPEC_NOTE_PLACEHOLDER`], which [`parse_verdict`] treats as an echo of the
 /// spec, not a verdict (fix(review) #3) — a check that merely quotes these

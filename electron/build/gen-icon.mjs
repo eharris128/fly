@@ -1,6 +1,8 @@
-// Generates a 512x512 RGBA PNG used as the source for `tauri icon`.
-// No external deps — raw PNG via zlib. Design: dark terminal backdrop with
-// an accent "fly" paper-plane triangle.
+// One-shot icon toolchain (not wired into any build script): generates the
+// 512x512 RGBA `icon-source.png` beside this file, from which the app icon
+// was derived once. No external deps — raw PNG via zlib. Design: dark
+// terminal backdrop with an accent "fly" paper-plane triangle. Re-run only to
+// regenerate the icon.
 import { deflateSync } from "node:zlib";
 import { writeFileSync } from "node:fs";
 

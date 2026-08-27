@@ -61,8 +61,9 @@ attention — so you can run a fleet and only look when there's something to do.
   run headless (a backend-owned `claude -p`, no pane or tab), deliver one
   fenced PASS/FAIL verdict, and retire the monitor. A FAIL writes a durable
   failure bundle and the dashboard offers a one-action recovery pickup
-  (`fly automation create --monitor --not-before …`, taught to agents by the
-  `fly-monitor-handoff` skill).
+  (`fly automation create --monitor --not-before …`; the check prompt carries
+  the verdict-block contract, so any agent that can run the CLI can register
+  one).
 - **The feed** — a loopback HTTP surface (bearer-token auth) for an external
   local consumer: an SSE roster of agents + automations (including monitor
   verdicts), per-agent latest reply / pending question / conversation tail,
@@ -181,9 +182,6 @@ cargo test --offline --manifest-path src-tauri/Cargo.toml         # Rust (state 
   (`KTD<n>` / `R<n>` / `U<n>`); `docs/notes/` — one-off evaluations and
   live-check records; `docs/core-protocol.md` — the control-socket wire
   contract.
-- `skills/` — the `fly-monitor-handoff` skill installed for agents;
-  `spikes/electron-probe/` — the retired measurement rig that motivated the
-  Electron shell (kept as the record of that decision).
 
 ## The CLI
 

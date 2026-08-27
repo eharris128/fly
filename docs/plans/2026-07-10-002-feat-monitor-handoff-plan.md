@@ -235,6 +235,7 @@ sequenceDiagram
 - **Approach:** The skill instructs the parent session to: summarize the experiment and expected finish window; write a self-contained check prompt embedding the exact verdict-block contract and "if not finished, say so and stop" guidance; choose a sparse schedule + not-before; run `fly automation list` to avoid same-name duplicates; run `fly automation create --monitor …` (model/effort optional); confirm registration output; state that fly must be running for checks to fire. Includes the verdict-block spec verbatim so the parser and the skill cannot drift — the spec text lives in one place, referenced from both.
 - **Test scenarios:** Test expectation: none — documentation and prompt-contract text; the parser contract is tested in U3.
 - **Verification:** dry-run the skill text against a real session in the dev flavor: handoff → tab closes → check fires → verdict → pickup.
+- **2026-08-27:** the skill was removed from the tree (personal workflow, install-by-copy, never shipped — see `2026-08-27-001` U0/KTD13); it lives in git history and in `~/.claude/skills/`. `VERDICT_BLOCK_SPEC` remains the contract's only home.
 
 ---
 

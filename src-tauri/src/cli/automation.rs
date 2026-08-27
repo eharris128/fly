@@ -829,7 +829,7 @@ fn handle_create(args: &[String]) -> i32 {
     // --monitor is agent-only and --not-before is monitor-only
     // (monitor-handoff U5, R1). The help text's verdict-block line is the
     // one-line summary of `automations::verdict::VERDICT_BLOCK_SPEC` — the
-    // full contract lives there (and verbatim in the U8 skill), nowhere else.
+    // full contract lives there, nowhere else.
     if let Err(e) = validate_monitor_flags(script.is_some(), monitor, not_before.is_some()) {
         eprintln!("fly automation create: {e}");
         return 2;

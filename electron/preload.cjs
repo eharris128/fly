@@ -10,7 +10,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 // from here — registered before any page script runs, so a live event loop
 // always acks — carrying whether the app has a close handler at all. No ack
 // within main's deadline ⇒ the renderer is dead/hung ⇒ main closes anyway;
-// an ack with `false` (the probe page, the crash page, a frontend that
+// an ack with `false` (the crash or no-frontend page, a frontend that
 // failed before wiring its handler) ⇒ nobody will ever send `fly:close-now`
 // ⇒ main closes at once. `true` ⇒ the app's flow decides, on its own time.
 let closeHandlers = 0;

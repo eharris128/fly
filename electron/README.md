@@ -26,9 +26,12 @@ renderer running the unchanged Svelte frontend over the preload bridge.
 - `protocol.js` — the JS half of the control-socket frame codec.
   **Edited only together with `src-tauri/src/control/` and
   `docs/core-protocol.md`** (the wire contract).
-- `probe.html` — the bare-bones U4 bridge probe page, the fallback entrypoint
-  when neither `FLY_SHELL_URL` nor a packaged frontend exists. Not a product
-  surface; the real dev loop points `FLY_SHELL_URL` at Vite.
+- `no-frontend.html` — inert dev-only page shown when the unpackaged shell
+  has neither `FLY_SHELL_URL` nor a built `../dist/` to load. (The U4 bridge
+  probe page it replaced is in git history.)
+- `build/` — electron-builder's resource dir: `icon.png` (the app icon) plus
+  the one-shot toolchain that produced it (`gen-icon.mjs` → `icon-source.png`).
+  Not part of any build script.
 - `deb/postinst.sh` / `deb/postrm.sh` — .deb lifecycle: SUID
   `chrome-sandbox` (fails the install if it can't — a silent skip would ship
   an app that refuses to launch), the `/usr/bin/fly` symlink that keeps the

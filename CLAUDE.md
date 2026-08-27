@@ -660,8 +660,8 @@ stream's `result` event text (no transcript-capture race; the check's
 pane path uses); anything surprising in the stream degrades to an
 infra-unreadable Failed close, never a fabricated verdict. The check text is
 parsed for one fenced ` ```verdict ` block (`automations/verdict.rs` — the
-contract text is `VERDICT_BLOCK_SPEC`, quoted verbatim by
-`skills/fly-monitor-handoff/SKILL.md`, edited only together; abstain-on-surprise,
+contract text is `VERDICT_BLOCK_SPEC`, appended to every check prompt by the
+manager — the contract's only home; abstain-on-surprise,
 so no block = "not done" = silent). A parsed PASS/FAIL verdict **retires** the
 monitor in the same store mutation that closes the row (`retiredAt` set,
 `next_run_at` cleared; claims/manual runs refused thereafter); FAIL also writes a durable
@@ -866,13 +866,14 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   `electron/protocol.test.js` codec tests, and `src-tauri/tests/backend_build.rs`
   smoke-builds the full shared backend).
 - Commits: conventional, with a `Co-Authored-By: Claude` trailer.
-- Repo-root oddities an agent may trip over: `spikes/electron-probe/` is the
-  retired measurement rig behind the Electron decision (kept as the record —
-  never build on it; the real shell is `electron/`); `packaging/` holds only
-  the one-shot icon toolchain (see its README — real packaging lives in
-  `electron/package.json` + `src-tauri/tauri.conf.json`); the archived
-  automations work-queue scratchpad lives at
-  `docs/notes/2026-07-02-automations-work-queue-archive.md` (historical only).
+- Repo-root oddities an agent may trip over: the archived automations
+  work-queue scratchpad lives at
+  `docs/notes/2026-07-02-automations-work-queue-archive.md` (historical only);
+  `electron/build/` holds the app icon plus the one-shot toolchain that
+  produced it (not part of any build). The Electron measurement spike and the
+  `fly-monitor-handoff` skill were removed from the tree 2026-08-27 (git
+  history has them; the spike's results are in
+  `docs/notes/2026-08-12-electron-engine-probe.md`).
 - Versioning: keep `package.json`, `src-tauri/Cargo.toml`,
   `src-tauri/tauri.conf.json`, and `electron/package.json` on the SAME
   version — the Electron deb ships the Rust binary, and `fly --version` /

@@ -7,6 +7,7 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const net = require('net');
 const path = require('path');
+const fs = require('fs');
 const { spawn } = require('child_process');
 const { encodeJson, encodePaneInput, FrameReader } = require('./protocol');
 const {
@@ -268,7 +269,7 @@ app.whenReady().then(async () => {
   // crashed/hung/never-loaded one gets no say and the close proceeds; a
   // live one must ACK the request (preload-level, before any page script)
   // within CLOSE_ACK_MS or it is treated as dead. An ack carrying "no app
-  // handler" (probe/crash page, a frontend that failed before wiring)
+  // handler" (the crash or no-frontend page, a frontend that failed before wiring)
   // closes at once; "handler present" waits for the app's flow — on the
   // user's time, since the confirm is theirs to answer.
   const CLOSE_ACK_MS = 3000;
@@ -374,14 +375,17 @@ app.whenReady().then(async () => {
 
 // Packaged: the built frontend travels inside the asar (`frontend/`, copied
 // from ../dist by the dist script — relative vite base, U7). Dev:
-// FLY_SHELL_URL points at the Vite dev server; bare fallback is the U4
-// bridge probe page. Also the renderer-crash reload path — the same load,
-// so recovery can never diverge from first launch.
+// FLY_SHELL_URL points at the Vite dev server; otherwise a built ../dist is
+// loaded straight from the tree; with neither, an inert "no frontend build"
+// page says what to do. Also the renderer-crash reload path — the same
+// load, so recovery can never diverge from first launch.
 function loadFrontend() {
   const url = process.env.FLY_SHELL_URL;
   if (url) return win.loadURL(url);
   if (app.isPackaged) return win.loadFile('frontend/index.html');
-  return win.loadFile('probe.html');
+  const built = path.join(__dirname, '..', 'dist', 'index.html');
+  if (fs.existsSync(built)) return win.loadFile(built);
+  return win.loadFile('no-frontend.html');
 }
 
 // Ordered core shutdown on quit (migration U6): ask the core to run the same
