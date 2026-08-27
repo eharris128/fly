@@ -15,6 +15,9 @@ renderer running the unchanged Svelte frontend over the preload bridge.
   (`core/shutdown` → wait → SIGTERM/SIGKILL ladder).
 - `recovery.js` — the pure half of renderer-crash recovery (reload budget,
   frame-delivery guard, close plan), tested in `recovery.test.js`.
+- `urgency.js` — the pure window-urgency rule (flash the frame on a `raised`
+  attention event while unfocused; cleared on focus in main), tested in
+  `urgency.test.js`. The OS banner itself is the core's (`notify-send`).
 - `crashed.html` — the page shown when the reload budget is exhausted
   (inert; `R` retries, handled in main).
 - `preload.cjs` — the renderer's whole surface (`window.fly`): `invoke`,

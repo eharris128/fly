@@ -10,6 +10,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { encodeJson, encodePaneInput, FrameReader } = require('./protocol');
+const { shouldFlash } = require('./urgency');
 const {
   ReloadBudget,
   canDeliver,
@@ -48,7 +49,13 @@ function launchArgs() {
 }
 
 // ---- single instance -------------------------------------------------------
-if (!app.requestSingleInstanceLock()) {
+// A second launch (`fly` / `fly resume` from a terminal while the app runs,
+// routine since bare `fly` execs this shell — 2026-08-27-001 KTD7) hands off
+// to the running instance's `second-instance` handler and must do nothing
+// else: `app.quit()` is asynchronous, and without the `gotLock` guard on
+// `whenReady` the loser raced on to adopt the core and try to load a window.
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
@@ -199,6 +206,11 @@ async function wireCore() {
         if ('ok' in msg) p.resolve(msg.ok);
         else p.reject(new Error(msg.err ?? 'unknown error'));
       } else if (msg.event !== undefined) {
+        // Window urgency on a raise (2026-08-27-001 KTD4): the hint the
+        // pre-Electron shell set on every banner; cleared on focus below.
+        if (win && !win.isDestroyed() && shouldFlash(msg.event, msg.payload, win.isFocused())) {
+          win.flashFrame(true);
+        }
         sendToRenderer('fly:event', msg.event, msg.payload);
       }
     },
@@ -252,6 +264,7 @@ ipcMain.on('fly:pane-input', (e, paneId, bytes) => {
 
 // ---- window -----------------------------------------------------------------
 app.whenReady().then(async () => {
+  if (!gotLock) return; // the losing second instance is already quitting
   try {
     await wireCore();
   } catch (e) {
@@ -271,6 +284,7 @@ app.whenReady().then(async () => {
   });
   win.removeMenu();
   win.on('page-title-updated', (e) => e.preventDefault());
+  win.on('focus', () => win.flashFrame(false)); // urgency cleared once the user looks (KTD4)
   const wc = win.webContents;
 
   // Quit-confirm flow (U5): the renderer owns the busy-agents confirm (the

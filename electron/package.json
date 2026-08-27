@@ -22,6 +22,7 @@
       "preload.cjs",
       "protocol.js",
       "recovery.js",
+      "urgency.js",
       "crashed.html",
       "frontend/**"
     ],
