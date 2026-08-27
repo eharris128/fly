@@ -9,7 +9,6 @@
   import { getConfig } from "./config";
   import type { Renderer as RendererMode } from "./config";
   import { wantsWebgl } from "./renderer";
-  import { renderMirrorHtml, type MirrorBuffer } from "./mirror";
   import type { Keymap } from "./keymap";
   import { resolveSpawnRace } from "./pane-maps";
   import type { ResumeTier } from "./resume";
@@ -52,15 +51,6 @@
      * alive under the dashboard avoids a dispose/recreate churn on every
      * `leader d` toggle. */
     visible?: boolean;
-    /**
-     * Mirror mode (tmux-substrate plan U5/KTD2): the pane is visible in the
-     * tab but unfocused, and App shows a cheap DOM snapshot instead of this
-     * live terminal. The xterm stays mounted and keeps parsing bytes (the
-     * buffer is the mirror's source); its container is display:none'd so
-     * xterm's IntersectionObserver pauses rendering, and WebGL never
-     * attaches while mirrored.
-     */
-    mirrored?: boolean;
     /** U7: an external terminal is attached to this pane's tmux session —
      * show the badge (the suppression side is backend-owned). */
     attachedElsewhere?: boolean;
@@ -102,7 +92,6 @@
     leafKey,
     focused,
     visible = true,
-    mirrored = false,
     attachedElsewhere = false,
     ephemeral = false,
     keymap,
@@ -148,8 +137,7 @@
   // only while this pane is visible and disposes it on hide — disposal is not
   // an unmount: xterm drops to the DOM renderer transparently, the buffer and
   // the agent survive, so the never-respawn invariant holds and live GL
-  // contexts stay bounded at one tab's panes (the many-context WebKitGTK
-  // blanking that kept WebGL opt-in cannot accumulate). The decision rule is
+  // contexts stay bounded at one tab's panes. The decision rule is
   // the pure `wantsWebgl` (lib/renderer.ts); this is the effectful half.
   let rendererMode: RendererMode = "dom"; // real value read from config at mount
   let webgl: WebglAddon | null = null;
@@ -157,9 +145,7 @@
 
   function syncRenderer() {
     if (!term) return;
-    // Render-visibility: a mirrored pane is user-visible but its live
-    // terminal is hidden DOM — no GL context for it (U5).
-    if (wantsWebgl(rendererMode, visible && !mirrored, webglFailed)) attachWebgl();
+    if (wantsWebgl(rendererMode, visible, webglFailed)) attachWebgl();
     else detachWebgl();
   }
 
@@ -195,28 +181,7 @@
   // `term` exists; onMount calls it once directly after the terminal opens.
   $effect(() => {
     void visible;
-    void mirrored;
     syncRenderer();
-  });
-
-  // U5 mirror snapshots: while mirrored, refresh a styled-DOM snapshot of
-  // the (hidden, still-parsing) terminal's viewport at 2 Hz. The interval
-  // exists only while mirrored — an unmirrored or hidden pane costs nothing.
-  let mirrorContent = $state("");
-  let mirrorFontSize = $state(15);
-  $effect(() => {
-    if (!mirrored) return;
-    const refresh = () => {
-      if (!term) return;
-      mirrorContent = renderMirrorHtml(
-        term.buffer.active as unknown as MirrorBuffer,
-        term.rows,
-        term.cols,
-      );
-    };
-    refresh();
-    const timer = setInterval(refresh, 500);
-    return () => clearInterval(timer);
   });
 
   const REASON_LABEL: Record<AttentionReason, string> = {
@@ -349,7 +314,6 @@
     // Renderer (KTD6/T4): after fit so the container is measured — a hidden
     // pane defers its attach to the ResizeObserver/visibility effect above.
     rendererMode = config.renderer;
-    mirrorFontSize = config.fontSize;
     syncRenderer();
     const cols = term.cols >= 2 ? term.cols : 80;
     const rows = term.rows >= 2 ? term.rows : 24;
@@ -370,9 +334,9 @@
     // not bounced through the hidden-mount geometry. `command` (a resume
     // argv) is moot for an adopted pane — the agent never stopped. Automation-linked and ephemeral
     // panes always spawn fresh: their leaves are minted per run, and a run
-    // must link a pane of its own. Null under Tauri (no Channel re-bind) and
-    // for any leaf nobody owns — the normal case — so this is one cheap
-    // round-trip per mount that changes nothing on a clean boot.
+    // must link a pane of its own. Null for any leaf nobody owns — the
+    // normal case — so this is one cheap round-trip per mount that changes
+    // nothing on a clean boot.
     let adopted: Awaited<ReturnType<typeof adoptLivePane>> = null;
     if (automationRunId === null && !ephemeral) {
       try {
@@ -563,13 +527,7 @@
   role="presentation"
   onpointerdown={() => onFocusRequest(leafKey)}
 >
-  <div class="terminal" class:term-mirrored={mirrored} bind:this={container}></div>
-  {#if mirrored}
-    <!-- U5: cheap snapshot of the hidden terminal's viewport. Clicking it
-         focuses the pane (the wrapper's pointerdown), which unmirrors and
-         reveals the live terminal. -->
-    <pre class="mirror" style="font-size:{mirrorFontSize}px" aria-hidden="true">{@html mirrorContent}</pre>
-  {/if}
+  <div class="terminal" bind:this={container}></div>
   {#if attachedElsewhere}
     <div class="attach-badge" title="an external terminal is attached to this session">
       ⇱ attached in terminal
@@ -604,12 +562,6 @@
     height: 100%;
     padding: 4px;
   }
-  /* U5: while mirrored, the live terminal is hidden DOM (xterm keeps
-     parsing; IntersectionObserver pauses its renderer) and the snapshot
-     takes its place. */
-  .terminal.term-mirrored {
-    display: none;
-  }
   .attach-badge {
     position: absolute;
     top: 6px;
@@ -622,19 +574,6 @@
     background: #1a2740cc;
     border: 1px solid #2b3a55;
     pointer-events: none;
-  }
-  .mirror {
-    width: 100%;
-    height: 100%;
-    margin: 0;
-    padding: 4px;
-    overflow: hidden;
-    font-family: monospace;
-    line-height: 1.2;
-    color: #c9d1d9;
-    background: #0b1020;
-    cursor: default;
-    user-select: none;
   }
   /* A subtle focus outline so the active pane is obvious. */
   .pane.focused::before {

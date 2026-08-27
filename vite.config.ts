@@ -1,16 +1,16 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
 export default defineConfig({
-  // Relative asset URLs, so the same dist/ loads over Tauri's asset protocol
-  // AND the packaged Electron shell's file:// (migration U7). Absolute '/'
-  // paths break file:// loading; relative works on both.
+  // Relative asset URLs: the packaged Electron shell loads the same dist/
+  // over file:// (migration U7), where absolute '/' paths break.
   base: "./",
   plugins: [
     svelte(),
     {
-      // WebKitGTK fails to load `crossorigin` module scripts from Tauri's
-      // custom asset protocol, leaving a blank window in release builds.
+      // A `crossorigin` module script forces CORS mode, and file:// is an
+      // opaque origin — the packaged shell would show a blank window. Strip
+      // the attribute Vite adds so the module loads under file://.
       name: "fly-strip-crossorigin",
       enforce: "post",
       transformIndexHtml(html) {
@@ -18,13 +18,19 @@ export default defineConfig({
       },
     },
   ],
-  // Tauri shows its own errors; don't let Vite wipe them.
+  // Keep the shell's own log lines visible in the dev terminal.
   clearScreen: false,
   server: {
-    // Tauri expects a fixed dev port.
+    // The Electron dev loop points FLY_SHELL_URL at this fixed port.
     port: 1420,
     strictPort: true,
     // Don't watch the Rust side — cargo handles that.
     watch: { ignored: ["**/src-tauri/**"] },
+  },
+  test: {
+    // Explicit (2026-08-27-001 KTD12): the shell's codec/recovery tests ride
+    // the same run as the frontend's; nothing else in the tree is a test.
+    include: ["src/**/*.test.ts", "electron/**/*.test.js"],
+    exclude: ["**/node_modules/**", "**/dist/**", "electron/dist-el/**", "electron/frontend/**"],
   },
 });

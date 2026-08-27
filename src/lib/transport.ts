@@ -1,22 +1,15 @@
 // The frontend's ONE transport seam (Electron-shell migration U5): every
 // backend touchpoint — command invoke, event subscription, pane output
-// bytes, window close — routes through here, running on either shell:
+// bytes, window close — routes through here, over the Electron preload's
+// `window.fly` bridge (see electron/preload.cjs): invoke over the control
+// socket, events fanned out from the backend's broadcast, pane output pushed
+// per-frame with the pane id. Command names and argument shapes are the ones
+// `control/registry.rs` pins (KTD1). Pane output subscribes by pane id after
+// spawn resolves — with a bounded pre-subscription buffer so early frames are
+// never dropped. No other file may touch `window.fly` directly.
 //
-// - **Tauri**: `@tauri-apps/api` invoke/listen/Channel, exactly as before.
-// - **Electron**: the preload's `window.fly` bridge (see electron/preload.cjs)
-//   — invoke over the control socket, events fanned out from the backend's
-//   broadcast, pane output pushed per-frame with the pane id.
-//
-// Command names and argument shapes are identical on both paths (KTD1); the
-// only structural difference is pane output: Tauri threads a `Channel` through
-// `spawn_pane`, Electron subscribes by pane id after spawn resolves — with a
-// bounded pre-subscription buffer so early frames are never dropped.
-
-import { invoke as tauriInvoke, Channel } from "@tauri-apps/api/core";
-import {
-  listen as tauriListen,
-  type UnlistenFn as TauriUnlistenFn,
-} from "@tauri-apps/api/event";
+// (The Tauri branch this seam once carried was retired by
+// docs/plans/2026-08-27-001; the bridge is now required, not detected.)
 
 export type UnlistenFn = () => void;
 
@@ -26,8 +19,8 @@ interface FlyBridge {
   onEvent(cb: (event: string, payload: unknown) => void): () => void;
   onPaneOutput(cb: (paneId: number, bytes: Uint8Array) => void): () => void;
   paneInput(paneId: number, bytes: Uint8Array): void;
-  onCloseRequested?(cb: () => void): () => void;
-  closeNow?(): void;
+  onCloseRequested(cb: () => void): () => void;
+  closeNow(): void;
 }
 
 declare global {
@@ -36,23 +29,31 @@ declare global {
   }
 }
 
-const bridge: FlyBridge | undefined =
-  typeof window !== "undefined" ? window.fly : undefined;
-
-/** True when running inside the Electron shell (U4's `window.fly` bridge). */
-export function isElectronShell(): boolean {
-  return bridge !== undefined;
+// Resolved lazily on first use rather than at module load, so importing this
+// module in a unit test (or a bare browser tab) never throws — only a real
+// transport call without the shell does, with a message that says why.
+let cached: FlyBridge | undefined;
+function bridge(): FlyBridge {
+  if (cached) return cached;
+  const b = typeof window !== "undefined" ? window.fly : undefined;
+  if (!b) {
+    throw new Error(
+      "fly: window.fly is missing — the frontend must run inside the Electron shell (electron/), not a bare browser tab",
+    );
+  }
+  cached = b;
+  return b;
 }
 
 // ---- invoke -----------------------------------------------------------------
 
 // JSON round-trip before any bridge IPC hop: Electron structured-clones its
 // arguments, which throws ("An object could not be cloned") on Svelte 5
-// `$state` proxies; Tauri always JSON-serialized (reading through proxies),
-// so this exactly preserves the wire semantics the commands were written
-// against. EVERY `bridge.invoke` call must pass through this — the resume
-// path shipped broken because `spawnPaneWithSink` skipped it and the replayed
-// argv arrived as a `$state` proxy.
+// `$state` proxies. Commands were written against JSON-serialized args, so
+// this exactly preserves their wire semantics. EVERY `bridge().invoke` call
+// must pass through this — the resume path shipped broken because
+// `spawnPaneWithSink` skipped it and the replayed argv arrived as a `$state`
+// proxy (a source-lint test pins the rule).
 function plainArgs(
   args?: Record<string, unknown>,
 ): Record<string, unknown> | undefined {
@@ -65,24 +66,22 @@ export function invoke<T = void>(
   cmd: string,
   args?: Record<string, unknown>,
 ): Promise<T> {
-  if (bridge) {
-    return bridge.invoke(cmd, plainArgs(args)) as Promise<T>;
-  }
-  return tauriInvoke<T>(cmd, args);
+  return bridge().invoke(cmd, plainArgs(args)) as Promise<T>;
 }
 
 // ---- events -----------------------------------------------------------------
-// Electron: one bridge subscription fans out to per-event handler sets, so
-// `listen` keeps Tauri's shape (`Promise<UnlistenFn>`, `{ payload }` arg).
+// One bridge subscription fans out to per-event handler sets; `listen` keeps
+// the `Promise<UnlistenFn>` / `{ payload }` shape the callers were written
+// against.
 
 type EventHandler = (ev: { payload: unknown }) => void;
 const eventHandlers = new Map<string, Set<EventHandler>>();
 let bridgeEventsWired = false;
 
 function wireBridgeEvents(): void {
-  if (bridgeEventsWired || !bridge) return;
+  if (bridgeEventsWired) return;
   bridgeEventsWired = true;
-  bridge.onEvent((event, payload) => {
+  bridge().onEvent((event, payload) => {
     const handlers = eventHandlers.get(event);
     if (!handlers) return;
     for (const h of [...handlers]) h({ payload });
@@ -93,7 +92,6 @@ export function listen<T>(
   event: string,
   handler: (ev: { payload: T }) => void,
 ): Promise<UnlistenFn> {
-  if (!bridge) return tauriListen<T>(event, handler) as Promise<TauriUnlistenFn>;
   wireBridgeEvents();
   let set = eventHandlers.get(event);
   if (!set) {
@@ -109,14 +107,11 @@ export function listen<T>(
 // ---- pane output ------------------------------------------------------------
 // One bridge subscription; per-pane sinks registered on spawn. Frames that
 // arrive between the backend spawning the pane and the renderer learning its
-// id are buffered (bounded) and flushed on registration — the Electron
-// analogue of the Channel being wired before spawn under Tauri.
+// id are buffered (bounded) and flushed on registration.
 
 /** Opaque per-pane output sink; construct with [`makeOutputSink`]. */
 export interface OutputSink {
   onBytes: (bytes: Uint8Array) => void;
-  /** Tauri only: the Channel threaded through `spawn_pane`. */
-  channel?: Channel<ArrayBuffer>;
 }
 
 const paneSinks = new Map<number, OutputSink>();
@@ -125,9 +120,9 @@ const preBuffers = new Map<number, { chunks: Uint8Array[]; total: number }>();
 let bridgeOutputWired = false;
 
 function wireBridgeOutput(): void {
-  if (bridgeOutputWired || !bridge) return;
+  if (bridgeOutputWired) return;
   bridgeOutputWired = true;
-  bridge.onPaneOutput((paneId, bytes) => {
+  bridge().onPaneOutput((paneId, bytes) => {
     const sink = paneSinks.get(paneId);
     if (sink) {
       sink.onBytes(bytes);
@@ -148,28 +143,19 @@ function wireBridgeOutput(): void {
 }
 
 export function makeOutputSink(onBytes: (bytes: Uint8Array) => void): OutputSink {
-  if (bridge) return { onBytes };
-  const channel = new Channel<ArrayBuffer>();
-  channel.onmessage = (message) => {
-    onBytes(new Uint8Array(message));
-  };
-  return { onBytes, channel };
+  return { onBytes };
 }
 
 /**
- * Spawn a pane with its output sink. Tauri threads the sink's Channel through
- * the command; Electron spawns first, then binds the sink to the returned
- * pane id and flushes any pre-subscription frames in order.
+ * Spawn a pane with its output sink: spawn first, then bind the sink to the
+ * returned pane id and flush any pre-subscription frames in order.
  */
 export async function spawnPaneWithSink(
   sink: OutputSink,
   args: Record<string, unknown>,
 ): Promise<number> {
-  if (!bridge) {
-    return tauriInvoke<number>("spawn_pane", { channel: sink.channel, ...args });
-  }
   wireBridgeOutput();
-  const paneId = (await bridge.invoke("spawn_pane", plainArgs(args))) as number;
+  const paneId = (await bridge().invoke("spawn_pane", plainArgs(args))) as number;
   paneSinks.set(paneId, sink);
   const buffered = preBuffers.get(paneId);
   if (buffered) {
@@ -193,14 +179,9 @@ export interface AdoptedPane {
 
 /**
  * Re-attach to the LIVE pane the backend still owns for `leafKey` instead
- * of spawning a second one — renderer-crash recovery: the Electron shell
- * reloads the frontend after the Chromium renderer dies, and the core with
- * every agent in it is still running. Null ⇒ nobody owns that leaf: spawn.
- *
- * Electron only. Under Tauri a pane's output Channel is bound at spawn and
- * baked into its coalescer — there is no re-bind, and the Tauri webview is
- * never reloaded in practice — so this answers null without a round-trip
- * (the Tauri command exists for surface parity and answers null too).
+ * of spawning a second one — renderer-crash recovery: the shell reloads the
+ * frontend after the Chromium renderer dies, and the core with every agent
+ * in it is still running. Null ⇒ nobody owns that leaf: spawn.
  *
  * Capture-then-subscribe: frames that reached the bridge before the sink
  * binds predate (or overlap) the tail snapshot, so they are DISCARDED — a
@@ -211,9 +192,8 @@ export async function adoptLivePaneWithSink(
   sink: OutputSink,
   args: { leafKey: string },
 ): Promise<AdoptedPane | null> {
-  if (!bridge) return null;
   wireBridgeOutput();
-  const adopted = (await bridge.invoke(
+  const adopted = (await bridge().invoke(
     "adopt_live_pane",
     plainArgs(args),
   )) as AdoptedPane | null;
@@ -230,29 +210,16 @@ export function releasePaneSink(paneId: number): void {
 }
 
 // ---- window close -----------------------------------------------------------
-// Tauri: getCurrentWindow().onCloseRequested + destroy. Electron: the main
-// process intercepts `close` and asks us; `closeNow` finishes the job.
+// The main process intercepts `close` and asks us; `closeNow` finishes the
+// job once the quit-confirm flow decides.
 
 export async function onWindowCloseRequested(
   handler: () => void | Promise<void>,
 ): Promise<void> {
-  if (bridge) {
-    bridge.onCloseRequested?.(() => void handler());
-    return;
-  }
-  const { getCurrentWindow } = await import("@tauri-apps/api/window");
-  await getCurrentWindow().onCloseRequested(async (event) => {
-    event.preventDefault();
-    await handler();
-  });
+  bridge().onCloseRequested(() => void handler());
 }
 
 /** Actually close the window (after the quit-confirm flow decides). */
 export async function destroyWindow(): Promise<void> {
-  if (bridge) {
-    bridge.closeNow?.();
-    return;
-  }
-  const { getCurrentWindow } = await import("@tauri-apps/api/window");
-  await getCurrentWindow().destroy();
+  bridge().closeNow();
 }

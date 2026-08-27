@@ -292,12 +292,6 @@
   // drives the tier transparency so a degraded resume is never passed off as exact.
   let resumeTierByLeaf = $state<Record<string, ResumeTier>>({});
   let saveScrollbackEnabled = $state(false);
-  // U5 (tmux-substrate plan): visible-but-unfocused panes render as 2 Hz DOM
-  // snapshots of their hidden xterm buffers — the WebKitGTK engine-floor
-  // relief. Seeded from config.mirrorUnfocused; default OFF since the
-  // Electron cutover (migration U8 — Chromium renders 5 live flooding panes
-  // at ~14% renderer main-thread, mirror or not); `true` restores snapshots.
-  let mirrorUnfocused = $state(false);
   // U7: leaves whose tmux session has an external terminal attached
   // (pane://attach events) — drives the badge and nothing else; the
   // suppression side lives in the backend AttentionManager.
@@ -1697,17 +1691,17 @@
     return buildHomeModel(workspaces, agents, cwdByLeaf, att, reasonByLeaf);
   });
   // A worker-driven interval that survives window backgrounding
-  // (fix-feed-stale-status-while-backgrounded). WebKit throttles/pauses
-  // main-thread `setInterval` when the fly window is occluded/minimized (the same
-  // finding `reportForeground` documents), which freezes the agent poll — so the
-  // dashboard reads stale on switch-back AND the SSE feed the `game` portfolio
-  // consumes goes stale until the throttled poll resumes. A Web Worker's timer
-  // runs on its own thread and is *not* subject to page-visibility throttling, so
-  // ticks keep arriving at full cadence while fly is backgrounded. Classic
-  // Blob-URL worker (no bundling / module / asset-protocol — that path is the
-  // WebKitGTK blank-window minefield `fly-strip-crossorigin` guards). Falls back
-  // to a plain `setInterval` if a worker can't be created, so the poll degrades
-  // to today's behavior rather than stopping entirely.
+  // (fix-feed-stale-status-while-backgrounded). Browser engines throttle
+  // main-thread `setInterval` when the fly window is occluded/minimized
+  // (measured on WebKitGTK at ~2 s; Chromium throttles hidden timers too),
+  // which freezes the agent poll — so the dashboard reads stale on
+  // switch-back AND the SSE feed an external consumer reads goes stale until
+  // the throttled poll resumes. A Web Worker's timer runs on its own thread
+  // and is *not* subject to page-visibility throttling, so ticks keep
+  // arriving at full cadence while fly is backgrounded. Classic Blob-URL
+  // worker (no bundling / module / file:// asset to resolve). Falls back to a
+  // plain `setInterval` if a worker can't be created, so the poll degrades
+  // rather than stopping entirely.
   function startPollTicker(ms: number, onTick: () => void): () => void {
     try {
       const url = URL.createObjectURL(
@@ -2286,7 +2280,6 @@
   async function restore() {
     const cfg = await getConfig();
     saveScrollbackEnabled = cfg.saveScrollback;
-    mirrorUnfocused = cfg.mirrorUnfocused ?? false;
     leaderKey = cfg.leaderKey;
     nudgeIdleMs = cfg.nudgeIdleMs;
     feedEnabled = cfg.feed.enabled;
@@ -2599,9 +2592,6 @@
               focused={p.tabId === activeTab?.id &&
                 activeTab?.focusedLeafKey === p.key}
               visible={p.tabId === activeTab?.id}
-              mirrored={mirrorUnfocused &&
-                p.tabId === activeTab?.id &&
-                activeTab?.focusedLeafKey !== p.key}
               attachedElsewhere={attachedByLeaf[p.key] ?? false}
               ephemeral={sinkCommandByLeaf[p.key] !== undefined}
               cwd={cwdByLeaf[p.key] ?? null}

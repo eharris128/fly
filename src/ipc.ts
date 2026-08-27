@@ -530,8 +530,7 @@ export interface AdoptedPane extends Omit<TransportAdoptedPane, "attention" | "r
 /**
  * Re-attach to the live pane the backend still owns for a leaf, binding the
  * output sink to its existing id (no spawn). Null when no live pane owns the
- * leaf — or under Tauri, where a pane's Channel can't be re-bound — so the
- * caller spawns as usual. The answer carries the pane's current grid (size
+ * leaf, so the caller spawns as usual. The answer carries the pane's current grid (size
  * the xterm to it first) and its output tail for the first paint. See
  * `transport.adoptLivePaneWithSink`.
  */

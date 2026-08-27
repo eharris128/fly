@@ -1,14 +1,14 @@
 // Tests for the transport seam's Electron-bridge path — above all the
-// `plainArgs` invariant: EVERY `bridge.invoke` must JSON-round-trip its args
+// `plainArgs` invariant: EVERY `bridge().invoke` must JSON-round-trip its args
 // before the IPC hop, because Electron structured-clones its arguments and a
 // Svelte 5 `$state` proxy fails that clone. The resume path shipped broken
 // (commit d483f5c) because `spawnPaneWithSink` skipped the round-trip; these
 // tests pin both existing call sites behaviorally AND lint the module source
-// so a future `bridge.invoke` call can't reintroduce the bug.
+// so a future `bridge().invoke` call can't reintroduce the bug.
 //
-// The bridge is captured from `window.fly` at module load, so each test
-// installs the mock bridge on a fresh `window` and dynamic-imports a fresh
-// module instance.
+// The bridge is resolved from `window.fly` on first use and cached, so each
+// test installs the mock bridge on a fresh `window` and dynamic-imports a
+// fresh module instance.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import transportSource from "./transport.ts?raw";
 
@@ -154,15 +154,15 @@ describe("listen (bridge path)", () => {
 });
 
 describe("the plainArgs invariant (source lint)", () => {
-  it("every bridge.invoke call site routes its args through plainArgs", () => {
-    const sites = transportSource.split("bridge.invoke(").slice(1);
+  it("every bridge().invoke call site routes its args through plainArgs", () => {
+    const sites = transportSource.split("bridge().invoke(").slice(1);
     expect(sites.length).toBeGreaterThanOrEqual(2); // invoke + spawnPaneWithSink
     for (const site of sites) {
       const head = site.slice(0, 80);
       const singleArg = /^[^,)]*\)/.test(head); // no args object at all — safe
       expect(
         singleArg || head.includes("plainArgs("),
-        `bridge.invoke call without plainArgs(): "${head.trim()}..." — ` +
+        `bridge().invoke call without plainArgs(): "${head.trim()}..." — ` +
           "Electron structured-clones IPC args; a $state proxy throws. " +
           "Wrap the args in plainArgs() (see the d483f5c resume regression).",
       ).toBe(true);
