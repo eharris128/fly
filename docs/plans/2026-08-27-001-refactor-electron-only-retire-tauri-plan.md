@@ -2,9 +2,11 @@
 title: "refactor: Electron-only — retire the Tauri shell, unify the build"
 type: refactor
 date: 2026-08-27
-status: design — not started. Answers open decision 3 of
+status: executed 2026-08-27 — U0–U7 all landed on main the same day (see the
+  results block at the bottom). Answers open decision 3 of
   docs/plans/2026-08-12-002-proposal-electron-shell-migration-plan.md
-  ("Tauri retirement horizon") with: retire now, before the repo goes public.
+  ("Tauri retirement horizon") with: retired now, before the repo goes public.
+  Rollback = git tag `tauri-shell-final` (proven to build the Tauri deb).
 origin: docs/plans/2026-08-12-002-proposal-electron-shell-migration-plan.md
   (KTD9 "stays buildable during transition, retired only after the Electron
   build has soaked as the daily driver" — it has: cutover 2026-08-12, daily
@@ -402,3 +404,66 @@ in any order and today.
   if it ever comes back it comes back as a shipped, installed artifact.
 - Plan status headers across `docs/plans/` (the open-source hygiene
   item that motivated this plan is tracked separately).
+
+---
+
+## Results (2026-08-27, as-built)
+
+Executed in order U0 → U7 in one session; each unit is its own commit on
+`main` (`b0b65a8` U0 … `9c0c2ca` U7). Three corrections against the text
+above, recorded rather than silently diverged from:
+
+- **KTD7's verify-first item had a real finding.** The shell spawned `fly
+  core` with no argv, so `fly resume` had reached nothing since the cutover —
+  only the crash-marker *offer* path worked. U3 made the CLI binary exec
+  `/opt/fly/fly-shell` with argv passed through, the shell forward `resume`
+  to the core it spawns (`fly core resume`), and `resolve_launch_mode` take
+  the bool. Live-verified: the packaged shell launched as `fly-shell resume`
+  spawns `fly core resume` and `get_launch_mode` answers `"resume"`.
+- **KTD4's parity check found the gap.** `main.js` had no window-urgency
+  handling at all. U7 added `electron/urgency.js` (pure `shouldFlash`,
+  tested) wired into the event bridge, cleared on focus.
+- **A second real bug fixed in passing:** a losing second launch raced past
+  `app.quit()` into `whenReady`, adopted the core and logged `ERR_FAILED`
+  loading the frontend. Now routine (bare `fly` execs the shell), so guarded.
+
+Gates:
+
+- R1: `git grep -i tauri` outside the historical doc dirs returns only the
+  deliberate retirement notes. `cargo tree | grep -i tauri` is empty.
+- R2/R3: `cargo test --offline` (814 lib + every integration file),
+  `pnpm check`, `pnpm test:unit` (417, incl. `electron/*.test.js` and the
+  new lockstep test) green at the end of every unit. One integration test
+  (`headless_runner::kill_run_seam…`, a 5 s bounded poll) failed once under
+  the fat-LTO release build's CPU load and passed on re-run.
+- R5: a clean `pnpm install` + `pnpm build:deb` produced a deb whose
+  `dpkg -c` file set is **identical** to the pre-U4 build (92 entries).
+- R6: `fly --version` → `fly 0.2.0`; `src/version-lockstep.test.ts` in the
+  run.
+- R7: bare `fly` with no shell → help + exit 2; with `FLY_SHELL_BIN` → exec
+  with argv (same pid). The real installed layout matches the derivation
+  (`/usr/bin/fly → /opt/fly/resources/fly`, `/opt/fly/fly-shell`).
+- R8: `tauri-shell-final` tagged at the post-U0 commit; the Tauri deb built
+  from it in a scratch worktree (needed the frontend prebuilt and
+  `beforeBuildCommand` blanked — pnpm's deps check refuses a symlinked
+  `node_modules`).
+- R4 (live, on the packaged artifact extracted from the deb, `fly-el`
+  flavor, installed app untouched throughout — its core pid 47783 ran the
+  whole time): sockets bound + `core/ping`; feed `/healthz` 200; a raise
+  from the spawned pane's own token → `pane://attention raised` on the
+  socket; with the window replicated as backgrounded, the same raise →
+  D-Bus `Notify` from `notify-send` with the exact title/body (KTD4 banner);
+  renderer SIGSEGV → `renderer gone … exitCode=139` → reload → new
+  renderer, **same pane pid** (adopted, no `pane://exit`); `core/shutdown`
+  → `shutting down (ordered)` → core exit → shell respawned a core; `fly
+  resume` from the packaged binary while running → single-instance handoff,
+  no second shell. Not exercised without a keyboard: the busy-agents quit
+  confirm and the actual `flashFrame` (its pure rule is unit-tested; the
+  window was focused throughout).
+
+**Not done, deliberately:** the deb was **not installed** — it would replace
+the daily driver mid-session. `electron/dist-el/fly-electron-shell_0.2.0_amd64.deb`
+is the artifact (same version as the installed one, so `sudo apt install
+--reinstall ./…deb`, or bump the version first). Installing it also finally
+ships the renderer-crash recovery the installed build predates.
+
