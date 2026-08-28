@@ -10,7 +10,9 @@ while holding the destination pipe's mutex; tmux 3.6 exonerated. U1: `fly
 substrate-pipe` landed (red→green: live suite 3/6 → **7/7**, incl. the new
 pinning test). U2: **gate 1 hit** — tmux 50/50 at every gap, p50 4.34–4.47 ms
 vs pty 4.23–4.29, zero withheld. Next: U3 (hook-path exit latency, geometry,
-history-limit on 3.6a) then U4 (the checklist on fly-el).
+history-limit on 3.6a) then U4 (the checklist on fly-el). **The operational
+script for U3–U5 — commands, who does what, pass criteria, where results go
+— is `2026-08-28-001-tmux-36-spike-RUNBOOK.md` beside this plan.**
 **Type**: spike (bounded validation + one targeted fix; not a feature)
 **Follows**: `docs/plans/2026-08-11-001-feat-tmux-session-substrate-plan.md`
 (the substrate, built and module-validated on tmux 3.4),
