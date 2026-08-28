@@ -146,6 +146,100 @@ fn tmux_pane_output_input_resize_teardown_roundtrip() {
     );
 }
 
+/// Spike 2026-08-28-001 KTD3: the `pipe-pane` consumer must deliver every
+/// byte as it arrives. With a splicing host `cat` (uutils/busybox — the
+/// default on Ubuntu ≥ 25.10) the kernel held the FIFO's pipe mutex across
+/// the socket wait, so an echo was released only by the *next* keystroke and
+/// the last one of a burst was held until more output (and a dead pane's
+/// exit never surfaced — the reader's `close()` blocked too). This pins the
+/// fly-owned read/write copier and fails loudly if anyone "simplifies" the
+/// consumer back to `cat` or `std::io::copy`.
+#[test]
+#[ignore = "needs a tmux binary; run with -- --ignored"]
+fn pipe_consumer_delivers_every_byte() {
+    let scratch = Scratch::new("u1pipe");
+    let substrate = scratch.substrate();
+    let mgr = PtyManager::new();
+    mgr.set_substrate(Arc::clone(&substrate));
+
+    let (out_tx, out_rx) = mpsc::channel::<(Instant, Vec<u8>)>();
+    let id = mgr.reserve_id();
+    // `cat` in the pane: canonical-mode echo returns exactly one byte per
+    // key and nothing else ever writes, so a withheld byte can't be masked
+    // by unrelated output.
+    let cfg = SpawnConfig {
+        command: Some(vec!["cat".into()]),
+        leaf_key: Some("pipe-leaf".into()),
+        rows: 24,
+        cols: 80,
+        ..Default::default()
+    };
+    mgr.spawn_with_id(
+        id,
+        cfg,
+        "cd".repeat(32),
+        Box::new(move |bytes: &[u8]| {
+            let _ = out_tx.send((Instant::now(), bytes.to_vec()));
+        }),
+        Box::new(|_: PaneId, _| {}),
+    )
+    .expect("spawn");
+    std::thread::sleep(Duration::from_millis(500)); // let the pane's cat come up
+    while out_rx.try_recv().is_ok() {} // discard any startup bytes
+
+    let keys: Vec<u8> = (b'a'..=b'l').collect(); // 12 distinct keys
+    let mut sent = Vec::new();
+    for k in &keys {
+        sent.push(Instant::now());
+        mgr.write(id, &[*k]).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    // Every echo must be in within 500 ms of the LAST key — no "released by
+    // the next keystroke", no "held until later output".
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut got: Vec<(Instant, u8)> = Vec::new();
+    while Instant::now() < deadline && got.len() < keys.len() {
+        while let Ok((t, chunk)) = out_rx.try_recv() {
+            got.extend(
+                chunk
+                    .into_iter()
+                    .filter(|b| keys.contains(b))
+                    .map(|b| (t, b)),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let echoed: Vec<u8> = got.iter().map(|(_, b)| *b).collect();
+    assert_eq!(
+        echoed, keys,
+        "every key echoes exactly once, in order (withheld = missing here)"
+    );
+    let worst = got
+        .iter()
+        .zip(&sent)
+        .map(|((t, _), s)| t.duration_since(*s))
+        .max()
+        .unwrap();
+    assert!(
+        worst <= Duration::from_millis(50),
+        "an echo took {worst:?} to arrive — the consumer is withholding output"
+    );
+
+    // And nothing trickles in once the pane goes quiet: a late arrival here
+    // is a write the consumer had been sitting on.
+    std::thread::sleep(Duration::from_millis(300));
+    let stray: usize = std::iter::from_fn(|| out_rx.try_recv().ok())
+        .map(|(_, c)| c.len())
+        .sum();
+    assert_eq!(
+        stray, 0,
+        "{stray} byte(s) arrived after the burst — a withheld write"
+    );
+
+    mgr.close(id).unwrap();
+}
+
 #[test]
 #[ignore = "needs a tmux binary; run with -- --ignored"]
 fn tmux_pane_child_exit_surfaces_exited_state() {

@@ -173,8 +173,9 @@ The same binary is the `fly` CLI, the headless backend (**`fly core`** — what
 the Electron shell spawns and drives), and — run bare, or as `fly resume` —
 the launcher that execs the installed desktop shell. Inside a pane, `fly
 notify` talks to the running app; `fly hooks setup|teardown` manages the Claude
-Code hooks; `fly substrate-event` is the tmux-hook endpoint (not for human
-use); `fly automation
+Code hooks; `fly substrate-event` (the tmux-hook endpoint) and `fly
+substrate-pipe` (the per-pane output consumer under the tmux substrate) are
+internal, not for human use; `fly automation
 <create|update|list|show|runs|pause|resume|run|delete>`
 manages cron-scheduled runs (`create --monitor --not-before …` registers a
 monitor; `update` patches a stored automation in place, keeping its id and run

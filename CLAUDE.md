@@ -116,12 +116,14 @@ answers (a second `fly core` on a live flavor exits at boot).
 
 ### One binary, two roles (and a launcher)
 `main.rs` → `lib.rs::run()`. If argv[1] is a CLI subcommand (`notify`, `hooks`,
-`automation`, `agents`, `send`, `substrate-event`, `core`, `help`/`--help`/`-h`,
+`automation`, `agents`, `send`, `substrate-event`, `substrate-pipe`, `core`,
+`help`/`--help`/`-h`,
 `--version`/`-V` — see `cli/mod.rs::is_cli_subcommand`), the process runs as
 the **`fly` CLI** and exits; of those, `fly core` runs the **headless backend**
 (the full `build_backend` stack served over the control socket — what the
-Electron shell spawns and drives) and `fly substrate-event` is the tmux
-run-shell hook endpoint. Otherwise (bare `fly`, `fly resume`) it is the
+Electron shell spawns and drives), `fly substrate-event` is the tmux
+run-shell hook endpoint, and `fly substrate-pipe` is the tmux substrate's
+per-pane `pipe-pane` consumer (spike 2026-08-28-001 KTD1). Otherwise (bare `fly`, `fly resume`) it is the
 **launcher**: it execs the Electron shell installed beside it with argv passed
 through (2026-08-27-001 KTD7), and prints help + exits 2 when no shell is
 there. `resume` is a launch-mode word, not a subcommand: the shell forwards it
@@ -178,7 +180,13 @@ see `docs/plans/2026-08-11-001-tmux-substrate-LIVE-CHECKLIST.md`) selects
 what backs a pane. Under `tmux`, every leaf-keyed pane is a **marked session
 on a fly-owned per-flavor tmux server** (`substrate/` — wrapper with executor
 seam, injective naming, durable leaf⇄session⇄token store): output streams
-through a `pipe-pane` FIFO into the same sink/activity/ring machinery, input
+through a `pipe-pane` FIFO into the same sink/activity/ring machinery (the
+pipe's consumer is **`fly substrate-pipe`**, a plain read/write copier —
+never the host `cat`: a splicing `cat` (uutils/busybox, Ubuntu ≥ 25.10's
+default) holds the FIFO's pipe mutex across its socket wait, which blocked
+fly's `read()`/`close()` until the pane's next byte — one keystroke of echo
+lag and exits that never surfaced; never `io::copy` either, whose Linux fast
+path splices; spike `2026-08-28-001`), input
 ships as binary-safe `send-keys -H` through a persistent control-mode client
 (the unmarked `flyctl-input` session; ~µs/key vs ~8 ms/key subprocess —
 fire-and-forget, subprocess fallback on client death), exits arrive via

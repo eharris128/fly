@@ -307,6 +307,23 @@ Build order; each lands green behind KTD10's flag until U9.
   leaves must not orphan sessions or grow the store. Automation linkage +
   R22 unchanged (same spawn path, link-before-spawn).
 
+- **2026-08-28 scar (spike `2026-08-28-001` U1): the `pipe-pane` consumer
+  is fly itself, never a host `cat`.** U3's `pipe-pane -o 'cat > <fifo>'`
+  was the substrate's typing-lag bug on every uutils/busybox coreutils box
+  (Ubuntu ≥ 25.10's default): those `cat`s copy with `splice`, and Linux's
+  `splice_file_to_pipe()` holds the destination FIFO's mutex while it
+  sleeps on tmux's socket, so fly's `read()`/`close()` on the FIFO blocked
+  uninterruptibly until the pane's next byte — each echo released by the
+  next keystroke, the last write of a burst withheld, and a dead pane's exit
+  never surfacing (the reader's `close()` hung; the three exit-family
+  `substrate_live` tests failed on this box for that reason, not because of
+  tmux 3.6). GNU `cat` (read/write) never showed it, which is why the
+  2026-08-12 numbers were clean. Fixed by `fly substrate-pipe <fifo>`, a
+  plain `read`/`write` copier in the binary the hooks already invoke (never
+  `std::io::copy` — its Linux fast path splices), pinned by
+  `substrate_live::pipe_consumer_delivers_every_byte`. Evidence:
+  `docs/notes/2026-08-28-tmux-36-substrate-spike.md`.
+
 ## Rollout & validation
 
 1. U1+U2 land inert (wrapper tested pure; socket/token groundwork live —

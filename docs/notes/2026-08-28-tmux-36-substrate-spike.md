@@ -120,6 +120,55 @@ was seen 0/150 in two runs and arrived as "stray bytes" during the next
 run). That is the felt input lag, quantified. The gate for U2 is the pty
 row: 100 % ≤ 500 ms, 0 withheld, p50 ≤ pty + 3 ms.
 
+## U1 — the consumer fix (executed 2026-08-28)
+
+`fly substrate-pipe <fifo>` (`cli/substrate.rs::run_pipe`, dispatched beside
+`substrate-event`, listed in `is_cli_subcommand` so the launcher never execs
+the shell for it, absent from help): a plain `read(2)`/`write(2)` loop, 64 KiB
+chunks, exits 0 on stdin EOF / any write error / an unopenable FIFO, never
+logs. `Tmux::pipe_pane_open(name, fifo, fly_bin)` now arms
+`pipe-pane -o "'<fly_bin>' substrate-pipe '<fifo>'"` with `fly_bin`
+quote-checked like the hook commands; `pty/pane.rs::spawn_tmux` passes
+`Substrate::fly_bin()` (the same path the hooks use). Unit test
+`substrate::tmux::tests::pipe_consumer_is_fly_itself_never_a_host_cat`.
+
+KTD3 discipline, red then green, same box, same tmux 3.6:
+
+| run | `substrate_live -- --ignored` | new `pipe_consumer_delivers_every_byte` |
+|---|---|---|
+| before (cat consumer) | 3 passed / **3 failed** (exit family), 28.6 s | **red** — 10/12 echoes in 500 ms, `k` `l` withheld |
+| after (`fly substrate-pipe`) | **7 passed / 0 failed, 5.7 s** | green |
+
+The three exit-family tests pass because the reader's `close()` no longer
+waits behind a splice; the suite is 5× faster for the same reason (no
+10 s timeouts). Crate unit suite 815/815; the one integration failure seen
+during the full run (`headless_runner::kill_run_seam_…`) passes 2/2 on rerun
+— load flake, unrelated. Clippy's four hits in `tmux.rs` pre-exist on `HEAD`.
+
+## U2 — acceptance probe on the fix (executed 2026-08-28)
+
+Same probe and cores as U0.3, tmux and pty back to back, debug binary at
+`759d258`+U1:
+
+| substrate | gap | echoed ≤ 500 ms | withheld | p50 | max |
+|---|---|---|---|---|---|
+| **tmux + U1** | 10 ms | 50/50 | 0 | **4.34 ms** | 8.35 ms |
+| tmux + U1 | 30 ms | 50/50 | 0 | **4.41 ms** | 4.59 ms |
+| tmux + U1 | 100 ms | 50/50 | 0 | **4.47 ms** | 4.60 ms |
+| tmux + U1 | 300 ms | 50/50 | 0 | **4.44 ms** | 4.58 ms |
+| pty | 10 ms | 50/50 | 0 | 4.23 ms | 4.33 ms |
+| pty | 30 ms | 50/50 | 0 | 4.27 ms | 4.35 ms |
+| pty | 100 ms | 50/50 | 0 | 4.29 ms | 4.37 ms |
+| pty | 300 ms | 50/50 | 0 | 4.28 ms | 4.56 ms |
+
+The `C-u` erase (150 bytes of "later output") arrived 150/150 in every run
+on both substrates — nothing is held back any more. **Gate 1: hit** — 100 %
+at every gap, zero withheld, tmux p50 within +0.2 ms of pty (gate allowed
++3 ms); the residual is the extra hop (socketpair → copier → FIFO), well
+under a millisecond. The second KTD2 condition (a real `claude` REPL,
+many-byte redraws) is not yet recorded — it rides U4's fly-el session, where
+a REPL pane exists anyway.
+
 ### Harness notes (for U1–U4)
 
 - Probe client: scratchpad `u0/probe.py` (stdlib; frames per

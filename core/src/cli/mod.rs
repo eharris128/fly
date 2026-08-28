@@ -36,6 +36,7 @@ pub fn is_cli_subcommand(arg: &str) -> bool {
             | "agents"
             | "send"
             | "substrate-event"
+            | "substrate-pipe"
             | "core"
             | "help"
             | "--help"
@@ -107,6 +108,14 @@ pub fn run(args: &[String]) -> i32 {
         // deliberately absent from the help text. Always exits 0.
         Some("substrate-event") => {
             substrate::run(&args[2..]);
+            0
+        }
+        // Spike 2026-08-28-001 KTD1: the pipe-pane consumer, spawned by the
+        // tmux server for every fly pane — never humans; absent from help.
+        // Must be listed in `is_cli_subcommand`, or the launcher would exec
+        // the Electron shell for every pane's output stream.
+        Some("substrate-pipe") => {
+            substrate::run_pipe(&args[2..]);
             0
         }
         Some("send") => peer::run_send(&args[2..]),

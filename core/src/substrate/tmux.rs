@@ -774,14 +774,29 @@ impl Tmux {
 
     /// Open the focused pane's byte stream into a FIFO (U3). `-o` opens only
     /// when no pipe exists, so restart re-arming is idempotent.
-    pub fn pipe_pane_open(&self, name: &str, fifo: &str) -> Result<(), TmuxError> {
+    ///
+    /// The consumer is **fly itself** (`fly substrate-pipe`, spike
+    /// 2026-08-28-001 KTD1), never the host's `cat`: a `cat` that copies with
+    /// `splice`/`sendfile` (uutils, busybox — Ubuntu ≥ 25.10's default) makes
+    /// the kernel hold the FIFO's pipe mutex while it sleeps on tmux's socket,
+    /// which blocks fly's `read()`/`close()` on that FIFO until the pane's
+    /// next byte — one keystroke of echo lag, and pane exits that never
+    /// surfaced (the reader's `close()` hung behind the lock). `fly_bin` is
+    /// spliced into a shell command, so it is quote-checked exactly like the
+    /// hook commands (KTD11).
+    pub fn pipe_pane_open(&self, name: &str, fifo: &str, fly_bin: &str) -> Result<(), TmuxError> {
         validate_session_name(name).map_err(TmuxError::InvalidName)?;
         if fifo.contains('\'') {
             return Err(TmuxError::InvalidName(format!(
                 "fifo path {fifo:?} contains a quote"
             )));
         }
-        let cmd = format!("cat > '{fifo}'");
+        if fly_bin.contains('\'') {
+            return Err(TmuxError::InvalidName(format!(
+                "fly binary path {fly_bin:?} contains a quote"
+            )));
+        }
+        let cmd = format!("'{fly_bin}' substrate-pipe '{fifo}'");
         self.simple(&["pipe-pane", "-o", "-t", name, &cmd])
     }
 
@@ -998,6 +1013,46 @@ mod tests {
         assert!(hook.contains("substrate-event pane-died 'fly-fly-a' '#{pane_dead_status}'"));
         drop(calls);
         assert!(t.arm_pane_died_hook("fly-fly-a", "/tmp/it's").is_err());
+    }
+
+    #[test]
+    fn pipe_consumer_is_fly_itself_never_a_host_cat() {
+        // Spike 2026-08-28-001 KTD1/KTD3: a splicing `cat` holds the FIFO's
+        // pipe lock across its socket wait (one keystroke of echo lag, exits
+        // that never surface); the consumer must be fly's own read/write
+        // copier, quote-checked like the hook commands.
+        let fake = leak(FakeExec::new(vec![]));
+        let t = tmux(fake);
+        t.pipe_pane_open(
+            "fly-fly-a",
+            "/run/user/1000/fly/pane-7.pipe",
+            "/opt/fly/resources/fly",
+        )
+        .unwrap();
+        let cmd = fake.calls.lock().unwrap()[0].0.join(" ");
+        assert!(
+            cmd.starts_with("-u -L fly pipe-pane -o -t fly-fly-a "),
+            "{cmd}"
+        );
+        assert!(
+            cmd.ends_with(
+                "'/opt/fly/resources/fly' substrate-pipe '/run/user/1000/fly/pane-7.pipe'"
+            ),
+            "{cmd}"
+        );
+        assert!(
+            !cmd.contains("cat "),
+            "a host cat must never be the consumer: {cmd}"
+        );
+        // Both spliced strings are quote-checked; nothing reaches tmux.
+        let before = fake.calls.lock().unwrap().len();
+        assert!(t
+            .pipe_pane_open("fly-fly-a", "/tmp/it's.pipe", "/opt/fly/resources/fly")
+            .is_err());
+        assert!(t
+            .pipe_pane_open("fly-fly-a", "/tmp/ok.pipe", "/tmp/it's/fly")
+            .is_err());
+        assert_eq!(fake.calls.lock().unwrap().len(), before);
     }
 
     #[test]

@@ -1,13 +1,16 @@
 # Spike: tmux 3.6 substrate validation — 2026-08-28-001
 
-**Status**: **U0 executed 2026-08-28** — results in
-`docs/notes/2026-08-28-tmux-36-substrate-spike.md`. Baseline recorded (pty
-4.3 ms / 100 %; tmux p50 ≈ inter-key gap, last write withheld); the three
+**Status**: **U0–U2 executed 2026-08-28** — results in
+`docs/notes/2026-08-28-tmux-36-substrate-spike.md`. U0: baseline recorded
+(pty 4.3 ms / 100 %; tmux p50 ≈ inter-key gap, last write withheld); the three
 `substrate_live` exit-family failures on 3.6 are **the same consumer bug**,
 not a tmux delta — the FIFO reader's `close()` (and `read()`) block
 uninterruptibly behind uutils `cat`'s `splice()`, which sleeps on the socket
-while holding the destination pipe's mutex. tmux 3.6 exonerated; Q2 collapses
-to a confirmation pass after U1. U1 next.
+while holding the destination pipe's mutex; tmux 3.6 exonerated. U1: `fly
+substrate-pipe` landed (red→green: live suite 3/6 → **7/7**, incl. the new
+pinning test). U2: **gate 1 hit** — tmux 50/50 at every gap, p50 4.34–4.47 ms
+vs pty 4.23–4.29, zero withheld. Next: U3 (hook-path exit latency, geometry,
+history-limit on 3.6a) then U4 (the checklist on fly-el).
 **Type**: spike (bounded validation + one targeted fix; not a feature)
 **Follows**: `docs/plans/2026-08-11-001-feat-tmux-session-substrate-plan.md`
 (the substrate, built and module-validated on tmux 3.4),
@@ -141,7 +144,7 @@ the substrate measured clean at build time and why the failure read as
   KTD2 probe against current `main` to record the *before* numbers on this
   tmux + kernel (expected: the ~1-in-3 failure). Record both in the results
   note.
-- **U1 — the consumer fix + its test** (KTD1, KTD3). `cli/substrate.rs`
+- **U1 — the consumer fix + its test** (KTD1, KTD3). **Done 2026-08-28** (results note §U1). `cli/substrate.rs`
   (or a sibling `cli/pipe.rs`): `fly substrate-pipe <fifo>`; `Tmux::
   pipe_pane_open(name, fifo, fly_bin)` with an arg-construction unit test
   beside `hooks_reject_quoted_paths…`; `pty/pane.rs::spawn_tmux` passes
@@ -150,7 +153,7 @@ the substrate measured clean at build time and why the failure read as
   green on this one. CLAUDE.md's substrate paragraph and the substrate plan's
   build log gain the one-paragraph scar ("never a host `cat`; never
   `io::copy`").
-- **U2 — acceptance probe on the fix** (KTD2). Both conditions (`cat` pane;
+- **U2 — acceptance probe on the fix** (KTD2). **Done 2026-08-28, gate 1 hit** (results note §U2; the `claude`-REPL condition rides U4). Both conditions (`cat` pane;
   `claude` REPL), `pty` run alongside for the parity column. This is the gate
   for everything after it.
 - **U3 — 3.6 conformance.** Whatever U0 left unanswered, explicitly: after a

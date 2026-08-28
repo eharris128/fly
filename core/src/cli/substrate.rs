@@ -51,3 +51,51 @@ pub fn run(args: &[String]) {
     // EOF framing: closing the write side ends the request.
     let _ = stream.shutdown(std::net::Shutdown::Write);
 }
+
+/// `fly substrate-pipe <fifo>` — the `pipe-pane` consumer (spike
+/// 2026-08-28-001 KTD1). tmux hands the pane's output to this process on
+/// stdin; it copies it into fly's per-pane FIFO with a plain `read`/`write`
+/// loop and nothing else.
+///
+/// Why fly owns this instead of `cat > fifo`: a `cat` that copies with
+/// `splice(2)`/`sendfile(2)` (uutils, busybox — the default `cat` on Ubuntu
+/// ≥ 25.10) makes the kernel take the FIFO's pipe mutex and then sleep on the
+/// socket *while holding it*, so fly's `read()`/`close()` on the FIFO block
+/// uninterruptibly until the pane's next byte: every echo was released by
+/// the next keystroke, and a dead pane's exit never surfaced. A read/write
+/// copier never holds the pipe lock across a wait. For the same reason this
+/// must never become `std::io::copy`, whose Linux specialization tries
+/// `copy_file_range` → `sendfile` → `splice` on fd pairs.
+///
+/// Exits 0 on stdin EOF (tmux closed the pipe), on any write error (fly tore
+/// the FIFO down first — Rust ignores SIGPIPE, so that is `EPIPE` here), or
+/// when the FIFO cannot be opened; never logs — a pipe child's stderr goes
+/// nowhere useful, and the `panes_status`/hook paths cover a lost stream.
+pub fn run_pipe(args: &[String]) {
+    use std::io::Read;
+    let Some(fifo) = args.first() else {
+        return;
+    };
+    // O_WRONLY on a FIFO blocks until a reader exists; fly opens its read end
+    // (O_RDWR) before arming the pipe, so this returns at once in practice,
+    // and an already-unlinked FIFO fails the open → silent exit.
+    let Ok(mut out) = std::fs::OpenOptions::new().write(true).open(fifo) else {
+        return;
+    };
+    // 64 KiB ≥ StdinLock's internal buffer, so each read is one read(2) on
+    // fd 0 — no buffering layer sits between tmux and the FIFO.
+    let mut buf = vec![0u8; 64 * 1024];
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    loop {
+        let n = match stdin.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        if out.write_all(&buf[..n]).is_err() {
+            return;
+        }
+    }
+}

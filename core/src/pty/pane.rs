@@ -607,18 +607,20 @@ impl Pane {
             })
             .map_err(|e| format!("spawn read thread failed: {e}"))?;
 
-        // Arm the pipe AFTER the reader thread exists: the reader's blocking
-        // open of the FIFO's read end pairs with `cat`'s write-end open, so
-        // order alone can't deadlock; arming late just delays first bytes.
+        // Arm the pipe AFTER the reader thread exists: the reader's O_RDWR
+        // open of the FIFO pairs with the consumer's write-end open, so order
+        // alone can't deadlock; arming late just delays first bytes. The
+        // consumer is `fly substrate-pipe` (spike 2026-08-28-001 KTD1) — the
+        // same binary the hooks below invoke, never the host's `cat`.
+        let fly_bin = substrate.fly_bin().to_string_lossy().into_owned();
         substrate
             .tmux()
-            .pipe_pane_open(&session, &fifo.to_string_lossy())
+            .pipe_pane_open(&session, &fifo.to_string_lossy(), &fly_bin)
             .map_err(|e| e.to_string())?;
 
         // KTD12 event hooks: pane-died reports arrive over the socket for
         // ~instant exit surfacing. Best-effort — the panes_status backstop is
         // the floor when arming fails or an event is lost.
-        let fly_bin = substrate.fly_bin().to_string_lossy().into_owned();
         let _ = substrate.tmux().arm_pane_died_hook(&session, &fly_bin);
         // U7: attach-state reports feed the R9 focused-elsewhere suppression.
         let _ = substrate.tmux().arm_attach_hooks(&session, &fly_bin);
@@ -841,7 +843,7 @@ impl Pane {
         } = &self.backend
         {
             // Explicit close (KTD7's kill arm): kill the session — idempotent
-            // if it already died — which ends `cat`, EOFs the FIFO, and lets
+            // if it already died — which ends the consumer, EOFs the FIFO, and lets
             // the read thread wind down; then reclaim the FIFO node and the
             // store record (an explicitly closed pane must not be reattached).
             let _ = substrate.tmux().kill_session(session);
@@ -962,7 +964,7 @@ fn read_loop(
 /// The tmux arm's read loop (tmux plan U3): drain the `pipe-pane` FIFO into
 /// the sink with the same activity/ring bookkeeping as the PTY loop. There is
 /// no owned child to reap — session death is observed as FIFO EOF (the
-/// `cat` writer dies with the session) and confirmed against `has-session`;
+/// consumer, `fly substrate-pipe`, dies with the session) and confirmed against `has-session`;
 /// a transient EOF with the session still alive (a future focus-tier re-arm,
 /// or pipe churn) re-opens and re-arms rather than declaring an exit.
 fn tmux_read_loop(
@@ -980,7 +982,7 @@ fn tmux_read_loop(
         // O_RDWR so the open never blocks on a writer AND the FIFO never
         // reaches all-writers-closed EOF spuriously between `cat` restarts;
         // end-of-pane is signalled by `forced_exit`/`stopping`, not EOF —
-        // live-pinned: a dead-but-remaining pane keeps its `cat` alive and
+        // live-pinned: a dead-but-remaining pane keeps its consumer alive and
         // `pipe-pane` refuses dead panes, so EOF simply never comes.
         let Ok(reader) = std::fs::OpenOptions::new().read(true).write(true).open(&fifo)
         else {
