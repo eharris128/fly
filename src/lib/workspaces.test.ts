@@ -45,11 +45,11 @@ beforeEach(() => {
 
 describe("basename", () => {
   it("returns the last path segment", () => {
-    expect(basename("/home/evan/projects/fly")).toBe("fly");
-    expect(basename("/home/evan")).toBe("evan");
+    expect(basename("/home/alice/projects/fly")).toBe("fly");
+    expect(basename("/home/alice")).toBe("alice");
   });
   it("ignores trailing slashes and handles root", () => {
-    expect(basename("/home/evan/")).toBe("evan");
+    expect(basename("/home/alice/")).toBe("alice");
     expect(basename("/")).toBe("/");
     expect(basename("//")).toBe("/");
   });
@@ -63,7 +63,7 @@ describe("tabDisplayTitle", () => {
   it("auto-names from the focused leaf cwd basename", () => {
     const leaf = newLeaf();
     const tab = makeTab(null, leaf);
-    expect(tabDisplayTitle(tab, { [leaf.key]: "/home/evan/projects/fly" })).toBe(
+    expect(tabDisplayTitle(tab, { [leaf.key]: "/home/alice/projects/fly" })).toBe(
       "fly",
     );
   });

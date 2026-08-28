@@ -34,7 +34,7 @@ describe("buildFeedPayload", () => {
       model([
         row({
           leafKey: "leaf-1",
-          cwd: "/home/evan/projects/fly",
+          cwd: "/home/alice/projects/fly",
           status: "working",
           workingForMs: 4200,
           num: 1,
@@ -46,7 +46,7 @@ describe("buildFeedPayload", () => {
       leafKey: "leaf-1",
       workspace: "home",
       tab: "fly",
-      cwd: "/home/evan/projects/fly",
+      cwd: "/home/alice/projects/fly",
       status: "working",
       workingForMs: 4200,
       num: 1,

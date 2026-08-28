@@ -1522,12 +1522,12 @@ mod tests {
     #[test]
     fn a_matching_identity_passes_and_a_mismatched_one_is_refused() {
         assert!(tailnet_identity_ok(
-            Some("evan@example.com"),
-            Some("evan@example.com")
+            Some("alice@example.com"),
+            Some("alice@example.com")
         ));
         assert!(!tailnet_identity_ok(
             Some("someone-else@example.com"),
-            Some("evan@example.com")
+            Some("alice@example.com")
         ));
     }
 
@@ -1535,15 +1535,15 @@ mod tests {
     /// that never crossed the proxy simply carries no header.
     #[test]
     fn an_absent_identity_header_is_allowed_even_when_configured() {
-        assert!(tailnet_identity_ok(None, Some("evan@example.com")));
-        assert!(tailnet_identity_ok(Some(""), Some("evan@example.com")));
+        assert!(tailnet_identity_ok(None, Some("alice@example.com")));
+        assert!(tailnet_identity_ok(Some(""), Some("alice@example.com")));
     }
 
     #[test]
     fn identity_comparison_ignores_case_and_surrounding_space() {
         assert!(tailnet_identity_ok(
-            Some(" Evan@Example.COM "),
-            Some("evan@example.com")
+            Some(" Alice@Example.COM "),
+            Some("alice@example.com")
         ));
     }
 

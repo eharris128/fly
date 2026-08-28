@@ -553,7 +553,7 @@ fn unauthenticated_drops_are_indistinguishable_for_known_and_unknown_agents() {
 
 #[test]
 fn a_mismatched_tailnet_identity_is_refused_and_a_matching_one_passes() {
-    let h = start_drop(DropBehavior::Deliver, Some("evan@example.com"));
+    let h = start_drop(DropBehavior::Deliver, Some("alice@example.com"));
     let (head, body) = drop_request(
         h.addr(),
         "agent=leaf-replied&pane=7",
@@ -575,7 +575,7 @@ fn a_mismatched_tailnet_identity_is_refused_and_a_matching_one_passes() {
         Some(TOKEN),
         &png(),
         None,
-        &[("Tailscale-User-Login", "evan@example.com")],
+        &[("Tailscale-User-Login", "alice@example.com")],
     );
     assert_eq!(status_of(&head), 200, "{head}");
 }
@@ -583,7 +583,7 @@ fn a_mismatched_tailnet_identity_is_refused_and_a_matching_one_passes() {
 /// Absence of the header is not a refusal — the token stays the boundary.
 #[test]
 fn an_absent_identity_header_still_passes_when_an_expectation_is_configured() {
-    let h = start_drop(DropBehavior::Deliver, Some("evan@example.com"));
+    let h = start_drop(DropBehavior::Deliver, Some("alice@example.com"));
     let (head, _) = ok_drop(h.addr(), "agent=leaf-replied&pane=7");
     assert_eq!(status_of(&head), 200, "{head}");
 }
@@ -1086,7 +1086,7 @@ fn the_refusal_precedence_table_holds_end_to_end() {
         },
         Case {
             name: "wrong tailnet identity",
-            behavior: DropBehavior::Deliver, expect_login: Some("evan@example.com"),
+            behavior: DropBehavior::Deliver, expect_login: Some("alice@example.com"),
             query: "agent=leaf-replied&pane=7", auth: true,
             header: Some(("Tailscale-User-Login", "nope@example.com")), body: None,
             status: 401, code: "",

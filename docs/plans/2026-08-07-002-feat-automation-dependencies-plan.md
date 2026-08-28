@@ -27,10 +27,11 @@ leg *usually* finishes by then, and it already misfires (run `j1xkxkfbhn`:
 `skipped — run in flight`; failed modal runs let the analysis chew yesterday's
 digest). The credential strip is deliberate security posture and is **not
 touched** — the fix is a scheduler feature. This edge is needed ~8 more times
-for the planned campaign DAG (`../secure/docs/campaign-dag-gaps.md` §1, §4.1,
-§6 — step 2 of its suggested order is exactly this plan).
+for a planned downstream campaign DAG (a sibling project's gap register, §1,
+§4.1, §6 — step 2 of its suggested order is exactly this plan).
 
-Origin: `../secure/docs/campaign-dag-gaps.md` (2026-08-07 design capture).
+Origin: a sibling (private) project's campaign-DAG gap register (2026-08-07
+design capture).
 
 ---
 

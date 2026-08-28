@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn resolves_a_leaf_to_its_transcripts_last_reply() {
         let dir = tempfile::tempdir().unwrap();
-        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/home/evan/projects/play", TRANSCRIPT);
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/home/alice/projects/play", TRANSCRIPT);
         let reply = r.resolve_io("leaf-1").reply.expect("a reply resolves");
         assert_eq!(reply.text, "All tests pass.");
         assert_eq!(reply.replied_at_ms, Some(REPLIED_AT));
@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn missing_links_resolve_to_none_not_error() {
         let dir = tempfile::tempdir().unwrap();
-        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/home/evan/projects/play", TRANSCRIPT);
+        let r = fixture(dir.path(), "leaf-1", "sid-abc", "/home/alice/projects/play", TRANSCRIPT);
         // Unknown leaf (no record) → None.
         assert_eq!(r.resolve_io("leaf-ghost").reply, None);
         // A record with no captured session yet → None.
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn cache_serves_unchanged_files_and_refreshes_on_change() {
         let dir = tempfile::tempdir().unwrap();
-        let cwd = "/home/evan/projects/play";
+        let cwd = "/home/alice/projects/play";
         let r = fixture(dir.path(), "leaf-1", "sid-abc", cwd, TRANSCRIPT);
         assert_eq!(r.resolve_io("leaf-1").reply.unwrap().text, "All tests pass.");
         // Append a newer reply (mtime/len change) → the resolver re-reads.

@@ -59,7 +59,7 @@ breaks at a seam the design did not account for:
    `null` `sessionId` is **proof the hook path never wrote an id** for this leaf.
 5. With `sessionId: null`, `buildResumeCommand` builds `claude --continue`
    (`src/lib/resume.ts:123`); `computeResumeForRestore` finds no `sessionCwd`, so
-   it spawns that in the pane's **layout cwd** (`/home/evan/projects/play`).
+   it spawns that in the pane's **layout cwd** (`/home/alice/projects/play`).
 6. `claude --continue` in `play` resolves to that directory's only transcript,
    `04d56f41-…jsonl` — the 06-19 first-chat. Its file mtime is 06-23 only because
    repeated metadata-only `--continue` opens bumped it; its last real turn is
@@ -148,8 +148,8 @@ durable store," is exactly that signal.
   exact. Reuses the existing offer/overlay machinery rather than a new system.
 - **KTD-E — Encode the cwd; degrade gracefully on a miss; never full-scan.** The
   project dir is found in O(1) by Claude's scheme — `/` **and** `.` both map to `-`
-  (verified against real dirs: `/home/evan/projects/play` →
-  `-home-evan-projects-play`; a `/.obsidian/` segment → `--obsidian`). A miss
+  (verified against real dirs: `/home/alice/projects/play` →
+  `-home-alice-projects-play`; a `/.obsidian/` segment → `--obsidian`). A miss
   (scheme change, unusual chars) degrades to the now-stale-guarded `--continue`,
   never an error. The transcript's own recorded `cwd` field is available to
   *confirm* a match when disambiguating (refinement, see Open Questions).
@@ -250,7 +250,7 @@ filesystem-pure test style.
 unit most likely to harbor a path-munging bug.
 
 **Test scenarios:**
-- `claude_project_dir`: `/home/evan/projects/play` → `…/-home-evan-projects-play`;
+- `claude_project_dir`: `/home/alice/projects/play` → `…/-home-alice-projects-play`;
   a path with a `/.dir/` segment → `--dir` double-dash; trailing slash normalized.
 - `active_session_id`: picks the max-mtime basename; empty list → `None`; with a
   recency floor, an all-old set → `None`.
@@ -468,7 +468,7 @@ the rendering is thin.
 
 - **On-disk evidence (this machine).** `~/.local/share/fly-dev/resume.json`
   (`leaf-5` with `sessionId: null`, `argv` ending `--continue`);
-  `~/.claude/projects/-home-evan-projects-play/` holding a single transcript whose
+  `~/.claude/projects/-home-alice-projects-play/` holding a single transcript whose
   **last real turn is 2026-06-19** though its mtime is 2026-06-23 (metadata-only
   `--continue` opens); installed `/usr/bin/fly` built **05:59** vs origin-U1 commit
   `d18f1d7` at **08:30**.

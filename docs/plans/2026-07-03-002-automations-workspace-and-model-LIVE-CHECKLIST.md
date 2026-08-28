@@ -35,7 +35,7 @@ TODO for that.
   background task — the harness reaps it (Vite dies, the app orphans without its
   dev server). Run it in a normal terminal you own.
 - **Use the dev binary for `fly automation …` inside the dev pane**, i.e.
-  `FLY=/home/evan/projects/fly/src-tauri/target/debug/fly`. The `fly` on `PATH`
+  `FLY=~/projects/fly/src-tauri/target/debug/fly`. The `fly` on `PATH`
   is the installed `/usr/bin/fly`, which as of this writing is **stale** (no
   `automation` subcommand, no `hook_event`), so it cannot drive the new flags and
   its Stop hook will not close automation runs. Mutating ops (`create`/`run`)
@@ -47,7 +47,7 @@ No hook changes needed.
 
 1. In the dev window's shell pane:
    ```bash
-   FLY=/home/evan/projects/fly/src-tauri/target/debug/fly
+   FLY=~/projects/fly/src-tauri/target/debug/fly
    $FLY automation create --name livetest --cron '*/5 * * * *' --tz America/New_York \
      --prompt 'Reply with exactly the word DONE, then stop.' --model sonnet --effort low
    # copy the printed id, then fire it immediately (skip the 5-min cron wait):
@@ -90,7 +90,7 @@ Stop hook must run a `fly` that sends `hook_event`. **Pick one:**
 - **Temporarily repoint the hook at the dev binary** (reversible):
   ```bash
   cp ~/.claude/settings.json ~/.claude/settings.json.bak
-  /home/evan/projects/fly/src-tauri/target/debug/fly hooks setup   # rewrites the fly hooks to the dev binary path
+  ~/projects/fly/src-tauri/target/debug/fly hooks setup   # rewrites the fly hooks to the dev binary path
   # … run Test A again, let the agent reply DONE and Stop …
   # restore afterwards:
   cp ~/.claude/settings.json.bak ~/.claude/settings.json

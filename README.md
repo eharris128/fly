@@ -181,3 +181,13 @@ monitor; `update` patches a stored automation in place, keeping its id and run
 history; `list`/`show`/`runs` are monitor-aware). `fly agents` lists the live
 agent roster and `fly send <pane> <message…>` delivers into another agent's
 pane (opt-in per pane, from the dashboard).
+
+## Security
+
+fly has two real trust boundaries — the token-authenticated hook socket
+(`core/src/hooks/`) and the bearer-token feed listener (`core/src/feed/`).
+To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
+
+## License
+
+[MIT](LICENSE).

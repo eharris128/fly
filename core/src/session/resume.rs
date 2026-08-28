@@ -526,7 +526,7 @@ mod tests {
             "leaf-5",
             ResumePartial {
                 session_id: Some("sess-A".into()),
-                session_cwd: Some("/home/evan/projects/play".into()),
+                session_cwd: Some("/home/alice/projects/play".into()),
                 ..Default::default()
             },
         )
@@ -534,7 +534,7 @@ mod tests {
 
         let rec = &read_records(&path)["leaf-5"];
         assert_eq!(rec.session_id.as_deref(), Some("sess-A"));
-        assert_eq!(rec.session_cwd.as_deref(), Some("/home/evan/projects/play"));
+        assert_eq!(rec.session_cwd.as_deref(), Some("/home/alice/projects/play"));
         assert_eq!(
             rec.argv.as_deref(),
             Some(["claude".to_string(), "--continue".into()].as_slice()),
@@ -548,7 +548,7 @@ mod tests {
             "leaf-5",
             ResumePartial {
                 session_id: Some("sess-B".into()),
-                session_cwd: Some("/home/evan/projects/play".into()),
+                session_cwd: Some("/home/alice/projects/play".into()),
                 ..Default::default()
             },
         )

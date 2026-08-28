@@ -83,8 +83,8 @@ mod tests {
     use super::*;
 
     /// The live shape captured 2026-07-10 (Claude Code 2.1.206), trimmed.
-    const WAITING: &str = r#"{"pid":91405,"sessionId":"8fbf500d-70c2-4868-b752-76c7c6a11b36","cwd":"/home/evan/projects/p2","startedAt":1783681928870,"version":"2.1.206","kind":"interactive","status":"waiting","updatedAt":1783681938899,"statusUpdatedAt":1783681938899,"waitingFor":"permission prompt"}"#;
-    const BUSY: &str = r#"{"pid":11569,"sessionId":"c3892a3a-0000-0000-0000-000000000000","cwd":"/home/evan/projects/fly","status":"busy","updatedAt":1783685291836,"statusUpdatedAt":1783685291836}"#;
+    const WAITING: &str = r#"{"pid":91405,"sessionId":"8fbf500d-70c2-4868-b752-76c7c6a11b36","cwd":"/home/alice/projects/p2","startedAt":1783681928870,"version":"2.1.206","kind":"interactive","status":"waiting","updatedAt":1783681938899,"statusUpdatedAt":1783681938899,"waitingFor":"permission prompt"}"#;
+    const BUSY: &str = r#"{"pid":11569,"sessionId":"c3892a3a-0000-0000-0000-000000000000","cwd":"/home/alice/projects/fly","status":"busy","updatedAt":1783685291836,"statusUpdatedAt":1783685291836}"#;
 
     #[test]
     fn matches_by_session_id_and_reads_waiting() {

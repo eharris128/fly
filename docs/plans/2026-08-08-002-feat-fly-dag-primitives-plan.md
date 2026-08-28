@@ -1,10 +1,9 @@
 # fly primitives for the CVE-outreach DAG — design note (G1–G9)
 
 **Status:** design, 2026-08-08. G1 implemented (this plan); G2–G9 proposed, not
-built. Written from the brief `../secure/docs/agent-prompts/fly-dag-primitives.md`
-after reading the two sibling repos' own gap registers
-(`../secure/docs/campaign-dag-gaps.md`, `../secure/docs/candidate-pipeline-ledger.md`)
-and the fly source they cite.
+built. Written from a brief prepared in a sibling (private) project, after
+reading that project's own gap registers (its campaign-DAG gap list and
+candidate-pipeline ledger) and the fly source they cite.
 
 **Scope of this repo's part.** fly *schedules* stages, *chains* them on run
 outcome (`--after`), *gates* (withholds), and *surfaces* state. The DAG's

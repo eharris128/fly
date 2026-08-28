@@ -514,11 +514,11 @@ mod tests {
         let mut c = Config::default();
         c.feed.drop_dir = Some("~/projects/inbox".into());
         c.feed.drop_max_bytes = 1024;
-        c.feed.expected_tailnet_login = Some("evan@example.com".into());
+        c.feed.expected_tailnet_login = Some("alice@example.com".into());
         let v = serde_json::to_value(&c).unwrap();
         assert_eq!(v["feed"]["dropDir"], "~/projects/inbox");
         assert_eq!(v["feed"]["dropMaxBytes"], 1024);
-        assert_eq!(v["feed"]["expectedTailnetLogin"], "evan@example.com");
+        assert_eq!(v["feed"]["expectedTailnetLogin"], "alice@example.com");
         let back: Config = serde_json::from_value(v).unwrap();
         assert_eq!(back, c);
     }

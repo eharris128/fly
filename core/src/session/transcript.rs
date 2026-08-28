@@ -5,7 +5,7 @@
 //! `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`: the **filename is the
 //! session id**, and `<encoded-cwd>` is the project's absolute path with every
 //! `/` and `.` replaced by `-` (verified against real dirs:
-//! `/home/evan/projects/play` → `-home-evan-projects-play`; a `/.obsidian`
+//! `/home/alice/projects/play` → `-home-alice-projects-play`; a `/.obsidian`
 //! segment → `--obsidian`). Deriving the id from this store makes precise capture
 //! independent of the installed `fly` binary's wire version — the version-skew
 //! root cause this fix removes — and lets it fire before the first
@@ -1291,18 +1291,18 @@ mod tests {
 
     #[test]
     fn encodes_slashes_to_dashes() {
-        assert_eq!(encode_cwd("/home/evan/projects/play"), "-home-evan-projects-play");
+        assert_eq!(encode_cwd("/home/alice/projects/play"), "-home-alice-projects-play");
     }
 
     #[test]
     fn encodes_a_dot_segment_to_a_double_dash() {
         // `/` → `-` AND `.` → `-`, so a `/.obsidian` segment yields `--obsidian`.
-        assert_eq!(encode_cwd("/home/evan/.obsidian/notes"), "-home-evan--obsidian-notes");
+        assert_eq!(encode_cwd("/home/alice/.obsidian/notes"), "-home-alice--obsidian-notes");
     }
 
     #[test]
     fn normalizes_a_trailing_slash() {
-        assert_eq!(encode_cwd("/home/evan/projects/play/"), "-home-evan-projects-play");
+        assert_eq!(encode_cwd("/home/alice/projects/play/"), "-home-alice-projects-play");
         // The bare root still encodes to a single dash.
         assert_eq!(encode_cwd("/"), "-");
     }
@@ -1311,11 +1311,11 @@ mod tests {
     fn project_dir_basename_is_the_encoded_cwd() {
         // Independent of where the home/config root resolves, the dir's final
         // component is the encoded cwd. (HOME is set in the test environment.)
-        let dir = claude_project_dir(Path::new("/home/evan/projects/play"))
+        let dir = claude_project_dir(Path::new("/home/alice/projects/play"))
             .expect("a home/config root resolves in tests");
         assert_eq!(
             dir.file_name().and_then(|s| s.to_str()),
-            Some("-home-evan-projects-play")
+            Some("-home-alice-projects-play")
         );
     }
 

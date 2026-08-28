@@ -284,10 +284,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         // Both `/` and `.` encode to `-` (KTD-E), so the `.obsidian` segment
         // yields a double dash in the project-dir name.
-        let records = records_with(Some("sess-1"), Some("/home/evan/.obsidian/notes"));
+        let records = records_with(Some("sess-1"), Some("/home/alice/.obsidian/notes"));
         let expected = write_transcript(
             root.path(),
-            "-home-evan--obsidian-notes",
+            "-home-alice--obsidian-notes",
             "sess-1",
             TURNFUL_FIXTURE,
         );
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(target.transcript_path, expected.to_string_lossy());
         assert_eq!(
             target.session_cwd.as_deref(),
-            Some("/home/evan/.obsidian/notes")
+            Some("/home/alice/.obsidian/notes")
         );
         assert_eq!(target.last_turn_ms, LAST_TURN_MS);
     }

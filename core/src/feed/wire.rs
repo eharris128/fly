@@ -427,7 +427,7 @@ mod tests {
                 leaf_key: "ws-1/tab-1/leaf-1".into(),
                 workspace: "home".into(),
                 tab: "fly".into(),
-                cwd: Some("/home/evan/projects/fly".into()),
+                cwd: Some("/home/alice/projects/fly".into()),
                 status: "working".into(),
                 needs_attention: false,
                 reason: None,

@@ -64,7 +64,7 @@ describe("migrateSession", () => {
   it("wraps a legacy {tabs, activeIndex} blob in one default workspace", () => {
     const legacy = {
       tabs: [
-        { tree: leaf, panes: { "leaf-1": { cwd: "/home/evan", title: null } } },
+        { tree: leaf, panes: { "leaf-1": { cwd: "/home/alice", title: null } } },
         { tree: leaf, panes: {} },
       ],
       activeIndex: 1,
@@ -75,7 +75,7 @@ describe("migrateSession", () => {
         {
           name: "default",
           tabs: [
-            { tree: leaf, panes: { "leaf-1": { cwd: "/home/evan", title: null } }, title: null },
+            { tree: leaf, panes: { "leaf-1": { cwd: "/home/alice", title: null } }, title: null },
             { tree: leaf, panes: {}, title: null },
           ],
           activeTabIndex: 1,
@@ -134,7 +134,7 @@ describe("toSavedWorkspaces", () => {
     const eph = liveTab("leaf-2", { ephemeral: true });
     const b = liveTab("leaf-3", { title: "named" });
     const out = toSavedWorkspaces([liveWs("w", [a, eph, b])], {
-      "leaf-1": { cwd: "/home/evan", title: null },
+      "leaf-1": { cwd: "/home/alice", title: null },
       "leaf-2": { cwd: "/tmp", title: null },
       "leaf-3": { cwd: null, title: null },
     });
@@ -144,7 +144,7 @@ describe("toSavedWorkspaces", () => {
         tabs: [
           {
             tree: a.tree,
-            panes: { "leaf-1": { cwd: "/home/evan", title: null } },
+            panes: { "leaf-1": { cwd: "/home/alice", title: null } },
             title: null,
           },
           { tree: b.tree, panes: { "leaf-3": { cwd: null, title: null } }, title: "named" },

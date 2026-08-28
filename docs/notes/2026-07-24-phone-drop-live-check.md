@@ -19,13 +19,13 @@ Claude *open* the file rather than treat the path as a string?
 the token `GRAPEFRUIT-7731`. The token is the discriminator: a model that treats
 the path as an opaque string cannot produce it. Read from a Claude Code session
 running **inside a fly pane** (`FLY_PANE_TOKEN` set, `FLY_SOCKET_PATH` =
-`/run/user/1000/fly/hook-5865.sock`), cwd `/home/evan/projects/fly` — i.e.
+`/run/user/1000/fly/hook-5865.sock`), cwd `~/projects/fly` — i.e.
 outside the drop directory. Pane argv confirmed `claude
 --dangerously-skip-permissions`.
 
 **Result. Confirmed, both halves.**
 
-- No permission prompt. The read of `/home/evan/projects/inbox/…` succeeded
+- No permission prompt. The read of `~/projects/inbox/…` succeeded
   directly despite being outside cwd.
 - The image content came back legibly (`GRAPEFRUIT-7731`), so the file was
   genuinely opened and decoded.
