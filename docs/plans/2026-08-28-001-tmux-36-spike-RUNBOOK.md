@@ -14,8 +14,8 @@ can start at the co-working step without re-deriving anything.
 | U0 baseline | done | note §U0 — pty 4.3 ms / 100 %; tmux p50 ≈ key gap; 3/6 live tests failing, root-caused |
 | U1 consumer fix | done, committed `0c52a21` | `fly substrate-pipe`; live suite 7/7 (was 3/6) |
 | U2 acceptance | done, **gate 1 hit** | tmux 50/50 at every gap, p50 4.34–4.47 ms vs pty 4.23–4.29, zero withheld |
-| U3 3.6 conformance | **next — unattended** | below |
-| U4 checklist on fly-el | **the co-working session** | below |
+| U3 3.6 conformance | done, **gate 2 hit** | note §U3 — hook-path exit 501 ms → **10 ms median** (wake pipe); history-limit ok; attach-geometry flip never wired (known limitation) |
+| U4 checklist on fly-el | **next — the co-working session** | below |
 | U5 results + wording | after U4 | below |
 
 Safety rule for every step, restated: nothing here touches the installed
@@ -23,10 +23,13 @@ release (flavor `fly`, `/run/user/1000/fly/*`, `tmux -L fly`, the core that
 hosts the pane this session runs in). Everything runs on `flylatt`/`flylatp`
 (scratch cores) or `fly-el` (the dev flavor, isolated by `FLY_APP_NAME`).
 
-## U3 — 3.6 conformance (agent, unattended, ~30 min)
+## U3 — 3.6 conformance (agent, unattended, ~30 min) — DONE 2026-08-28
 
-Gate 2 of the plan. The suite is already 7/7 on 3.6a; three explicit
-measurements remain.
+Gate 2 of the plan — hit. Kept below as the record of what was run; results
+in the note §U3. Two things U4 inherits: **check 8** should now see an exit
+surface in ~10 ms (not "~1.5 s or instantly"), and **check 4** will show the
+attached terminal at fly's 80-column-ish grid rather than filling the
+terminal — the KTD2 flip was never built; judge the typing, not the size.
 
 **U3.1 Hook-path exit latency.** Question: when a pane's child dies, how
 long until `pane://exit` reaches a control client *with no `panes_status`
@@ -130,7 +133,9 @@ clears the sessions.
   http://127.0.0.1:4940/agents/<key>/output`, the SSE `/feed`, and a
   `POST …/input` submit into a tmux-backed agent — same shapes as on pty.
 - **Check 8 — exit surface.** `exit` in a shell pane → the pane shows exited
-  within ~0.5 s (hook path; U3.1 gives the number) and the final screen stays.
+  essentially at once (hook path + wake pipe: 10 ms median in U3.1; the
+  1.5 s `panes_status` poll remains the lost-hook floor) and the final
+  screen stays.
 - **Check 9 — ephemeral hygiene (U10).** `fly automation create --paned …`
   a one-shot; after its tab closes (or a quit) `tmux -L fly-el ls` shows no
   automation session and `substrate-sessions.json` no stale record.
@@ -152,7 +157,9 @@ subjective sign-off. Record: `[x] 1. 2026-08-xx — Evan: …` one line.
 
 **Check 4 — `leader t` native attach (R1/R9).** Focus a `claude` pane →
 `leader t` → your terminal opens attached to that session; type there —
-native latency by construction. Back in fly, the pane shows the
+native latency by construction. (Expect the session at fly's grid size,
+letterboxed if your terminal is bigger — the attached-client-wins flip was
+never wired, see note §U3.2; that is a known limitation, not a fail.) Back in fly, the pane shows the
 "attached in terminal" badge. Now make the agent raise attention (ask it
 something that needs a permission) **while attached**: expect **no** OS
 banner (attached-elsewhere suppresses, R9) though the pane/tab still rings.

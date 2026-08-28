@@ -169,6 +169,53 @@ under a millisecond. The second KTD2 condition (a real `claude` REPL,
 many-byte redraws) is not yet recorded — it rides U4's fly-el session, where
 a REPL pane exists anyway.
 
+## U3 — 3.6 conformance (executed 2026-08-28)
+
+Scripts: scratchpad `u3/u3.sh` + `u3/u3_exit.py` (a `flylatt` core, panes
+spawned over the control socket, no `panes_status` polling anywhere).
+
+**U3.1 hook-path exit latency.** 10 trials of a pane running `sh -c 'read x;
+exit 7'`, death triggered by a `\n` down the 0x03 frame, stopwatch to the
+matching `pane://exit` event:
+
+| reader | n | min | median | max | < 300 ms |
+|---|---|---|---|---|---|
+| as built (FIFO `poll` with a 500 ms timeout) | 10/10 | 501 ms | 501 ms | 512 ms | **0/10** |
+| with the wake pipe (this unit) | 10/10 | **7 ms** | **10 ms** | 17 ms | **10/10** |
+
+The "before" row is the finding: the `pane-died` hook itself lands within a
+millisecond or two (the spread is ±1 ms around exactly 500), but
+`force_dead` only set a flag and poked the pause condvar — the read thread
+was asleep in `poll()` on the FIFO, so every hook-driven exit waited for the
+poll timeout. The hook's precision was entirely the poll timeout, and the
+plan's < 300 ms target would have failed *by design*. Fix (one unit, in this
+commit): a non-blocking, close-on-exec self-pipe per tmux pane
+(`pty/pane.rs::wake_pipe`); the read thread polls the FIFO and the pipe
+together (`poll_fifo_or_wake`), and `force_dead`, `teardown_detach`, and
+`teardown` write a byte. The 500 ms timeout stays as a safety floor only.
+Side effect: closing/detaching a tmux pane no longer stalls up to 500 ms
+either — the live suite dropped from 5.7 s to 2.6 s.
+
+**U3.2 geometry across attach/detach (KTD2).** Spawned at 80×24: `80x24`,
+`window-size=manual`. A real 100×30 client attached (the S4 `script`
+trick): still `80x24`/`manual`, `session_attached=1`. Detached: unchanged.
+**Not a 3.6 change — the KTD2 flip was never wired**: `Tmux::
+set_window_size_latest` has no callers; the `attach-state` handler feeds
+suppression (R9) and the `pane://attach` badge only. So `leader t` shows the
+session at fly's grid, letterboxed in a larger terminal. Doing it properly
+means fly's own xterm following the tmux window while a client is attached
+(the mirror that would have letterboxed was removed with the Tauri shell) —
+more than one unit, so it is recorded as a known limitation for check 4 and
+for the substrate plan's residuals, not built here.
+
+**U3.3 history-limit (KTD9).** Server `history-limit` 10000; a fresh pane's
+`#{history_limit}` 10000. Pass.
+
+**Gate 2: hit** — suite 7/7 on 3.6a, hook-path exits 10/10 under 300 ms
+(median 10 ms), geometry and history behave as the plan assumes *as built*
+(the never-built attach flip noted). No tmux-3.6-specific behaviour was found
+anywhere in U0–U3.
+
 ### Harness notes (for U1–U4)
 
 - Probe client: scratchpad `u0/probe.py` (stdlib; frames per

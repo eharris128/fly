@@ -9,8 +9,12 @@ uninterruptibly behind uutils `cat`'s `splice()`, which sleeps on the socket
 while holding the destination pipe's mutex; tmux 3.6 exonerated. U1: `fly
 substrate-pipe` landed (red→green: live suite 3/6 → **7/7**, incl. the new
 pinning test). U2: **gate 1 hit** — tmux 50/50 at every gap, p50 4.34–4.47 ms
-vs pty 4.23–4.29, zero withheld. Next: U3 (hook-path exit latency, geometry,
-history-limit on 3.6a) then U4 (the checklist on fly-el). **The operational
+vs pty 4.23–4.29, zero withheld. U3: **gate 2 hit** — suite 7/7 on 3.6a;
+hook-path exit latency was 501 ms ± 1 (the reader's poll timeout, a real
+finding) → a per-pane wake pipe makes it 7–17 ms, median 10; history-limit
+binds as assumed; the KTD2 attach-geometry flip turns out never to have been
+wired (recorded as a known limitation for check 4, not built). Next: U4 (the
+checklist on fly-el). **The operational
 script for U3–U5 — commands, who does what, pass criteria, where results go
 — is `2026-08-28-001-tmux-36-spike-RUNBOOK.md` beside this plan.**
 **Type**: spike (bounded validation + one targeted fix; not a feature)
@@ -158,7 +162,9 @@ the substrate measured clean at build time and why the failure read as
 - **U2 — acceptance probe on the fix** (KTD2). **Done 2026-08-28, gate 1 hit** (results note §U2; the `claude`-REPL condition rides U4). Both conditions (`cat` pane;
   `claude` REPL), `pty` run alongside for the parity column. This is the gate
   for everything after it.
-- **U3 — 3.6 conformance.** Whatever U0 left unanswered, explicitly: after a
+- **U3 — 3.6 conformance.** **Done 2026-08-28, gate 2 hit** (results note
+  §U3; the one-unit fix taken was the reader wake pipe). Whatever U0 left
+  unanswered, explicitly: after a
   detach→adopt (`restart_roundtrip_…`), do `pane-died` and the attach hooks
   still reach the socket on the *new* instance (KTD12 token continuity), and
   what is the exit-surface latency on the hook path vs the 1.5 s poll floor

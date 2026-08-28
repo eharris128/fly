@@ -191,7 +191,9 @@ ships as binary-safe `send-keys -H` through a persistent control-mode client
 (the unmarked `flyctl-input` session; ~µs/key vs ~8 ms/key subprocess —
 fire-and-forget, subprocess fallback on client death), exits arrive via
 `pane-died` hooks over the socket (KTD12 server-scope token, persisted for cross-instance
-continuity) with a 1.5 s poll floor, and **sessions outlive fly**: quit
+continuity; the hook wakes the FIFO reader through a per-pane self-pipe, so an
+exit surfaces in ~10 ms — spike 2026-08-28-001 U3 — with the 1.5 s
+`panes_status` poll as the lost-hook floor), and **sessions outlive fly**: quit
 detaches (ephemeral automation/sink panes are killed instead), restart
 adopts — same child pid, stored pane token re-registered, ~2k lines
 replayed. `leader t` opens the focused session in a real terminal

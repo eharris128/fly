@@ -323,6 +323,15 @@ Build order; each lands green behind KTD10's flag until U9.
   `std::io::copy` — its Linux fast path splices), pinned by
   `substrate_live::pipe_consumer_delivers_every_byte`. Evidence:
   `docs/notes/2026-08-28-tmux-36-substrate-spike.md`.
+- **2026-08-28 (spike U3): the FIFO reader is woken, not polled, for exits.**
+  Every hook-driven exit had surfaced at 501 ms ± 1 — the hook landed in
+  ~1 ms, then waited for the reader's 500 ms `poll()` timeout. A per-pane
+  non-blocking self-pipe (`pty/pane.rs::wake_pipe`) now sits in the poll
+  set; `force_dead`/`teardown` write a byte; exits surface in ~10 ms and
+  close/detach no longer stall. Also found: the KTD2 attach-time flip to
+  `window-size latest` was never wired (`set_window_size_latest` has no
+  callers) — `leader t` shows fly's grid, letterboxed; a proper version
+  needs fly's xterm to follow the tmux window while attached. Residual.
 
 ## Rollout & validation
 

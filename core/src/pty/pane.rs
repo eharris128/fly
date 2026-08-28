@@ -259,8 +259,9 @@ struct PaneShared {
     /// Tmux arm only (U4): an externally-observed pane death, set by the
     /// `panes_status` backstop (or the KTD12 hook path). The FIFO gives no
     /// EOF for a dead-but-remaining pane — live-pinned: `pipe-pane` refuses
-    /// a dead pane and its `cat` survives — so the read thread polls this
-    /// between reads and exits with the recorded status.
+    /// a dead pane and its consumer survives — so the read thread checks this
+    /// between reads (woken at once through `wake_tx`) and exits with the
+    /// recorded status.
     forced_exit: Mutex<Option<i32>>,
     /// Raw output tail (feed-question-screen-fallback U1). Its own lock, taken
     /// only by the read thread (append) and the on-demand snapshot — never by
@@ -269,6 +270,29 @@ struct PaneShared {
     /// Last-known PTY grid size, set at spawn and updated on resize, so a
     /// screen snapshot carries the width the bytes were rendered against.
     dims: Mutex<(u16, u16)>,
+    /// Tmux arm only (spike 2026-08-28-001 U3): the write end of a self-pipe
+    /// the FIFO read thread polls beside the FIFO. `force_dead` and teardown
+    /// write a byte so the thread acts on `forced_exit`/`stopping` at once
+    /// instead of at its next 500 ms poll timeout — before this, every
+    /// hook-driven exit surfaced at 501 ms ± 1: the hook's precision was
+    /// entirely the poll timeout. `None` on the PTY arm.
+    wake_tx: Option<std::os::fd::OwnedFd>,
+}
+
+impl PaneShared {
+    /// Poke the tmux-arm read thread out of its FIFO poll (no-op on the PTY
+    /// arm). Non-blocking: a full pipe already holds a pending wake, and the
+    /// waker must never stall on the reader.
+    fn wake(&self) {
+        if let Some(fd) = &self.wake_tx {
+            use std::os::fd::AsRawFd;
+            // SAFETY: a one-byte write on a non-blocking fd we own; the
+            // result is irrelevant (EAGAIN = a wake is already pending).
+            unsafe {
+                libc::write(fd.as_raw_fd(), b"w".as_ptr().cast(), 1);
+            }
+        }
+    }
 }
 
 /// What actually backs a pane's byte streams and control ops.
@@ -421,6 +445,7 @@ impl Pane {
             forced_exit: Mutex::new(None),
             tail: Mutex::new(TailRing::new(TAIL_RING_CAP)),
             dims: Mutex::new((size.rows, size.cols)),
+            wake_tx: None,
         });
 
         let thread_shared = Arc::clone(&shared);
@@ -539,6 +564,11 @@ impl Pane {
         let _ = std::fs::remove_file(&fifo);
         mkfifo_0600(&fifo)?;
 
+        // Self-pipe so force_dead/teardown can wake the FIFO poll (spike
+        // 2026-08-28-001 U3): O_CLOEXEC so the pipe-pane child never inherits
+        // it, O_NONBLOCK so a wake never blocks the waker.
+        let (wake_rx, wake_tx) = wake_pipe()?;
+
         let (reaped_tx, reaped_rx) = mpsc::channel();
         let shared = Arc::new(PaneShared {
             lifecycle: Mutex::new(LifecycleState::Live),
@@ -551,6 +581,7 @@ impl Pane {
             forced_exit: Mutex::new(None),
             tail: Mutex::new(TailRing::new(TAIL_RING_CAP)),
             dims: Mutex::new((rows, cols)),
+            wake_tx: Some(wake_tx),
         });
 
         // Adoption keeps the STORED token (the agent's long-lived env holds
@@ -600,6 +631,7 @@ impl Pane {
                     thread_substrate,
                     thread_session,
                     thread_fifo,
+                    wake_rx,
                     sink,
                     thread_shared,
                     on_exit,
@@ -746,8 +778,10 @@ impl Pane {
             *fe = Some(status);
         }
         drop(fe);
-        // Wake a paused reader so the exit isn't gated on resume.
+        // Wake a paused reader so the exit isn't gated on resume, and a
+        // polling one so it isn't gated on the poll timeout.
         self.shared.pause_cv.notify_all();
+        self.shared.wake();
     }
 
     /// The foreground process group leader pid, used by U10 for `/proc`-based
@@ -817,6 +851,7 @@ impl Pane {
         log::debug!("detaching pane {} (session survives)", self.id.0);
         self.shared.stopping.store(true, Ordering::Release);
         self.shared.pause_cv.notify_all();
+        self.shared.wake();
         let _ = substrate.tmux().pipe_pane_close(session);
         let _ = std::fs::remove_file(fifo);
         if let Some(handle) = self.reader_handle.take() {
@@ -833,8 +868,10 @@ impl Pane {
         }
         log::debug!("tearing down pane {}", self.id.0);
         self.shared.stopping.store(true, Ordering::Release);
-        // Wake the read thread if it's parked on the pause condvar.
+        // Wake the read thread if it's parked on the pause condvar (or, on
+        // the tmux arm, in its FIFO poll).
         self.shared.pause_cv.notify_all();
+        self.shared.wake();
 
         if let Backend::Tmux {
             substrate,
@@ -972,6 +1009,7 @@ fn tmux_read_loop(
     _substrate: Arc<crate::substrate::Substrate>,
     _session: String,
     fifo: std::path::PathBuf,
+    wake_rx: std::os::fd::OwnedFd,
     mut sink: OutputSink,
     shared: Arc<PaneShared>,
     on_exit: ExitCallback,
@@ -1006,9 +1044,15 @@ fn tmux_read_loop(
                 dead_status = Some(code);
                 break 'outer;
             }
-            // Wait for readability, ≤500 ms, then drain what's there. The
-            // timeout bounds how stale a forced-exit/stop check can be.
-            if !poll_readable(&reader, Duration::from_millis(500)) {
+            // Wait for FIFO bytes OR a wake (force_dead/teardown), ≤500 ms.
+            // The wake pipe makes an exit/stop surface at once; the timeout is
+            // only a safety floor for a wake that somehow never arrives.
+            let (fifo_ready, woken) =
+                poll_fifo_or_wake(&reader, &wake_rx, Duration::from_millis(500));
+            if woken {
+                drain_wake(&wake_rx);
+            }
+            if !fifo_ready {
                 continue;
             }
             match (&reader).read(&mut buf) {
@@ -1096,17 +1140,63 @@ fn set_nonblocking(f: &std::fs::File) {
     }
 }
 
-/// `poll(2)` for readability with a timeout; false on timeout/error.
-fn poll_readable(f: &std::fs::File, timeout: Duration) -> bool {
+/// `poll(2)` on the FIFO and the wake pipe together (tmux arm, spike
+/// 2026-08-28-001 U3): `(fifo_readable, woken)`; both false on timeout or
+/// error. A hung-up wake pipe (the `Pane` dropped its write end) counts as
+/// woken so the loop re-checks `stopping` instead of sleeping on.
+fn poll_fifo_or_wake(
+    fifo: &std::fs::File,
+    wake: &std::os::fd::OwnedFd,
+    timeout: Duration,
+) -> (bool, bool) {
     use std::os::fd::AsRawFd;
-    let mut fds = libc::pollfd {
-        fd: f.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: valid pollfd array of length 1.
-    let rc = unsafe { libc::poll(&mut fds, 1, timeout.as_millis() as i32) };
-    rc > 0 && (fds.revents & libc::POLLIN) != 0
+    let mut fds = [
+        libc::pollfd {
+            fd: fifo.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: valid pollfd array of length 2.
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout.as_millis() as i32) };
+    if rc <= 0 {
+        return (false, false);
+    }
+    (
+        (fds[0].revents & libc::POLLIN) != 0,
+        (fds[1].revents & (libc::POLLIN | libc::POLLHUP)) != 0,
+    )
+}
+
+/// Empty the wake pipe (non-blocking) so a stale byte can't spin the loop.
+fn drain_wake(wake: &std::os::fd::OwnedFd) {
+    use std::os::fd::AsRawFd;
+    let mut sink = [0u8; 64];
+    // SAFETY: non-blocking reads on an fd we own; EAGAIN (or EOF) ends it.
+    while unsafe { libc::read(wake.as_raw_fd(), sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
+}
+
+/// A non-blocking, close-on-exec self-pipe: `(read end, write end)`.
+fn wake_pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd), String> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe2 fills two fresh descriptors this process then owns.
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    if rc != 0 {
+        return Err(format!("wake pipe: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: fresh fds from a successful pipe2, each owned exactly once.
+    Ok(unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    })
 }
 
 /// `#{pane_pid}` of a session's (only) pane — the signal target and the cwd
