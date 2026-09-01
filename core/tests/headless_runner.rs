@@ -486,10 +486,13 @@ fn env_is_inherited_minus_strip_list_and_argv_has_pane_parity() {
         "CLAUDE_CODE_SESSION_ID",
         "CLAUDE_CODE_ENTRYPOINT",
     ];
+    // SAFETY: unsynchronized against other test threads reading the env —
+    // the pre-2024 race made explicit, not a new one. Test-only; only this
+    // test in the binary sets these keys.
     for key in STRIPPED {
-        std::env::set_var(key, "leaked-value");
+        unsafe { std::env::set_var(key, "leaked-value") };
     }
-    std::env::set_var("FLY_HEADLESS_TEST_CANARY", "inherited");
+    unsafe { std::env::set_var("FLY_HEADLESS_TEST_CANARY", "inherited") };
 
     let h = harness("env-dump.sh", fast_timing());
     let launch = ResolvedLaunch {
@@ -501,9 +504,9 @@ fn env_is_inherited_minus_strip_list_and_argv_has_pane_parity() {
         .run(&monitor_automation("auto-env", &h.cwd(), "dump the env"), "r1", &launch);
     let (_, _, outcome) = h.one_closed(Duration::from_secs(10));
     for key in STRIPPED {
-        std::env::remove_var(key);
+        unsafe { std::env::remove_var(key) };
     }
-    std::env::remove_var("FLY_HEADLESS_TEST_CANARY");
+    unsafe { std::env::remove_var("FLY_HEADLESS_TEST_CANARY") };
     assert!(matches!(outcome, CheckOutcome::Clean { .. }));
 
     let env_dump = std::fs::read_to_string(h.dir.path().join("env-dump.txt")).unwrap();

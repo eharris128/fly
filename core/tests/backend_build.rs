@@ -36,11 +36,13 @@ fn builds_full_backend_isolated_refuses_second_and_shuts_down_clean() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&runtime).unwrap();
     let flavor = format!("fly-betest-{}", std::process::id());
-    std::env::set_var("FLY_APP_NAME", &flavor);
-    std::env::set_var("HOME", &home);
-    std::env::set_var("XDG_RUNTIME_DIR", &runtime);
-    std::env::remove_var("XDG_CONFIG_HOME");
-    std::env::remove_var("XDG_DATA_HOME");
+    // SAFETY: this binary holds one test and nothing has spawned a thread yet,
+    // so the env is written single-threaded, before the backend it configures.
+    unsafe { std::env::set_var("FLY_APP_NAME", &flavor) };
+    unsafe { std::env::set_var("HOME", &home) };
+    unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime) };
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    unsafe { std::env::remove_var("XDG_DATA_HOME") };
     // Feed listener off: the default port may be held by a real running fly,
     // which would make `feed_server`'s presence nondeterministic here.
     let cfg_dir = home.join(".config").join(&flavor);

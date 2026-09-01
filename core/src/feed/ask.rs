@@ -51,7 +51,7 @@ pub enum AnswerOutcome {
 }
 
 struct Entry {
-    gen: u64,
+    generation: u64,
     asked_at_ms: u64,
     payload: AskPayload,
     tx: Sender<String>,
@@ -83,26 +83,26 @@ impl AskRegistry {
         if inner.len() >= MAX_HELD_ASKS && !inner.contains_key(leaf_key) {
             return None;
         }
-        let gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
+        let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::channel();
         inner.insert(
             leaf_key.to_string(),
             Entry {
-                gen,
+                generation,
                 asked_at_ms: now_ms,
                 payload,
                 tx,
             },
         );
-        Some((gen, rx))
+        Some((generation, rx))
     }
 
-    /// Remove the leaf's entry only if it still holds `gen` (the drop guard —
+    /// Remove the leaf's entry only if it still holds `generation` (the drop guard —
     /// a stale connection's death never clears a newer ask). Returns whether
     /// an entry was actually removed (the caller bumps the feed only then).
-    pub fn clear_if(&self, leaf_key: &str, gen: u64) -> bool {
+    pub fn clear_if(&self, leaf_key: &str, generation: u64) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        if inner.get(leaf_key).is_some_and(|e| e.gen == gen) {
+        if inner.get(leaf_key).is_some_and(|e| e.generation == generation) {
             inner.remove(leaf_key);
             return true;
         }
@@ -159,15 +159,15 @@ mod tests {
     #[test]
     fn register_get_and_drop_guard_lifecycle() {
         let r = AskRegistry::new();
-        let (gen, _rx) = r.register("leaf-1", ask("Bash"), 1_000).unwrap();
+        let (generation, _rx) = r.register("leaf-1", ask("Bash"), 1_000).unwrap();
         let held = r.get("leaf-1").expect("held");
         assert_eq!(held.asked_at_ms, 1_000);
         assert_eq!(held.payload.tool.as_deref(), Some("Bash"));
         // The armed drop guard clears its own generation…
-        assert!(r.clear_if("leaf-1", gen));
+        assert!(r.clear_if("leaf-1", generation));
         assert_eq!(r.get("leaf-1"), None);
         // …and is idempotent once gone.
-        assert!(!r.clear_if("leaf-1", gen));
+        assert!(!r.clear_if("leaf-1", generation));
     }
 
     #[test]

@@ -1290,8 +1290,11 @@ mod tests {
     // notify/command.rs precedent), while FLY_AUTOMATION_ID / _RUN_ID are set.
     #[test]
     fn env_is_allowlisted_tokens_absent_automation_ids_present_r14() {
-        std::env::set_var("FLY_PANE_TOKEN", "super-secret");
-        std::env::set_var("FLY_SOCKET_PATH", "/run/fly/hook.sock");
+        // SAFETY: unsynchronized against other test threads reading the env —
+        // the pre-2024 race made explicit, not a new one. Test-only; the child's
+        // env_clear is what the assertion checks, so a concurrent writer can't flip it.
+        unsafe { std::env::set_var("FLY_PANE_TOKEN", "super-secret") };
+        unsafe { std::env::set_var("FLY_SOCKET_PATH", "/run/fly/hook.sock") };
         let h = harness();
         let a = h.automation(
             "envprobe",
@@ -1302,8 +1305,8 @@ mod tests {
         );
         h.runner.dispatch_script(&a, "run-42").unwrap();
         let (_, _, outcome) = h.one_closed();
-        std::env::remove_var("FLY_PANE_TOKEN");
-        std::env::remove_var("FLY_SOCKET_PATH");
+        unsafe { std::env::remove_var("FLY_PANE_TOKEN") };
+        unsafe { std::env::remove_var("FLY_SOCKET_PATH") };
 
         match outcome {
             RunOutcome::Succeeded { output: Some(out) } => {

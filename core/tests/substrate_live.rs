@@ -297,7 +297,10 @@ fn tmux_pane_child_exit_surfaces_exited_state() {
 fn server_env_is_scrubbed_of_claude_markers() {
     // The overlay trap (KTD3): the server's global env is every pane's
     // baseline, so the marker strip must hold THERE.
-    std::env::set_var("CLAUDECODE", "1");
+    // SAFETY: unsynchronized against other test threads reading the env —
+    // the pre-2024 race made explicit, not a new one. Test-only; only this
+    // test in the binary sets this key.
+    unsafe { std::env::set_var("CLAUDECODE", "1") };
     let scratch = Scratch::new("u3env");
     let substrate = scratch.substrate();
     substrate.ensure_server().unwrap();
@@ -323,7 +326,7 @@ fn server_env_is_scrubbed_of_claude_markers() {
         !global.lines().any(|l| l.starts_with("CLAUDECODE=")),
         "server global env must not carry CLAUDECODE; got:\n{global}"
     );
-    std::env::remove_var("CLAUDECODE");
+    unsafe { std::env::remove_var("CLAUDECODE") };
 }
 
 #[test]

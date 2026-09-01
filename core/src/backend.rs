@@ -518,12 +518,12 @@ pub fn build_backend(seams: BackendSeams) -> Result<Backend, String> {
                     },
                 );
             }
-            let (gen, rx) = registry.register(&leaf_key, payload, notify::now_unix_ms())?;
+            let (generation, rx) = registry.register(&leaf_key, payload, notify::now_unix_ms())?;
             feed_state.bump();
             let drop_registry = Arc::clone(&registry);
             let drop_feed = Arc::clone(&feed_state);
             let on_drop = Box::new(move || {
-                if drop_registry.clear_if(&leaf_key, gen) {
+                if drop_registry.clear_if(&leaf_key, generation) {
                     drop_feed.bump();
                 }
             });

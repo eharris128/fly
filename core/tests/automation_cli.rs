@@ -579,8 +579,11 @@ fn cli_create_monitor_over_socket_stamps_r8_defaults_and_floor() {
     let server = server_over(&mgr, &tokens);
     let tok = tokens.issue(PaneId(11));
     // The mutating CLI path resolves the pane env; only this test sets these.
-    std::env::set_var("FLY_PANE_TOKEN", &tok);
-    std::env::set_var("FLY_SOCKET_PATH", server.socket_path());
+    // SAFETY: unsynchronized against other test threads reading the env —
+    // the pre-2024 race made explicit, not a new one. Test-only; only this
+    // test in the binary sets these keys.
+    unsafe { std::env::set_var("FLY_PANE_TOKEN", &tok) };
+    unsafe { std::env::set_var("FLY_SOCKET_PATH", server.socket_path()) };
 
     // 2026-07-12T00:00:00Z — after the harness clock T0 (2026-01-06).
     let nb_ms: u64 = 1_783_814_400_000;

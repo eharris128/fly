@@ -32,12 +32,12 @@ fn no_dispatch() -> Dispatch {
 fn handler(registry: Arc<AskRegistry>) -> AskHandler {
     Arc::new(move |pane, payload: AskPayload| {
         let leaf = format!("leaf-{}", pane.0);
-        let (gen, rx) = registry.register(&leaf, payload, STAMP)?;
+        let (generation, rx) = registry.register(&leaf, payload, STAMP)?;
         let reg = Arc::clone(&registry);
         Some(AskTicket {
             decision_rx: rx,
             on_drop: Box::new(move || {
-                reg.clear_if(&leaf, gen);
+                reg.clear_if(&leaf, generation);
             }),
         })
     })

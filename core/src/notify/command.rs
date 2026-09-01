@@ -169,8 +169,11 @@ mod tests {
         // Simulate a future where the app process carries the pane token: the
         // command must still not see it (env_clear + allowlist). Guards a
         // refactor that might put the token in the app env.
-        std::env::set_var("FLY_PANE_TOKEN", "super-secret-token");
-        std::env::set_var("FLY_SOCKET_PATH", "/run/fly/hook.sock");
+        // SAFETY: unsynchronized against other test threads reading the env —
+        // the pre-2024 race made explicit, not a new one. Test-only; the child's
+        // env_clear is what the assertion checks, so a concurrent writer can't flip it.
+        unsafe { std::env::set_var("FLY_PANE_TOKEN", "super-secret-token") };
+        unsafe { std::env::set_var("FLY_SOCKET_PATH", "/run/fly/hook.sock") };
         let contents = run_to_file(
             |p| format!(
                 "printf 'T=%s S=%s' \"${{FLY_PANE_TOKEN:-none}}\" \"${{FLY_SOCKET_PATH:-none}}\" > '{p}'"
@@ -179,8 +182,8 @@ mod tests {
             "s",
             "b",
         );
-        std::env::remove_var("FLY_PANE_TOKEN");
-        std::env::remove_var("FLY_SOCKET_PATH");
+        unsafe { std::env::remove_var("FLY_PANE_TOKEN") };
+        unsafe { std::env::remove_var("FLY_SOCKET_PATH") };
         assert_eq!(contents, "T=none S=none", "tokens were cleared from the child env");
     }
 
