@@ -7,9 +7,7 @@ the moment an agent needs you. v1 wires **Claude Code** as the attention source.
 **Stack:** Rust backend (`fly core`, a headless process serving a Unix control
 socket) · [Electron](https://electronjs.org) shell (the desktop window) ·
 [Svelte 5](https://svelte.dev) (Vite / TypeScript frontend) ·
-[xterm.js](https://xtermjs.org) terminal panes. **Linux only.** (The Tauri
-shell fly started on, and its best-effort macOS build, were retired on
-2026-08-27; tag `tauri-shell-final` if you ever need them.)
+[xterm.js](https://xtermjs.org) terminal panes. **Linux only.**
 
 > The full design lives in [`docs/plans/`](docs/plans/README.md) (indexed by ID);
 > the primary contributor guide is [`CLAUDE.md`](CLAUDE.md). This README is the
