@@ -256,7 +256,8 @@ Findings and residuals (also summarized on the checklist):
   socket rode the spawn chain (shell → `fly core` → tmux server) without
   CLOEXEC and outlived the app — the *tmux server* held `:9222`, blocking
   the next dev launch's bind. General mechanism, dev-only trigger observed.
-  Fix shape: fd hygiene on the core/server spawn seams.
+  **Fixed 2026-09-01** (`close_inherited_fds` on both tmux spawn seams —
+  see the checklist residuals block).
 - **Instant-ack is easy to misread as a bug during validation.** A raise on
   a visible pane in a foregrounded window acknowledges born-cleared (no
   banner, no bell, event `state:"acknowledged"`) — correct per
@@ -287,6 +288,7 @@ sentence promises) all pass; 2, 7, 9, 10 recorded as passes too; 3 N/A.
   spike's): the data supports flipping `SubstrateKind::default` → `Tmux` —
   typing at pty parity (U2, and Evan's check-1 sign-off), renderer cost
   *lower* than the pty reference, exits at hook speed, adoption/hygiene/feed
-  all clean. If flipped, do it with a release soak, and weigh the two open
-  residuals above (fd hygiene; the one-off roster read) plus the never-wired
-  attach-geometry flip, which becomes more visible once tmux is the default.
+  all clean. If flipped, do it with a release soak, and weigh the remaining
+  open residuals (the one-off roster read; the fd leak was fixed same day)
+  plus the never-wired attach-geometry flip, which becomes more visible once
+  tmux is the default.

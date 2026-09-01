@@ -142,14 +142,15 @@ checklist is the app-level pass that gates the default flip and U9.
 
 ## Residuals from the 2026-09-01 run (recorded, non-blocking)
 
-- **fd leak into the detached tmux server.** The shell's listening sockets
-  are inherited down the spawn chain (shell → `fly core` → tmux server) and
-  outlive the app: after quitting a dev shell launched with
-  `--remote-debugging-port=9222`, the *tmux server* held the port's LISTEN
-  socket (fd 64), blocking the next launch's devtools bind. Dev-only
-  trigger, but the mechanism is general — the long-lived server keeps any
-  non-CLOEXEC fd the shell had open. Fix shape: close-fds/CLOEXEC hygiene on
-  the core-spawn and server-spawn seams.
+- ~~**fd leak into the detached tmux server.**~~ **FIXED 2026-09-01**
+  (`fix(substrate): close inherited fds before exec'ing tmux clients`): the
+  shell's listening sockets were inherited down the spawn chain (shell →
+  `fly core` → tmux server) and outlived the app — a dev shell's devtools
+  LISTEN socket ended up held by the *tmux server*, blocking the next
+  launch's bind. Now a `pre_exec` `close_range(3, ~0)` on both tmux spawn
+  seams (executor + control-mode input client) strips everything above
+  stdio before the server can inherit it; unit-tested with an unhardened
+  control leg, live suite re-run 7/7.
 - **One-off, unreproduced:** in one adopted instance (the second of the
   day), three raises reached the renderer's history (recorded unread) while
   the feed roster's `needsAttention` stayed false across three reads. A
