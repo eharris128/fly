@@ -107,6 +107,29 @@ pub trait Executor: Send + Sync {
     ) -> Result<ExecOutput, String>;
 }
 
+/// Close every inherited fd above stdio in the child before exec (spike
+/// 2026-08-28-001 U4 residual): an fd that reaches fly *without* CLOEXEC —
+/// live-observed: the Electron shell's devtools LISTEN socket, which rode
+/// shell → `fly core` — would otherwise pass through a tmux client into the
+/// daemonized server, which deliberately outlives fly and then holds it
+/// forever (a dev relaunch found its CDP port still bound by the tmux
+/// server). Applied to every tmux client spawn, because whichever client
+/// runs first is the one that auto-starts the server.
+fn close_inherited_fds(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: the closure runs post-fork/pre-exec and performs only one raw
+    // async-signal-safe syscall. Runs after std's stdio dup2s, so 0–2 are
+    // already the child's real stdio. close_range needs kernel ≥ 5.9; on
+    // any failure the child still execs — the leak is an fd-hygiene loss,
+    // not a tmux correctness loss.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+            Ok(())
+        });
+    }
+}
+
 /// Production executor: real `tmux` subprocesses, hard timeout via a waiter
 /// thread (std-only; no new crates).
 pub struct RealExecutor;
@@ -132,6 +155,7 @@ impl Executor for RealExecutor {
             cmd.env_clear();
             cmd.envs(env);
         }
+        close_inherited_fds(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| format!("spawning tmux: {e}"))?;
         if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
             // A paste payload is bounded (feed/peer caps) and far below pipe
@@ -202,27 +226,29 @@ struct InputClient {
 
 impl InputClient {
     fn spawn(socket_name: &str) -> Option<InputClient> {
-        let mut child = Command::new("tmux")
-            .args([
-                "-u",
-                "-L",
-                socket_name,
-                "-C",
-                // NO `-d`: control mode is "attach a client" — with -d the
-                // client exits the moment the (detached) session exists, and
-                // a write can race into the dying pipe and silently drop a
-                // keystroke (caught by substrate_live on first landing).
-                "new-session",
-                "-A",
-                "-s",
-                INPUT_CLIENT_SESSION,
-                "sleep infinity",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+        let mut cmd = Command::new("tmux");
+        cmd.args([
+            "-u",
+            "-L",
+            socket_name,
+            "-C",
+            // NO `-d`: control mode is "attach a client" — with -d the
+            // client exits the moment the (detached) session exists, and
+            // a write can race into the dying pipe and silently drop a
+            // keystroke (caught by substrate_live on first landing).
+            "new-session",
+            "-A",
+            "-s",
+            INPUT_CLIENT_SESSION,
+            "sleep infinity",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+        // This client auto-starts the server on a cold boot, so it needs the
+        // same fd hygiene as the executor path.
+        close_inherited_fds(&mut cmd);
+        let mut child = cmd.spawn().ok()?;
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
         // Drain everything the server sends (%begin/%end blocks, %output
@@ -830,6 +856,46 @@ fn parse_version(s: &str) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// The 2026-09-01 residual's fix: a non-CLOEXEC fd (standing in for the
+    /// shell's inherited devtools listener) must not survive into a hardened
+    /// child, or it ends up trapped in the daemonized tmux server. The
+    /// unhardened control leg proves the leak is real (guards against the
+    /// hardened leg passing vacuously).
+    #[test]
+    fn close_inherited_fds_strips_non_cloexec_fds_from_the_child() {
+        use std::os::fd::AsRawFd as _;
+        // Padding fds so the probe fd sits above the low numbers a child's
+        // own transient opens (ls's dir fd) would reuse after close_range.
+        let pad: Vec<std::fs::File> = (0..4)
+            .map(|_| std::fs::File::open("/proc/self/status").unwrap())
+            .collect();
+        let probe = std::fs::File::open("/proc/self/status").unwrap();
+        let fd = probe.as_raw_fd();
+        // std opens with CLOEXEC; clear it to model an inherited listener.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+        let child_fds = |harden: bool| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "ls /proc/self/fd"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            if harden {
+                close_inherited_fds(&mut cmd);
+            }
+            let out = cmd.output().expect("spawn sh");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let has_fd = |listing: &str| listing.lines().any(|l| l.trim() == fd.to_string());
+        assert!(
+            has_fd(&child_fds(false)),
+            "control: the cleared-CLOEXEC fd should leak into an unhardened child"
+        );
+        assert!(
+            !has_fd(&child_fds(true)),
+            "hardened child still holds the inherited fd"
+        );
+        drop(pad);
+    }
 
     /// Scripted fake: records invocations, pops queued outputs (or succeeds
     /// silently when the queue is empty).
