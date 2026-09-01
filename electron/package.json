@@ -13,7 +13,7 @@
     "dist": "test -f ../dist/index.html || { echo 'electron/dist: ../dist missing \u2014 run pnpm build first' >&2; exit 1; }; rm -rf frontend && cp -r ../dist frontend && electron-builder --linux deb"
   },
   "build": {
-    "appId": "dev.evanharris.fly",
+    "appId": "dev.eharris128.fly",
     "productName": "fly",
     "directories": {
       "output": "dist-el"
