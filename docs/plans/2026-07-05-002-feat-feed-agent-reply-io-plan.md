@@ -4,7 +4,7 @@ type: feat
 date: 2026-07-05
 status: built
 depth: compact
-origin: game-portfolio consumer request (as-built record)
+origin: external consumer request (as-built record)
 ---
 
 # feat: Feed agent reply read + input write endpoints (`feed-agent-reply-io`)
@@ -12,8 +12,8 @@ origin: game-portfolio consumer request (as-built record)
 ## Summary
 
 Three additions to the existing local feed HTTP server
-(`2026-07-04-001-feat-agent-state-local-feed`), requested by its consumer (the
-`game` 3D portfolio) so each agent tile can show the agent's **latest reply**
+(`2026-07-04-001-feat-agent-state-local-feed`), requested by its consumer (a
+3D portfolio) so each agent tile can show the agent's **latest reply**
 and **send a prompt/answer back**:
 
 1. `GET /agents/{key}/output` — the agent's latest textual reply

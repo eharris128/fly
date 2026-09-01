@@ -386,4 +386,4 @@ G1 changes nothing until you opt in. Nothing below is required; do it when ready
 4. **Do not** touch the script legs' verdicts yet (G1 is agent-mode only); their
    exactly-once poll consumers are unaffected and remain correct.
 
-Ask Evan before opting in the leg that feeds a spend stage.
+Ask the maintainer before opting in the leg that feeds a spend stage.

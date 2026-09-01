@@ -235,7 +235,7 @@ anywhere in U0–U3.
 
 ## U4 — the LIVE-CHECKLIST on fly-el (executed 2026-09-01)
 
-The co-working session per the RUNBOOK: Evan drove checks 1 and 4, the agent
+The co-working session per the RUNBOOK: the maintainer drove checks 1 and 4, the agent
 drove 2, 5–10 over CDP (`--remote-debugging-port`), the feed (`:4940`), and
 borrowed pane tokens. Binary: `core/target/debug/fly` at `a423daa` (the
 fixed consumer + wake pipe). Full dated results are the ticked lines in
@@ -284,9 +284,9 @@ sentence promises) all pass; 2, 7, 9, 10 recorded as passes too; 3 N/A.
 - README: **"opt-in" stays as written** — no change needed.
 - CLAUDE.md: the substrate paragraph's "until live validation" caveat is
   resolved (edited this commit); the default remains `pty`.
-- **Default-flip recommendation** (the decision is Evan's, not this
+- **Default-flip recommendation** (the decision is the maintainer's, not this
   spike's): the data supports flipping `SubstrateKind::default` → `Tmux` —
-  typing at pty parity (U2, and Evan's check-1 sign-off), renderer cost
+  typing at pty parity (U2, and the maintainer's check-1 sign-off), renderer cost
   *lower* than the pty reference, exits at hook speed, adoption/hygiene/feed
   all clean. If flipped, do it with a release soak, and weigh the remaining
   open residuals (the one-off roster read; the fd leak was fixed same day)

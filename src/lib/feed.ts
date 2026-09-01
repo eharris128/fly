@@ -3,7 +3,7 @@
 // in `core/src/feed/wire.rs`: the frontend PUSHES the agent roster (which
 // only the webview computes, folding topology + status + debounce), and the
 // backend fills the automations half + `version`/`emittedAt` before it streams
-// the snapshot to the local `game` consumer over SSE.
+// the snapshot to the local consumer over SSE.
 //
 // `buildFeedPayload` flattens the dashboard's grouped model (`HomeWorkspaceGroup[]`
 // from `home.ts`) into the flat `AgentEntry[]` the wire carries — reusing the

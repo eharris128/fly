@@ -41,7 +41,7 @@ keeps the existing `keys`/`other` injection path: an `allow` decision cannot
 skip a `requiresUserInteraction` tool (verified), so the picker is answered on
 screen or not at all.
 
-The game/feed consumer contract is unchanged except for two strict additions:
+The feed consumer contract is unchanged except for two strict additions:
 `question.source` may now be `"hook"`, and `mode:"decision"` exists.
 
 ## The hook contract (probed live, 2026-07-11, Claude Code 2.1.207)

@@ -3,8 +3,8 @@
 Executes `docs/plans/2026-08-12-001-spike-electron-engine-probe-plan.md`. Rig in
 `spikes/electron-probe/` (Electron 37 / Chromium, `@xterm/xterm` 5.5 +
 WebGL addon fontSize 15 — fly's exact terminal stack — `node-pty`, command
-socket injecting at `pty.write`). Same box as every prior number: hybrid
-Intel display + NVIDIA T1000, Wayland GNOME 46; probe = python-xlib pixel-diff
+socket injecting at `pty.write`). Same box as every prior number (hybrid-GPU
+laptop, Wayland GNOME 46); probe = python-xlib pixel-diff
 on the input-line region, ≥12 trials; renderer main thread sampled per-tid at
 100 ms. Same-day fly baselines (installed release, tmux substrate, Claude REPL
 pane, memory `substrate-typing-latency-numbers`).

@@ -27,7 +27,7 @@ it through `POST /agents/{key}/input`.
 
 ## Problem Frame
 
-The `game` consumer correctly saw `reason: "permission"` on a waiting agent but
+The feed consumer correctly saw `reason: "permission"` on a waiting agent but
 had no way to render the question being posed or the context sentence above it
 (observed live on an automation pane running an AskUserQuestion prompt). The
 content exists nowhere fly currently reads it out:
@@ -155,7 +155,7 @@ the machinery to read it per leaf (the `ReplyResolver` chain).
   because the on-screen dialog is a tool *inside* the subagent (an `isSidechain`
   entry the scan skips), so the named tool and summary would not match what a
   keystroke approves — a confused-deputy hole, not a benign miss. **(2)** the
-  primary `game` use case (fly backgrounded) keeps the pane `Raised`, so the
+  primary consumer use case (fly backgrounded) keeps the pane `Raised`, so the
   reason reaches the roster and the gate works. Remaining accepted miss,
   degrading to "not exposed": a permission prompt on a **focused** pane is
   acknowledged on a glance (visibility change transitions `Raised →
@@ -227,7 +227,7 @@ flowchart TB
   REASON["attention reason == permission?"] --> EF
   REASON --> OUT
   HOOK["Notification hook dispatch (U5)"] -->|"delayed 2s bump"| EF
-  GAME["consumer"] -->|"POST /input mode:keys + ifAskedAt (U6)"| LATCH["answered latch (U6)"]
+  CONSUMER["consumer"] -->|"POST /input mode:keys + ifAskedAt (U6)"| LATCH["answered latch (U6)"]
   LATCH --> PTY["pane PTY (clears attention)"]
 ```
 
@@ -511,7 +511,7 @@ this boundary):
 
 **Not in this plan**
 
-- Game-side rendering and unread/answer UX — separate repo; it consumes the
+- Consumer-side rendering and unread/answer UX — separate repo; it consumes the
   wire contract pinned here.
 - Multi-question and multiSelect answering: `questions[]` is exposed faithfully
   (read-only), but v1 answers only a single single-select question or free text

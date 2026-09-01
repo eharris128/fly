@@ -15,9 +15,9 @@ finding) → a per-pane wake pipe makes it 7–17 ms, median 10; history-limit
 binds as assumed; the KTD2 attach-geometry flip turns out never to have been
 wired (recorded as a known limitation for check 4, not built). U4/U5
 executed 2026-09-01: **gate 3 hit — the LIVE-CHECKLIST is a full pass**
-(checks 1+4 signed off by Evan at the keyboard; 2, 5–10 agent-driven; note
+(checks 1+4 signed off by the maintainer at the keyboard; 2, 5–10 agent-driven; note
 §U4 for the numbers, §U5 for the verdict and the default-flip
-recommendation — the flip decision itself stays Evan's). README keeps
+recommendation — the flip decision itself stays the maintainer's). README keeps
 "opt-in"; CLAUDE.md's validation caveat resolved. **Spike complete.** **The operational
 script for U3–U5 — commands, who does what, pass criteria, where results go
 — is `2026-08-28-001-tmux-36-spike-RUNBOOK.md` beside this plan.**
@@ -183,7 +183,7 @@ the substrate measured clean at build time and why the failure read as
   would be adopted). Checks **2, 5, 6, 7, 8, 9** driven by the agent with the
   existing toolkit (CDP `--remote-debugging-port`, the control socket, the
   borrowed-token `fly notify` technique, `dbus-monitor` for banners); checks
-  **1 and 4** by Evan from a prepared script: side-by-side fly-el-on-tmux vs
+  **1 and 4** by the maintainer from a prepared script: side-by-side fly-el-on-tmux vs
   the installed release-on-pty, two `claude` panes streaming, type into the
   focused pane; then `leader t`, native typing in the terminal, a permission
   ask while attached → no banner, badge clears on close. Each result lands in
@@ -197,7 +197,7 @@ the substrate measured clean at build time and why the failure read as
   and the README sentence per the gate below; refresh memory
   (`tmux-substrate-withholds-output` → resolved, `electron-cutover-pending`'s
   open-items list). The default-flip *recommendation* goes in the note; the
-  decision is Evan's and is not part of this spike.
+  decision is the maintainer's and is not part of this spike.
 
 ## Decision gate (set before any measurement)
 
@@ -242,7 +242,7 @@ substrate stays behind the flag with the note as the handoff. Gate 3 partial
 - `FLY_APP_NAME` must be set on every packaged-shell or core launch in this
   spike; the packaged shell defaults to flavor `fly` and would adopt the
   installed release's core.
-- Checks 1 and 4 need Evan for ~20 minutes at a keyboard; everything else is
+- Checks 1 and 4 need the maintainer for ~20 minutes at a keyboard; everything else is
   unattended.
 - Budget: U0–U3 one session (half a day including the numbers); U4 a second
   session around the human checks; U5 an hour. Timebox: if U3 finds a 3.6

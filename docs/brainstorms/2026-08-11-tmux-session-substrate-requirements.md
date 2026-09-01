@@ -18,7 +18,7 @@ saturation that typing currently queues behind.
 This is Path A of the 2026-08-11 direction decision. The evidence that forced
 it: `docs/notes/2026-08-11-webkitgtk-engine-floor.md` — after T1/T2/T4 all
 landed, the webview main thread still grinds at 60–90% of a core under a few
-streaming panes, identically across NVIDIA / no-DMABUF / Intel GL, with WebGL
+streaming panes, identically across discrete GPU / no-DMABUF / integrated GL, with WebGL
 active. The per-flush cost is WebKitGTK main-thread work upstream of pixels;
 no setting recovers it, and keydown shares that thread. The field survey found
 no project shipping N interactive xterm.js panes in WebKitGTK; the

@@ -3,7 +3,7 @@
 //!
 //! A narrowly-scoped, loopback-only realization of the browser-reachable HTTP
 //! endpoint the hook socket deliberately deferred (`hooks/CLAUDE.md`, KTD7). It
-//! lets an external local consumer (the `game` portfolio) *see* what agents are
+//! lets an external local consumer *see* what agents are
 //! running and what automations exist, read an agent's latest reply
 //! (`GET /agents/{key}/output`), and submit a prompt back to it
 //! (`POST /agents/{key}/input`) — the one deliberate mutation route, equivalent

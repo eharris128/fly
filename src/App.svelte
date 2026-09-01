@@ -361,7 +361,7 @@
   let nudgeIdleMs = $state(1500);
   // Whether the local read-only feed is enabled (feat-agent-state-local-feed).
   // Seeded from config on restore. When on, the agent poll runs always (not just
-  // while the dashboard is open) so the feed the `game` portfolio reads stays
+  // while the dashboard is open) so the feed an external consumer reads stays
   // live; the backend caches the pushed roster and serves it over SSE.
   let feedEnabled = $state(false);
   // Whether the "move along" nudge overlay is showing for the focused pane (U6).

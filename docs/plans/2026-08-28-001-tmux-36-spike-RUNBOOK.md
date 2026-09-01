@@ -3,7 +3,7 @@
 Companion to `docs/plans/2026-08-28-001-spike-tmux-36-substrate-validation-plan.md`
 (the decisions) and `docs/notes/2026-08-28-tmux-36-substrate-spike.md` (the
 numbers). This file is the **operational script**: what runs unattended,
-what needs Evan at the keyboard, the exact commands, what "pass" looks like,
+what needs the maintainer at the keyboard, the exact commands, what "pass" looks like,
 and where each result gets written. Written 2026-08-28 so the next session
 can start at the co-working step without re-deriving anything.
 
@@ -66,11 +66,11 @@ end; the `~/.config/flylatt` / `flylatp` dirs stay until U5.
 
 This is `docs/plans/2026-08-11-001-tmux-substrate-LIVE-CHECKLIST.md`, run
 for real on the dev flavor, on the fixed consumer. Split: the agent drives
-**2, 5, 6, 7, 8, 9** over CDP + the control socket + the hook socket; Evan
+**2, 5, 6, 7, 8, 9** over CDP + the control socket + the hook socket; the maintainer
 drives **1 and 4** (typing feel, native attach) — the two that are a human
-judgement. Budget: ~20 min of Evan's keyboard time, ~1 h total.
+judgement. Budget: ~20 min of the maintainer's keyboard time, ~1 h total.
 
-### Setup (agent, before Evan sits down)
+### Setup (agent, before the maintainer sits down)
 
 ```bash
 # 0. Pre-flight facts as of 2026-08-28: no `tmux -L fly-el` server, no
@@ -144,7 +144,7 @@ clears the sessions.
   the resume offer (not a hang, not a phantom adopt); `substrate-server.json`
   (the persisted KTD12 token) is simply reused.
 
-### Evan-driven checks (the co-working bit, ~20 min)
+### Maintainer-driven checks (the co-working bit, ~20 min)
 
 **Check 1 — typing feel, the whole point.** Side by side: fly-el (tmux,
 fixed consumer) and the installed release (pty). In fly-el open 3–4 panes,
@@ -153,7 +153,7 @@ type into the focused pane — a shell, then a `claude` composer. Compare with
 the same motion in the release window. Expect: no hitching, no
 "character appears when I type the next one", the composer keeps up. The
 objective half is already recorded (U2: tmux p50 4.4 ms = pty); this is the
-subjective sign-off. Record: `[x] 1. 2026-08-xx — Evan: …` one line.
+subjective sign-off. Record: `[x] 1. 2026-08-xx — maintainer: …` one line.
 
 **Check 4 — `leader t` native attach (R1/R9).** Focus a `claude` pane →
 `leader t` → your terminal opens attached to that session; type there —
@@ -187,6 +187,6 @@ note; a subjective miss is exactly the signal the checklist exists to catch.
 5. Scratch cleanup: `rm -rf ~/.config/flylatt ~/.config/flylatp
    ~/.local/share/flylatt ~/.local/share/flylatp`, `tmux -L flylatt
    kill-server`, stale `/tmp/tmux-1000/fly{latt,latp}` sockets. Leave
-   `fly-el`'s config on whatever Evan wants for daily dev; note it.
+   `fly-el`'s config on whatever the maintainer wants for daily dev; note it.
 6. Commit; the default-flip *recommendation* goes in the note — the
-   decision stays Evan's and is not part of this spike.
+   decision stays the maintainer's and is not part of this spike.

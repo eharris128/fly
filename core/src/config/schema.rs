@@ -135,8 +135,8 @@ impl Default for AutomationDefaults {
 
 /// Settings for the local, read-only agent/automation feed
 /// (feat-agent-state-local-feed). The feed binds a **loopback-only** HTTP
-/// listener guarded by a bearer `token`, so an external local consumer (the
-/// `game` portfolio) can read what agents/automations are live.
+/// listener guarded by a bearer `token`, so an external local consumer
+/// can read what agents/automations are live.
 ///
 /// The nested-serde recipe (see [`ReasonEffectsConfig`]): struct-level
 /// `#[serde(default)]` here **plus** the parent `Config`'s container default

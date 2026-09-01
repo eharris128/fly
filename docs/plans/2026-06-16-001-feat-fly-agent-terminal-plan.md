@@ -277,7 +277,7 @@ Grouped into phases. Phases are sequential; units within a phase are dependency-
 - **Requirements:** R15
 - **Dependencies:** none
 - **Files:** `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `src-tauri/src/main.rs`, `src-tauri/capabilities/default.json`, `package.json`, `vite.config.ts`, `src/main.ts`, `packaging/`
-- **Approach:** Scaffold from the Tauri v2 Svelte template. Set the app identifier (placeholder `dev.evan.fly`). In `main.rs`, before `run()`, set `WEBKIT_DISABLE_DMABUF_RENDERER=1` on Linux. Register the notification and store plugins and add `notification:default` and `store:default` to capabilities. Set `bundle.targets` to `["deb","appimage"]` and declare `.deb` depends. Document the Ubuntu 22.04 build baseline and the `libwebkit2gtk-4.1-dev` requirement.
+- **Approach:** Scaffold from the Tauri v2 Svelte template. Set the app identifier (a placeholder at this stage). In `main.rs`, before `run()`, set `WEBKIT_DISABLE_DMABUF_RENDERER=1` on Linux. Register the notification and store plugins and add `notification:default` and `store:default` to capabilities. Set `bundle.targets` to `["deb","appimage"]` and declare `.deb` depends. Document the Ubuntu 22.04 build baseline and the `libwebkit2gtk-4.1-dev` requirement.
 - **Patterns to follow:** `create-tauri-app` Svelte template; Tauri v2 capabilities config.
 - **Test scenarios:** Test expectation: none (scaffold) — verified by a build/launch smoke check: `cargo tauri build` produces a `.deb` and an AppImage, and the app launches to a blank window under both a Wayland and an X11 session with no blank-screen regression.
 - **Verification:** the `.deb` installs and launches on a clean Ubuntu 22.04; the window renders under both display servers.

@@ -558,7 +558,10 @@ mod tests {
 
     /// Real captured renders (Claude Code 2.1.206, 2026-07-10): an
     /// AskUserQuestion picker and a Bash permission dialog, each at 80 and 120
-    /// columns, raw PTY bytes from spawn through the settled dialog.
+    /// columns, raw PTY bytes from spawn through the settled dialog. The
+    /// captures are scrubbed byte-for-byte: the user's name is swapped for a
+    /// same-length placeholder (`Alex` / `Alex Morgan`) and the MCP status
+    /// notice is blanked, so every cursor move and row width is untouched.
     const ASK_80: &[u8] = include_bytes!("../../tests/fixtures/screen/ask-80.raw");
     const ASK_120: &[u8] = include_bytes!("../../tests/fixtures/screen/ask-120.raw");
     const PERM_80: &[u8] = include_bytes!("../../tests/fixtures/screen/perm-80.raw");
@@ -653,8 +656,8 @@ mod tests {
         // "Type something." and "Chat about this" extras.
         let digits: Vec<u32> = p.options.iter().map(|o| o.digit).collect();
         assert_eq!(digits, vec![1, 2, 3, 4, 5]);
-        assert_eq!(p.options[0].label, "Evan");
-        assert_eq!(p.options[1].label, "Evan Harris");
+        assert_eq!(p.options[0].label, "Alex");
+        assert_eq!(p.options[1].label, "Alex Morgan");
         assert_eq!(p.options[2].label, "Something else");
         assert_eq!(p.options[3].label, "Type something.");
         assert_eq!(p.options[4].label, "Chat about this");

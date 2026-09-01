@@ -2282,7 +2282,7 @@ fn keys_answers_to_permission_dialogs_are_config_gated() {
     // the bearer token must not be a remote permission-approval credential
     // unless explicitly opted in (KTD6, resolved Open Question). The 403
     // carries a JSON discriminator body so a consumer doesn't mistake this
-    // policy refusal for an auth failure (api-contract review — the game
+    // policy refusal for an auth failure (api-contract review: the
     // consumer blanket-maps 403→auth-error).
     let (state, server, delivered) = start();
     state.publish(vec![agent_with_reason("leaf-permission", "waiting", "permission")], 0);

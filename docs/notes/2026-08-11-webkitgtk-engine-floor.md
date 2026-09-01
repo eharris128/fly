@@ -10,13 +10,11 @@ architecture is at its engine floor.**
 
 ## Why the GPU path was suspect
 
-- This box is hybrid Intel (display/compositing, `renderD129`) + NVIDIA
-  Quadro T1000 (`renderD128`).
-- The webview's GL was live-confirmed on the **NVIDIA** driver
-  (`nvidia.so.595.84` mapped in WebKitWebProcess, `/dev/nvidia0` fds) while
-  the desktop composites on Intel — the exact WebKitGTK+NVIDIA DMABUF
-  combination Tauri's Linux-graphics docs flag for high input latency, with
-  cross-GPU buffer traffic per frame.
+- The dev machine is a hybrid-GPU laptop: the desktop composites on the
+  integrated GPU while the webview's GL was live-confirmed (driver mapped in
+  WebKitWebProcess, device fds open) on the discrete one, the exact
+  WebKitGTK + discrete-GPU DMABUF combination Tauri's Linux-graphics docs
+  flag for high input latency, with cross-GPU buffer traffic per frame.
 - WebKitGTK masks the WebGL renderer string ("Apple GPU"), and WebGL context
   creation succeeds even on a software rasterizer — T4's `auto` cannot detect
   a slow path. (Software rasterization was ruled out directly: no `llvmpipe-*`
@@ -35,13 +33,13 @@ rounds 1 and 3 (per-flush repaint region far larger than the bare spinner).
 
 | config                                   | GL driver     | avg   | peak | >50% busy |
 |------------------------------------------|---------------|-------|------|-----------|
-| baseline (DMABUF renderer)               | NVIDIA        | 63.2% | 80%  | 87%       |
-| `WEBKIT_DISABLE_DMABUF_RENDERER=1`       | NVIDIA        | 47.0%* | 100% | 53%*     |
-| `__EGL_VENDOR_LIBRARY_FILENAMES=…mesa…`  | Intel (Mesa)  | 65.7% | 90%  | 86%       |
+| baseline (DMABUF renderer)               | discrete      | 63.2% | 80%  | 87%       |
+| `WEBKIT_DISABLE_DMABUF_RENDERER=1`       | discrete      | 47.0%* | 100% | 53%*     |
+| `__EGL_VENDOR_LIBRARY_FILENAMES=…mesa…`  | integrated    | 65.7% | 90%  | 86%       |
 
 \* load generator stalled partway through this round (a pane hit backpressure
 → pause → kernel PTY buffer filled → blocked writer), so the stimulus was
-weaker; treat as "modest improvement at best," not a win. The Intel round ran
+weaker; treat as "modest improvement at best," not a win. The integrated-GPU round ran
 its full load with *fewer* panes (3 vs baseline's 5) and still matched
 baseline — the strongest evidence that the driver/presentation path is
 irrelevant.
@@ -52,7 +50,7 @@ irrelevant.
 ## Interpretation
 
 - ~60–90% of one core of webview **main-thread** time under a few streaming
-  panes, invariant across NVIDIA / no-DMABUF / Intel. The cost is upstream of
+  panes, invariant across discrete GPU / no-DMABUF / integrated GPU. The cost is upstream of
   presentation: channel `eval` + JS, VT parse, xterm buffer/render
   orchestration, and layout, all sharing the one thread that also services
   keydown. WebGL moved cell *rasterization* off the DOM but the per-flush

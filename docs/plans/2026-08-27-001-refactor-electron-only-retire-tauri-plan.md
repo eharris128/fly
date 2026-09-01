@@ -159,7 +159,7 @@ re-plumb, not a rewrite.
   happens by default-glob accident (no `test` block in `vite.config.ts`).
   Add `test.include` naming both trees so the contract is written down.
 - **KTD13 — The skill is removed, not relocated.** It is install-by-copy
-  with no runtime reader and not shipped in the deb; it is Evan's workflow.
+  with no runtime reader and not shipped in the deb; it is the maintainer's workflow.
   Copy it to `~/.claude/skills/fly-monitor-handoff/` (if not already there)
   in the same step that deletes it from the tree. The monitor feature's
   contract is unaffected: the manager appends `VERDICT_BLOCK_SPEC` to the

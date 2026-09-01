@@ -26,7 +26,7 @@ deliberately-deferred remainder.
   a file the code's own doc says can be multi-MB. Concurrent SSE consumers and
   `/output` reads serialize behind that parse.
 - **Why deferred:** KTD5 deliberately parses under the lock, and real contention
-  is low for a single-consumer desktop feed (the `game` portfolio + a handful of
+  is low for a single-consumer desktop feed (one local consumer app + a handful of
   agents). The fix (double-checked locking: check under lock → drop → parse →
   re-lock → insert) adds a possible redundant parse under race and changes a
   deliberate design decision. Revisit if a second live consumer or very large

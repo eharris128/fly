@@ -16,7 +16,7 @@ the A/B/C fork), `docs/notes/2026-08-08-typing-latency-diagnosis.md`, and the
 
 Option B (Electron engine swap) rests on one empirical claim: **Chromium
 erases the ~90 ms WebKitGTK render leg for fly's exact workload on this exact
-box** (hybrid Intel display + NVIDIA Quadro T1000, Wayland, GNOME 46). VS Code
+box** (a hybrid-GPU laptop, Wayland, GNOME 46). VS Code
 is the existence proof elsewhere; nothing has measured it *here*. This spike
 produces that number and nothing else.
 

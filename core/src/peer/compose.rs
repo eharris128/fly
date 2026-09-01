@@ -102,9 +102,9 @@ mod tests {
     fn sender() -> SenderIdentity {
         SenderIdentity {
             pane_id: 7,
-            cwd: Some("/home/u/projects/game".into()),
+            cwd: Some("/home/u/projects/demo".into()),
             workspace: Some("home".into()),
-            tab: Some("game".into()),
+            tab: Some("demo".into()),
         }
     }
 
@@ -112,7 +112,7 @@ mod tests {
     fn frame_names_the_sender_and_wraps_the_body() {
         let out = compose_peer_message(&sender(), "the run finished; see /tmp/out").unwrap();
         assert!(out.contains("From pane 7"));
-        assert!(out.contains("/home/u/projects/game"));
+        assert!(out.contains("/home/u/projects/demo"));
         assert!(out.contains("UNTRUSTED"));
         let begin = out.find(BEGIN_DELIM).unwrap();
         let end = out.find(END_DELIM).unwrap();

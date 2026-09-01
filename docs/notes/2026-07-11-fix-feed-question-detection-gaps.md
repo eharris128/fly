@@ -8,7 +8,7 @@ plan: a bug post-mortem. The change is cross-referenced from code comments as
 ## Symptom
 
 An agent pane (leaf-18, "p2") sat blocked on a *re-asked* AskUserQuestion
-picker — "What is your name? (Evan / Evan Harris / Something else)" below a
+picker — "What is your name? (Alex / Alex Morgan / Something else)" below a
 "User declined to answer questions" line — while the feed reported
 `status:"idle", needsAttention:false, questionPendingAt:null` and
 `GET /agents/{key}/output` served `{"text":""}`. Every downstream consumer
@@ -78,7 +78,7 @@ question body now reflect blockage, matching the transcript-derived contract.
 ## Known limitation (accepted)
 
 The picker's 4th option — the appended **"Type something."** free-text user
-input row — does not work in this scenario (verified by Evan post-fix).
+input row — does not work in this scenario (verified by the maintainer post-fix).
 Accepted, not blocking: the marker, question body, and the ordinary option
 digits are the fixed contract; the free-text row's remote path
 (feed-other-answer `mode:"other"`) stays guarded exactly as before — a

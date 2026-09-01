@@ -1,5 +1,5 @@
 ---
-title: "feat: Local read-only agent/automation feed for the game portfolio"
+title: "feat: Local read-only agent/automation feed for an external local consumer"
 type: feat
 date: 2026-07-04
 status: implemented
@@ -7,7 +7,7 @@ depth: standard
 origin: none (solo ce-plan invocation)
 ---
 
-# feat: Local read-only agent/automation feed for the `game` portfolio
+# feat: Local read-only agent/automation feed for an external local consumer
 
 > **Addendum (2026-07-16) — wire sketch superseded by the shipped contract.**
 > The entry shapes sketched below have drifted as later plans enriched the
@@ -21,7 +21,7 @@ origin: none (solo ce-plan invocation)
 ## Summary
 
 Expose fly's live picture of **what agents are running** and **what automations
-exist** to an external, locally-deployed consumer — the `game` 3D web portfolio —
+exist** to an external, locally-deployed consumer (a 3D web portfolio)
 over a **read-only, loopback-only SSE endpoint** guarded by a bearer token.
 
 The design deliberately takes the cheap/low-risk path established in the design
@@ -33,7 +33,7 @@ it — merged with automations it reads directly from its own authoritative stor
 as a Server-Sent Events stream. A second change lifts the agent poll out of the
 "dashboard is open" gate so the feed stays live whenever fly is running.
 
-No control surface: `game` can *see* agents and automations, not act on them.
+No control surface: the consumer can *see* agents and automations, not act on them.
 
 ---
 
@@ -58,11 +58,11 @@ From the investigation earlier in this session:
   (`src-tauri/src/automations/store.rs`), surfaced by the `list_automations`
   command as an `AutomationsDashboard`.
 
-`game` runs in a browser and cannot reach a Tauri `invoke` or a Unix socket. It
+The consumer runs in a browser and cannot reach a Tauri `invoke` or a Unix socket. It
 needs an actual HTTP surface. That surface is precisely the KTD7 piece fly
 deferred — this plan builds a **narrowly-scoped, read-only** version of it.
 
-**Goal:** `game` can render (a) a live view of in-flight agents (working /
+**Goal:** the consumer can render (a) a live view of in-flight agents (working /
 waiting / idle / running, with cwd + title + attention) and (b) the automations
 roster with schedule + last-run status — updating live, from a local endpoint.
 
@@ -80,7 +80,7 @@ roster with schedule + last-run status — updating live, from a local endpoint.
   dashboard is open.
 - **R5** — Automations flow through the **same** endpoint, sourced from the
   backend store (no dependency on the frontend or the dashboard being mounted).
-- **R6** — A **stable, documented wire contract** exists so `game` can be built
+- **R6** — A **stable, documented wire contract** exists so the consumer can be built
   against a mock before fly ships the endpoint.
 - **R7** — The feature is config-gated (port, token, enable flag) and shuts down
   cleanly with the app (no orphaned listener thread).
@@ -111,7 +111,7 @@ roster with schedule + last-run status — updating live, from a local endpoint.
 - **KTD3 — Token is the boundary, loopback is the reduction.** A `127.0.0.1`
   listener is reachable by *any* local process (any user) — same reason the hook
   path originally chose a UDS + `SO_PEERCRED`. TCP can't use `SO_PEERCRED`, so the
-  **bearer token** is what scopes the feed to `game`. Compare it in **constant
+  **bearer token** is what scopes the feed to the consumer. Compare it in **constant
   time** (reuse `subtle::ConstantTimeEq`, as `hooks/token.rs` does). Reject bad
   tokens with a bare 401 and no body — don't leak whether agents exist.
 
@@ -147,18 +147,18 @@ flowchart LR
         autos["AutomationManager\n(automation://changed)"] --> cache
         cache --> srv["tiny_http server\n127.0.0.1:PORT  GET /feed (SSE)"]
     end
-    srv -->|"bearer token → SSE: data: {snapshot}\\n\\n"| game["game (local browser app)"]
+    srv -->|"bearer token → SSE: data: {snapshot}\\n\\n"| consumer["consumer (local browser app)"]
 
     style webview fill:#1f2a44,stroke:#5b7bd0,color:#fff
     style backend fill:#20402c,stroke:#5bd08a,color:#fff
-    style game fill:#402038,stroke:#d05ba8,color:#fff
+    style consumer fill:#402038,stroke:#d05ba8,color:#fff
 ```
 
-Connection lifecycle for one `game` client:
+Connection lifecycle for one consumer client:
 
 ```mermaid
 sequenceDiagram
-    participant G as game
+    participant G as consumer
     participant S as tiny_http server
     participant F as FeedState
     G->>S: GET /feed  (Authorization: Bearer <token>)
@@ -198,9 +198,9 @@ src/lib/
 
 ## Implementation Units
 
-### U1. Wire contract (`game`'s consumption shape)
+### U1. Wire contract (the consumer's consumption shape)
 
-**Goal:** Pin the JSON `game` consumes so it can be built against a mock before
+**Goal:** Pin the JSON the consumer consumes so it can be built against a mock before
 the endpoint exists. This is the anchor for every other unit.
 
 **Requirements:** R6.
@@ -344,7 +344,7 @@ persisted on first run.
 **Approach:** Follow the `AutomationDefaults` precedent for an additive,
 `#[serde(default)]` config block so existing config files still parse. Reuse the
 CSPRNG token minting from `hooks/token.rs` (or the same `rand`/`getrandom` path).
-Document where `game`'s local server reads the token (the config file path under
+Document where the consumer's local server reads the token (the config file path under
 `~/.config/<app>/`); a `fly feed token` CLI helper is deferred (see Scope).
 
 **Patterns to follow:** `AutomationDefaults` additive config
@@ -443,14 +443,14 @@ contract, the always-on publisher, config + token, and lifecycle wiring.
 - Pushing topology/status aggregation **down into Rust** — explicitly the
   expensive alternative this plan avoids (KTD1).
 - **Remote / non-loopback** exposure, TLS, tunnels, or auth beyond the bearer
-  token — `game` is deployed locally; loopback + token is the whole threat model.
+  token — the consumer is deployed locally; loopback + token is the whole threat model.
 
 ### Deferred to Follow-Up Work
-- A `fly feed token` / `fly feed status` CLI helper so `game`'s local server can
+- A `fly feed token` / `fly feed status` CLI helper so the consumer's local server can
   fetch the token/URL instead of reading the config file. Natural fit for the
   existing `cli/` surface; not needed for a first local integration.
-- A `game`-side mock server + fixtures built against the U1 contract (lives in the
-  `game` repo, not fly).
+- A consumer-side mock server + fixtures built against the U1 contract (lives in
+  the consumer's repo, not fly).
 - Diffing/patch frames (send only changed agents) if the full-snapshot-per-bump
   stream ever gets heavy — premature now.
 
@@ -461,7 +461,7 @@ contract, the always-on publisher, config + token, and lifecycle wiring.
 - **Default-on vs default-off.** This plan defaults the feed **enabled** (KTD6)
   for a single-user tool. If fly is ever distributed more broadly, an always-on
   local HTTP listener should likely flip to **opt-in** — revisit the default then.
-- **Token handoff to `game`.** Plan of record: `game`'s local server reads the
+- **Token handoff to the consumer.** Plan of record: its local server reads the
   token from fly's config file. If that proves awkward in practice, pull the
   deferred `fly feed token` CLI helper forward.
 - **Port default + collision.** Pick a default port unlikely to collide; decide
@@ -497,7 +497,7 @@ contract, the always-on publisher, config + token, and lifecycle wiring.
   must still behave identically (it reads the same maps).
 - **New command + wire contract.** `publish_agent_feed` joins the `invoke_handler!`
   and `src/ipc.ts` (per `CLAUDE.md`); the U1 contract is a new stable shape shared
-  across the socket-free HTTP boundary and the `game` repo.
+  across the socket-free HTTP boundary and the consumer's repo.
 
 ---
 

@@ -1,5 +1,5 @@
 //! The feed wire contract (U1): the JSON shape an external, local consumer
-//! (the `game` portfolio) reads over the read-only SSE endpoint.
+//! reads over the read-only SSE endpoint.
 //!
 //! This is the single source of truth for the boundary shape and is mirrored
 //! by `src/lib/feed.ts` on the frontend — the `AgentEntry` half is *pushed*
@@ -164,9 +164,8 @@ pub struct QuestionBody {
 }
 
 /// The last run's healthcheck verdict on the wire (monitor enrichment, U6 of
-/// the *game* repo's `2026-07-11-001-feat-ambient-wall-monitor-fixture-plan.md`
-/// — not a fly plan; fly's own `2026-07-11-001-*` is the unrelated
-/// feed-other-answer plan. Fly-side record:
+/// the consumer's own plan, not a fly plan; fly's own `2026-07-11-001-*` is
+/// the unrelated feed-other-answer plan. Fly-side record:
 /// `docs/notes/2026-07-16-feed-monitor-enrichment.md`):
 /// the PASS/FAIL outcome plus its short note, projected from the terminal
 /// run's [`crate::automations::model::Verdict`]. A verdict is parsed only from
@@ -457,7 +456,7 @@ mod tests {
             }],
         };
         let v = serde_json::to_value(&snap).unwrap();
-        // Golden camelCase keys the `game` consumer relies on.
+        // Golden camelCase keys the external consumer relies on.
         assert_eq!(v["version"], 7);
         assert_eq!(v["emittedAt"], 1_700_000_000_000u64);
         assert_eq!(v["agents"][0]["leafKey"], "ws-1/tab-1/leaf-1");
@@ -814,7 +813,7 @@ mod tests {
 
     #[test]
     fn output_body_choice_question_round_trips_golden_keys() {
-        // The full choice shape the `game` consumer pins against
+        // The full choice shape the external consumer pins against
         // (feed-pending-question R1/R4/R7).
         let body = AgentOutputBody {
             text: "Pick a lag feel.".into(),

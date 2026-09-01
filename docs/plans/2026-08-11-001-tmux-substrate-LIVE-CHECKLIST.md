@@ -3,12 +3,12 @@
 status: **closed — full pass, 2026-09-01** (spike 2026-08-28-001 U4, run on
 `fly-el` with the fixed `fly substrate-pipe` consumer at `a423daa`): checks
 1–2 and 4–9 all pass (3 is N/A), plus the proposed check 10 (clean-quit
-variant). Evan signed off 1 and 4 at the keyboard; the rest ran agent-driven
+variant). The maintainer signed off 1 and 4 at the keyboard; the rest ran agent-driven
 over CDP + the feed + borrowed pane tokens. Residuals recorded at the bottom.
 This checklist gated the
 `config.substrate` default flip (`SubstrateKind::default` → `Tmux`) and the
 U9 retirements — **the flip conversation is now open on data; the decision
-stays with Evan** (spike results note, gate 3).
+stays with the maintainer** (spike results note, gate 3).
 
 > **2026-08-21 reconciliation (post-Electron-cutover):** this checklist was
 > written for the Tauri/WebKitGTK shell; the shipped shell is now Electron
@@ -53,7 +53,7 @@ checklist is the app-level pass that gates the default flip and U9.
 - [x] 1. **Typing feel (the whole point).** Open 3–4 panes, start `claude` in
       two, get them streaming, then type into the focused pane. Compare
       against the release build side by side. Expect: no hitching.
-      *2026-09-01 — Evan, fly-el (tmux) vs installed release (pty) side by
+      *2026-09-01 — maintainer, fly-el (tmux) vs installed release (pty) side by
       side, two claudes streaming: "the responsiveness feels fine." Objective
       backing: U2 p50 4.4 ms = pty; in-app REPL probe under check 2.*
 - [x] 2. **R2 measurement** (Electron era: sample the Chromium renderer
@@ -74,7 +74,7 @@ checklist is the app-level pass that gates the default flip and U9.
       → your terminal opens attached to the session. Typing there is native.
       The fly pane shows the "attached in terminal" badge; a raise while
       attached does NOT notify (R9); close the terminal → badge clears.
-      *2026-09-01 — Evan: attach + native typing work; the session renders at
+      *2026-09-01 — maintainer: attach + native typing work; the session renders at
       fly's ~80-col grid, letterboxed ("feels super weird because the ui is
       ugly but i do not really care") — the known U3.2 limitation (the KTD2
       attached-client-wins flip was never wired), not a fail. The R9 cycle
