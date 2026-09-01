@@ -15,8 +15,8 @@ can start at the co-working step without re-deriving anything.
 | U1 consumer fix | done, committed `0c52a21` | `fly substrate-pipe`; live suite 7/7 (was 3/6) |
 | U2 acceptance | done, **gate 1 hit** | tmux 50/50 at every gap, p50 4.34–4.47 ms vs pty 4.23–4.29, zero withheld |
 | U3 3.6 conformance | done, **gate 2 hit** | note §U3 — hook-path exit 501 ms → **10 ms median** (wake pipe); history-limit ok; attach-geometry flip never wired (known limitation) |
-| U4 checklist on fly-el | **next — the co-working session** | below |
-| U5 results + wording | after U4 | below |
+| U4 checklist on fly-el | done 2026-09-01, **gate 3 hit — full pass** | LIVE-CHECKLIST ticked; note §U4 |
+| U5 results + wording | done 2026-09-01 | note §U5; README unchanged ("opt-in" stays); CLAUDE.md caveat resolved |
 
 Safety rule for every step, restated: nothing here touches the installed
 release (flavor `fly`, `/run/user/1000/fly/*`, `tmux -L fly`, the core that

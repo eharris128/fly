@@ -5,10 +5,13 @@ date: 2026-08-11
 status: implemented behind the KTD10 flag (U1–U8, U10 overnight 2026-08-11→12;
   every unit live-validated on scratch servers incl. the R4 restart roundtrip —
   same child pid, token continuity, history replay, cross-instance hooks.
-  Deferred, gated on the user's dev-flavor live validation: U9 retirements
-  (pty path stays), the substrate default flip, the frontend kill-all quit
-  variant, settings-menu toggles for mirrorUnfocused/terminal, the in-app R2
-  measurement. See LIVE-CHECKLIST beside this plan.)
+  Dev-flavor live validation **passed in full 2026-09-01** — the
+  LIVE-CHECKLIST beside this plan is closed (spike 2026-08-28-001 U4/U5,
+  after that spike's consumer fix + exit wake pipe). Still deferred, now
+  gated only on the default-flip decision (Evan's): U9 retirements (pty path
+  stays), the substrate default flip, the frontend kill-all quit variant,
+  settings-menu toggles. Residuals: the never-wired KTD2 attach-geometry
+  flip, the checklist's 2026-09-01 residuals block.)
 origin: docs/brainstorms/2026-08-11-tmux-session-substrate-requirements.md
 evidence:
   - docs/notes/2026-08-11-webkitgtk-engine-floor.md   # why (engine floor proven)

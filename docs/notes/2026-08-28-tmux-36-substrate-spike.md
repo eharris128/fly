@@ -232,3 +232,61 @@ anywhere in U0–U3.
 - A watcher polling `ls -t /tmp/tmux-1000 | grep <prefix> | head -1` must
   clear stale scratch sockets first or it watches the previous run's
   corpse.
+
+## U4 — the LIVE-CHECKLIST on fly-el (executed 2026-09-01)
+
+The co-working session per the RUNBOOK: Evan drove checks 1 and 4, the agent
+drove 2, 5–10 over CDP (`--remote-debugging-port`), the feed (`:4940`), and
+borrowed pane tokens. Binary: `core/target/debug/fly` at `a423daa` (the
+fixed consumer + wake pipe). Full dated results are the ticked lines in
+`docs/plans/2026-08-11-001-tmux-substrate-LIVE-CHECKLIST.md`; the numbers
+worth keeping here:
+
+| measurement | result | target / reference |
+|---|---|---|
+| renderer main thread, 5 × 33 Hz streaming panes (10 s @ 100 ms) | **avg 5.0 %, max 20 %, 0 > 50 %** | < 20 % avg; pty ref 13.8 % (2026-08-12) |
+| claude-REPL keystroke→output-frame, in-renderer, visible pane (KTD2 rider) | **p50 23.3 / p90 24.3 / max 26.3 ms**, 25/25 echoed | full bridge→socket→tmux→claude-redraw→FIFO→bridge path; tight spread = no tmux wall |
+| `exit` → `pane://exit` in the renderer | **17.6 ms** (incl. probe's send-keys exec) | U3.1 hook path 10 ms median; poll floor 1.5 s never needed |
+| restart adoption | same paneIds + same child pids + mid-quit reply served post-adopt; 0 respawns | R4 |
+| cold boot after `kill-server` | fresh server, fresh shells, `substrate-server.json` byte-identical | R10 (clean-quit leg only) |
+
+Findings and residuals (also summarized on the checklist):
+
+- **fd leak into the detached tmux server.** The dev shell's devtools LISTEN
+  socket rode the spawn chain (shell → `fly core` → tmux server) without
+  CLOEXEC and outlived the app — the *tmux server* held `:9222`, blocking
+  the next dev launch's bind. General mechanism, dev-only trigger observed.
+  Fix shape: fd hygiene on the core/server spawn seams.
+- **Instant-ack is easy to misread as a bug during validation.** A raise on
+  a visible pane in a foregrounded window acknowledges born-cleared (no
+  banner, no bell, event `state:"acknowledged"`) — correct per
+  `state/policy.rs`, but it cost an hour of chasing until the layout
+  (`session.json`) showed the "hidden" pane was really a visible split
+  sibling. Validation raises should target a pane in a *non-active* tab.
+- **One-off, unreproduced:** in instance #2 of the day (adopted panes, no
+  CDP), three raises landed in the renderer's history (unread — so events
+  arrived and the backend said not-viewing) while the feed roster's
+  `needsAttention` stayed false across three fresh-publish reads. A
+  deliberate fresh-vs-adopted A/B in instances #3/#4 was correct on both
+  legs, exonerating adoption; dashboard-open was exonerated separately.
+  Unexplained; watch.
+- The pnpm→electron process chain means `pgrep -f` on the electron argv
+  matches wrappers too — a `kill` aimed via `head -1` hits the pnpm wrapper
+  and leaves the real app running (which then wins the single-instance
+  race against the next launch; that guard verified working, incidentally).
+
+## U5 — gate 3 verdict + wording (2026-09-01)
+
+**Gate 3: hit — full pass.** Checks 1, 4, 5, 6, 8 (the five the README
+sentence promises) all pass; 2, 7, 9, 10 recorded as passes too; 3 N/A.
+
+- README: **"opt-in" stays as written** — no change needed.
+- CLAUDE.md: the substrate paragraph's "until live validation" caveat is
+  resolved (edited this commit); the default remains `pty`.
+- **Default-flip recommendation** (the decision is Evan's, not this
+  spike's): the data supports flipping `SubstrateKind::default` → `Tmux` —
+  typing at pty parity (U2, and Evan's check-1 sign-off), renderer cost
+  *lower* than the pty reference, exits at hook speed, adoption/hygiene/feed
+  all clean. If flipped, do it with a release soak, and weigh the two open
+  residuals above (fd hygiene; the one-off roster read) plus the never-wired
+  attach-geometry flip, which becomes more visible once tmux is the default.

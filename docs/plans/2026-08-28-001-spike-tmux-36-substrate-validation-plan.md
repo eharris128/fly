@@ -1,6 +1,6 @@
 # Spike: tmux 3.6 substrate validation — 2026-08-28-001
 
-**Status**: **U0–U2 executed 2026-08-28** — results in
+**Status**: **complete — U0–U5 executed 2026-08-28 → 2026-09-01, all three gates hit** — results in
 `docs/notes/2026-08-28-tmux-36-substrate-spike.md`. U0: baseline recorded
 (pty 4.3 ms / 100 %; tmux p50 ≈ inter-key gap, last write withheld); the three
 `substrate_live` exit-family failures on 3.6 are **the same consumer bug**,
@@ -13,8 +13,12 @@ vs pty 4.23–4.29, zero withheld. U3: **gate 2 hit** — suite 7/7 on 3.6a;
 hook-path exit latency was 501 ms ± 1 (the reader's poll timeout, a real
 finding) → a per-pane wake pipe makes it 7–17 ms, median 10; history-limit
 binds as assumed; the KTD2 attach-geometry flip turns out never to have been
-wired (recorded as a known limitation for check 4, not built). Next: U4 (the
-checklist on fly-el). **The operational
+wired (recorded as a known limitation for check 4, not built). U4/U5
+executed 2026-09-01: **gate 3 hit — the LIVE-CHECKLIST is a full pass**
+(checks 1+4 signed off by Evan at the keyboard; 2, 5–10 agent-driven; note
+§U4 for the numbers, §U5 for the verdict and the default-flip
+recommendation — the flip decision itself stays Evan's). README keeps
+"opt-in"; CLAUDE.md's validation caveat resolved. **Spike complete.** **The operational
 script for U3–U5 — commands, who does what, pass criteria, where results go
 — is `2026-08-28-001-tmux-36-spike-RUNBOOK.md` beside this plan.**
 **Type**: spike (bounded validation + one targeted fix; not a feature)

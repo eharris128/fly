@@ -175,8 +175,10 @@ time/inputs as arguments so they're tested without a running app.
 
 ### The tmux session substrate (built 2026-08-11/12, behind a flag)
 
-`config.substrate: "pty" | "tmux"` (default `pty` until live validation —
-see `docs/plans/2026-08-11-001-tmux-substrate-LIVE-CHECKLIST.md`) selects
+`config.substrate: "pty" | "tmux"` (default `pty`; the live validation
+gating a default flip **passed in full 2026-09-01** —
+`docs/plans/2026-08-11-001-tmux-substrate-LIVE-CHECKLIST.md` is closed, and
+the flip is now a pending product decision, not a validation gap) selects
 what backs a pane. Under `tmux`, every leaf-keyed pane is a **marked session
 on a fly-owned per-flavor tmux server** (`substrate/` — wrapper with executor
 seam, injective naming, durable leaf⇄session⇄token store): output streams
