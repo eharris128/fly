@@ -15,11 +15,10 @@ const JS_RUNTIMES = new Set(["node", "bun", "deno"]);
 
 /**
  * Claude flags that consume a following value. Used only to avoid mistaking a
- * flag's value for a trailing positional prompt — best-effort, since the config
- * flag floor (R8) is the real backstop, so an omission here is not load-bearing
- * (at worst a value is dropped or a prompt is kept, both recoverable). The
- * dominant default flag `--dangerously-skip-permissions` is boolean and
- * deliberately absent.
+ * flag's value for a trailing positional prompt — best-effort: at worst a value
+ * is dropped or a prompt is kept, both recoverable, and a configured flag floor
+ * (R8) can backstop a dropped flag. `--dangerously-skip-permissions` is boolean
+ * and deliberately absent.
  */
 const VALUE_FLAGS = new Set([
   "--model",
@@ -153,8 +152,9 @@ function sanitizeFlags(rest: string[]): string[] {
  *   the captured argv re-supplies `--dangerously-skip-permissions`, which Claude
  *   otherwise drops across a resume (#21974).
  * - Record without argv (renderer crash, or a pane the poll never saw) →
- *   `claude` + the resume/continue flag + the configured `defaultArgs` floor, so
- *   the permission posture is never lost (R8).
+ *   `claude` + the resume/continue flag + the configured `defaultArgs` floor
+ *   (R8). The floor ships empty since 2026-09-01: an uncaptured resume runs in
+ *   Claude's default permission mode rather than assuming bypass.
  */
 export function buildResumeCommand(
   record: ResumeRecord | null | undefined,

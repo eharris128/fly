@@ -91,7 +91,9 @@ Sources).
 - **R7** — Resume preserves the **never-unmount / stable-leaf-key invariant**
   (KTD5): a resumed spawn is a normal first-mount; nothing remounts mid-session,
   no agent is silently respawned.
-- **R8** — A configurable default flag set (default `--dangerously-skip-permissions`)
+- **R8** — A configurable default flag set (default `--dangerously-skip-permissions`;
+  *amended 2026-09-01 for the public release: the default is now empty, see
+  `config/schema.rs`*)
   is the flag floor when argv was not captured.
 - **R9** — An **unclean shutdown is detected** on the next launch (a clean-exit
   marker absent) and resume is **auto-offered** (not silently auto-run).
@@ -595,7 +597,8 @@ first-mount, so R7 holds; a resumed pane is `Live`, not `RestoredInert`.
   persisted by default — identifiers and paths, not conversation content — worth a
   line in any privacy doc and a candidate for a "don't persist resume data" opt-out
   later. The clean-exit marker is a trivial sentinel.
-- **Config.** New `resumeDefaultArgs` (default `["--dangerously-skip-permissions"]`).
+- **Config.** New `resumeDefaultArgs` (default `["--dangerously-skip-permissions"]`;
+  `[]` since 2026-09-01).
 - **New IPC surface.** Commands `load_resume_records`, `save_resume_record`,
   `pane_command`, `get_launch_mode`; `spawn_pane` gains `leaf_key` + `command`.
   Each registered in both `lib.rs` and `ipc.ts`.

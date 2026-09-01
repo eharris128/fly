@@ -69,11 +69,9 @@ fn old_config_without_notification_keys_loads_new_defaults() {
         Some("message-new-instant")
     );
     assert_eq!(config.notification_command, None);
-    // A config predating resume also fills the flag floor (R8).
-    assert_eq!(
-        config.resume_default_args,
-        vec!["--dangerously-skip-permissions".to_string()]
-    );
+    // A config predating resume fills the flag floor (R8) — empty since the
+    // 2026-09-01 flip: no permission flag is added to an uncaptured resume.
+    assert!(config.resume_default_args.is_empty());
     for reason in [
         Reason::Question,
         Reason::Permission,

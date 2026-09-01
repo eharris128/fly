@@ -79,7 +79,8 @@ export interface Config {
   /** Per-reason, per-effect notification mask (R18). */
   reasonEffects: ReasonEffectsConfig;
   /** Flag floor replayed on resume when an agent's launch argv wasn't captured
-   * (R8/KTD-C); default ["--dangerously-skip-permissions"]. */
+   * (R8/KTD-C); default [] since 2026-09-01, so an uncaptured resume runs in
+   * Claude's default permission mode. */
   resumeDefaultArgs: string[];
   /** Shared default model/effort + fallback for automation agent runs (U3). */
   automationDefaults: AutomationDefaults;

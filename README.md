@@ -39,7 +39,9 @@ attention, so you can run a fleet and only look when there's something to do.
 - **Resume & handoff**: each pane's last session is durably recorded, so a
   crash can offer to resume every agent, and a stale pane can hand its previous
   session to a fresh `claude` in a split alongside (`leader f` quick / `leader F`
-  guided).
+  guided). Resumed agents replay their captured launch flags; when the flags
+  are unknown, fly resumes in Claude's default permission mode
+  (`resumeDefaultArgs` in config sets a different floor).
 - **Session attribution**: precise, per-pane session identity even when several
   `claude` sessions share one working directory (see below).
 - **Automations**: cron-scheduled agent or script runs (`fly automation …`),

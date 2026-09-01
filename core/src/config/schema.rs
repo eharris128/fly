@@ -270,8 +270,13 @@ pub struct Config {
     pub reason_effects: ReasonEffectsConfig,
     /// Flag floor replayed when resuming an agent whose launch argv was not
     /// captured (renderer crash, or a pane the poll never saw) — R8/KTD-C.
-    /// Defaults to `--dangerously-skip-permissions` so the permission posture is
-    /// never silently lost on resume (Claude drops it across `--resume`, #21974).
+    /// Empty by default since 2026-09-01 (public release): an uncaptured resume
+    /// runs in Claude's default permission mode, because the floor cannot know
+    /// the lost posture and adding `--dangerously-skip-permissions` to an agent
+    /// that never had it is the unsafe direction. Set it to
+    /// `["--dangerously-skip-permissions"]` to restore the pre-release
+    /// always-bypass floor. Captured argv is replayed verbatim either way
+    /// (Claude drops the flag across `--resume`, #21974).
     pub resume_default_args: Vec<String>,
     /// Shared default model / effort + fallback model for automation agent runs
     /// (automations-workspace-and-model U3, R12/R15). See [`AutomationDefaults`].
@@ -322,7 +327,7 @@ impl Default for Config {
             notification_sound: Some("message-new-instant".into()),
             notification_command: None,
             reason_effects: ReasonEffectsConfig::default(),
-            resume_default_args: vec!["--dangerously-skip-permissions".into()],
+            resume_default_args: Vec::new(),
             automation_defaults: AutomationDefaults::default(),
             feed: FeedConfig::default(),
             terminal: "x-terminal-emulator".into(),

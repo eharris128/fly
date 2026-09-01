@@ -437,10 +437,12 @@ Plan:
   `feed.port` (4939). Two are security-relevant: **`notificationCommand`**
   (opt-in, default off — runs an arbitrary user command on every surfaced
   notification; env/quoting contract in `notify::command`) and
-  **`resumeDefaultArgs`** (defaults to `--dangerously-skip-permissions` —
-  the flag floor replayed when resuming an agent whose argv wasn't captured,
-  so the permission posture isn't silently lost on resume; it means an
-  uncaptured resume runs permission-free by design).
+  **`resumeDefaultArgs`** (the flag floor replayed when resuming an agent
+  whose argv wasn't captured; **empty by default since 2026-09-01** — an
+  uncaptured resume runs in Claude's default permission mode, because adding
+  `--dangerously-skip-permissions` to an agent that never had it is the
+  unsafe direction; set `["--dangerously-skip-permissions"]` to restore the
+  pre-release always-bypass floor).
 - `notify/` (sanitize, the `notify-send` banner, chime, the opt-in
   notification command), `cwd/` (via `/proc`); ordered shutdown is
   `backend::ordered_shutdown` (reap every pane, no zombies/orphans).
