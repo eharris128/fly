@@ -23,7 +23,7 @@ pnpm shell:dev                                   # Electron, dev flavor     (ter
 ```
 
 The dev shell runs as the `fly-el` flavor, fully isolated from an installed
-release (config, session, sockets) — see `CLAUDE.md` → "Stable + dev side by
+release (config, session, sockets); see `CLAUDE.md` → "Stable + dev side by
 side". `pnpm build:deb` produces the installable package. System deps and the
 things that will bite you (cargo behind a sandbox, why `cargo run` never opens
 a window, where the logs go) are in `CLAUDE.md` → "Commands".
@@ -39,7 +39,7 @@ cargo test --offline --manifest-path core/Cargo.toml         # Rust: state machi
 Behavior-bearing units ship with tests. The Rust state machines are pure and
 time-injected so they test without a running app; frontend view-models
 (`src/lib/*.ts`) are framework-free for the same reason. A change to
-`core/src/hooks/` or `core/src/feed/` is a change to a trust boundary — read
+`core/src/hooks/` or `core/src/feed/` is a change to a trust boundary: read
 `core/src/hooks/CLAUDE.md` and keep the existing tests' shape.
 
 ## Conventions
@@ -50,13 +50,13 @@ time-injected so they test without a running app; frontend view-models
   the referenced IDs accurate; when you add a design decision, write it down.
 - **Commits.** Conventional commits (`feat(scope): …`, `fix: …`, `docs: …`).
 - **Versions.** `package.json`, `electron/package.json`, and `core/Cargo.toml`
-  stay on the same version — `src/version-lockstep.test.ts` fails otherwise.
+  stay on the same version; `src/version-lockstep.test.ts` fails otherwise.
 - **README.** When a change moves the product story (shell, install path, CLI
   surface, headline features), update `README.md` too.
 
 ## Security issues
 
-Do not open a public issue for a vulnerability — see [`SECURITY.md`](SECURITY.md).
+Do not open a public issue for a vulnerability; see [`SECURITY.md`](SECURITY.md).
 
 ## License
 
