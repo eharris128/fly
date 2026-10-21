@@ -85,9 +85,34 @@ fn oauth_from_json(body: &str) -> Result<OAuthCreds, String> {
 fn read_oauth() -> Result<OAuthCreds, String> {
     let path = credentials_path()
         .ok_or("no HOME or CLAUDE_CONFIG_DIR set to locate Claude credentials")?;
-    let body = std::fs::read_to_string(&path)
-        .map_err(|e| format!("can't read {}: {e}", path.display()))?;
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        #[cfg(target_os = "macos")]
+        Err(e) => keychain_credentials()
+            .ok_or_else(|| format!("can't read {} or the login keychain: {e}", path.display()))?,
+        #[cfg(not(target_os = "macos"))]
+        Err(e) => return Err(format!("can't read {}: {e}", path.display())),
+    };
     oauth_from_json(&body)
+}
+
+/// macOS: Claude Code keeps the same JSON in the login keychain (generic
+/// password, service `Claude Code-credentials`) instead of the file. It
+/// writes the item with `security`, so reading it back the same way stays
+/// read-only and needs no extra keychain grant.
+#[cfg(target_os = "macos")]
+fn keychain_credentials() -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8(out.stdout).ok()?;
+    let body = body.trim();
+    (!body.is_empty()).then(|| body.to_string())
 }
 
 // ---- wire shapes (defensive: every field optional / defaulted) -------------

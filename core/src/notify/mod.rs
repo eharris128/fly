@@ -97,9 +97,29 @@ pub fn now_unix_ms() -> u64 {
 /// The `notify-send` argv for one banner: title and body ride as separate
 /// argv entries (never through a shell), `--app-name=fly` so the daemon
 /// groups them under the app.
+#[cfg(not(target_os = "macos"))]
 fn banner_command(title: &str, body: &str) -> Command {
     let mut cmd = Command::new("notify-send");
     cmd.arg("--app-name=fly").arg(title).arg(body);
+    cmd
+}
+
+/// macOS: `osascript`'s `display notification`. Title and body still ride as
+/// argv (`item n of argv` inside the script), never spliced into AppleScript
+/// source, so content stays data.
+#[cfg(target_os = "macos")]
+fn banner_command(title: &str, body: &str) -> Command {
+    let mut cmd = Command::new("osascript");
+    cmd.args([
+        "-e",
+        "on run argv",
+        "-e",
+        "display notification (item 2 of argv) with title (item 1 of argv)",
+        "-e",
+        "end run",
+    ])
+    .arg(title)
+    .arg(body);
     cmd
 }
 
@@ -155,10 +175,34 @@ pub fn play_sound(name: &str) {
     if name.is_empty() {
         return;
     }
-    let mut cmd = Command::new("canberra-gtk-play");
-    cmd.arg("-i").arg(name);
+    #[cfg(not(target_os = "macos"))]
+    let cmd = {
+        let mut cmd = Command::new("canberra-gtk-play");
+        cmd.arg("-i").arg(name);
+        cmd
+    };
+    #[cfg(target_os = "macos")]
+    let cmd = {
+        let mut cmd = Command::new("afplay");
+        cmd.arg(mac_sound_path(name));
+        cmd
+    };
     // Handle ignored; the cap bounds the fan-out (see `spawn_detached`).
     spawn_detached(cmd);
+}
+
+/// macOS has no XDG sound theme: a path plays as-is, a bare name resolves
+/// against `/System/Library/Sounds/<name>.aiff`, and a name that isn't there
+/// (the freedesktop default `message-new-instant`, carried over from a Linux
+/// config) falls back to `Glass` rather than going silent.
+#[cfg(target_os = "macos")]
+fn mac_sound_path(name: &str) -> std::path::PathBuf {
+    if name.contains('/') {
+        return name.into();
+    }
+    let sys = std::path::Path::new("/System/Library/Sounds");
+    let named = sys.join(format!("{name}.aiff"));
+    if named.is_file() { named } else { sys.join("Glass.aiff") }
 }
 
 /// Max concurrent in-flight detached helper processes (the chime). Without it, N
@@ -481,6 +525,7 @@ mod banner_tests {
     use super::*;
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn banner_argv_passes_title_and_body_as_data() {
         let cmd = banner_command("fly: pane 3", "needs you; $(rm -rf /) `x`");
         let args: Vec<String> = cmd
@@ -492,6 +537,22 @@ mod banner_tests {
             args,
             vec!["--app-name=fly", "fly: pane 3", "needs you; $(rm -rf /) `x`"],
             "no shell: title/body are argv entries verbatim"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn banner_argv_passes_title_and_body_as_data() {
+        let cmd = banner_command("fly: pane 3", "needs you; $(rm -rf /) `x` \" end");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(cmd.get_program(), "osascript");
+        assert_eq!(
+            &args[args.len() - 2..],
+            ["fly: pane 3", "needs you; $(rm -rf /) `x` \" end"],
+            "no shell, no AppleScript splice: title/body are trailing argv verbatim"
         );
     }
 

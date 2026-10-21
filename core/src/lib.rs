@@ -134,9 +134,15 @@ pub(crate) fn resolve_launch_mode(resume_requested: bool) -> LaunchMode {
 /// is `/opt/fly/fly-shell` — one directory up. Pure so the derivation is
 /// unit-tested; `None` when the layout doesn't hold (a repo build, a bare
 /// copy of the binary). `FLY_SHELL_BIN` overrides for dev.
+///
+/// macOS: the binary is `fly.app/Contents/Resources/fly` and the shell is the
+/// bundle's main executable, `fly.app/Contents/MacOS/fly`.
 pub(crate) fn shell_binary_beside(exe: &std::path::Path) -> Option<PathBuf> {
     let resources = exe.parent()?;
     let root = resources.parent()?;
+    if cfg!(target_os = "macos") {
+        return Some(root.join("MacOS").join("fly"));
+    }
     Some(root.join("fly-shell"))
 }
 
@@ -169,7 +175,7 @@ pub fn run() {
         std::process::exit(1);
     }
     eprintln!("{}", cli::top_level_help());
-    eprintln!("fly: no desktop shell found beside this binary (expected the packaged layout /opt/fly/fly-shell, or FLY_SHELL_BIN); this binary serves the CLI and `fly core`.");
+    eprintln!("fly: no desktop shell found beside this binary (expected the packaged layout /opt/fly/fly-shell or fly.app/Contents/MacOS/fly, or FLY_SHELL_BIN); this binary serves the CLI and `fly core`.");
     std::process::exit(2);
 }
 
@@ -650,12 +656,23 @@ mod tests {
     // ---- the desktop launcher (2026-08-27-001 KTD7) --------------------------
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn shell_binary_is_one_level_above_the_resources_dir() {
         // /usr/bin/fly → /opt/fly/resources/fly (this binary) ⇒ /opt/fly/fly-shell.
         let exe = std::path::Path::new("/opt/fly/resources/fly");
         assert_eq!(
             shell_binary_beside(exe),
             Some(PathBuf::from("/opt/fly/fly-shell"))
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn shell_binary_is_the_app_bundles_main_executable() {
+        let exe = std::path::Path::new("/Applications/fly.app/Contents/Resources/fly");
+        assert_eq!(
+            shell_binary_beside(exe),
+            Some(PathBuf::from("/Applications/fly.app/Contents/MacOS/fly"))
         );
     }
 

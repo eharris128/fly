@@ -894,6 +894,19 @@ impl Pane {
             return;
         }
 
+        // macOS: a child exiting with output still queued on the slave blocks
+        // in exit until the master side reads it (state `E`, unkillable even
+        // by SIGKILL) — so a paused, flooding pane would wedge this join
+        // forever. Make the master non-blocking (the reader is a dup sharing
+        // its file status flags) so the read thread can drain-and-discard
+        // until the child is reaped, without risking a block of its own.
+        #[cfg(target_os = "macos")]
+        if let Backend::Pty { master } = &self.backend {
+            if let Some(fd) = master.as_raw_fd() {
+                set_nonblocking_fd(fd);
+            }
+        }
+
         if let Some(pid) = self.pid {
             // Graceful hangup unless the child is already gone. The shell is a
             // session leader (portable-pty setsid), so its death makes the
@@ -971,8 +984,35 @@ fn read_loop(
         }
     }
 
+    // macOS teardown: keep the master drained (non-blocking, output discarded)
+    // until the child is reaped — see `Pane::teardown` for why exit wedges
+    // otherwise. A natural EOF skips this: the slave is already closed.
+    #[cfg(target_os = "macos")]
+    let drained = if shared.stopping.load(Ordering::Acquire) {
+        loop {
+            if let Ok(Some(st)) = child.try_wait() {
+                break Some(st);
+            }
+            match reader.read(&mut buf) {
+                Ok(n) if n > 0 => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                _ => break None, // EOF/EIO: the slave is closed; wait() won't wedge
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let drained = None;
+
     // The read side ended ⟹ the child closed the PTY ⟹ it has exited. Reap it.
-    let status = child.wait();
+    let status = match drained {
+        Some(st) => Ok(st),
+        None => child.wait(),
+    };
     let final_state = {
         let mut lc = shared.lifecycle.lock().unwrap();
         if !lc.is_terminal() {
@@ -1132,9 +1172,12 @@ impl Write for TmuxWriter {
 /// `fcntl(F_SETFL, O_NONBLOCK)` on an open file (the FIFO read handle).
 fn set_nonblocking(f: &std::fs::File) {
     use std::os::fd::AsRawFd;
+    set_nonblocking_fd(f.as_raw_fd());
+}
+
+fn set_nonblocking_fd(fd: std::os::fd::RawFd) {
     // SAFETY: plain fcntl on a fd we own.
     unsafe {
-        let fd = f.as_raw_fd();
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
@@ -1186,7 +1229,24 @@ fn wake_pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd), String> {
     use std::os::fd::FromRawFd;
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: pipe2 fills two fresh descriptors this process then owns.
+    #[cfg(target_os = "linux")]
     let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    // macOS has no pipe2: pipe, then set the flags. The pane spawn that could
+    // race an exec past the CLOEXEC gap runs on this same thread, so the
+    // window is not observable.
+    #[cfg(not(target_os = "linux"))]
+    let rc = unsafe {
+        let mut rc = libc::pipe(fds.as_mut_ptr());
+        for &fd in &fds {
+            if rc == 0 {
+                rc = libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            if rc == 0 {
+                rc = libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK);
+            }
+        }
+        rc
+    };
     if rc != 0 {
         return Err(format!("wake pipe: {}", std::io::Error::last_os_error()));
     }

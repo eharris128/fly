@@ -6,17 +6,24 @@
 //! Sampled on a low cadence (focus change / before a save / the dashboard poll),
 //! never on the hot output path. The optional OSC 7 fast path and the OSC/BEL
 //! attention scanner are deferred with the multi-agent matrix (KTD9).
+//!
+//! macOS has no `/proc`; the same readers are backed by `libproc`
+//! (`proc_pidinfo` / `proc_listallpids`) and `sysctl(KERN_PROCARGS2)` in
+//! [`macos`], re-exported under the same names so callers stay platform-blind.
 
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
 /// The current working directory of process `pid`, via `/proc/<pid>/cwd`.
 /// Returns `None` if the process is gone or unreadable.
+#[cfg(target_os = "linux")]
 pub fn proc_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
 /// The process name from `/proc/<pid>/comm` (kernel-truncated to 15 bytes),
 /// trimmed of its trailing newline. `None` if the process is gone/unreadable.
+#[cfg(target_os = "linux")]
 pub fn proc_comm(pid: u32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()
@@ -26,6 +33,7 @@ pub fn proc_comm(pid: u32) -> Option<String> {
 /// The argv of process `pid` from `/proc/<pid>/cmdline` (NUL-separated), as a
 /// vector of UTF-8-lossy strings with empty trailing fields dropped. An empty or
 /// unreadable cmdline yields an empty vec.
+#[cfg(target_os = "linux")]
 pub fn proc_cmdline(pid: u32) -> Vec<String> {
     match std::fs::read(format!("/proc/{pid}/cmdline")) {
         Ok(raw) => raw
@@ -48,6 +56,7 @@ pub fn proc_cmdline(pid: u32) -> Vec<String> {
 /// snapshot is what [`count_background_task_groups`] resolves the root and its
 /// descendants against, so a per-call count is internally consistent against pid
 /// reuse (KTD4).
+#[cfg(target_os = "linux")]
 pub fn read_proc_table() -> Vec<ProcEntry> {
     let mut out = Vec::new();
     let Ok(dir) = std::fs::read_dir("/proc") else {
@@ -79,6 +88,7 @@ pub fn read_proc_table() -> Vec<ProcEntry> {
 /// don't understand is skipped, never a panic). `pub(crate)`: the headless
 /// check runner's kill discipline shares this one parser
 /// (headless-monitor-checks U3) rather than growing a second copy of the trap.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn parse_stat_line(line: &str) -> Option<ProcEntry> {
     let lparen = line.find('(')?;
     let rparen = line.rfind(')')?;
@@ -100,6 +110,7 @@ pub(crate) fn parse_stat_line(line: &str) -> Option<ProcEntry> {
 /// **foreground job**, which restores the PTY arm's `process_group_leader`
 /// precision without any tmux round trip (tmux-substrate U4). `None` when
 /// the process is gone or has no controlling tty (tpgid = -1).
+#[cfg(target_os = "linux")]
 pub(crate) fn foreground_tpgid(pid: u32) -> Option<u32> {
     let line = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rparen = line.rfind(')')?;
@@ -111,9 +122,185 @@ pub(crate) fn foreground_tpgid(pid: u32) -> Option<u32> {
 /// Read + parse one pid's `stat`. `None` when the process is gone/unreadable —
 /// the same tolerance as [`read_proc_table`]. Shared with the headless check
 /// runner's liveness pin (headless-monitor-checks U3).
+#[cfg(target_os = "linux")]
 pub(crate) fn read_stat(pid: u32) -> Option<ProcEntry> {
     let line = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_stat_line(&line)
+}
+
+#[cfg(target_os = "macos")]
+pub use macos::{proc_cmdline, proc_comm, proc_cwd, read_proc_table};
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{foreground_tpgid, read_stat};
+
+/// macOS backing for the `/proc` readers above. `start_time` is the process
+/// start timestamp in microseconds since the epoch rather than ticks since
+/// boot; callers only ever compare it for equality (the pid-reuse pin), so
+/// the unit difference is invisible to them.
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::ProcEntry;
+    use std::ffi::CStr;
+    use std::mem::{size_of, zeroed};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
+        let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
+        let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: a correctly-sized, zeroed out-param for PROC_PIDTBSDINFO.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        (n == size).then_some(info)
+    }
+
+    /// `proc_bsdinfo.pbi_status` (`SIDL`..`SZOMB`) as the Linux run-state char.
+    fn state_char(status: u32) -> char {
+        match status {
+            1 => 'I', // SIDL
+            2 => 'R', // SRUN
+            3 => 'S', // SSLEEP
+            4 => 'T', // SSTOP
+            5 => 'Z', // SZOMB
+            _ => '?',
+        }
+    }
+
+    fn entry(info: &libc::proc_bsdinfo) -> ProcEntry {
+        // SAFETY: pbi_comm is a NUL-padded MAXCOMLEN array from the kernel.
+        let comm = unsafe { CStr::from_ptr(info.pbi_comm.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        ProcEntry {
+            pid: info.pbi_pid,
+            ppid: info.pbi_ppid,
+            pgid: info.pbi_pgid,
+            state: state_char(info.pbi_status),
+            start_time: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+            comm,
+        }
+    }
+
+    pub fn proc_cwd(pid: u32) -> Option<PathBuf> {
+        let mut info: libc::proc_vnodepathinfo = unsafe { zeroed() };
+        let size = size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        // SAFETY: a correctly-sized, zeroed out-param for PROC_PIDVNODEPATHINFO.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        if n != size {
+            return None;
+        }
+        // SAFETY: vip_path is a NUL-terminated MAXPATHLEN buffer.
+        let path = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr() as *const libc::c_char) };
+        let bytes = path.to_bytes();
+        (!bytes.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+
+    /// The `p_comm` name (truncated to 16 bytes by the kernel, like Linux's
+    /// 15-byte `comm`).
+    pub fn proc_comm(pid: u32) -> Option<String> {
+        bsdinfo(pid).map(|i| entry(&i).comm)
+    }
+
+    /// argv via `sysctl(KERN_PROCARGS2)`: an `argc` int, the exec path, NUL
+    /// padding, then `argc` NUL-terminated argv strings (then the env, ignored).
+    pub fn proc_cmdline(pid: u32) -> Vec<String> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+        let mut argmax: libc::c_int = 0;
+        let mut len = size_of::<libc::c_int>();
+        let mut argmax_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: sysctl with correctly-sized out-params.
+        let rc = unsafe {
+            libc::sysctl(
+                argmax_mib.as_mut_ptr(),
+                2,
+                &mut argmax as *mut _ as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || argmax <= 0 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; argmax as usize];
+        let mut size = buf.len();
+        // SAFETY: buf is `size` bytes; the kernel writes at most that many.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || size < size_of::<libc::c_int>() {
+            return Vec::new();
+        }
+        buf.truncate(size);
+        let argc = i32::from_ne_bytes(buf[..4].try_into().unwrap()).max(0) as usize;
+        let rest = &buf[4..];
+        // Skip the exec path, then its NUL padding.
+        let Some(path_end) = rest.iter().position(|&b| b == 0) else {
+            return Vec::new();
+        };
+        let Some(args_start) = rest[path_end..].iter().position(|&b| b != 0) else {
+            return Vec::new();
+        };
+        rest[path_end + args_start..]
+            .split(|&b| b == 0)
+            .take(argc)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect()
+    }
+
+    pub fn read_proc_table() -> Vec<ProcEntry> {
+        // SAFETY: a null buffer asks for the current pid count.
+        let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if n <= 0 {
+            return Vec::new();
+        }
+        // Headroom for processes spawned between the two calls.
+        let mut pids = vec![0 as libc::c_int; n as usize + 64];
+        let bytes = (pids.len() * size_of::<libc::c_int>()) as libc::c_int;
+        // SAFETY: pids is `bytes` long; the call returns how many it filled.
+        let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr() as *mut libc::c_void, bytes) };
+        if n <= 0 {
+            return Vec::new();
+        }
+        pids.truncate(n as usize);
+        pids.into_iter()
+            .filter(|&p| p > 0)
+            .filter_map(|p| read_stat(p as u32))
+            .collect()
+    }
+
+    pub(crate) fn read_stat(pid: u32) -> Option<ProcEntry> {
+        bsdinfo(pid).map(|i| entry(&i))
+    }
+
+    pub(crate) fn foreground_tpgid(pid: u32) -> Option<u32> {
+        let tpgid = bsdinfo(pid)?.e_tpgid;
+        // No controlling tty reads as 0 (Linux reports -1).
+        (tpgid != 0 && tpgid != u32::MAX).then_some(tpgid)
+    }
 }
 
 /// The transitive descendants of `root_pid` in `table` (root excluded):
