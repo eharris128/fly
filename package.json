@@ -15,7 +15,8 @@
     "test:unit": "vitest run",
     "shell:dev": "FLY_APP_NAME=fly-el FLY_SHELL_URL=http://localhost:1420 pnpm --filter fly-electron-shell dev",
     "build:core": "cargo build --release --offline --manifest-path core/Cargo.toml",
-    "build:deb": "pnpm build && pnpm build:core && pnpm --filter fly-electron-shell dist"
+    "build:deb": "pnpm build && pnpm build:core && pnpm --filter fly-electron-shell dist",
+    "build:mac": "pnpm build && pnpm build:core && pnpm --filter fly-electron-shell dist:mac"
   },
   "dependencies": {
     "@xterm/addon-fit": "0.11.0",

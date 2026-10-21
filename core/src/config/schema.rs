@@ -330,7 +330,8 @@ impl Default for Config {
             resume_default_args: Vec::new(),
             automation_defaults: AutomationDefaults::default(),
             feed: FeedConfig::default(),
-            terminal: "x-terminal-emulator".into(),
+            terminal: if cfg!(target_os = "macos") { "Terminal" } else { "x-terminal-emulator" }
+                .into(),
             substrate: SubstrateKind::default(),
         }
     }

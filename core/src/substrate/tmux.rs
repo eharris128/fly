@@ -122,9 +122,23 @@ fn close_inherited_fds(cmd: &mut Command) {
     // already the child's real stdio. close_range needs kernel ≥ 5.9; on
     // any failure the child still execs — the leak is an fd-hygiene loss,
     // not a tmux correctness loss.
+    #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(|| {
             libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+            Ok(())
+        });
+    }
+    // macOS has no close_range: close() each fd up to the descriptor limit,
+    // read here pre-fork since sysconf is not async-signal-safe. Capped so a
+    // raised rlimit can't turn every tmux spawn into a million-syscall loop.
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let max = libc::sysconf(libc::_SC_OPEN_MAX).clamp(256, 65_536) as libc::c_int;
+        cmd.pre_exec(move || {
+            for fd in 3..max {
+                libc::close(fd);
+            }
             Ok(())
         });
     }
@@ -868,15 +882,16 @@ mod tests {
         // Padding fds so the probe fd sits above the low numbers a child's
         // own transient opens (ls's dir fd) would reuse after close_range.
         let pad: Vec<std::fs::File> = (0..4)
-            .map(|_| std::fs::File::open("/proc/self/status").unwrap())
+            .map(|_| std::fs::File::open("/dev/null").unwrap())
             .collect();
-        let probe = std::fs::File::open("/proc/self/status").unwrap();
+        let probe = std::fs::File::open("/dev/null").unwrap();
         let fd = probe.as_raw_fd();
         // std opens with CLOEXEC; clear it to model an inherited listener.
         assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
         let child_fds = |harden: bool| {
             let mut cmd = Command::new("sh");
-            cmd.args(["-c", "ls /proc/self/fd"])
+            // /dev/fd is per-process on both Linux and macOS (no /proc there).
+            cmd.args(["-c", "ls /dev/fd"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
             if harden {
