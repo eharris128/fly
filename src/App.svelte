@@ -184,6 +184,19 @@
     const t = makeTab();
     return { id: `ws-${nextWorkspaceId++}`, name, tabs: [t], activeTabId: t.id };
   }
+  // User-facing tabs/workspaces open straight into Claude Code: the leaf's start
+  // command is seeded here, before the tab is appended, because the Terminal
+  // reads it once at mount. Internal tabs (Automations workspace, handoff and
+  // pickup panes) keep using makeTab/makeWorkspace and their own commands.
+  function makeClaudeTab(): Tab {
+    const t = makeTab();
+    startCommandByLeaf = { ...startCommandByLeaf, [leaves(t.tree)[0].key]: ["claude"] };
+    return t;
+  }
+  function makeClaudeWorkspace(name: string): Workspace {
+    const t = makeClaudeTab();
+    return { id: `ws-${nextWorkspaceId++}`, name, tabs: [t], activeTabId: t.id };
+  }
 
   // Automations-workspace-and-model U7 (R1/R3/KTD2): resolve — or provision —
   // the one durable "Automations" workspace that hosts every automation agent
@@ -252,6 +265,9 @@
   // missing entry means a bare shell (the normal case). Read once per Terminal
   // at mount, so it must be set before workspaces are assigned.
   let resumeCommandByLeaf = $state<Record<string, string[]>>({});
+  // leaf key → the launch command for a fresh user-facing tab (`claude`); same
+  // read-once-at-mount contract as resumeCommandByLeaf, lowest precedence.
+  let startCommandByLeaf = $state<Record<string, string[]>>({});
   // leaf key → automation agent command / run id (U8). An agent-run event
   // creates a background ephemeral tab; these are seeded before the tab is
   // appended so the Terminal reads them once at mount (like resumeCommandByLeaf).
@@ -835,7 +851,7 @@
     // The target workspace may have been deleted during the await — never point
     // active at a gone workspace (it would render a blank layout). Bail if so.
     if (!workspaces.some((w) => w.id === wsId)) return;
-    const t = makeTab();
+    const t = makeClaudeTab();
     const newKey = leaves(t.tree)[0].key;
     // Seed the new leaf's cwd in the same synchronous block that adds the tab, so
     // it's present before the Terminal mounts (Terminal reads cwd once at mount).
@@ -969,12 +985,12 @@
     closeLeafInTab(target.tabId, target.leafKey);
   }
   function newWorkspace() {
-    const ws = makeWorkspace(`workspace ${workspaces.length + 1}`);
+    const ws = makeClaudeWorkspace(`workspace ${workspaces.length + 1}`);
     workspaces = [...workspaces, ws];
     activeWorkspaceId = ws.id;
   }
   function doDeleteWorkspace(wsId: string) {
-    const res = deleteWorkspaceFrom(workspaces, wsId, () => makeWorkspace("default"));
+    const res = deleteWorkspaceFrom(workspaces, wsId, () => makeClaudeWorkspace("default"));
     workspaces = res.workspaces;
     if (activeWorkspaceId === wsId) activeWorkspaceId = res.nextActiveId;
     pruneNotifications(); // drop history for the deleted workspace's leaves
@@ -2333,7 +2349,7 @@
           focusedLeafKey: leaves(st.tree)[0]?.key ?? "",
           title: st.title ?? null,
         }));
-        if (tabs.length === 0) tabs.push(makeTab()); // never an empty workspace
+        if (tabs.length === 0) tabs.push(makeClaudeTab()); // never an empty workspace
         const activeTabId =
           tabs[Math.min(Math.max(0, sw.activeTabIndex), tabs.length - 1)]?.id ??
           tabs[0].id;
@@ -2358,17 +2374,15 @@
       // raises — neither touches this restore path, U5/U21).
       notifications = saved.notifications;
     } else {
-      const ws = makeWorkspace("default");
+      const ws = makeClaudeWorkspace("default");
       workspaces = [ws];
       activeWorkspaceId = ws.id;
     }
     ready = true;
-    // Open to the dashboard as the home base (R1/KTD5): set synchronously here,
-    // right after `ready`, so the dashboard is the first painted view rather than
-    // flashing the restored grid first. The crash-resume offer was already
-    // awaited above (inside computeResumeForRestore), so opening underneath it
-    // never clobbers it; panes stay mounted and run hidden behind the dashboard.
-    homeViewOpen = true;
+    // Open straight to the main pane, not the dashboard: fly launches into Claude
+    // Code. The dashboard is still one chord away (`leader d`). This supersedes
+    // the dashboard-as-home-base launch view (R1/KTD5 of the dashboard plans).
+    homeViewOpen = false;
 
     // Flush a final save before the window closes, while the shells are still
     // alive so their cwds are captured (R13/R14). Then the backend reaps panes.
@@ -2416,7 +2430,7 @@
     void restore().catch((e) => {
       void frontendLog(`restore failed: ${String(e)}`);
       if (!ready) {
-        const ws = makeWorkspace("default");
+        const ws = makeClaudeWorkspace("default");
         workspaces = [ws];
         activeWorkspaceId = ws.id;
         ready = true;
@@ -2599,6 +2613,7 @@
                 automationCommandByLeaf[p.key] ??
                 sinkCommandByLeaf[p.key] ??
                 handoffCommandByLeaf[p.key] ??
+                startCommandByLeaf[p.key] ??
                 null}
               automationRunId={automationRunIdByLeaf[p.key] ?? null}
               resumeTier={resumeTierByLeaf[p.key] ?? null}
