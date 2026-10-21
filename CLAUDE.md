@@ -21,7 +21,12 @@ panes, tabs + splits (one agent per pane), and an attention indicator + OS
 notification when an agent needs you. v1 wires **Claude Code** as the attention
 source. Stack: a **Rust** backend (`fly core`, headless, served over a Unix
 control socket) + an **Electron** shell (the window) + **Svelte 5** (Vite/TS
-frontend) + **xterm.js** terminal panes. Linux only.
+frontend) + **xterm.js** terminal panes. Linux, plus a macOS port (`pnpm
+build:mac` → `.dmg`; the platform seams are `cwd/` (libproc instead of
+`/proc`), `notify/` (`osascript`/`afplay`), `substrate::attach_command`
+(Terminal/iTerm via AppleScript), the `pipe2`/`close_range` fallbacks, the
+macOS teardown drain in `pty/pane.rs`, the keychain read in `usage/`, and
+`electron/main.js`'s login-shell PATH + app menu — see README "macOS").
 
 ## Commands
 

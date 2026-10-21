@@ -357,8 +357,11 @@ fn request(path: &Path, json: &str) -> Vec<u8> {
     use std::io::Read;
     let mut s = UnixStream::connect(path).unwrap();
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-    s.write_all(json.as_bytes()).unwrap();
-    s.shutdown(Shutdown::Write).unwrap();
+    // A server that rejects mid-request (the oversize bound) may hang up while
+    // we're still writing; macOS's small socket buffer surfaces that as EPIPE
+    // here. The response (empty) is what the tests assert, not the write.
+    let _ = s.write_all(json.as_bytes());
+    let _ = s.shutdown(Shutdown::Write);
     let mut buf = Vec::new();
     let _ = s.read_to_end(&mut buf);
     buf

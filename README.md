@@ -1,13 +1,13 @@
 # fly
 
-A Linux desktop **terminal for AI coding agents**: real PTY-backed panes, tabs
+A Linux and macOS desktop **terminal for AI coding agents**: real PTY-backed panes, tabs
 and splits (one agent per pane), and an attention indicator plus OS notification
 the moment an agent needs you. v1 wires **Claude Code** as the attention source.
 
 **Stack:** Rust backend (`fly core`, a headless process serving a Unix control
 socket) · [Electron](https://electronjs.org) shell (the desktop window) ·
 [Svelte 5](https://svelte.dev) (Vite / TypeScript frontend) ·
-[xterm.js](https://xtermjs.org) terminal panes. **Linux only.**
+[xterm.js](https://xtermjs.org) terminal panes. **Linux and macOS.**
 
 > The full design lives in [`docs/plans/`](docs/plans/README.md) (indexed by ID);
 > the primary contributor guide is [`CLAUDE.md`](CLAUDE.md). This README is the
@@ -136,6 +136,39 @@ to install the Claude Code hooks (attention + the `SessionStart` capture hook);
 
 For the Electron dev loop and running a dev build **alongside** the installed
 release (isolated state under `FLY_APP_NAME`), see `CLAUDE.md` → Commands.
+
+### macOS
+
+```bash
+pnpm install
+pnpm build:mac   # vite build → cargo build --release → electron-builder
+                 # → electron/dist-el/fly-<ver>-arm64.dmg (+ .zip)
+```
+
+Open the `.dmg` and drag **fly** to Applications. The build is unsigned, so
+the first launch needs right-click → **Open** (or
+`xattr -dr com.apple.quarantine /Applications/fly.app`). To put the CLI on
+your PATH, symlink the bundled binary, then install the hooks:
+
+```bash
+ln -sf /Applications/fly.app/Contents/Resources/fly /usr/local/bin/fly
+fly hooks setup
+```
+
+What differs from Linux:
+
+- **Banners** go through `osascript` (`display notification`), so macOS lists
+  them under Script Editor in System Settings → Notifications; allow them there.
+- **The chime** plays with `afplay`. `notificationSound` takes a name from
+  `/System/Library/Sounds` (e.g. `Glass`, `Ping`) or a path; unknown names fall
+  back to `Glass`.
+- **`terminal`** (the `leader t` native attach) defaults to `Terminal`; `iTerm`
+  is also driven through AppleScript, and any other value gets the Linux
+  `<terminal> -e tmux …` shape. The first attach asks for Automation permission.
+- **PATH**: a Finder/Dock launch reads your login shell's `PATH` at startup, so
+  Homebrew's `tmux` and `~/.local/bin/claude` resolve in panes.
+- Config and data still live under `~/.config/<app>` and `~/.local/share/<app>`
+  (XDG paths, honored as on Linux); sockets live under `$TMPDIR/<app>/`.
 
 ## Testing
 
