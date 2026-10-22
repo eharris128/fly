@@ -70,6 +70,10 @@ export interface Config {
   saveScrollback: boolean;
   /** Show the 🔔 notifications icon in the control bar (settings-menu toggle). */
   showNotificationsIcon: boolean;
+  /** Open to the terminal instead of the dashboard at launch (default off). */
+  launchToTerminal: boolean;
+  /** New tabs/workspaces start `claude` instead of a bare shell (default off). */
+  newTabsStartClaude: boolean;
   /** Start with global do-not-disturb on (R17). */
   notificationsMutedDefault: boolean;
   /** Sound-theme name for surfaced notifications, or null for silent (R23). */

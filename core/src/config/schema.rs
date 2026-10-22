@@ -254,6 +254,12 @@ pub struct Config {
     /// vanishes with the button, but `leader n` still opens the panel and OS
     /// notifications still surface.
     pub show_notifications_icon: bool,
+    /// Launch to the terminal instead of the dashboard home base (R1/KTD5).
+    /// Off by default: fly opens to the dashboard. Settings-menu toggle.
+    pub launch_to_terminal: bool,
+    /// New user-facing tabs/workspaces start `claude` instead of a bare shell.
+    /// Off by default. Settings-menu toggle; restored panes are unaffected.
+    pub new_tabs_start_claude: bool,
     /// Start with global do-not-disturb on (R17). Per-workspace mute is runtime
     /// only in v1; this is the one mute startup default.
     pub notifications_muted_default: bool,
@@ -323,6 +329,8 @@ impl Default for Config {
             font_size: 15,
             save_scrollback: false,
             show_notifications_icon: true,
+            launch_to_terminal: false,
+            new_tabs_start_claude: false,
             notifications_muted_default: false,
             notification_sound: Some("message-new-instant".into()),
             notification_command: None,
@@ -438,6 +446,15 @@ mod tests {
     fn missing_show_notifications_icon_defaults_shown() {
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(cfg.show_notifications_icon);
+    }
+
+    /// The launch preferences default to the original behavior (dashboard at
+    /// launch, bare-shell new tabs), including for a config predating them.
+    #[test]
+    fn launch_preferences_default_off() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.launch_to_terminal);
+        assert!(!cfg.new_tabs_start_claude);
     }
 
     /// A config predating the feed block loads with the feed enabled on the

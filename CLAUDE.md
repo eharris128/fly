@@ -438,7 +438,10 @@ Plan:
   holds: `leaderKey`, `attentionDebounceMs` (400), `nudgeIdleMs`,
   `notificationCoalesceThreshold`, `oscBelFallback`, `scrollbackLines`
   (10k), `saveScrollback`, `showNotificationsIcon`,
-  `notificationsMutedDefault`, `notificationSound`, `reasonEffects`, and
+  `notificationsMutedDefault`, `notificationSound`, `reasonEffects`, the
+  opt-in launch prefs `launchToTerminal` (open to the terminal instead of the
+  dashboard) and `newTabsStartClaude` (new tabs run `claude`; both default off,
+  settings-menu toggles), and
   `feed.port` (4939). Two are security-relevant: **`notificationCommand`**
   (opt-in, default off — runs an arbitrary user command on every surfaced
   notification; env/quoting contract in `notify::command`) and
