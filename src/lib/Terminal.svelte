@@ -557,10 +557,13 @@
     height: 100%;
     background: #0b1020;
   }
+  /* Inset instead of padded: FitAddon reads this element's border-box height
+     but subtracts only the xterm element's padding, so padding here would
+     over-count rows and clip the last line — and padding on .xterm would show
+     xterm's black viewport background in the gutter. */
   .terminal {
-    width: 100%;
-    height: 100%;
-    padding: 4px;
+    position: absolute;
+    inset: 4px;
   }
   .attach-badge {
     position: absolute;
