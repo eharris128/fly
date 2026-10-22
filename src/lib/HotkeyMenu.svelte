@@ -4,7 +4,11 @@
   // so it can never drift from the real bindings (R3/KTD1). The parent owns the
   // open state and dismissal; this component is purely presentational and takes
   // no DOM focus (KTD3) — Escape is handled by the parent's window listener.
+  import X from "@lucide/svelte/icons/x";
+  import { useIconDefaults } from "./icons";
   import { BINDINGS, DIGIT_CHORD, LEADER_KEY, formatLeader, type Binding } from "./keymap";
+
+  useIconDefaults(14);
 
   interface Props {
     open: boolean;
@@ -39,7 +43,7 @@
       <div class="head">
         <span class="title">Hotkeys</span>
         <span class="leader">Leader&nbsp;<kbd>{formattedLeader}</kbd></span>
-        <button class="close" title="close" onclick={onClose}>×</button>
+        <button class="close" title="close" onclick={onClose}><X /></button>
       </div>
       <ul class="rows">
         {#each BINDINGS as b (b.label)}
@@ -73,22 +77,22 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: rgba(5, 8, 16, 0.6);
+    background: var(--color-overlay);
   }
   .menu {
     display: flex;
     flex-direction: column;
-    background: #0b1020;
-    border: 1px solid #2b3a55;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
     border-radius: 6px;
     min-width: 320px;
     max-width: 90vw;
     max-height: 70vh;
-    color: #c9d1d9;
-    font:
-      15px/1 ui-monospace,
-      monospace;
-    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: var(--font-size-sm);
+    line-height: 1;
+    box-shadow: var(--shadow-lg);
     overflow: hidden;
   }
   .head {
@@ -96,18 +100,21 @@
     align-items: center;
     gap: 12px;
     padding: 10px 14px;
-    border-bottom: 1px solid #161b2c;
-    background: #0a0e1a;
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-bg-subtle);
   }
   .title {
     font-weight: bold;
-    color: #4da3ff;
+    color: var(--color-accent);
   }
   .leader {
     flex: 1;
     opacity: 0.7;
   }
   .close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     background: none;
     border: none;
     color: inherit;
@@ -142,11 +149,11 @@
   }
   kbd {
     display: inline-block;
-    background: #11182b;
-    border: 1px solid #2b3a55;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
     border-radius: 3px;
     padding: 2px 6px;
     font: inherit;
-    color: #c9d1d9;
+    color: var(--color-text);
   }
 </style>

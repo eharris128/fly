@@ -4,7 +4,7 @@
 // only through the preload's typed surface — proposal KTD4).
 'use strict';
 
-const { app, BrowserWindow, ipcMain, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, nativeTheme } = require('electron');
 const net = require('net');
 const path = require('path');
 const fs = require('fs');
@@ -295,9 +295,18 @@ app.whenReady().then(async () => {
     width: 1200,
     height: 800,
     title: `fly (${FLAVOR})`,
-    backgroundColor: '#0d1117',
+    // First-paint colour only; matches --color-bg in src/styles/tokens.css.
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#15151b' : '#f7f7f8',
+    // macOS: no native title bar — the traffic lights float over the control bar
+    // (the renderer's `titlebar-overlay` class clears space for them).
+    ...(process.platform === 'darwin'
+      ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 16, y: 16 } }
+      : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
+      // Read back by the preload (`window.fly.flavor`): the renderer shows the
+      // flavor in the control bar now that macOS has no title bar to carry it.
+      additionalArguments: [`--fly-flavor=${FLAVOR}`],
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -400,7 +409,13 @@ app.whenReady().then(async () => {
     renderer.crashed = false;
     renderer.loaded = true;
     droppedLogged = false;
+    sendFullscreen(); // a reload mid-fullscreen must not lose the state
   });
+  // The traffic lights vanish in fullscreen; the renderer drops its gutter.
+  const sendFullscreen = () =>
+    sendToRenderer('fly:event', 'shell://fullscreen', win.isFullScreen());
+  win.on('enter-full-screen', sendFullscreen);
+  win.on('leave-full-screen', sendFullscreen);
   // Hung is not dead: a renderer busy with a huge synchronous write can trip
   // this and recover. Log, let a pending close through, otherwise wait —
   // a hung renderer's state is still the user's; a reload would discard it.

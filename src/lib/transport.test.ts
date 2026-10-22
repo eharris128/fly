@@ -55,6 +55,22 @@ async function loadTransport() {
   return await import("./transport");
 }
 
+describe("shellInfo", () => {
+  it("reports the platform and flavor the preload exposes", async () => {
+    (globalThis as Record<string, unknown>).window = {
+      fly: { ...bridge, platform: "darwin", flavor: "fly-el" },
+    };
+    const t = await loadTransport();
+    expect(t.shellInfo()).toEqual({ platform: "darwin", flavor: "fly-el" });
+  });
+
+  it("degrades to a non-mac packaged shell without the bridge", async () => {
+    delete (globalThis as Record<string, unknown>).window;
+    const t = await loadTransport();
+    expect(t.shellInfo()).toEqual({ platform: "", flavor: "fly" });
+  });
+});
+
 describe("invoke (bridge path)", () => {
   it("passes a JSON-plain deep clone, never the caller's object", async () => {
     const t = await loadTransport();

@@ -19,6 +19,7 @@
     "build:mac": "pnpm build && pnpm build:core && pnpm --filter fly-electron-shell dist:mac"
   },
   "dependencies": {
+    "@lucide/svelte": "^1.60.0",
     "@xterm/addon-fit": "0.11.0",
     "@xterm/addon-serialize": "0.14.0",
     "@xterm/addon-unicode11": "0.9.0",

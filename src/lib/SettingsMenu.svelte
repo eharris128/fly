@@ -144,22 +144,22 @@
     align-items: center;
     justify-content: center;
     padding: 8px;
-    background: rgba(5, 8, 16, 0.5);
+    background: var(--color-overlay);
   }
   .panel {
     display: flex;
     flex-direction: column;
-    background: #0b1020;
-    border: 1px solid #2b3a55;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
     border-radius: 6px;
     width: 420px;
     max-width: 92vw;
     max-height: 80vh;
-    color: #c9d1d9;
-    font:
-      16px/1.4 ui-monospace,
-      monospace;
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+    box-shadow: var(--shadow-lg);
     overflow: hidden;
     outline: none;
   }
@@ -168,8 +168,8 @@
     align-items: center;
     justify-content: space-between;
     padding: 9px 12px;
-    border-bottom: 1px solid #161b2c;
-    background: #0a0e1a;
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-bg-subtle);
   }
   .ttl {
     font-weight: 600;
@@ -189,8 +189,8 @@
     border-left: 2px solid transparent;
   }
   .row.sel {
-    background: #11182b;
-    border-left-color: #4da3ff;
+    background: var(--color-surface);
+    border-left-color: var(--color-accent);
   }
   .mid {
     flex: 1;
@@ -212,8 +212,8 @@
     width: 34px;
     height: 18px;
     border-radius: 9px;
-    border: 1px solid #2b3a55;
-    background: #161b2c;
+    border: 1px solid var(--color-border);
+    background: var(--color-surface);
     cursor: pointer;
     padding: 0;
     transition:
@@ -221,8 +221,8 @@
       border-color 0.12s ease;
   }
   .switch.on {
-    background: #2f6bd8;
-    border-color: #4da3ff;
+    background: var(--color-accent);
+    border-color: var(--color-accent);
   }
   .knob {
     position: absolute;
@@ -231,12 +231,12 @@
     width: 14px;
     height: 14px;
     border-radius: 50%;
-    background: #c9d1d9;
+    background: var(--color-text);
     transition: transform 0.12s ease;
   }
   .switch.on .knob {
     transform: translateX(16px);
-    background: #fff;
+    background: var(--color-surface);
   }
   .empty {
     padding: 16px 12px;
@@ -245,7 +245,7 @@
   }
   .hint {
     padding: 6px 12px;
-    border-top: 1px solid #161b2c;
+    border-top: 1px solid var(--color-border);
     font-size: 14px;
     opacity: 0.45;
   }
