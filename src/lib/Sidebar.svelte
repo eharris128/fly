@@ -10,7 +10,17 @@
   // workspaces.ts (insertionIndex); this component wires it to pointer events,
   // mirroring App.svelte's split-divider `startDrag`. Order persistence is the
   // parent's job — the reorder fires `onReorderWorkspace(from, to)`.
+  import GripVertical from "@lucide/svelte/icons/grip-vertical";
+  import ChevronDown from "@lucide/svelte/icons/chevron-down";
+  import ChevronRight from "@lucide/svelte/icons/chevron-right";
+  import VolumeX from "@lucide/svelte/icons/volume-x";
+  import Volume2 from "@lucide/svelte/icons/volume-2";
+  import Plus from "@lucide/svelte/icons/plus";
+  import X from "@lucide/svelte/icons/x";
+  import { useIconDefaults } from "./icons";
   import { insertionIndex, type AttentionKind } from "./workspaces";
+
+  useIconDefaults(14);
 
   interface SidebarTab {
     id: string;
@@ -52,7 +62,6 @@
     onCommitEdit: (name: string) => void;
     onCancelEdit: () => void;
     onToggleWorkspaceMute: (wsId: string) => void;
-    onToggleCollapsed: () => void;
     onReorderWorkspace: (fromIndex: number, toIndex: number) => void;
   }
   let {
@@ -70,7 +79,6 @@
     onCommitEdit,
     onCancelEdit,
     onToggleWorkspaceMute,
-    onToggleCollapsed,
     onReorderWorkspace,
   }: Props = $props();
 
@@ -205,7 +213,7 @@
             title="drag to reorder"
             aria-label="drag to reorder workspace"
             onpointerdown={(e) => startWsDrag(i, e)}
-            onclick={(e) => e.stopPropagation()}>⠿</button
+            onclick={(e) => e.stopPropagation()}><GripVertical /></button
           >
           <button
             class="twisty"
@@ -213,7 +221,7 @@
             onclick={(e) => {
               e.stopPropagation();
               toggleFold(ws.id);
-            }}>{open ? "▾" : "▸"}</button
+            }}>{#if open}<ChevronDown />{:else}<ChevronRight />{/if}</button
           >
           {#if isEditingWs(ws.id)}
             <input
@@ -246,7 +254,7 @@
             <span class="count" title="{ws.unread} unread">{ws.unread}</span>
           {/if}
           {#if ws.muted}
-            <span class="muted-ind" title="workspace muted">🔇</span>
+            <span class="muted-ind" title="workspace muted"><VolumeX /></span>
           {/if}
           <span class="ws-actions">
             <button
@@ -255,7 +263,7 @@
               onclick={(e) => {
                 e.stopPropagation();
                 onNewTab(ws.id);
-              }}>+</button
+              }}><Plus /></button
             >
             <button
               class="icon"
@@ -263,7 +271,7 @@
               onclick={(e) => {
                 e.stopPropagation();
                 onToggleWorkspaceMute(ws.id);
-              }}>{ws.muted ? "🔊" : "🔇"}</button
+              }}>{#if ws.muted}<Volume2 />{:else}<VolumeX />{/if}</button
             >
             <button
               class="icon"
@@ -271,7 +279,7 @@
               onclick={(e) => {
                 e.stopPropagation();
                 onDeleteWorkspace(ws.id);
-              }}>×</button
+              }}><X /></button
             >
           </span>
         </div>
@@ -328,7 +336,7 @@
                   onclick={(e) => {
                     e.stopPropagation();
                     onCloseTab(tab.id);
-                  }}>×</button
+                  }}><X /></button
                 >
               </div>
             {/each}
@@ -343,12 +351,7 @@
 
   <div class="footer">
     <button class="foot-btn" title="new workspace" onclick={onNewWorkspace}
-      >+ workspace</button
-    >
-    <button
-      class="foot-btn collapse"
-      title="collapse sidebar"
-      onclick={onToggleCollapsed}>‹</button
+      ><Plus /> workspace</button
     >
   </div>
 </div>
@@ -357,62 +360,65 @@
   .sidebar {
     display: flex;
     flex-direction: column;
-    width: 250px;
+    width: var(--size-sidebar);
     flex: none;
     height: 100%;
-    background: #0a0e1a;
-    border-right: 1px solid #161b2c;
+    background: var(--color-bg-subtle);
+    border-right: var(--border-width) solid var(--color-border);
     user-select: none;
-    font:
-      15px/1.3 ui-monospace,
-      monospace;
-    color: #c9d1d9;
+    font-family: var(--font-sans);
+    font-size: var(--font-size-sm);
+    line-height: 1.3;
+    color: var(--color-text);
     overflow: hidden;
   }
   .tree {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 4px 0;
+    padding: var(--space-2);
   }
   .ws-head {
     display: flex;
     align-items: center;
-    gap: 4px;
-    padding: 4px 6px 4px 4px;
+    gap: var(--space-1);
+    padding: var(--space-1) var(--space-2) var(--space-1) var(--space-1);
+    border-radius: var(--radius-md);
     cursor: pointer;
-    opacity: 0.85;
+    color: var(--color-text-muted);
   }
   .ws-head:hover {
-    background: #11182b;
+    background: var(--color-surface);
   }
-  .ws.active > .ws-head {
-    opacity: 1;
-  }
+  .ws.active > .ws-head,
   .ws.active > .ws-head .ws-name {
-    color: #4da3ff;
+    color: var(--color-text);
   }
   .twisty {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     background: none;
     border: none;
     color: inherit;
     opacity: 0.7;
     cursor: pointer;
-    font-size: 13px;
-    width: 18px;
+    width: var(--space-5);
     padding: 0;
     line-height: 1;
   }
   /* Drag handle: faint by default (discoverable), brighter on row hover. */
   .grip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     background: none;
     border: none;
     color: inherit;
     opacity: 0.25;
     cursor: grab;
-    font-size: 14px;
     line-height: 1;
-    width: 14px;
+    width: var(--size-icon);
     flex: none;
     padding: 0;
     touch-action: none;
@@ -428,10 +434,10 @@
   }
   /* Insertion indicator between rows while dragging. */
   .drop-line {
-    height: 2px;
-    margin: 1px 6px;
-    background: #4da3ff;
-    border-radius: 1px;
+    height: var(--border-width-strong);
+    margin: var(--space-0) var(--space-2);
+    background: var(--color-accent);
+    border-radius: var(--radius-sm);
   }
   .ws-name {
     flex: 1;
@@ -442,7 +448,7 @@
     color: inherit;
     cursor: pointer;
     font: inherit;
-    font-weight: bold;
+    font-weight: var(--font-weight-semibold);
     padding: 0;
     white-space: nowrap;
     overflow: hidden;
@@ -450,7 +456,7 @@
   }
   .ws-actions {
     display: none;
-    gap: 2px;
+    gap: var(--space-1);
   }
   .ws-head:hover .ws-actions {
     display: flex;
@@ -462,18 +468,19 @@
   .tab {
     display: flex;
     align-items: center;
-    gap: 5px;
-    padding: 3px 6px 3px 18px;
+    gap: var(--space-1);
+    margin-left: var(--space-4);
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius-md);
     cursor: pointer;
-    opacity: 0.7;
+    color: var(--color-text-muted);
   }
   .tab:hover {
-    background: #11182b;
+    background: var(--color-surface);
   }
   .tab.active {
-    opacity: 1;
-    background: #0b1020;
-    box-shadow: inset 2px 0 0 #4da3ff;
+    color: var(--color-text);
+    background: var(--color-accent-subtle);
   }
   .tab-name {
     flex: 1;
@@ -493,38 +500,41 @@
      non-finished raise, which must read urgent). Blue = finished, result ready
      — the calmer cue, matching the notification panel's "finished" tag. */
   .dot {
-    width: 7px;
-    height: 7px;
+    width: var(--space-2);
+    height: var(--space-2);
     flex: none;
     border-radius: 50%;
-    background: #f5a623;
-    box-shadow: 0 0 6px #f5a623;
+    background: var(--color-warning);
+    box-shadow: 0 0 var(--space-2) var(--color-warning);
   }
   .dot.done {
-    background: #4da3ff;
-    box-shadow: 0 0 6px #4da3ff;
+    background: var(--color-accent);
+    box-shadow: 0 0 var(--space-2) var(--color-accent);
   }
   .dot-spacer {
-    width: 7px;
+    width: var(--space-2);
     flex: none;
   }
   /* Unread-notification count — a distinct cue from the amber raised dot. */
   .count {
     flex: none;
-    min-width: 20px;
-    height: 19px;
-    padding: 0 5px;
-    border-radius: 10px;
-    background: #2b3a55;
-    color: #c9d1d9;
-    font-size: 13px;
-    font-weight: 700;
-    line-height: 19px;
+    min-width: var(--space-5);
+    height: var(--space-5);
+    padding: var(--space-0) var(--space-1);
+    border-radius: var(--radius-full);
+    background: var(--color-bg);
+    border: var(--border-width) solid var(--color-border);
+    color: var(--color-text-muted);
+    font-size: var(--font-size-xs);
+    font-weight: var(--font-weight-semibold);
+    line-height: var(--space-5);
     text-align: center;
   }
   .muted-ind {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     flex: none;
-    font-size: 14px;
     line-height: 1;
     opacity: 0.85;
   }
@@ -533,14 +543,16 @@
     opacity: 0.5;
   }
   .icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     background: none;
     border: none;
     color: inherit;
     opacity: 0.5;
     cursor: pointer;
-    font-size: 16px;
     line-height: 1;
-    padding: 0 3px;
+    padding: var(--space-0) var(--space-1);
   }
   .icon:hover {
     opacity: 1;
@@ -555,12 +567,12 @@
   .rename {
     flex: 1;
     min-width: 0;
-    background: #0b1020;
-    border: 1px solid #4da3ff;
-    border-radius: 3px;
-    color: #c9d1d9;
+    background: var(--color-surface);
+    border: var(--border-width) solid var(--color-accent);
+    border-radius: var(--radius-sm);
+    color: var(--color-text);
     font: inherit;
-    padding: 1px 4px;
+    padding: var(--space-1);
   }
   .rename:focus {
     outline: none;
@@ -569,25 +581,24 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    border-top: 1px solid #161b2c;
-    padding: 4px 6px;
+    border-top: var(--border-width) solid var(--color-border);
+    padding: var(--space-2) var(--space-3);
   }
   .foot-btn {
+    gap: var(--space-1);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     background: none;
     border: none;
-    color: #c9d1d9;
-    opacity: 0.6;
+    color: var(--color-text-muted);
     cursor: pointer;
     font: inherit;
-    padding: 4px 6px;
-    border-radius: 4px;
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius-md);
   }
   .foot-btn:hover {
-    opacity: 1;
-    background: #11182b;
-  }
-  .collapse {
-    font-size: 18px;
-    padding: 2px 8px;
+    color: var(--color-text);
+    background: var(--color-surface);
   }
 </style>

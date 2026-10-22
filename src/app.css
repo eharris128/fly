@@ -1,17 +1,10 @@
-:root {
-  color-scheme: dark;
-}
+@import "./styles/tokens.css";
+@import "./styles/base.css";
 
-* {
-  box-sizing: border-box;
-}
-
+/* fly is a fixed-viewport shell: the document never scrolls. */
 html,
 body {
-  margin: 0;
-  padding: 0;
   height: 100%;
-  background: #0b1020;
   overflow: hidden;
 }
 

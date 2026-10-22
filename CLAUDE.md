@@ -108,7 +108,10 @@ installed stable app, use the `fly-el` loop from Commands above
   `~/.local/share/<app>/`, and the hook + control sockets under
   `$XDG_RUNTIME_DIR/<app>/`. The installed release stays on `fly`.
 - The window title carries the flavor (`fly (fly-el)`) so the dev window is
-  distinguishable from the stable one.
+  distinguishable from the stable one. On macOS the native title bar is hidden
+  (`titleBarStyle: 'hiddenInset'`; the control bar is the title bar), so there
+  the flavor shows as a tag in the control bar instead — the preload exposes it
+  as `window.fly.flavor`, read through `transport.ts::shellInfo()`.
 
 The hook socket lives at a stable per-flavor path (`hook.sock` under the
 runtime dir — tmux-substrate U2/KTD8: substrate sessions outlive the process,
@@ -802,6 +805,16 @@ isolated. fly only ever **reads** under `~/.claude`; it writes nothing there.
   Renders through WebGL while its pane is in the active tab, disposed on hide
   (the KTD6 eviction, built as perf-audit T4 — `lib/renderer.ts` holds the
   pure attach rule; `renderer: "dom"` in config is the escape hatch).
+- `styles/{tokens,base}.css` — the design tokens (colour, type, spacing, radii,
+  shadows; light + dark following the system), **shared with the Local Chat
+  app: the same file, kept in sync** — components use `var(--…)`, never raw
+  values. fly's only additions are `--size-traffic-lights` (the macOS
+  overlay-title-bar gutter; `main.ts` toggles `titlebar-overlay`, dropping it in
+  fullscreen via the shell's `shell://fullscreen` event). `lib/theme.ts` feeds
+  the tokens to xterm (a canvas can't inherit CSS vars; one shared
+  subscription re-themes every pane on a scheme flip, and light mode swaps in a
+  token-derived ANSI palette). Icons are `@lucide/svelte`, sized per component
+  through `lib/icons.ts::useIconDefaults`.
 - `lib/Sidebar.svelte` — collapsible cmux-style workspace tree with a
   **reason-typed attention dot** (`workspaces.ts::attentionKind` /
   `rollupAttentionKind`: amber = an agent is blocked on you, blue = one

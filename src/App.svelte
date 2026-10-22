@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import Terminal from "./lib/Terminal.svelte";
-  import { listen, onWindowCloseRequested, destroyWindow } from "./lib/transport";
+  import { listen, onWindowCloseRequested, destroyWindow, shellInfo } from "./lib/transport";
   import ControlBar from "./lib/ControlBar.svelte";
   import Sidebar from "./lib/Sidebar.svelte";
   import HotkeyMenu from "./lib/HotkeyMenu.svelte";
@@ -1225,6 +1225,16 @@
   // before installing its own resolver, so any prior picker settles defensively.
   // answerSessionPicker(null) focuses the active pane; harmless from the openers,
   // which run closeAllOverlays() BEFORE raising their own flag and taking focus.
+  // Any backdrop overlay up (the control bar stops being a drag region under one).
+  const overlayOpen = $derived(
+    pendingConfirm !== null ||
+      menuOpen ||
+      paletteOpen ||
+      settingsOpen ||
+      notificationPanelOpen ||
+      sessionPicker !== null ||
+      resumeOffer !== null,
+  );
   function closeAllOverlays() {
     pendingConfirm = null;
     menuOpen = false;
@@ -2569,6 +2579,10 @@
 
 <div class="app">
   <ControlBar
+    flavor={shellInfo().flavor}
+    dragEnabled={!overlayOpen}
+    homeOpen={homeViewOpen}
+    onToggleHome={toggleHome}
     workspaceName={activeWorkspace?.name ?? ""}
     tabName={activeTab ? tabDisplayTitle(activeTab, cwdByLeaf) : ""}
     {sidebarCollapsed}
@@ -2601,7 +2615,6 @@
         onCommitEdit={commitEdit}
         onCancelEdit={cancelEdit}
         onToggleWorkspaceMute={toggleWorkspaceMute}
-        onToggleCollapsed={() => (sidebarCollapsed = true)}
         onReorderWorkspace={(from, to) =>
           (workspaces = reorderWorkspaces(workspaces, from, to))}
       />
@@ -2839,7 +2852,7 @@
     flex: 1;
     min-width: 0;
     min-height: 0;
-    background: #161b2c;
+    background: var(--color-surface);
   }
   /* Hide the terminal grid for the home view (U7). Panes stay mounted — the
      never-unmount invariant (KTD5) — so toggling never respawns an agent. */
@@ -2877,16 +2890,16 @@
     padding: 1px 10px 2px;
   }
   .pane-title {
-    color: #9fb2d8;
-    background: rgba(22, 27, 44, 0.92);
-    border: 1px solid #2b3a55;
+    color: var(--color-text-muted);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
     border-bottom: none;
     cursor: default;
   }
   .pane-title-edit {
-    color: #dfe7f5;
-    background: #0b1020;
-    border: 1px solid #4a6296;
+    color: var(--color-text);
+    background: var(--color-bg);
+    border: 1px solid var(--color-border-strong);
     border-bottom: none;
     outline: none;
     width: 275px;
@@ -2895,10 +2908,10 @@
   .divider {
     position: absolute;
     z-index: 5;
-    background: #161b2c;
+    background: var(--color-surface);
   }
   .divider:hover {
-    background: #2b3a55;
+    background: var(--color-border);
   }
   .divider.horizontal {
     cursor: col-resize;
@@ -2913,20 +2926,20 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: rgba(5, 8, 16, 0.6);
+    background: var(--color-overlay);
   }
   .confirm {
-    background: #0b1020;
-    border: 1px solid #2b3a55;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
     border-radius: 6px;
     padding: 18px 20px;
     min-width: 260px;
     text-align: center;
-    color: #c9d1d9;
-    font:
-      16px/1.4 ui-monospace,
-      monospace;
-    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+    box-shadow: var(--shadow-lg);
   }
   .confirm-msg {
     margin: 0 0 14px;
@@ -2943,23 +2956,23 @@
     justify-content: center;
   }
   .btn {
-    background: #11182b;
-    border: 1px solid #2b3a55;
-    color: #c9d1d9;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
     border-radius: 4px;
     padding: 6px 14px;
     cursor: pointer;
     font: inherit;
   }
   .btn:hover {
-    background: #1a2740;
+    background: var(--color-surface-raised);
   }
   .btn.danger {
-    border-color: #f5a623;
-    color: #f5a623;
+    border-color: var(--color-warning);
+    color: var(--color-warning);
   }
   .btn.danger:hover {
-    background: #2a2410;
+    background: var(--color-warning-subtle);
   }
   .confirm-hint {
     margin: 12px 0 0;
@@ -2976,19 +2989,19 @@
     transform: translateX(-50%);
     z-index: 50;
     max-width: 80vw;
-    background: #11182b;
-    border: 1px solid #2b3a55;
-    color: #c9d1d9;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
     border-radius: 6px;
     padding: 8px 14px;
     font: inherit;
     font-size: 15px;
     cursor: pointer;
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-lg);
     opacity: 0.92;
   }
   .notice:hover {
     opacity: 1;
-    background: #1a2740;
+    background: var(--color-surface-raised);
   }
 </style>

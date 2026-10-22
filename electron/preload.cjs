@@ -18,7 +18,12 @@ ipcRenderer.on('fly:close-request', () => {
   ipcRenderer.send('fly:close-ack', closeHandlers > 0);
 });
 
+const flavorArg = process.argv.find((a) => a.startsWith('--fly-flavor='));
+
 contextBridge.exposeInMainWorld('fly', {
+  /** The shell's platform and app flavor — the one source the renderer styles from. */
+  platform: process.platform,
+  flavor: flavorArg ? flavorArg.slice('--fly-flavor='.length) : 'fly',
   /** invoke(cmd, args) — the KTD1 command surface: the names/shapes `control/registry.rs` pins. */
   invoke: (cmd, args) => ipcRenderer.invoke('fly:invoke', cmd, args),
   /** Subscribe to backend events (`pane://…`, `automation://…`, …). */
