@@ -179,6 +179,30 @@ impl Substrate {
 /// Pure so the table is unit-tested; unknown terminals get the `-e` shape.
 pub fn attach_command(terminal: &str, socket_name: &str, session: &str) -> Vec<String> {
     let base = terminal.rsplit('/').next().unwrap_or(terminal);
+    // macOS's Terminal.app / iTerm take no command argv: drive them through
+    // AppleScript, the tmux line passed as an osascript argv (shell-quoted for
+    // the terminal's shell, never spliced into the script source).
+    let mac_app = match base.trim_end_matches(".app") {
+        "Terminal" => Some("Terminal"),
+        "iTerm" | "iTerm2" => Some("iTerm"),
+        _ => None,
+    };
+    if let Some(app) = mac_app {
+        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let line = format!("tmux -L {} attach-session -t {}", q(socket_name), q(session));
+        let script = if app == "iTerm" {
+            "tell application \"iTerm\" to create window with default profile command (item 1 of argv)"
+        } else {
+            "tell application \"Terminal\" to do script (item 1 of argv)"
+        };
+        return [
+            "osascript", "-e", "on run argv", "-e", script, "-e",
+            &format!("tell application \"{app}\" to activate"), "-e", "end run", &line,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    }
     let mut argv: Vec<String> = vec![terminal.to_string()];
     if base.starts_with("gnome-terminal") {
         argv.push("--".into());
@@ -196,6 +220,20 @@ pub fn attach_command(terminal: &str, socket_name: &str, session: &str) -> Vec<S
 #[cfg(test)]
 mod attach_tests {
     use super::attach_command;
+
+    #[test]
+    fn macos_terminal_apps_attach_through_osascript_argv() {
+        let a = attach_command("Terminal", "fly", "fly-it's-a");
+        assert_eq!(a[0], "osascript");
+        assert_eq!(
+            a.last().unwrap(),
+            "tmux -L 'fly' attach-session -t 'fly-it'\\''s-a'",
+            "the tmux line is one shell-quoted argv, not script source"
+        );
+        assert!(attach_command("/Applications/iTerm.app", "fly", "s")
+            .iter()
+            .any(|s| s.contains("iTerm")));
+    }
 
     #[test]
     fn attach_command_adapts_separator_per_family() {

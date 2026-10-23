@@ -11,6 +11,7 @@
   import { wantsWebgl } from "./renderer";
   import type { Keymap } from "./keymap";
   import { resolveSpawnRace } from "./pane-maps";
+  import { terminalTheme, onThemeChange } from "./theme";
   import type { ResumeTier } from "./resume";
   import {
     injectionSpawned,
@@ -285,8 +286,10 @@
       cursorBlink: true,
       scrollback: config.scrollbackLines,
       allowProposedApi: true,
-      theme: { background: "#0b1020", foreground: "#c9d1d9" },
+      theme: terminalTheme(),
     });
+
+    unlisteners.push(onThemeChange((theme) => term && (term.options.theme = theme)));
 
     fit = new FitAddon();
     term.loadAddon(fit);
@@ -555,12 +558,15 @@
     position: relative;
     width: 100%;
     height: 100%;
-    background: #0b1020;
+    background: var(--color-bg);
   }
+  /* Inset instead of padded: FitAddon reads this element's border-box height
+     but subtracts only the xterm element's padding, so padding here would
+     over-count rows and clip the last line — and padding on .xterm would show
+     xterm's black viewport background in the gutter. */
   .terminal {
-    width: 100%;
-    height: 100%;
-    padding: 4px;
+    position: absolute;
+    inset: 4px;
   }
   .attach-badge {
     position: absolute;
@@ -570,9 +576,9 @@
     padding: 2px 8px;
     border-radius: 4px;
     font: 11px system-ui, sans-serif;
-    color: #9fb3d9;
-    background: #1a2740cc;
-    border: 1px solid #2b3a55;
+    color: var(--color-text-muted);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
     pointer-events: none;
   }
   /* A subtle focus outline so the active pane is obvious. */
@@ -580,7 +586,7 @@
     content: "";
     position: absolute;
     inset: 0;
-    border: 1px solid #2b3a55;
+    border: 1px solid var(--color-border);
     pointer-events: none;
   }
   .pane.raised::after,
@@ -593,13 +599,13 @@
     pointer-events: none;
   }
   .pane.raised::after {
-    border-color: #f5a623;
+    border-color: var(--color-warning);
     box-shadow:
-      inset 0 0 12px rgba(245, 166, 35, 0.35),
-      0 0 0 1px rgba(245, 166, 35, 0.5);
+      inset 0 0 12px color-mix(in srgb, var(--color-warning) 35%, transparent),
+      0 0 0 1px color-mix(in srgb, var(--color-warning) 50%, transparent);
   }
   .pane.acknowledged::after {
-    border-color: rgba(245, 166, 35, 0.25);
+    border-color: color-mix(in srgb, var(--color-warning) 25%, transparent);
   }
   .badge {
     position: absolute;
@@ -609,11 +615,11 @@
     font:
       600 14px/1.4 ui-monospace,
       monospace;
-    color: #1a1205;
-    background: #f5a623;
+    color: var(--color-on-accent);
+    background: var(--color-warning);
     border-radius: 10px;
     pointer-events: none;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+    box-shadow: var(--shadow-sm);
   }
   /* Imprecise-resume disclosure banner (fix-003 U4): quiet, bottom-left so it
      clears the top-right attention badge; dismissible. */
@@ -626,19 +632,19 @@
     font:
       14px/1.4 ui-monospace,
       monospace;
-    color: #c9d1d9;
-    background: #11182b;
-    border: 1px solid #2b3a55;
+    color: var(--color-text);
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
     border-radius: 10px;
     cursor: pointer;
     opacity: 0.85;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+    box-shadow: var(--shadow-sm);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .resume-banner:hover {
     opacity: 1;
-    background: #1a2740;
+    background: var(--color-surface-raised);
   }
 </style>

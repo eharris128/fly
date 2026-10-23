@@ -41,25 +41,25 @@
     display: flex;
     align-items: center;
     gap: 12px;
-    background: rgba(17, 24, 43, 0.93);
-    border: 1px solid #2b3a55;
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
     border-radius: 8px;
     padding: 8px 14px;
-    color: #c9d1d9;
-    font:
-      15px/1.4 ui-monospace,
-      monospace;
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+    box-shadow: var(--shadow-lg);
   }
   .msg {
     font-weight: 600;
   }
   .keys {
-    color: #8b93b2;
+    color: var(--color-text-muted);
   }
   kbd {
-    background: #2a3350;
-    color: #cdd3ea;
+    background: var(--color-border-strong);
+    color: var(--color-text);
     border-radius: 4px;
     padding: 1px 5px;
     font: inherit;

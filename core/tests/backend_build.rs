@@ -29,7 +29,10 @@ fn seams(events_log: Arc<Mutex<Vec<String>>>) -> BackendSeams {
 #[test]
 fn builds_full_backend_isolated_refuses_second_and_shuts_down_clean() {
     // ---- isolated flavor: every path root derives from these ----
-    let root = std::env::temp_dir().join(format!("fly-backend-test-{}", std::process::id()));
+    // macOS's per-user $TMPDIR is long enough that runtime/<flavor>/hook.sock
+    // under it overruns the 104-byte sun_path; /tmp keeps the socket legal.
+    let tmp = if cfg!(target_os = "macos") { "/tmp".into() } else { std::env::temp_dir() };
+    let root = tmp.join(format!("fly-backend-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let home = root.join("home");
     let runtime = root.join("runtime");

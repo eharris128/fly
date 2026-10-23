@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import Terminal from "./lib/Terminal.svelte";
-  import { listen, onWindowCloseRequested, destroyWindow } from "./lib/transport";
+  import { listen, onWindowCloseRequested, destroyWindow, shellInfo } from "./lib/transport";
   import ControlBar from "./lib/ControlBar.svelte";
   import Sidebar from "./lib/Sidebar.svelte";
   import HotkeyMenu from "./lib/HotkeyMenu.svelte";
@@ -184,6 +184,23 @@
     const t = makeTab();
     return { id: `ws-${nextWorkspaceId++}`, name, tabs: [t], activeTabId: t.id };
   }
+  // User-facing tabs/workspaces open straight into Claude Code when the
+  // `newTabsStartClaude` setting is on (off by default: a bare shell). The leaf's
+  // start command is seeded here, before the tab is appended, because the
+  // Terminal reads it once at mount. Internal tabs (Automations workspace,
+  // handoff and pickup panes) keep using makeTab/makeWorkspace and their own
+  // commands.
+  function makeClaudeTab(): Tab {
+    const t = makeTab();
+    if (newTabsStartClaude) {
+      startCommandByLeaf = { ...startCommandByLeaf, [leaves(t.tree)[0].key]: ["claude"] };
+    }
+    return t;
+  }
+  function makeClaudeWorkspace(name: string): Workspace {
+    const t = makeClaudeTab();
+    return { id: `ws-${nextWorkspaceId++}`, name, tabs: [t], activeTabId: t.id };
+  }
 
   // Automations-workspace-and-model U7 (R1/R3/KTD2): resolve — or provision —
   // the one durable "Automations" workspace that hosts every automation agent
@@ -252,6 +269,10 @@
   // missing entry means a bare shell (the normal case). Read once per Terminal
   // at mount, so it must be set before workspaces are assigned.
   let resumeCommandByLeaf = $state<Record<string, string[]>>({});
+  // leaf key → the launch command for a fresh user-facing tab (`claude`, only
+  // when `newTabsStartClaude` is on); same read-once-at-mount contract as
+  // resumeCommandByLeaf, lowest precedence.
+  let startCommandByLeaf = $state<Record<string, string[]>>({});
   // leaf key → automation agent command / run id (U8). An agent-run event
   // creates a background ephemeral tab; these are seeded before the tab is
   // appended so the Terminal reads them once at mount (like resumeCommandByLeaf).
@@ -338,6 +359,10 @@
   // config in restore(); flipped through the settings menu, which persists it
   // via setConfig. Hiding it never disables notifications (leader n still works).
   let showNotificationsIcon = $state(true);
+  // Launch preferences (both off = the original behavior: open to the dashboard,
+  // new tabs start a bare shell). Seeded from config in restore().
+  let launchToTerminal = $state(false);
+  let newTabsStartClaude = $state(false);
   // Global do-not-disturb. Seeded from the config default on restore; the
   // runtime toggle is the session's source of truth, mirrored to the backend.
   let muted = $state(false);
@@ -835,7 +860,7 @@
     // The target workspace may have been deleted during the await — never point
     // active at a gone workspace (it would render a blank layout). Bail if so.
     if (!workspaces.some((w) => w.id === wsId)) return;
-    const t = makeTab();
+    const t = makeClaudeTab();
     const newKey = leaves(t.tree)[0].key;
     // Seed the new leaf's cwd in the same synchronous block that adds the tab, so
     // it's present before the Terminal mounts (Terminal reads cwd once at mount).
@@ -969,12 +994,12 @@
     closeLeafInTab(target.tabId, target.leafKey);
   }
   function newWorkspace() {
-    const ws = makeWorkspace(`workspace ${workspaces.length + 1}`);
+    const ws = makeClaudeWorkspace(`workspace ${workspaces.length + 1}`);
     workspaces = [...workspaces, ws];
     activeWorkspaceId = ws.id;
   }
   function doDeleteWorkspace(wsId: string) {
-    const res = deleteWorkspaceFrom(workspaces, wsId, () => makeWorkspace("default"));
+    const res = deleteWorkspaceFrom(workspaces, wsId, () => makeClaudeWorkspace("default"));
     workspaces = res.workspaces;
     if (activeWorkspaceId === wsId) activeWorkspaceId = res.nextActiveId;
     pruneNotifications(); // drop history for the deleted workspace's leaves
@@ -1200,6 +1225,16 @@
   // before installing its own resolver, so any prior picker settles defensively.
   // answerSessionPicker(null) focuses the active pane; harmless from the openers,
   // which run closeAllOverlays() BEFORE raising their own flag and taking focus.
+  // Any backdrop overlay up (the control bar stops being a drag region under one).
+  const overlayOpen = $derived(
+    pendingConfirm !== null ||
+      menuOpen ||
+      paletteOpen ||
+      settingsOpen ||
+      notificationPanelOpen ||
+      sessionPicker !== null ||
+      resumeOffer !== null,
+  );
   function closeAllOverlays() {
     pendingConfirm = null;
     menuOpen = false;
@@ -1244,6 +1279,22 @@
         showNotificationsIcon = !value;
         void frontendLog(`settings: persist ${key} failed: ${String(e)}`);
       }
+    } else if (key === "launchToTerminal") {
+      launchToTerminal = value;
+      try {
+        await setConfig({ launchToTerminal: value });
+      } catch (e) {
+        launchToTerminal = !value;
+        void frontendLog(`settings: persist ${key} failed: ${String(e)}`);
+      }
+    } else if (key === "newTabsStartClaude") {
+      newTabsStartClaude = value;
+      try {
+        await setConfig({ newTabsStartClaude: value });
+      } catch (e) {
+        newTabsStartClaude = !value;
+        void frontendLog(`settings: persist ${key} failed: ${String(e)}`);
+      }
     }
   }
   // Rebuilt whenever a backing value changes so the menu's switch tracks it.
@@ -1254,6 +1305,20 @@
       description:
         "Show the 🔔 in the control bar. Hiding it doesn't disable notifications — leader n still opens the panel.",
       value: showNotificationsIcon,
+    },
+    {
+      key: "launchToTerminal",
+      label: "Launch to terminal",
+      description:
+        "Open fly to the terminal instead of the dashboard. Takes effect on next launch; leader d still opens the dashboard.",
+      value: launchToTerminal,
+    },
+    {
+      key: "newTabsStartClaude",
+      label: "New tabs start Claude Code",
+      description:
+        "New tabs and workspaces run `claude` instead of a bare shell. Restored panes are unchanged.",
+      value: newTabsStartClaude,
     },
   ]);
   // ---- notification panel + mute (U21) -------------------------------------
@@ -2284,6 +2349,8 @@
     nudgeIdleMs = cfg.nudgeIdleMs;
     feedEnabled = cfg.feed.enabled;
     showNotificationsIcon = cfg.showNotificationsIcon;
+    launchToTerminal = cfg.launchToTerminal;
+    newTabsStartClaude = cfg.newTabsStartClaude;
     // Seed global mute from the config default; the backend seeds the same value
     // at startup, so they start in sync (the runtime toggle keeps them so).
     muted = cfg.notificationsMutedDefault;
@@ -2333,7 +2400,7 @@
           focusedLeafKey: leaves(st.tree)[0]?.key ?? "",
           title: st.title ?? null,
         }));
-        if (tabs.length === 0) tabs.push(makeTab()); // never an empty workspace
+        if (tabs.length === 0) tabs.push(makeClaudeTab()); // never an empty workspace
         const activeTabId =
           tabs[Math.min(Math.max(0, sw.activeTabIndex), tabs.length - 1)]?.id ??
           tabs[0].id;
@@ -2358,17 +2425,19 @@
       // raises — neither touches this restore path, U5/U21).
       notifications = saved.notifications;
     } else {
-      const ws = makeWorkspace("default");
+      const ws = makeClaudeWorkspace("default");
       workspaces = [ws];
       activeWorkspaceId = ws.id;
     }
     ready = true;
-    // Open to the dashboard as the home base (R1/KTD5): set synchronously here,
-    // right after `ready`, so the dashboard is the first painted view rather than
-    // flashing the restored grid first. The crash-resume offer was already
-    // awaited above (inside computeResumeForRestore), so opening underneath it
-    // never clobbers it; panes stay mounted and run hidden behind the dashboard.
-    homeViewOpen = true;
+    // Open to the dashboard as the home base (R1/KTD5) unless the user chose to
+    // launch to the terminal (`launchToTerminal` setting; the dashboard is then
+    // one chord away, `leader d`). Set synchronously here, right after `ready`,
+    // so the chosen view is the first painted rather than flashing the restored
+    // grid first. The crash-resume offer was already awaited above (inside
+    // computeResumeForRestore), so opening underneath it never clobbers it; panes
+    // stay mounted and run hidden behind the dashboard.
+    homeViewOpen = !launchToTerminal;
 
     // Flush a final save before the window closes, while the shells are still
     // alive so their cwds are captured (R13/R14). Then the backend reaps panes.
@@ -2416,7 +2485,7 @@
     void restore().catch((e) => {
       void frontendLog(`restore failed: ${String(e)}`);
       if (!ready) {
-        const ws = makeWorkspace("default");
+        const ws = makeClaudeWorkspace("default");
         workspaces = [ws];
         activeWorkspaceId = ws.id;
         ready = true;
@@ -2510,6 +2579,10 @@
 
 <div class="app">
   <ControlBar
+    flavor={shellInfo().flavor}
+    dragEnabled={!overlayOpen}
+    homeOpen={homeViewOpen}
+    onToggleHome={toggleHome}
     workspaceName={activeWorkspace?.name ?? ""}
     tabName={activeTab ? tabDisplayTitle(activeTab, cwdByLeaf) : ""}
     {sidebarCollapsed}
@@ -2542,7 +2615,6 @@
         onCommitEdit={commitEdit}
         onCancelEdit={cancelEdit}
         onToggleWorkspaceMute={toggleWorkspaceMute}
-        onToggleCollapsed={() => (sidebarCollapsed = true)}
         onReorderWorkspace={(from, to) =>
           (workspaces = reorderWorkspaces(workspaces, from, to))}
       />
@@ -2599,6 +2671,7 @@
                 automationCommandByLeaf[p.key] ??
                 sinkCommandByLeaf[p.key] ??
                 handoffCommandByLeaf[p.key] ??
+                startCommandByLeaf[p.key] ??
                 null}
               automationRunId={automationRunIdByLeaf[p.key] ?? null}
               resumeTier={resumeTierByLeaf[p.key] ?? null}
@@ -2779,7 +2852,7 @@
     flex: 1;
     min-width: 0;
     min-height: 0;
-    background: #161b2c;
+    background: var(--color-surface);
   }
   /* Hide the terminal grid for the home view (U7). Panes stay mounted — the
      never-unmount invariant (KTD5) — so toggling never respawns an agent. */
@@ -2817,16 +2890,16 @@
     padding: 1px 10px 2px;
   }
   .pane-title {
-    color: #9fb2d8;
-    background: rgba(22, 27, 44, 0.92);
-    border: 1px solid #2b3a55;
+    color: var(--color-text-muted);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
     border-bottom: none;
     cursor: default;
   }
   .pane-title-edit {
-    color: #dfe7f5;
-    background: #0b1020;
-    border: 1px solid #4a6296;
+    color: var(--color-text);
+    background: var(--color-bg);
+    border: 1px solid var(--color-border-strong);
     border-bottom: none;
     outline: none;
     width: 275px;
@@ -2835,10 +2908,10 @@
   .divider {
     position: absolute;
     z-index: 5;
-    background: #161b2c;
+    background: var(--color-surface);
   }
   .divider:hover {
-    background: #2b3a55;
+    background: var(--color-border);
   }
   .divider.horizontal {
     cursor: col-resize;
@@ -2853,20 +2926,20 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: rgba(5, 8, 16, 0.6);
+    background: var(--color-overlay);
   }
   .confirm {
-    background: #0b1020;
-    border: 1px solid #2b3a55;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
     border-radius: 6px;
     padding: 18px 20px;
     min-width: 260px;
     text-align: center;
-    color: #c9d1d9;
-    font:
-      16px/1.4 ui-monospace,
-      monospace;
-    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+    box-shadow: var(--shadow-lg);
   }
   .confirm-msg {
     margin: 0 0 14px;
@@ -2883,23 +2956,23 @@
     justify-content: center;
   }
   .btn {
-    background: #11182b;
-    border: 1px solid #2b3a55;
-    color: #c9d1d9;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
     border-radius: 4px;
     padding: 6px 14px;
     cursor: pointer;
     font: inherit;
   }
   .btn:hover {
-    background: #1a2740;
+    background: var(--color-surface-raised);
   }
   .btn.danger {
-    border-color: #f5a623;
-    color: #f5a623;
+    border-color: var(--color-warning);
+    color: var(--color-warning);
   }
   .btn.danger:hover {
-    background: #2a2410;
+    background: var(--color-warning-subtle);
   }
   .confirm-hint {
     margin: 12px 0 0;
@@ -2916,19 +2989,19 @@
     transform: translateX(-50%);
     z-index: 50;
     max-width: 80vw;
-    background: #11182b;
-    border: 1px solid #2b3a55;
-    color: #c9d1d9;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
     border-radius: 6px;
     padding: 8px 14px;
     font: inherit;
     font-size: 15px;
     cursor: pointer;
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+    box-shadow: var(--shadow-lg);
     opacity: 0.92;
   }
   .notice:hover {
     opacity: 1;
-    background: #1a2740;
+    background: var(--color-surface-raised);
   }
 </style>

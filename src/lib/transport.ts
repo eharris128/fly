@@ -15,6 +15,8 @@ export type UnlistenFn = () => void;
 
 /** The Electron preload surface (electron/preload.cjs). */
 interface FlyBridge {
+  platform?: string;
+  flavor?: string;
   invoke(cmd: string, args?: unknown): Promise<unknown>;
   onEvent(cb: (event: string, payload: unknown) => void): () => void;
   onPaneOutput(cb: (paneId: number, bytes: Uint8Array) => void): () => void;
@@ -43,6 +45,14 @@ function bridge(): FlyBridge {
   }
   cached = b;
   return b;
+}
+
+/** Where the shell runs and which app flavor it is (`fly` when packaged,
+ * `fly-el` for the dev loop). Safe without the bridge (a unit test, a bare
+ * browser tab): reports a non-mac, packaged shell. */
+export function shellInfo(): { platform: string; flavor: string } {
+  const b = typeof window !== "undefined" ? window.fly : undefined;
+  return { platform: b?.platform ?? "", flavor: b?.flavor ?? "fly" };
 }
 
 // ---- invoke -----------------------------------------------------------------

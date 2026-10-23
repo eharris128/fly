@@ -3,6 +3,8 @@
   // model from `home.ts` and owns only its keyboard selection + a 1s tick for
   // the live "working for" timer. All data + the never-unmount hide live in
   // App.svelte; jumping and closing are prop callbacks.
+  import X from "@lucide/svelte/icons/x";
+  import { useIconDefaults } from "./icons";
   import {
     formatDuration,
     formatTaskCount,
@@ -14,6 +16,8 @@
   } from "./home";
   import type { AutomationRow, LastStatus } from "./automations";
   import type { UsageSnapshot } from "../ipc";
+
+  useIconDefaults(14);
 
   let {
     model,
@@ -356,7 +360,7 @@
                 }}
                 title="Delete this automation (removes its run history; stops an in-flight run)"
                 aria-label={`Delete automation ${a.name}`}
-              >✕</button>
+              ><X /></button>
             </span>
           </li>
           {#if pickupFallback?.automationId === a.id}
@@ -442,19 +446,20 @@
     min-width: 0;
     min-height: 0;
     overflow-y: auto;
-    background: #161b2c;
-    color: #e6e9f2;
+    background: var(--color-surface);
+    color: var(--color-text);
     padding: 20px 24px;
     outline: none;
+    position: relative;
   }
   .usage-panel {
     flex: none;
     width: 300px;
     min-height: 0;
     overflow-y: auto;
-    background: #12172480;
-    border-left: 1px solid #262d44;
-    color: #e6e9f2;
+    background: var(--color-bg-subtle);
+    border-left: 1px solid var(--color-border);
+    color: var(--color-text);
     padding: 20px 18px;
   }
   .usage-head {
@@ -469,7 +474,7 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    color: #aeb6d4;
+    color: var(--color-text-muted);
     margin: 0;
   }
   .usage-actions {
@@ -481,8 +486,8 @@
     font-size: 14px;
     font-weight: 600;
     text-transform: capitalize;
-    color: #cdd3ea;
-    background: #2a3350;
+    color: var(--color-text);
+    background: var(--color-border-strong);
     border-radius: 4px;
     padding: 1px 7px;
   }
@@ -495,17 +500,17 @@
     width: 22px;
     height: 22px;
     padding: 0;
-    border: 1px solid #2a3350;
+    border: 1px solid var(--color-border);
     border-radius: 5px;
-    background: #1d2336;
-    color: #aeb6d4;
+    background: var(--color-surface);
+    color: var(--color-text-muted);
     font-size: 16px;
     line-height: 1;
     cursor: pointer;
   }
   .refresh:hover:not(:disabled) {
-    background: #232a40;
-    color: #e6e9f2;
+    background: var(--color-surface-raised);
+    color: var(--color-text);
   }
   .refresh:disabled {
     cursor: default;
@@ -521,11 +526,11 @@
   }
   .usage-msg {
     font-size: 16px;
-    color: #7b84a3;
+    color: var(--color-text-faint);
     margin: 0;
   }
   .usage-msg.error {
-    color: #f0a8a8;
+    color: var(--color-danger);
   }
   .limits {
     list-style: none;
@@ -544,51 +549,51 @@
   }
   .limit-label {
     font-size: 16px;
-    color: #cdd3ea;
+    color: var(--color-text);
   }
   /* The currently-binding window stands out from the others. */
   .limit.active .limit-label {
     font-weight: 600;
-    color: #e6e9f2;
+    color: var(--color-text);
   }
   .limit-pct {
     font-size: 15px;
     font-variant-numeric: tabular-nums;
-    color: #aeb6d4;
+    color: var(--color-text-muted);
   }
   .bar {
     height: 6px;
     border-radius: 3px;
-    background: #2a3350;
+    background: var(--color-border-strong);
     overflow: hidden;
   }
   .bar-fill {
     height: 100%;
     border-radius: 3px;
-    background: #4d7cff;
+    background: var(--color-accent);
     transition: width 0.3s ease;
   }
   /* Severity tints, escalating as a window fills (Claude's `severity`). */
   .bar-fill.sev-warning {
-    background: #fbbf24;
+    background: var(--color-warning);
   }
   .bar-fill.sev-critical {
-    background: #f87171;
+    background: var(--color-danger);
   }
   .limit-reset {
     display: block;
     margin-top: 5px;
     font-size: 14px;
-    color: #7b84a3;
+    color: var(--color-text-faint);
   }
   .usage-foot {
     margin: 20px 0 0;
     font-size: 14px;
-    color: #5d667f;
+    color: var(--color-text-faint);
   }
   .usage-foot code {
     font-size: 14px;
-    color: #8b93b2;
+    color: var(--color-text-muted);
   }
   .home-head {
     display: flex;
@@ -603,12 +608,12 @@
   }
   .hint {
     font-size: 15px;
-    color: #7b84a3;
+    color: var(--color-text-faint);
   }
   .empty {
     margin-top: 64px;
     text-align: center;
-    color: #7b84a3;
+    color: var(--color-text-faint);
   }
   .empty .sub {
     font-size: 16px;
@@ -631,7 +636,7 @@
   .ws-label {
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    color: #8b93b2;
+    color: var(--color-text-muted);
   }
   .tab {
     margin-bottom: 10px;
@@ -639,7 +644,7 @@
   .tab-title {
     font-size: 16px;
     font-weight: 500;
-    color: #aeb6d4;
+    color: var(--color-text-muted);
     margin: 0 0 4px;
   }
   .row {
@@ -649,7 +654,7 @@
     gap: 12px;
     width: 100%;
     text-align: left;
-    background: #1d2336;
+    background: var(--color-surface);
     border: 1px solid transparent;
     border-radius: 6px;
     padding: 8px 12px;
@@ -659,17 +664,17 @@
     cursor: pointer;
   }
   .row:hover {
-    background: #232a40;
+    background: var(--color-surface-raised);
   }
   /* Raised agents stand out even when not selected (R5): an amber accent that
      echoes the in-pane attention ring. Defined before .selected so the active
      cursor's blue border wins when a row is both raised and selected. */
   .row.attn {
-    border-color: #f5a623;
+    border-color: var(--color-warning);
   }
   .row.selected {
-    border-color: #4d7cff;
-    background: #232a40;
+    border-color: var(--color-accent);
+    background: var(--color-surface-raised);
   }
   /* Per-agent jump keycap (R4/R8). The empty placeholder span holds the column
      for un-numbered rows past ten so the grid stays aligned. */
@@ -681,8 +686,8 @@
     justify-content: center;
     padding: 0 4px;
     border-radius: 4px;
-    background: #2a3350;
-    color: #cdd3ea;
+    background: var(--color-border-strong);
+    color: var(--color-text);
     font: inherit;
     font-size: 14px;
     font-weight: 700;
@@ -697,18 +702,18 @@
     text-transform: capitalize;
   }
   .status.working {
-    color: #4ade80;
+    color: var(--color-success);
   }
   .status.waiting {
-    color: #fbbf24;
+    color: var(--color-warning);
   }
   .status.idle {
-    color: #7b84a3;
+    color: var(--color-text-faint);
   }
   /* Busy-but-quiet: live background work, no output stretch. A cyan/teal distinct
      from working(green), waiting(amber), idle(gray). */
   .status.running {
-    color: #38bdf8;
+    color: var(--color-accent);
   }
   /* Reason-typed triage badge (R4): on a raised row the status slot shows *why*
      the agent needs you instead of the generic "waiting", so the row never reads
@@ -718,28 +723,28 @@
      reason (U12/R18) — only reachable on an agent row if a pane sends it via
      `fly notify`, since the alerts sink pane is not an agent-list row.) */
   .status.reason-question {
-    color: #fbbf24;
+    color: var(--color-warning);
   }
   .status.reason-permission {
-    color: #fb923c;
+    color: var(--color-warning);
   }
   .status.reason-alert {
-    color: #2dd4bf;
+    color: var(--color-success);
   }
   .status.reason-finished {
-    color: #818cf8;
+    color: var(--color-accent);
   }
   .status.reason-error {
-    color: #f87171;
+    color: var(--color-danger);
   }
   .dur {
     font-variant-numeric: tabular-nums;
     font-size: 16px;
-    color: #cdd3ea;
+    color: var(--color-text);
   }
   .cwd {
     font-size: 15px;
-    color: #7b84a3;
+    color: var(--color-text-faint);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -753,20 +758,20 @@
     font-size: 14px;
     padding: 2px 8px;
     border-radius: 9px;
-    border: 1px solid #343d59;
-    color: #7b84a3;
+    border: 1px solid var(--color-border);
+    color: var(--color-text-faint);
     white-space: nowrap;
     cursor: pointer;
     user-select: none;
   }
   .peer-toggle:hover {
-    border-color: #4a5578;
-    color: #aab3d0;
+    border-color: var(--color-border-strong);
+    color: var(--color-text-muted);
   }
   .peer-toggle.on {
-    border-color: #3d6bd6;
-    color: #7fa4f5;
-    background: rgba(61, 107, 214, 0.12);
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+    background: var(--color-accent-subtle);
   }
 
   /* Automations panel — stacked below the agent list in the same left column,
@@ -774,7 +779,7 @@
   .automations {
     margin-top: 28px;
     padding-top: 18px;
-    border-top: 1px solid #262d44;
+    border-top: 1px solid var(--color-border);
   }
   .auto-head {
     display: flex;
@@ -789,13 +794,13 @@
   }
   .auto-head .hint {
     font-size: 15px;
-    color: #7b84a3;
+    color: var(--color-text-faint);
   }
   .auto-head code,
   .auto-empty code,
   .auto-warn code {
     font-size: 14px;
-    color: #8b93b2;
+    color: var(--color-text-muted);
   }
   .auto-warn {
     display: flex;
@@ -803,19 +808,19 @@
     align-items: baseline;
     gap: 4px;
     font-size: 15px;
-    color: #f0a8a8;
-    background: #2a1a1e;
-    border: 1px solid #5a2a30;
+    color: var(--color-danger);
+    background: var(--color-danger-subtle);
+    border: 1px solid var(--color-danger);
     border-radius: 6px;
     padding: 8px 12px;
     margin: 0 0 12px;
   }
   .auto-warn code {
-    color: #f0c0c0;
+    color: var(--color-danger);
   }
   .auto-empty {
     font-size: 16px;
-    color: #7b84a3;
+    color: var(--color-text-faint);
     margin: 0;
   }
   .auto-list {
@@ -834,7 +839,7 @@
     grid-template-columns: minmax(96px, max-content) 1fr auto;
     align-items: baseline;
     gap: 12px;
-    background: #1d2336;
+    background: var(--color-surface);
     border: 1px solid transparent;
     border-radius: 6px;
     padding: 8px 12px;
@@ -851,28 +856,28 @@
     white-space: nowrap;
   }
   .a-status.s-succeeded {
-    color: #4ade80;
+    color: var(--color-success);
   }
   .a-status.s-failed {
-    color: #f87171;
+    color: var(--color-danger);
   }
   .a-status.s-running {
-    color: #38bdf8;
+    color: var(--color-accent);
   }
   .a-status.s-skipped {
-    color: #fbbf24;
+    color: var(--color-warning);
   }
   /* automation-dependencies R17: the honest dependency decline — distinct
      from the amber skip (overloaded) and the red fail (dependent broke). */
   .a-status.s-withheld {
-    color: #fb923c;
+    color: var(--color-warning);
   }
   .a-status.s-never {
-    color: #7b84a3;
+    color: var(--color-text-faint);
   }
   .a-name {
     font-size: 16px;
-    color: #e6e9f2;
+    color: var(--color-text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -882,8 +887,8 @@
     font-size: 13px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: #8b93b2;
-    background: #2a3350;
+    color: var(--color-text-muted);
+    background: var(--color-border-strong);
     border-radius: 4px;
     padding: 1px 5px;
   }
@@ -894,8 +899,8 @@
     font-size: 13px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: #9ecbff;
-    background: #1f3350;
+    color: var(--color-accent);
+    background: var(--color-accent-subtle);
     border-radius: 4px;
     padding: 1px 5px;
   }
@@ -905,8 +910,8 @@
     margin-left: 6px;
     font-size: 13px;
     letter-spacing: 0.02em;
-    color: #fcd39b;
-    background: #3a2d1a;
+    color: var(--color-warning);
+    background: var(--color-warning-subtle);
     border-radius: 4px;
     padding: 1px 5px;
   }
@@ -915,44 +920,44 @@
      retired-fail read apart at a glance — the label word still carries the
      meaning (never color-only). */
   .a-monitor.m-parked {
-    color: #7dd3fc;
-    background: #16324a;
+    color: var(--color-accent);
+    background: var(--color-accent-subtle);
   }
   .a-monitor.m-paused {
-    color: #aeb6d4;
-    background: #2a3350;
+    color: var(--color-text-muted);
+    background: var(--color-border-strong);
   }
   .a-monitor.m-broken {
-    color: #fca5a5;
-    background: #4a1d24;
+    color: var(--color-danger);
+    background: var(--color-danger-subtle);
   }
   .a-monitor.m-retired-pass {
-    color: #86efac;
-    background: #163a28;
+    color: var(--color-success);
+    background: var(--color-success-subtle);
   }
   .a-monitor.m-retired-fail {
-    color: #fda4af;
-    background: #45182b;
+    color: var(--color-danger);
+    background: var(--color-danger-subtle);
   }
   .a-monitor.m-retired {
-    color: #8b93b2;
-    background: #262d44;
+    color: var(--color-text-muted);
+    background: var(--color-surface-raised);
   }
   /* The R16 pickup action — the panel's one interactive control. */
   .a-pickup {
     font: inherit;
     font-size: 14px;
     font-weight: 600;
-    color: #fda4af;
-    background: #45182b;
-    border: 1px solid #6b2440;
+    color: var(--color-danger);
+    background: var(--color-danger-subtle);
+    border: 1px solid var(--color-danger);
     border-radius: 4px;
     padding: 1px 8px;
     cursor: pointer;
   }
   .a-pickup:hover:not(:disabled) {
-    background: #58203a;
-    color: #ffd3da;
+    background: var(--color-danger-subtle);
+    color: var(--color-danger);
   }
   .a-pickup:disabled {
     cursor: default;
@@ -962,10 +967,13 @@
      removal sits behind App's confirm overlay, so the button itself can stay
      unceremonious. */
   .a-delete {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     font: inherit;
     font-size: 14px;
     line-height: 1;
-    color: #7b84a3;
+    color: var(--color-text-faint);
     background: transparent;
     border: 1px solid transparent;
     border-radius: 4px;
@@ -973,20 +981,20 @@
     cursor: pointer;
   }
   .a-delete:hover {
-    color: #fda4af;
-    background: #45182b;
-    border-color: #6b2440;
+    color: var(--color-danger);
+    background: var(--color-danger-subtle);
+    border-color: var(--color-danger);
   }
   /* R17 fallback block: the explanation + raw bundle text shown under the
      retired-fail row when a recovery spawn would break. Modest — an inline
      list item, not a new overlay archetype. */
   .pickup-fallback {
-    background: #171c2d;
-    border: 1px solid #45182b;
+    background: var(--color-surface);
+    border: 1px solid var(--color-danger);
     border-radius: 6px;
     padding: 10px 12px;
     font-size: 15px;
-    color: #cdd3ea;
+    color: var(--color-text);
   }
   .pf-head {
     display: flex;
@@ -995,22 +1003,22 @@
     gap: 12px;
   }
   .pf-explain {
-    color: #f0a8a8;
+    color: var(--color-danger);
   }
   .pf-dismiss {
     flex: none;
     font: inherit;
     font-size: 14px;
-    color: #aeb6d4;
-    background: #1d2336;
-    border: 1px solid #2a3350;
+    color: var(--color-text-muted);
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
     border-radius: 4px;
     padding: 1px 8px;
     cursor: pointer;
   }
   .pf-dismiss:hover {
-    background: #232a40;
-    color: #e6e9f2;
+    background: var(--color-surface-raised);
+    color: var(--color-text);
   }
   .pf-bundle {
     margin: 8px 0 0;
@@ -1019,30 +1027,30 @@
     white-space: pre-wrap;
     word-break: break-word;
     font-size: 14px;
-    color: #aeb6d4;
-    background: #12172480;
+    color: var(--color-text-muted);
+    background: var(--color-bg-subtle);
     border-radius: 4px;
     padding: 8px 10px;
   }
   .pf-none {
     margin: 8px 0 0;
-    color: #7b84a3;
+    color: var(--color-text-faint);
   }
   .a-meta {
     display: flex;
     gap: 8px;
     font-size: 15px;
-    color: #7b84a3;
+    color: var(--color-text-faint);
     white-space: nowrap;
   }
   .a-next {
-    color: #aeb6d4;
+    color: var(--color-text-muted);
     font-variant-numeric: tabular-nums;
   }
   /* Launch model · effort chip (U9). Subtle — it is reference detail, not the
      row's headline. */
   .a-model {
-    color: #8b93b2;
+    color: var(--color-text-muted);
     font-variant-numeric: tabular-nums;
   }
 </style>

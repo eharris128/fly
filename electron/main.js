@@ -4,11 +4,11 @@
 // only through the preload's typed surface — proposal KTD4).
 'use strict';
 
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, nativeTheme } = require('electron');
 const net = require('net');
 const path = require('path');
 const fs = require('fs');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const { encodeJson, encodePaneInput, FrameReader } = require('./protocol');
 const { shouldFlash } = require('./urgency');
 const {
@@ -26,6 +26,27 @@ const {
 const FLAVOR = process.env.FLY_APP_NAME || (app.isPackaged ? 'fly' : 'fly-el');
 process.env.FLY_APP_NAME = FLAVOR;
 app.setPath('userData', path.join(app.getPath('appData'), `${FLAVOR}-shell`));
+
+// ---- macOS login-shell PATH ------------------------------------------------
+// A Finder/Dock launch inherits launchd's bare PATH (/usr/bin:/bin:…), so the
+// core — and every pane it spawns — would miss Homebrew's tmux, ~/.local/bin's
+// claude, and the rest of the user's toolchain. Ask the login shell once, at
+// startup, before the core is spawned with this env. Best-effort: on any
+// failure the inherited PATH stands.
+if (process.platform === 'darwin' && app.isPackaged) {
+  try {
+    const shell = process.env.SHELL || '/bin/zsh';
+    const out = execFileSync(shell, ['-ilc', 'printf "__FLYPATH__%s" "$PATH"'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const found = out.split('__FLYPATH__').pop().trim();
+    if (found) process.env.PATH = found;
+  } catch (e) {
+    console.error(`[shell] could not read the login-shell PATH: ${e}`);
+  }
+}
 
 const RUNTIME_DIR =
   process.env.XDG_RUNTIME_DIR || process.env.TMPDIR || '/tmp';
@@ -274,15 +295,33 @@ app.whenReady().then(async () => {
     width: 1200,
     height: 800,
     title: `fly (${FLAVOR})`,
-    backgroundColor: '#0d1117',
+    // First-paint colour only; matches --color-bg in src/styles/tokens.css.
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#15151b' : '#f7f7f8',
+    // macOS: no native title bar — the traffic lights float over the control bar
+    // (the renderer's `titlebar-overlay` class clears space for them).
+    ...(process.platform === 'darwin'
+      ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 16, y: 16 } }
+      : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
+      // Read back by the preload (`window.fly.flavor`): the renderer shows the
+      // flavor in the control bar now that macOS has no title bar to carry it.
+      additionalArguments: [`--fly-flavor=${FLAVOR}`],
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
     },
   });
-  win.removeMenu();
+  if (process.platform === 'darwin') {
+    // macOS keeps one app-level menu bar, and its Edit roles are what route
+    // ⌘C/⌘V/⌘A into xterm's copy/paste handlers; ⌘Q/⌘H/⌘M come from the
+    // app/window roles. No View menu: ⌘R must not reload the frontend.
+    Menu.setApplicationMenu(
+      Menu.buildFromTemplate([{ role: 'appMenu' }, { role: 'editMenu' }, { role: 'windowMenu' }])
+    );
+  } else {
+    win.removeMenu();
+  }
   win.on('page-title-updated', (e) => e.preventDefault());
   win.on('focus', () => win.flashFrame(false)); // urgency cleared once the user looks (KTD4)
   const wc = win.webContents;
@@ -370,7 +409,13 @@ app.whenReady().then(async () => {
     renderer.crashed = false;
     renderer.loaded = true;
     droppedLogged = false;
+    sendFullscreen(); // a reload mid-fullscreen must not lose the state
   });
+  // The traffic lights vanish in fullscreen; the renderer drops its gutter.
+  const sendFullscreen = () =>
+    sendToRenderer('fly:event', 'shell://fullscreen', win.isFullScreen());
+  win.on('enter-full-screen', sendFullscreen);
+  win.on('leave-full-screen', sendFullscreen);
   // Hung is not dead: a renderer busy with a huge synchronous write can trip
   // this and recover. Log, let a pending close through, otherwise wait —
   // a hung renderer's state is still the user's; a reload would discard it.

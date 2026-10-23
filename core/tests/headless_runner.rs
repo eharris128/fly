@@ -444,6 +444,12 @@ fn kill_run_seam_terminates_the_check_and_the_runner_closes() {
     );
 
     h.runner.kill_run("r-unknown"); // unknown id: no-op
+    // Let the fixture record its pids before the kill, or the no-orphans
+    // check below has nothing to read (a spawn-latency race, seen on macOS).
+    let end = Instant::now() + Duration::from_secs(5);
+    while !h.dir.path().join("pids.txt").exists() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let start = Instant::now();
     h.runner.kill_run("r-seam");
 
