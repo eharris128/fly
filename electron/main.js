@@ -4,7 +4,7 @@
 // only through the preload's typed surface — proposal KTD4).
 'use strict';
 
-const { app, BrowserWindow, ipcMain, Menu, nativeTheme } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, nativeTheme, screen } = require('electron');
 const net = require('net');
 const path = require('path');
 const fs = require('fs');
@@ -291,9 +291,12 @@ app.whenReady().then(async () => {
   } catch (e) {
     console.error(`[shell] cannot reach fly core: ${e}`);
   }
+  // Default 1200x800, clamped to the usable area (workArea excludes panels/docks)
+  // of the display the cursor is on, so a small monitor never clips the bottom.
+  const { workAreaSize } = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
   win = new BrowserWindow({
-    width: 1200,
-    height: 800,
+    width: Math.min(1200, workAreaSize.width),
+    height: Math.min(800, workAreaSize.height),
     title: `fly (${FLAVOR})`,
     // First-paint colour only; matches --color-bg in src/styles/tokens.css.
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#15151b' : '#f7f7f8',
