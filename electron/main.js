@@ -291,9 +291,9 @@ app.whenReady().then(async () => {
   } catch (e) {
     console.error(`[shell] cannot reach fly core: ${e}`);
   }
-  // Open like Konsole/Alacritty: a fixed default size (Alacritty's 100x30 cells
-  // is ~1000x690 px), never forced to maximize. It is only clamped so it can't
-  // exceed the display the cursor is on; the compositor places it.
+  // Default content size of 1000x690 (Alacritty's 100x30 cells), like Konsole and
+  // Alacritty, which open at a fixed size rather than maximized. The size is only
+  // clamped to the display the cursor is on.
   const { workAreaSize } = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
   const CHROME_MARGIN = 40; // title bar headroom; Wayland workArea can't see the panel
   win = new BrowserWindow({
