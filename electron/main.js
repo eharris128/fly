@@ -291,12 +291,15 @@ app.whenReady().then(async () => {
   } catch (e) {
     console.error(`[shell] cannot reach fly core: ${e}`);
   }
-  // Default 1200x800, clamped to the usable area (workArea excludes panels/docks)
-  // of the display the cursor is on, so a small monitor never clips the bottom.
+  // Open like Konsole/Alacritty: a fixed default size (Alacritty's 100x30 cells
+  // is ~1000x690 px), never forced to maximize. It is only clamped so it can't
+  // exceed the display the cursor is on; the compositor places it.
   const { workAreaSize } = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+  const CHROME_MARGIN = 40; // title bar headroom; Wayland workArea can't see the panel
   win = new BrowserWindow({
-    width: Math.min(1200, workAreaSize.width),
-    height: Math.min(800, workAreaSize.height),
+    useContentSize: true,
+    width: Math.min(1000, workAreaSize.width),
+    height: Math.min(690, workAreaSize.height - CHROME_MARGIN),
     title: `fly (${FLAVOR})`,
     // First-paint colour only; matches --color-bg in src/styles/tokens.css.
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#15151b' : '#f7f7f8',
